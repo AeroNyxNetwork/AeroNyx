@@ -17,6 +17,7 @@
 //! - Opens and semantically verifies each response before allowing the next.
 //! - Poisons the complete runtime after any authenticated-reply failure.
 //! - Classifies terminal errors into bounded privacy-safe workflow failures.
+//! - Redacts transport and verifier details from standard diagnostics.
 //!
 //! ## Dependencies
 //! - `send_sequence.rs`: payload-bound ordered network authority.
@@ -39,7 +40,9 @@
 //! - Verifiers must validate workload frame, request identity, and signed result.
 //! - Do not expose adapter state, reply keys, payloads, or work ids in telemetry.
 //!
-//! Last Modified: v1.3.0-TerminalFailureClassification - Added one extensible,
+//! Last Modified: v1.4.0-PrivacySafeRuntimeDiagnostics - Replaced generic
+//! transport/verifier Debug and Display output with stable classifications.
+//! v1.3.0-TerminalFailureClassification - Added one extensible,
 //! privacy-safe runtime error classification boundary.
 //! v1.2.0-RetirementPermitGate - Blocked old-lease retirement
 //! before I/O unless the active workflow issued an exact permit.
@@ -349,7 +352,6 @@ pub enum BlindVaultReplicaTerminalAttemptRuntimeBuildError {
 }
 
 /// Ordered send, authenticated reply, or workload verification failure.
-#[derive(Debug)]
 pub enum BlindVaultReplicaTerminalAttemptError<TransportError, VerificationError> {
     /// Runtime had already authenticated every expected terminal response.
     SequenceComplete,
@@ -406,7 +408,7 @@ where
     }
 }
 
-impl<TransportError: fmt::Display, VerificationError: fmt::Display> fmt::Display
+impl<TransportError, VerificationError> fmt::Display
     for BlindVaultReplicaTerminalAttemptError<TransportError, VerificationError>
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -435,16 +437,33 @@ impl<TransportError: fmt::Display, VerificationError: fmt::Display> fmt::Display
             Self::RetirementRequestInvalid => {
                 formatter.write_str("blind vault replacement retirement request is invalid")
             }
-            Self::Transport(error) => {
-                write!(formatter, "blind vault terminal transport failed: {error}")
+            Self::Transport(_) => formatter.write_str("blind vault terminal transport failed"),
+            Self::Reply(_) => {
+                formatter.write_str("blind vault terminal reply authentication failed")
             }
-            Self::Reply(error) => fmt::Display::fmt(error, formatter),
-            Self::Verification(error) => {
-                write!(
-                    formatter,
-                    "blind vault terminal reply verification failed: {error}"
-                )
+            Self::Verification(_) => {
+                formatter.write_str("blind vault terminal reply verification failed")
             }
+        }
+    }
+}
+
+impl<TransportError, VerificationError> fmt::Debug
+    for BlindVaultReplicaTerminalAttemptError<TransportError, VerificationError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SequenceComplete => formatter.write_str("SequenceComplete"),
+            Self::RuntimePoisoned => formatter.write_str("RuntimePoisoned"),
+            Self::PayloadMismatch => formatter.write_str("PayloadMismatch"),
+            Self::StateMismatch => formatter.write_str("StateMismatch"),
+            Self::SessionRequestMismatch => formatter.write_str("SessionRequestMismatch"),
+            Self::RetirementPermitRequired => formatter.write_str("RetirementPermitRequired"),
+            Self::RetirementPermitMismatch => formatter.write_str("RetirementPermitMismatch"),
+            Self::RetirementRequestInvalid => formatter.write_str("RetirementRequestInvalid"),
+            Self::Transport(_) => formatter.write_str("Transport(<redacted>)"),
+            Self::Reply(_) => formatter.write_str("Reply(<redacted>)"),
+            Self::Verification(_) => formatter.write_str("Verification(<redacted>)"),
         }
     }
 }

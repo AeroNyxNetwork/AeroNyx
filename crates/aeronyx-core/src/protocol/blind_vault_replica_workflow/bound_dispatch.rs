@@ -37,7 +37,9 @@
 //! - Keep the generic path for compatibility; new compound adapters use this.
 //! - Network send remains forbidden until `into_terminal_send_sequence`.
 //!
-//! Last Modified: v1.10.0-OwnedResolutionBinding - Exposed the exact opaque
+//! Last Modified: v1.11.0-PrivacySafeTransportDiagnostics - Redacted generic
+//! route, sender, transport, reply, and verifier diagnostic details.
+//! v1.10.0-OwnedResolutionBinding - Exposed the exact opaque
 //! committed binding needed to resolve an owned bound attempt after evidence.
 //! v1.9.0-RecoverablePublication - Added consuming publication
 //! permits whose errors retain the exact committed state for idempotent retry.

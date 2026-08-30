@@ -14,6 +14,7 @@
 //! - Requires workflow-issued authorization before retiring an old lease.
 //! - Advances only after transport reports success.
 //! - Exposes bounded local context without route or private payload metadata.
+//! - Redacts adapter-defined transport errors from standard diagnostics.
 //!
 //! ## Dependencies
 //! - Parent bound durable dispatch marker.
@@ -35,7 +36,9 @@
 //! - A transport must honor `authorized_terminal_node_id` when it is present.
 //! - Route replacement belongs inside the transport adapter, not this binding.
 //!
-//! Last Modified: v1.3.0-RetirementPermitGate - Required an exact workflow
+//! Last Modified: v1.4.0-PrivacySafeTransportDiagnostics - Replaced generic
+//! transport Debug/Display output with stable redacted classifications.
+//! v1.3.0-RetirementPermitGate - Required an exact workflow
 //! permit and terminal binding before old-lease retirement transport.
 //! v1.2.0-OwnedEffectSource - Added an internal owned binding
 //! path so complete runtimes do not require self-referential integration.
@@ -330,7 +333,7 @@ impl fmt::Debug for BlindVaultReplicaTerminalSendSequence<'_> {
 }
 
 /// Payload-binding or transport failure for one ordered send.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum BlindVaultReplicaTerminalSendError<TransportError> {
     /// Durable effect count or cursor could not fit the bounded context.
     BindingInvalid,
@@ -348,9 +351,7 @@ pub enum BlindVaultReplicaTerminalSendError<TransportError> {
     Transport(TransportError),
 }
 
-impl<TransportError: fmt::Display> fmt::Display
-    for BlindVaultReplicaTerminalSendError<TransportError>
-{
+impl<TransportError> fmt::Display for BlindVaultReplicaTerminalSendError<TransportError> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BindingInvalid => {
@@ -371,9 +372,21 @@ impl<TransportError: fmt::Display> fmt::Display
             Self::RetirementRequestInvalid => {
                 formatter.write_str("blind vault replacement retirement request is invalid")
             }
-            Self::Transport(error) => {
-                write!(formatter, "blind vault terminal transport failed: {error}")
-            }
+            Self::Transport(_) => formatter.write_str("blind vault terminal transport failed"),
+        }
+    }
+}
+
+impl<TransportError> fmt::Debug for BlindVaultReplicaTerminalSendError<TransportError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BindingInvalid => formatter.write_str("BindingInvalid"),
+            Self::SequenceComplete => formatter.write_str("SequenceComplete"),
+            Self::PayloadMismatch => formatter.write_str("PayloadMismatch"),
+            Self::RetirementPermitRequired => formatter.write_str("RetirementPermitRequired"),
+            Self::RetirementPermitMismatch => formatter.write_str("RetirementPermitMismatch"),
+            Self::RetirementRequestInvalid => formatter.write_str("RetirementRequestInvalid"),
+            Self::Transport(_) => formatter.write_str("Transport(<redacted>)"),
         }
     }
 }

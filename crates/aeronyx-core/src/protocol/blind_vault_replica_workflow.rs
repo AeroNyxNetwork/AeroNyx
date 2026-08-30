@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.64.0-DispatchDurabilityConfirmation - Added bounded exact
+//! Last Modified: v1.65.0-PrivacySafeTransportDiagnostics - Redacted generic
+//! route, transport, reply, and verification adapter diagnostics.
+//! v1.64.0-DispatchDurabilityConfirmation - Added bounded exact
 //! confirmation across prepared, committed, and prepared-abort transitions.
 //! v1.63.0-SnapshotReconciliation - Reused one sealed snapshot
 //! generation to confirm ambiguous normal-state publication outcomes.

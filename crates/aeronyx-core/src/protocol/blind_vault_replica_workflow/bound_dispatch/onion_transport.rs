@@ -16,6 +16,7 @@
 //! - Enforces permit-authorized terminal identity before envelope construction.
 //! - Builds a path-derived-TTL envelope through `VerifiedOnionRoute`.
 //! - Gives the sender only entry-node identity and opaque onion bytes.
+//! - Redacts route-provider and sender errors from standard diagnostics.
 //!
 //! ## Dependencies
 //! - `send_sequence.rs`: trusted exact-effect transport boundary.
@@ -37,7 +38,9 @@
 //! - Never ignore `context.authorized_terminal_node_id()` during selection.
 //! - Endpoint retry policy belongs to the sender and route provider composition.
 //!
-//! Last Modified: v1.1.0-AuthorizedTerminalBinding - Enforced exact terminal
+//! Last Modified: v1.2.0-PrivacySafeTransportDiagnostics - Replaced generic
+//! route/sender Debug and Display output with stable classifications.
+//! v1.1.0-AuthorizedTerminalBinding - Enforced exact terminal
 //! selection for workflow-permitted lifecycle operations.
 //! v1.0.0-VerifiedOnionEffectTransport - Initial route/provider,
 //! envelope construction, and opaque sender composition.
@@ -213,7 +216,6 @@ impl<Routes, Sender> fmt::Debug for BlindVaultReplicaVerifiedOnionTransport<'_, 
 }
 
 /// Fail-closed route selection, envelope construction, or I/O error.
-#[derive(Debug)]
 pub enum BlindVaultReplicaVerifiedOnionTransportError<RouteError, SenderError> {
     /// Route provider could not produce fresh policy-compliant material.
     RouteProvider(RouteError),
@@ -227,25 +229,34 @@ pub enum BlindVaultReplicaVerifiedOnionTransportError<RouteError, SenderError> {
     Sender(SenderError),
 }
 
-impl<RouteError: fmt::Display, SenderError: fmt::Display> fmt::Display
+impl<RouteError, SenderError> fmt::Display
     for BlindVaultReplicaVerifiedOnionTransportError<RouteError, SenderError>
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::RouteProvider(error) => {
-                write!(formatter, "blind vault route provider failed: {error}")
-            }
+            Self::RouteProvider(_) => formatter.write_str("blind vault route provider failed"),
             Self::PurposeMismatch => {
                 formatter.write_str("blind vault onion route purpose mismatched")
             }
             Self::TerminalIdentityMismatch => {
                 formatter.write_str("blind vault onion route terminal identity mismatched")
             }
-            Self::RoutePlan(error) => fmt::Display::fmt(error, formatter),
-            Self::Sender(error) => write!(
-                formatter,
-                "blind vault onion envelope sender failed: {error}"
-            ),
+            Self::RoutePlan(_) => formatter.write_str("blind vault onion route plan failed"),
+            Self::Sender(_) => formatter.write_str("blind vault onion envelope sender failed"),
+        }
+    }
+}
+
+impl<RouteError, SenderError> fmt::Debug
+    for BlindVaultReplicaVerifiedOnionTransportError<RouteError, SenderError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RouteProvider(_) => formatter.write_str("RouteProvider(<redacted>)"),
+            Self::PurposeMismatch => formatter.write_str("PurposeMismatch"),
+            Self::TerminalIdentityMismatch => formatter.write_str("TerminalIdentityMismatch"),
+            Self::RoutePlan(_) => formatter.write_str("RoutePlan(<redacted>)"),
+            Self::Sender(_) => formatter.write_str("Sender(<redacted>)"),
         }
     }
 }
