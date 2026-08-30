@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.49.0-SingleEffectReplyContext - Centralized fail-closed
+//! Last Modified: v1.50.0-ReplyPolicyExports - Restored flat protocol exports
+//! for every typed completion and reply-policy integration type.
+//! v1.49.0-SingleEffectReplyContext - Centralized fail-closed
 //! work, attempt, sequence, and authorization checks for single replies.
 //! v1.48.0-DurableRenewalCompletion - Added typed atomic
 //! resolution for policy-issued exact-generation renewal completion.
