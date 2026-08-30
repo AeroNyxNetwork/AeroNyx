@@ -125,6 +125,9 @@
 //! - [DIRECT-RELAY-VERIFY-ADMISSION 2026-08-30 by Codex] Runs direct previous-
 //!   hop and sender signature verification behind bounded blocking admission
 //!   so hostile cryptographic work cannot stall asynchronous relay I/O
+//! - [RELAY-STORAGE-ADMISSION 2026-08-30 by Codex] Reserves bounded ChatRelay
+//!   or Blind Vault execution before arming terminal effects, then keeps each
+//!   permit inside its blocking worker through durable completion
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -329,6 +332,8 @@
 //!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.71.0-RelayStorageAdmission - Move synchronous terminal SQLite work out
+//! of async workers and reserve bounded execution before effect arming
 //! v0.70.0-DirectRelayVerifyAdmission - Bound all direct-relay signature work
 //! outside Tokio workers with immediate backpressure and coarse diagnostics
 //! v0.69.0-PreparedTerminalEffect - Separate terminal parsing, authentication,
@@ -481,7 +486,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{sync::Semaphore, time::sleep};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::sleep,
+};
 use tracing::{debug, warn};
 
 #[cfg(test)]
@@ -619,6 +627,18 @@ const MAX_DIRECT_RELAY_SIGNATURE_VERIFICATIONS_IN_FLIGHT: usize = 8;
 
 /// Process-wide admission for CPU-bound direct-relay authentication.
 static DIRECT_RELAY_SIGNATURE_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Maximum concurrent blocking ChatRelay custody operations.
+const MAX_CHAT_RELAY_STORAGE_OPERATIONS_IN_FLIGHT: usize = 8;
+
+/// Admission before scheduling synchronous ChatRelay SQLite work.
+static CHAT_RELAY_STORAGE_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Maximum concurrent blocking Blind Vault terminal operations.
+const MAX_BLIND_VAULT_TERMINAL_OPERATIONS_IN_FLIGHT: usize = 8;
+
+/// Admission before scheduling synchronous Blind Vault crypto/SQLite work.
+static BLIND_VAULT_TERMINAL_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Domain for the complete authenticated blind request, including onward data.
 const BLIND_RELAY_AUTHENTICATED_REQUEST_COMMITMENT_DOMAIN: &[u8] =
@@ -1393,6 +1413,9 @@ enum ChatPeerRelayError {
     #[error("direct relay signature verification unavailable")]
     VerificationUnavailable,
 
+    #[error("chat relay durable storage is busy")]
+    StorageBackpressure,
+
     #[error("invalid envelope signature")]
     InvalidSignature,
 
@@ -1560,7 +1583,7 @@ impl BlindRelayError {
 impl ChatPeerRelayError {
     fn status_code(&self) -> StatusCode {
         match self {
-            Self::RelayUnavailable | Self::VerificationUnavailable => {
+            Self::RelayUnavailable | Self::VerificationUnavailable | Self::StorageBackpressure => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             Self::VerificationBackpressure => StatusCode::TOO_MANY_REQUESTS,
@@ -1579,6 +1602,7 @@ impl ChatPeerRelayError {
             Self::RelayUnavailable => "relay_unavailable",
             Self::VerificationBackpressure => "signature_backpressure",
             Self::VerificationUnavailable => "signature_verification_unavailable",
+            Self::StorageBackpressure => "store_backpressure",
             Self::InvalidSignature => "invalid_signature",
             Self::EnvelopeTooLarge { .. } => "envelope_too_large",
             Self::Serialization => "envelope_serialization_failed",
@@ -2121,7 +2145,33 @@ async fn process_authenticated_peer_relay(
     envelope: ChatEnvelope,
     now: u64,
 ) -> Result<PeerChatRelayResponse, ChatPeerRelayError> {
-    let Some(relay) = state.chat_relay else {
+    let storage_permit = acquire_chat_relay_storage(&state, now)?;
+    process_authenticated_peer_relay_with_storage_permit(state, envelope, now, storage_permit).await
+}
+
+fn acquire_chat_relay_storage(
+    state: &ChatPeerState,
+    now: u64,
+) -> Result<OwnedSemaphorePermit, ChatPeerRelayError> {
+    if state.chat_relay.is_none() {
+        return Err(ChatPeerRelayError::RelayUnavailable);
+    }
+    chat_relay_storage_admission()
+        .try_acquire_owned()
+        .map_err(|_| {
+            let error = ChatPeerRelayError::StorageBackpressure;
+            record_peer_envelope_rejection(state, now, &error);
+            error
+        })
+}
+
+async fn process_authenticated_peer_relay_with_storage_permit(
+    state: ChatPeerState,
+    envelope: ChatEnvelope,
+    now: u64,
+    storage_permit: OwnedSemaphorePermit,
+) -> Result<PeerChatRelayResponse, ChatPeerRelayError> {
+    let Some(relay) = state.chat_relay.as_ref().map(Arc::clone) else {
         return Err(ChatPeerRelayError::RelayUnavailable);
     };
 
@@ -2131,7 +2181,26 @@ async fn process_authenticated_peer_relay(
     // accepted retry; an onion terminal could then sign a receipt for bytes it
     // had never stored. `store_pending` is idempotent for byte-identical retries
     // and rejects same-ID/different-envelope collisions atomically.
-    relay.store_pending(&envelope).map_err(|error| {
+    // [RELAY-STORAGE-ADMISSION 2026-08-30 by Codex] SQLite custody is
+    // synchronous. Keep its owned permit inside the blocking worker so request
+    // cancellation cannot create unbounded detached database tasks.
+    let store_relay = Arc::clone(&relay);
+    let worker = tokio::task::spawn_blocking(move || {
+        let _storage_permit = storage_permit;
+        let result = store_relay.store_pending(&envelope);
+        (envelope, result)
+    })
+    .await;
+    let (envelope, result) = match worker {
+        Ok(result) => result,
+        Err(_) => {
+            warn!("[CHAT_PEER] Pending custody worker failed closed");
+            let error = ChatPeerRelayError::StoreFailed;
+            record_peer_envelope_rejection(&state, now, &error);
+            return Err(error);
+        }
+    };
+    result.map_err(|error| {
         let reason = error.reason_bucket();
         warn!(reason, "[CHAT_PEER] Failed to durably accept peer envelope");
         // [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Preserve the
@@ -2212,6 +2281,21 @@ fn direct_relay_signature_admission() -> Arc<Semaphore> {
         Arc::new(Semaphore::new(signature_verification_capacity(
             MAX_DIRECT_RELAY_SIGNATURE_VERIFICATIONS_IN_FLIGHT,
         )))
+    }))
+}
+
+fn chat_relay_storage_admission() -> Arc<Semaphore> {
+    Arc::clone(
+        CHAT_RELAY_STORAGE_ADMISSION
+            .get_or_init(|| Arc::new(Semaphore::new(MAX_CHAT_RELAY_STORAGE_OPERATIONS_IN_FLIGHT))),
+    )
+}
+
+fn blind_vault_terminal_admission() -> Arc<Semaphore> {
+    Arc::clone(BLIND_VAULT_TERMINAL_ADMISSION.get_or_init(|| {
+        Arc::new(Semaphore::new(
+            MAX_BLIND_VAULT_TERMINAL_OPERATIONS_IN_FLIGHT,
+        ))
     }))
 }
 
@@ -2913,16 +2997,25 @@ struct OnionTerminalDelivery {
 /// This enum deliberately has no `Debug` implementation because every variant
 /// contains either ciphertext, private capabilities, or sender routing data.
 enum PreparedOnionTerminalPayload {
-    BlindVaultReply(PreparedTerminalReply),
-    LegacyBlindVaultPut(BlindVaultPutRequest),
-    Message(ChatEnvelope),
+    BlindVaultReply {
+        reply: PreparedTerminalReply,
+        execution_permit: OwnedSemaphorePermit,
+    },
+    LegacyBlindVaultPut {
+        request: BlindVaultPutRequest,
+        execution_permit: OwnedSemaphorePermit,
+    },
+    Message {
+        envelope: ChatEnvelope,
+        storage_permit: OwnedSemaphorePermit,
+    },
 }
 
 impl PreparedOnionTerminalPayload {
     const fn requires_durable_guard(&self) -> bool {
         match self {
-            Self::BlindVaultReply(reply) => reply.effect().requires_durable_guard(),
-            Self::LegacyBlindVaultPut(_) | Self::Message(_) => true,
+            Self::BlindVaultReply { reply, .. } => reply.effect().requires_durable_guard(),
+            Self::LegacyBlindVaultPut { .. } | Self::Message { .. } => true,
         }
     }
 }
@@ -2941,7 +3034,13 @@ async fn prepare_onion_terminal_payload(
             .ok_or(BlindRelayError::ForwardFailed)?;
         let reply =
             prepare_blind_vault_inline_reply(payload).map_err(map_terminal_reply_failure)?;
-        return Ok(PreparedOnionTerminalPayload::BlindVaultReply(reply));
+        let execution_permit = blind_vault_terminal_admission()
+            .try_acquire_owned()
+            .map_err(|_| BlindRelayError::Backpressure)?;
+        return Ok(PreparedOnionTerminalPayload::BlindVaultReply {
+            reply,
+            execution_permit,
+        });
     }
 
     if is_blind_vault_frame(payload) {
@@ -2956,15 +3055,26 @@ async fn prepare_onion_terminal_payload(
             .blind_vault
             .as_ref()
             .ok_or(BlindRelayError::ForwardFailed)?;
-        return Ok(PreparedOnionTerminalPayload::LegacyBlindVaultPut(request));
+        let execution_permit = blind_vault_terminal_admission()
+            .try_acquire_owned()
+            .map_err(|_| BlindRelayError::Backpressure)?;
+        return Ok(PreparedOnionTerminalPayload::LegacyBlindVaultPut {
+            request,
+            execution_permit,
+        });
     }
 
     let envelope =
         decode_envelope(payload).map_err(|_| BlindRelayError::OnionTerminalPayloadRejected)?;
     let envelope = validate_peer_envelope_for_relay(state, envelope, now_secs)
         .await
-        .map_err(|_| BlindRelayError::ForwardFailed)?;
-    Ok(PreparedOnionTerminalPayload::Message(envelope))
+        .map_err(map_terminal_chat_preparation_error)?;
+    let storage_permit =
+        acquire_chat_relay_storage(state, now_secs).map_err(map_terminal_chat_preparation_error)?;
+    Ok(PreparedOnionTerminalPayload::Message {
+        envelope,
+        storage_permit,
+    })
 }
 
 async fn execute_onion_terminal_payload(
@@ -2974,7 +3084,10 @@ async fn execute_onion_terminal_payload(
     now_secs: u64,
 ) -> Result<OnionTerminalDelivery, BlindRelayError> {
     match prepared {
-        PreparedOnionTerminalPayload::BlindVaultReply(reply) => {
+        PreparedOnionTerminalPayload::BlindVaultReply {
+            reply,
+            execution_permit,
+        } => {
             let vault = Arc::clone(
                 state
                     .blind_vault
@@ -2984,6 +3097,7 @@ async fn execute_onion_terminal_payload(
             let terminal_identity = Arc::clone(&state.node_identity);
             let now_ms = now_secs.saturating_mul(1_000);
             let reply = tokio::task::spawn_blocking(move || {
+                let _execution_permit = execution_permit;
                 reply.execute(vault.as_ref(), terminal_identity.as_ref(), route_id, now_ms)
             })
             .await
@@ -2995,30 +3109,46 @@ async fn execute_onion_terminal_payload(
                 opaque_response_b64: Some(reply.opaque_response_b64),
             })
         }
-        PreparedOnionTerminalPayload::LegacyBlindVaultPut(request) => {
-            let vault = state
-                .blind_vault
-                .as_ref()
-                .ok_or(BlindRelayError::ForwardFailed)?;
-            vault
-                .put(&request, now_secs.saturating_mul(1_000))
-                .map_err(|error| map_blind_vault_put_error(&error))?;
+        PreparedOnionTerminalPayload::LegacyBlindVaultPut {
+            request,
+            execution_permit,
+        } => {
+            let vault = Arc::clone(
+                state
+                    .blind_vault
+                    .as_ref()
+                    .ok_or(BlindRelayError::ForwardFailed)?,
+            );
+            let now_ms = now_secs.saturating_mul(1_000);
+            tokio::task::spawn_blocking(move || {
+                let _execution_permit = execution_permit;
+                vault.put(&request, now_ms)
+            })
+            .await
+            .map_err(|_| BlindRelayError::ForwardFailed)?
+            .map_err(|error| map_blind_vault_put_error(&error))?;
             Ok(OnionTerminalDelivery {
                 purpose: OnionRoutePurpose::BlindVaultPut,
                 proof_mode: OnionReplyProofMode::RelayVisibleTerminalReceipt,
                 opaque_response_b64: None,
             })
         }
-        PreparedOnionTerminalPayload::Message(envelope) => {
-            process_authenticated_peer_relay(state.clone(), envelope, now_secs)
-                .await
-                .map(|_| OnionTerminalDelivery {
-                    purpose: OnionRoutePurpose::MessageRelay,
-                    proof_mode: OnionReplyProofMode::RelayVisibleTerminalReceipt,
-                    opaque_response_b64: None,
-                })
-                .map_err(|_| BlindRelayError::ForwardFailed)
-        }
+        PreparedOnionTerminalPayload::Message {
+            envelope,
+            storage_permit,
+        } => process_authenticated_peer_relay_with_storage_permit(
+            state.clone(),
+            envelope,
+            now_secs,
+            storage_permit,
+        )
+        .await
+        .map(|_| OnionTerminalDelivery {
+            purpose: OnionRoutePurpose::MessageRelay,
+            proof_mode: OnionReplyProofMode::RelayVisibleTerminalReceipt,
+            opaque_response_b64: None,
+        })
+        .map_err(|_| BlindRelayError::ForwardFailed),
     }
 }
 
@@ -3032,6 +3162,15 @@ fn map_terminal_reply_failure(failure: TerminalReplyFailure) -> BlindRelayError 
         // for any capacity failure that occurs before response sealing.
         TerminalReplyFailure::Capacity => BlindRelayError::OnionTerminalCapacityExhausted,
         TerminalReplyFailure::Unavailable => BlindRelayError::ForwardFailed,
+    }
+}
+
+fn map_terminal_chat_preparation_error(error: ChatPeerRelayError) -> BlindRelayError {
+    match error {
+        ChatPeerRelayError::VerificationBackpressure | ChatPeerRelayError::StorageBackpressure => {
+            BlindRelayError::Backpressure
+        }
+        _ => BlindRelayError::ForwardFailed,
     }
 }
 
