@@ -67,7 +67,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.18.0-PrivacySafeLifecycleDebug - Redacted replica action,
+//! Last Modified: v1.19.0-PrivacySafeFrameDebug - Redacted top-level frames,
+//! encrypted objects, bearer recovery requests, and storage receipts.
+//! v1.18.0-PrivacySafeLifecycleDebug - Redacted replica action,
 //! target, and plan topology from diagnostic formatting.
 //! v1.17.0-BlindVaultEncryptedFailure - Added typed,
 //! source-only terminal failure replies inside the fixed-size onion carrier.
@@ -245,7 +247,7 @@ pub const BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES: [usize; 4] =
     [4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024];
 
 /// Binary frame carrying either an immutable put request or a node receipt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum BlindVaultFrame {
     /// Client request to persist one immutable encrypted object.
     Put(BlindVaultPutRequest),
@@ -287,6 +289,36 @@ pub enum BlindVaultFrame {
     LeaseInventoryReceipt(BlindVaultLeaseInventoryReceipt),
     /// Coarse workload failure visible only after source-side reply decryption.
     TerminalFailure(BlindVaultTerminalFailure),
+}
+
+impl std::fmt::Debug for BlindVaultFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // [BLIND-VAULT-PRIVACY-SAFE-FRAME-DEBUG 2026-08-30 by Codex] Never
+        // recurse into wire values: capabilities, ciphertext, commitments,
+        // signatures, and replica identifiers must not enter node logs.
+        formatter.write_str(match self {
+            Self::Put(_) => "BlindVaultFrame::Put(<redacted>)",
+            Self::StoredReceipt(_) => "BlindVaultFrame::StoredReceipt(<redacted>)",
+            Self::LeaseCreate(_) => "BlindVaultFrame::LeaseCreate(<redacted>)",
+            Self::Delete(_) => "BlindVaultFrame::Delete(<redacted>)",
+            Self::DeletedReceipt(_) => "BlindVaultFrame::DeletedReceipt(<redacted>)",
+            Self::LeaseAdmission(_) => "BlindVaultFrame::LeaseAdmission(<redacted>)",
+            Self::PullRequest(_) => "BlindVaultFrame::PullRequest(<redacted>)",
+            Self::PullResponse(_) => "BlindVaultFrame::PullResponse(<redacted>)",
+            Self::BlindLeaseAdmission(_) => "BlindVaultFrame::BlindLeaseAdmission(<redacted>)",
+            Self::BlindIssuerDirectory(_) => "BlindVaultFrame::BlindIssuerDirectory(<redacted>)",
+            Self::BlindLeaseAccepted(_) => "BlindVaultFrame::BlindLeaseAccepted(<redacted>)",
+            Self::LeaseRetire(_) => "BlindVaultFrame::LeaseRetire(<redacted>)",
+            Self::LeaseRetiredReceipt(_) => "BlindVaultFrame::LeaseRetiredReceipt(<redacted>)",
+            Self::BlindLeaseRenewal(_) => "BlindVaultFrame::BlindLeaseRenewal(<redacted>)",
+            Self::BlindLeaseRenewed(_) => "BlindVaultFrame::BlindLeaseRenewed(<redacted>)",
+            Self::LeaseStatus(_) => "BlindVaultFrame::LeaseStatus(<redacted>)",
+            Self::LeaseStatusReceipt(_) => "BlindVaultFrame::LeaseStatusReceipt(<redacted>)",
+            Self::LeaseInventory(_) => "BlindVaultFrame::LeaseInventory(<redacted>)",
+            Self::LeaseInventoryReceipt(_) => "BlindVaultFrame::LeaseInventoryReceipt(<redacted>)",
+            Self::TerminalFailure(_) => "BlindVaultFrame::TerminalFailure(<redacted>)",
+        })
+    }
 }
 
 /// Blind Vault operation answered by one encrypted terminal failure.
@@ -1330,7 +1362,7 @@ fn append_blind_issuer_epochs(bytes: &mut Vec<u8>, epochs: &[BlindVaultBlindIssu
 }
 
 /// Capability-authenticated request for one stable recovery snapshot page.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultPullRequest {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -1342,6 +1374,18 @@ pub struct BlindVaultPullRequest {
     pub continuation_cursor: Vec<u8>,
     /// Requested page size, bounded again by node policy.
     pub limit: u16,
+}
+
+impl std::fmt::Debug for BlindVaultPullRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlindVaultPullRequest")
+            .field("version", &self.version)
+            .field("limit", &self.limit)
+            .field("has_continuation", &!self.continuation_cursor.is_empty())
+            .field("capability", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl BlindVaultPullRequest {
@@ -1361,7 +1405,7 @@ impl BlindVaultPullRequest {
 }
 
 /// One immutable ciphertext object returned by a Blind Vault recovery page.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultRecoveredObject {
     /// Replica-local immutable object identifier.
     pub object_id: [u8; 32],
@@ -1371,6 +1415,16 @@ pub struct BlindVaultRecoveredObject {
     pub ciphertext_commitment: [u8; 32],
     /// Object retention deadline in Unix milliseconds.
     pub expires_at_ms: u64,
+}
+
+impl std::fmt::Debug for BlindVaultRecoveredObject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlindVaultRecoveredObject")
+            .field("ciphertext_bytes", &self.ciphertext.len())
+            .field("object", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl BlindVaultRecoveredObject {
@@ -1396,7 +1450,7 @@ impl BlindVaultRecoveredObject {
 /// The signature authenticates ciphertext commitments rather than hashing the
 /// multi-megabyte ciphertext a second time. Validation recomputes each stored
 /// commitment first, so the signature remains bound to the exact bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultPullResponse {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -1413,6 +1467,18 @@ pub struct BlindVaultPullResponse {
     /// Ed25519 signature by `node_id` over page commitments and metadata.
     #[serde(with = "serde_bytes64")]
     pub signature: [u8; 64],
+}
+
+impl std::fmt::Debug for BlindVaultPullResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlindVaultPullResponse")
+            .field("version", &self.version)
+            .field("object_count", &self.objects.len())
+            .field("has_continuation", &!self.continuation_cursor.is_empty())
+            .field("page", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl BlindVaultPullResponse {
@@ -1602,7 +1668,7 @@ pub enum BlindVaultOnionPullError {
 /// `lease_id`, `object_id`, and `request_id` MUST be independently random for
 /// each replica. Reusing them across nodes would allow colluding operators to
 /// correlate copies even when `ciphertext` is re-randomised.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultPutRequest {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -1622,6 +1688,17 @@ pub struct BlindVaultPutRequest {
     /// Signature by the replica/epoch-specific lease write key.
     #[serde(with = "serde_bytes64")]
     pub signature: [u8; 64],
+}
+
+impl std::fmt::Debug for BlindVaultPutRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlindVaultPutRequest")
+            .field("version", &self.version)
+            .field("ciphertext_bytes", &self.ciphertext.len())
+            .field("request", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl BlindVaultPutRequest {
@@ -1703,7 +1780,7 @@ impl BlindVaultPutRequest {
 
 /// Signed proof that one node accepted one exact opaque object until a bounded
 /// time. It proves storage acceptance, not recipient delivery or message read.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultStoredReceipt {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -1724,6 +1801,16 @@ pub struct BlindVaultStoredReceipt {
     /// Ed25519 signature by `node_id` over the canonical receipt fields.
     #[serde(with = "serde_bytes64")]
     pub signature: [u8; 64],
+}
+
+impl std::fmt::Debug for BlindVaultStoredReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlindVaultStoredReceipt")
+            .field("version", &self.version)
+            .field("receipt", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl BlindVaultStoredReceipt {
