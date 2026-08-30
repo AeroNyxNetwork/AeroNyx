@@ -67,7 +67,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.19.0-PrivacySafeFrameDebug - Redacted top-level frames,
+//! Last Modified: v1.20.0-PrivacySafeTypedDebug - Redacted direct formatting
+//! for capability-, topology-, and commitment-bearing protocol values.
+//! v1.19.0-PrivacySafeFrameDebug - Redacted top-level frames,
 //! encrypted objects, bearer recovery requests, and storage receipts.
 //! v1.18.0-PrivacySafeLifecycleDebug - Redacted replica action,
 //! target, and plan topology from diagnostic formatting.
@@ -245,6 +247,28 @@ pub const MAX_BLIND_VAULT_FRAME_BYTES: u64 = MAX_BLIND_VAULT_PULL_RESPONSE_FRAME
 /// classes. Attachments and media must use the encrypted blob channel.
 pub const BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES: [usize; 4] =
     [4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024];
+
+// [BLIND-VAULT-PRIVACY-SAFE-TYPED-DEBUG 2026-08-30 by Codex] Typed handlers
+// frequently format a decoded request directly rather than its outer frame.
+// Capability- and topology-bearing protocol values therefore share one closed
+// redacted implementation instead of relying on every caller to remember.
+macro_rules! impl_blind_vault_redacted_debug {
+    ($($value:ty),+ $(,)?) => {
+        $(
+            impl std::fmt::Debug for $value {
+                fn fmt(
+                    &self,
+                    formatter: &mut std::fmt::Formatter<'_>,
+                ) -> std::fmt::Result {
+                    formatter
+                        .debug_struct(stringify!($value))
+                        .field("private_fields", &"[REDACTED]")
+                        .finish_non_exhaustive()
+                }
+            }
+        )+
+    };
+}
 
 /// Binary frame carrying either an immutable put request or a node receipt.
 #[derive(Clone, PartialEq, Eq)]
@@ -495,7 +519,7 @@ impl BlindVaultTerminalFailure {
 /// Admission and quota policy are deliberately outside this structure. A node
 /// must authenticate or rate-limit lease creation separately without adding an
 /// account identity to the durable lease record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultLeaseCreateRequest {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -598,7 +622,7 @@ impl BlindVaultLeaseCreateRequest {
 /// Version 1 is deliberately named a bearer ticket rather than a blind token:
 /// unlinkable issuance requires a separately audited blind-signature or VOPRF
 /// issuer and will use an additive protocol version.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultAdmissionTicket {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -695,7 +719,7 @@ impl BlindVaultAdmissionTicket {
 }
 
 /// Atomic wire request pairing one bearer admission with one anonymous lease.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultLeaseAdmissionRequest {
     /// Short-lived issuer-signed one-time credential.
     pub admission: BlindVaultAdmissionTicket,
@@ -729,7 +753,7 @@ impl BlindVaultLeaseAdmissionRequest {
 /// epoch key, and cannot correlate redemption with the issuance transcript.
 /// Resource limits and validity are intentionally absent: they are fixed by
 /// the pinned issuer-key policy so a blind client cannot choose its own quota.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultBlindAdmissionToken {
     /// Blind-admission credential version; independent of the outer frame.
     pub version: u16,
@@ -810,7 +834,7 @@ impl BlindVaultBlindAdmissionToken {
 }
 
 /// Atomic V2 redemption pairing one unlinkable token with one random lease.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultBlindLeaseAdmissionRequest {
     /// RFC 9474 finalized one-time credential.
     pub admission: BlindVaultBlindAdmissionToken,
@@ -824,7 +848,7 @@ pub struct BlindVaultBlindLeaseAdmissionRequest {
 /// opaque credential spend marker and exact self-authenticating lease without
 /// exposing the issuer key, token id, or lease authority to middle relays. It
 /// is returned only inside a fixed-size encrypted onion response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultBlindLeaseAcceptedReceipt {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -2017,7 +2041,7 @@ pub enum BlindVaultOnionPutError {
 ///
 /// Nodes retain only a bounded tombstone needed for idempotent retries; no
 /// application deletion reason or account identifier belongs on this frame.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultDeleteRequest {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -2102,7 +2126,7 @@ impl BlindVaultDeleteRequest {
 /// ciphertext object and object tombstone under the lease in one transaction.
 /// No user identity, application reason, or cross-replica identifier belongs
 /// in this request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultLeaseRetireRequest {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -2199,7 +2223,7 @@ impl BlindVaultLeaseRetireRequest {
 }
 
 /// Signed node proof that one complete replica lease was retired.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultLeaseRetiredReceipt {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -2312,7 +2336,7 @@ impl BlindVaultLeaseRetiredReceipt {
 /// both the expected current expiry and requested next expiry. This makes a
 /// stale or reordered renewal fail closed instead of silently extending a
 /// different lease generation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultLeaseRenewRequest {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -2440,7 +2464,7 @@ impl BlindVaultLeaseRenewRequest {
 }
 
 /// Atomic V2 renewal pairing one unlinkable capacity token with one lease.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultBlindLeaseRenewalRequest {
     /// New RFC 9474 one-time credential authorizing additional retention.
     pub admission: BlindVaultBlindAdmissionToken,
@@ -2449,7 +2473,7 @@ pub struct BlindVaultBlindLeaseRenewalRequest {
 }
 
 /// Terminal-signed proof that one blind-authorized renewal was committed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultBlindLeaseRenewedReceipt {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -2569,7 +2593,7 @@ impl BlindVaultBlindLeaseRenewedReceipt {
 /// inside the encrypted terminal layer. It authorizes disclosure of aggregate
 /// lease-local retention state to the administrator without publishing a
 /// lease identifier, activity timestamp, or usage count to route relays.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultLeaseStatusRequest {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -2660,7 +2684,7 @@ impl BlindVaultLeaseStatusRequest {
 }
 
 /// Terminal-signed coherent status for one still-live replica lease.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultLeaseStatusReceipt {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -2778,7 +2802,7 @@ impl BlindVaultLeaseStatusReceipt {
 /// This type is deliberately not serializable as a protocol frame. It exists
 /// only to let a source and terminal independently derive the same per-replica
 /// commitment without publishing an object list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BlindVaultInventoryCommitmentEntry {
     /// Replica-local random object identifier.
     pub object_id: [u8; 32],
@@ -2791,7 +2815,7 @@ pub struct BlindVaultInventoryCommitmentEntry {
 }
 
 /// Aggregate result of one canonical inventory commitment pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BlindVaultInventoryCommitmentSummary {
     /// Number of entries committed by the builder.
     pub object_count: u64,
@@ -2883,7 +2907,7 @@ impl BlindVaultInventoryCommitmentBuilder {
 }
 
 /// Administration-key request for one private replica inventory commitment.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultLeaseInventoryRequest {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -2975,7 +2999,7 @@ impl BlindVaultLeaseInventoryRequest {
 }
 
 /// Terminal-signed commitment to one coherent still-live replica inventory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultLeaseInventoryReceipt {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -3097,7 +3121,7 @@ impl BlindVaultLeaseInventoryReceipt {
 /// This type is deliberately not serializable. Replica object identifiers and
 /// commitments are local repair material and must never become public-chain,
 /// discovery, or cross-replica correlation metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BlindVaultReplicaManifestExpectation {
     node_id: [u8; 32],
     lease_id: [u8; 32],
@@ -3167,7 +3191,7 @@ impl BlindVaultReplicaManifestExpectation {
 /// source-owned manifest. A valid but divergent receipt remains evidence: the
 /// planner classifies it for reconciliation instead of confusing divergence
 /// with an invalid signature.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BlindVaultVerifiedReplicaInventory {
     node_id: [u8; 32],
     lease_id: [u8; 32],
@@ -3866,7 +3890,7 @@ pub enum BlindVaultReplicaPlanError {
 
 /// Signed node proof that an opaque object was deleted or had already been
 /// deleted under the same tombstone commitment.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindVaultDeletedReceipt {
     /// Independent Blind Vault protocol version.
     pub version: u16,
@@ -3886,6 +3910,30 @@ pub struct BlindVaultDeletedReceipt {
     #[serde(with = "serde_bytes64")]
     pub signature: [u8; 64],
 }
+
+impl_blind_vault_redacted_debug!(
+    BlindVaultLeaseCreateRequest,
+    BlindVaultAdmissionTicket,
+    BlindVaultLeaseAdmissionRequest,
+    BlindVaultBlindAdmissionToken,
+    BlindVaultBlindLeaseAdmissionRequest,
+    BlindVaultBlindLeaseAcceptedReceipt,
+    BlindVaultDeleteRequest,
+    BlindVaultLeaseRetireRequest,
+    BlindVaultLeaseRetiredReceipt,
+    BlindVaultLeaseRenewRequest,
+    BlindVaultBlindLeaseRenewalRequest,
+    BlindVaultBlindLeaseRenewedReceipt,
+    BlindVaultLeaseStatusRequest,
+    BlindVaultLeaseStatusReceipt,
+    BlindVaultInventoryCommitmentEntry,
+    BlindVaultInventoryCommitmentSummary,
+    BlindVaultLeaseInventoryRequest,
+    BlindVaultLeaseInventoryReceipt,
+    BlindVaultReplicaManifestExpectation,
+    BlindVaultVerifiedReplicaInventory,
+    BlindVaultDeletedReceipt,
+);
 
 impl BlindVaultDeletedReceipt {
     /// Builds an unsigned deletion receipt.
