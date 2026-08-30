@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.46.0-DurableObservationCompletion - Added typed atomic
+//! Last Modified: v1.47.0-RenewalReplyPolicy - Added exact lease-generation,
+//! single-effect renewal reply verification.
+//! v1.46.0-DurableObservationCompletion - Added typed atomic
 //! resolution for policy-issued observation-retry completion.
 //! v1.45.0-ObservationReplyPolicy - Added exact single-effect,
 //! freshness-bounded observation-retry reply verification.
@@ -195,9 +197,10 @@ pub use bound_continuation::{
 pub use bound_dispatch::{
     BlindVaultReplicaBoundRuntimeError, BlindVaultReplicaCommittedBoundAttemptDispatch,
     BlindVaultReplicaCompletedObservation, BlindVaultReplicaCompletedProvisioning,
-    BlindVaultReplicaCompletedReconciliation, BlindVaultReplicaCompletedReplacement,
-    BlindVaultReplicaDurableBoundAttemptDispatch, BlindVaultReplicaObservationReplyOutcome,
-    BlindVaultReplicaObservationReplyPolicy, BlindVaultReplicaObservationReplyPolicyBuildError,
+    BlindVaultReplicaCompletedReconciliation, BlindVaultReplicaCompletedRenewal,
+    BlindVaultReplicaCompletedReplacement, BlindVaultReplicaDurableBoundAttemptDispatch,
+    BlindVaultReplicaObservationReplyOutcome, BlindVaultReplicaObservationReplyPolicy,
+    BlindVaultReplicaObservationReplyPolicyBuildError,
     BlindVaultReplicaObservationReplyPolicyError, BlindVaultReplicaOnionDispatchPlan,
     BlindVaultReplicaOnionEnvelopeSender, BlindVaultReplicaOnionRouteProvider,
     BlindVaultReplicaPersistedBoundAttemptJournal, BlindVaultReplicaPreparedBoundAttemptJournal,
@@ -205,7 +208,9 @@ pub use bound_dispatch::{
     BlindVaultReplicaProvisioningReplyPolicy, BlindVaultReplicaProvisioningReplyPolicyBuildError,
     BlindVaultReplicaProvisioningReplyPolicyError, BlindVaultReplicaReconcileReplyOutcome,
     BlindVaultReplicaReconcileReplyPolicy, BlindVaultReplicaReconcileReplyPolicyBuildError,
-    BlindVaultReplicaReconcileReplyPolicyError, BlindVaultReplicaReplacementAuthorizationError,
+    BlindVaultReplicaReconcileReplyPolicyError, BlindVaultReplicaRenewalReplyOutcome,
+    BlindVaultReplicaRenewalReplyPolicy, BlindVaultReplicaRenewalReplyPolicyBuildError,
+    BlindVaultReplicaRenewalReplyPolicyError, BlindVaultReplicaReplacementAuthorizationError,
     BlindVaultReplicaReplacementPermitIssueError, BlindVaultReplicaReplacementReplyOutcome,
     BlindVaultReplicaReplacementReplyPolicy, BlindVaultReplicaReplacementReplyPolicyBuildError,
     BlindVaultReplicaReplacementReplyPolicyError,

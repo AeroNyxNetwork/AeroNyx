@@ -35,7 +35,9 @@
 //! - Keep the generic path for compatibility; new compound adapters use this.
 //! - Network send remains forbidden until `into_terminal_send_sequence`.
 //!
-//! Last Modified: v1.6.0-ObservationReplyPolicy - Added exact single-effect
+//! Last Modified: v1.7.0-RenewalReplyPolicy - Added exact lease-generation
+//! compare-and-swap verification for single-effect renewal attempts.
+//! v1.6.0-ObservationReplyPolicy - Added exact single-effect
 //! fresh inventory verification for observation-retry attempts.
 //! v1.5.0-ReconcileReplyPolicy - Added ordered write/delete and
 //! post-mutation inventory verification for exact reconciliation attempts.
@@ -70,6 +72,7 @@ mod observation_reply_policy;
 mod onion_transport;
 mod provisioning_reply_policy;
 mod reconcile_reply_policy;
+mod renewal_reply_policy;
 mod replacement_reply_policy;
 mod request_bound_verifier;
 mod send_sequence;
@@ -98,6 +101,11 @@ pub use reconcile_reply_policy::{
     BlindVaultReplicaCompletedReconciliation, BlindVaultReplicaReconcileReplyOutcome,
     BlindVaultReplicaReconcileReplyPolicy, BlindVaultReplicaReconcileReplyPolicyBuildError,
     BlindVaultReplicaReconcileReplyPolicyError,
+};
+pub use renewal_reply_policy::{
+    BlindVaultReplicaCompletedRenewal, BlindVaultReplicaRenewalReplyOutcome,
+    BlindVaultReplicaRenewalReplyPolicy, BlindVaultReplicaRenewalReplyPolicyBuildError,
+    BlindVaultReplicaRenewalReplyPolicyError,
 };
 pub use replacement_reply_policy::{
     BlindVaultReplicaCompletedReplacement, BlindVaultReplicaReplacementAuthorizationError,
