@@ -12,6 +12,7 @@
 //! - Produces a persisted-journal marker only after the store returns success.
 //! - Commits dispatch and seals its exact post-transition restart snapshot.
 //! - Restores the in-memory state if snapshot sealing fails.
+//! - Confirms ambiguous prepared and committed local durability transitions.
 //! - Produces a durable dispatch permit only after atomic store publication.
 //! - Preserves the complete committed marker across ambiguous store failures.
 //! - Redacts all markers and zeroizes the owned sealed snapshot on drop.
@@ -36,7 +37,9 @@
 //! - Keep the low-level legacy methods for compatibility, but new adapters
 //!   should use this path before every private mutating network attempt.
 //!
-//! Last Modified: v1.3.0-OwnedResolutionBinding - Preserved the private journal
+//! Last Modified: v1.4.0-BoundedDurabilityConfirmation - Replayed each exact
+//! local prepared/committed transition once after an ambiguous store error.
+//! v1.3.0-OwnedResolutionBinding - Preserved the private journal
 //! commitment needed to resolve an owned durable send permit after evidence.
 //! v1.2.0-RecoverablePublication - Added a consuming publication
 //! path whose error retains the complete retryable committed capability.
@@ -129,7 +132,12 @@ impl BlindVaultReplicaPreparedAttemptJournal {
         Store: BlindVaultReplicaRecoveryStore,
     {
         let record = BlindVaultReplicaPreparedAttemptRecord::from(self);
-        store.persist_prepared_attempt(&record)?;
+        // [BLIND-VAULT-PREPARED-CONFIRMATION 2026-08-30 by Codex] No workflow
+        // mutation or network effect exists yet. A single exact replay either
+        // completes publication or re-confirms an already visible generation.
+        if store.persist_prepared_attempt(&record).is_err() {
+            store.persist_prepared_attempt(&record)?;
+        }
         Ok(BlindVaultReplicaPersistedAttemptJournal { prepared: self })
     }
 }
@@ -199,14 +207,9 @@ impl<'a> BlindVaultReplicaCommittedAttemptDispatch<'a> {
     where
         Store: BlindVaultReplicaRecoveryStore,
     {
-        let snapshot = BlindVaultReplicaSnapshotRecord::from_validated_parts(
-            self.workflow_id,
-            self.snapshot_sequence,
-            &self.sealed_snapshot,
-        );
-        let committed =
-            BlindVaultReplicaCommittedAttemptRecord::from_validated_parts(snapshot, self.prepared);
-        store.persist_committed_attempt(&committed)?;
+        if self.persist_committed_generation(store).is_err() {
+            self.persist_committed_generation(store)?;
+        }
         Ok(BlindVaultReplicaDurableAttemptDispatch { committed: self })
     }
 
@@ -225,27 +228,16 @@ impl<'a> BlindVaultReplicaCommittedAttemptDispatch<'a> {
     where
         Store: BlindVaultReplicaRecoveryStore,
     {
-        // [BLIND-VAULT-RECOVERABLE-PUBLICATION 2026-08-30 by Codex] Keep all
-        // records borrowing the sealed snapshot inside this scope. Once the
-        // store call returns, the failure branch can safely retain `self` as
-        // the sole owner of retry authority.
-        let persistence = {
-            let snapshot = BlindVaultReplicaSnapshotRecord::from_validated_parts(
-                self.workflow_id,
-                self.snapshot_sequence,
-                &self.sealed_snapshot,
-            );
-            let committed = BlindVaultReplicaCommittedAttemptRecord::from_validated_parts(
-                snapshot,
-                self.prepared,
-            );
-            store.persist_committed_attempt(&committed)
-        };
-        if let Err(source) = persistence {
-            return Err(BlindVaultReplicaCommitPublicationError {
-                committed: self,
-                source,
-            });
+        // [BLIND-VAULT-RECOVERABLE-PUBLICATION 2026-08-30 by Codex] A single
+        // exact replay confirms ambiguous local durability. If confirmation
+        // also fails, `self` remains the sole owner of retry authority.
+        if self.persist_committed_generation(store).is_err() {
+            if let Err(source) = self.persist_committed_generation(store) {
+                return Err(BlindVaultReplicaCommitPublicationError {
+                    committed: self,
+                    source,
+                });
+            }
         }
         Ok(BlindVaultReplicaOwnedDurableAttemptDispatch {
             work_id: self.work_id(),
@@ -254,6 +246,20 @@ impl<'a> BlindVaultReplicaCommittedAttemptDispatch<'a> {
             journal_sequence: self.prepared.journal_sequence(),
             journal_commitment: sealed_record_commitment(self.prepared.sealed_journal()),
         })
+    }
+
+    fn persist_committed_generation<Store>(&self, store: &mut Store) -> Result<(), Store::Error>
+    where
+        Store: BlindVaultReplicaRecoveryStore,
+    {
+        let snapshot = BlindVaultReplicaSnapshotRecord::from_validated_parts(
+            self.workflow_id,
+            self.snapshot_sequence,
+            &self.sealed_snapshot,
+        );
+        let committed =
+            BlindVaultReplicaCommittedAttemptRecord::from_validated_parts(snapshot, self.prepared);
+        store.persist_committed_attempt(&committed)
     }
 }
 

@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.63.0-SnapshotReconciliation - Reused one sealed snapshot
+//! Last Modified: v1.64.0-DispatchDurabilityConfirmation - Added bounded exact
+//! confirmation across prepared, committed, and prepared-abort transitions.
+//! v1.63.0-SnapshotReconciliation - Reused one sealed snapshot
 //! generation to confirm ambiguous normal-state publication outcomes.
 //! v1.62.0-ResolutionReconciliation - Added exact idempotent
 //! durability confirmation for ambiguous atomic attempt-resolution outcomes.

@@ -36,7 +36,9 @@
 //! - Never log, clone unnecessarily, or expose the private continuation bytes.
 //! - Delete a journal only after accepted evidence or explicit safe resolution.
 //!
-//! Last Modified: v1.4.0-DurableResolutionBinding - Retained the sealed
+//! Last Modified: v1.5.0-PreparedAbortConfirmation - Replayed exact prepared
+//! cleanup once to confirm ambiguous local durability outcomes.
+//! v1.4.0-DurableResolutionBinding - Retained the sealed
 //! journal commitment required for exact post-evidence resolution.
 //! v1.3.0-PreparedRecoveryAuthentication - Added an
 //! identity-authenticated proof that a durable journal stopped before send.
@@ -228,7 +230,16 @@ impl BlindVaultReplicaAuthenticatedPreparedAttempt {
     where
         Store: BlindVaultReplicaRecoveryStore,
     {
-        store.abort_prepared_attempt(self.journal_sequence, self.journal_commitment)
+        // [BLIND-VAULT-PREPARED-ABORT-CONFIRMATION 2026-08-30 by Codex]
+        // Prepared proves no network dispatch occurred. One exact local replay
+        // can safely complete or re-confirm cleanup without widening authority.
+        if store
+            .abort_prepared_attempt(self.journal_sequence, self.journal_commitment)
+            .is_err()
+        {
+            store.abort_prepared_attempt(self.journal_sequence, self.journal_commitment)?;
+        }
+        Ok(())
     }
 }
 
