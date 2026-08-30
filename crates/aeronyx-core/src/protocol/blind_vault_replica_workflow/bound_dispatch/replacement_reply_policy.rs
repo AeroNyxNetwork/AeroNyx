@@ -64,6 +64,7 @@ use super::attempt_runtime::{
 use super::request_bound_verifier::{
     BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaRequestBoundReply,
     BlindVaultReplicaRequestBoundReplyError, BlindVaultReplicaRequestBoundReplyVerifier,
+    BlindVaultReplicaVerificationClock,
 };
 use super::send_sequence::{
     BlindVaultReplicaTerminalEffectTransport, BlindVaultReplicaTerminalSendContext,
@@ -73,25 +74,6 @@ use crate::protocol::blind_vault::{
     BlindVaultVerifiedReplicaInventory,
 };
 use crate::protocol::onion::OnionRoutePurpose;
-
-/// Replaceable source clock used for bounded receipt verification.
-pub trait BlindVaultReplicaVerificationClock {
-    type Error;
-
-    /// Returns nonzero Unix time in milliseconds.
-    fn now_ms(&mut self) -> Result<u64, Self::Error>;
-}
-
-impl<Clock, ClockError> BlindVaultReplicaVerificationClock for Clock
-where
-    Clock: FnMut() -> Result<u64, ClockError>,
-{
-    type Error = ClockError;
-
-    fn now_ms(&mut self) -> Result<u64, Self::Error> {
-        self()
-    }
-}
 
 /// Successful source-private transition produced by one terminal reply.
 #[derive(Clone, PartialEq, Eq)]

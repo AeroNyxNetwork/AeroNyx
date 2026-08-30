@@ -39,7 +39,9 @@
 //! - Never implement a permissive default private policy.
 //! - Debug output must remain redacted because requests can contain ciphertext.
 //!
-//! Last Modified: v1.1.0-StagedPolicyMutation - Allowed source adapters to
+//! Last Modified: v1.2.0-SharedVerificationClock - Moved the replaceable
+//! source-time boundary beside the common private reply-policy contract.
+//! v1.1.0-StagedPolicyMutation - Allowed source adapters to
 //! install workflow authority between verified replacement stages.
 //! v1.0.0-RequestBoundReplyVerification - Initial protocol and
 //! private-policy composition for replica workflow terminal replies.
@@ -66,6 +68,28 @@ use crate::protocol::onion::OnionRoutePurpose;
 use crate::protocol::onion_reply::{
     decode_onion_reply_request, OnionReplyError, OnionReplyPayload,
 };
+
+/// Replaceable source clock used by freshness-bounded private reply policies.
+///
+/// [BLIND-VAULT-SHARED-VERIFICATION-CLOCK 2026-08-30 by Codex] The clock
+/// belongs to the common source-policy boundary, not any one lifecycle action.
+pub trait BlindVaultReplicaVerificationClock {
+    type Error;
+
+    /// Returns nonzero Unix time in milliseconds.
+    fn now_ms(&mut self) -> Result<u64, Self::Error>;
+}
+
+impl<Clock, ClockError> BlindVaultReplicaVerificationClock for Clock
+where
+    Clock: FnMut() -> Result<u64, ClockError>,
+{
+    type Error = ClockError;
+
+    fn now_ms(&mut self) -> Result<u64, Self::Error> {
+        self()
+    }
+}
 
 /// Exact signed request/receipt pair authenticated at the common protocol layer.
 pub enum BlindVaultReplicaRequestBoundReply {

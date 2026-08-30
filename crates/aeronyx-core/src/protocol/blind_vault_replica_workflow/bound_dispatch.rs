@@ -80,11 +80,12 @@ pub use replacement_reply_policy::{
     BlindVaultReplicaReplacementPermitIssueError, BlindVaultReplicaReplacementReplyOutcome,
     BlindVaultReplicaReplacementReplyPolicy, BlindVaultReplicaReplacementReplyPolicyBuildError,
     BlindVaultReplicaReplacementReplyPolicyError,
-    BlindVaultReplicaReplacementRetirementDispatchError, BlindVaultReplicaVerificationClock,
+    BlindVaultReplicaReplacementRetirementDispatchError,
 };
 pub use request_bound_verifier::{
     BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaRequestBoundReply,
     BlindVaultReplicaRequestBoundReplyError, BlindVaultReplicaRequestBoundReplyVerifier,
+    BlindVaultReplicaVerificationClock,
 };
 pub use send_sequence::{
     BlindVaultReplicaTerminalEffectTransport, BlindVaultReplicaTerminalSendContext,

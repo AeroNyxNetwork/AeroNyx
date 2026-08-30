@@ -75,6 +75,8 @@
 //!   active workflow authority to permit-gated transport and reply validation.
 //! - [BLIND-VAULT-PROVISIONING-LEASE-LIFETIME 2026-08-30 by Codex] Prevented
 //!   expired new leases from satisfying aggregate replica provisioning.
+//! - [BLIND-VAULT-SHARED-VERIFICATION-CLOCK 2026-08-30 by Codex] Located the
+//!   source-time trait at the common private reply-policy boundary.
 //!
 //! ## Main Functionality
 //!
