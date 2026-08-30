@@ -38,7 +38,9 @@
 //! - Never add a transition that accepts retirement before verified inventory.
 //! - Never expose request, receipt, manifest, node, or lease values in Debug.
 //!
-//! Last Modified: v1.4.0-AuthorizedRetirementDispatch - Composed workflow
+//! Last Modified: v1.5.0-WriteLeaseLifetime - Bound replacement write receipts
+//! to the current admission time and signed lease expiry.
+//! v1.4.0-AuthorizedRetirementDispatch - Composed workflow
 //! authority and the permit-gated runtime send behind one typed operation.
 //! v1.3.0-RetryablePermitComposition - Revalidated and reused
 //! the same live replacement permit after retryable transport failure.
@@ -378,7 +380,7 @@ where
                 Ok(BlindVaultReplicaReplacementReplyOutcome::AdmissionAccepted)
             }
             (
-                BlindVaultReplicaReplacementReplyState::Populating { binding, .. },
+                BlindVaultReplicaReplacementReplyState::Populating { binding, admission },
                 BlindVaultReplicaRequestBoundReply::ObjectStored { receipt, .. },
             ) => {
                 require_same_attempt(binding, context)?;
@@ -390,6 +392,11 @@ where
                     .map_err(BlindVaultReplicaReplacementReplyPolicyError::Clock)?;
                 if now_ms == 0
                     || receipt.stored_until_ms <= now_ms
+                    // [BLIND-VAULT-REPLACEMENT-WRITE-LIFETIME 2026-08-30 by Codex]
+                    // A valid write receipt must remain inside the exact
+                    // terminal-signed admission lifecycle it is populating.
+                    || receipt.stored_until_ms > admission.lease_expires_at_ms()
+                    || receipt.accepted_at_ms < admission.accepted_at_ms()
                     || (receipt.accepted_at_ms > now_ms
                         && receipt.accepted_at_ms - now_ms > self.maximum_future_clock_skew_ms)
                 {

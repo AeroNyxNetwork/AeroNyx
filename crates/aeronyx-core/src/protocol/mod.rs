@@ -81,6 +81,8 @@
 //!   exact-count state machine for aggregate admission, writes, and inventory.
 //! - [BLIND-VAULT-DURABLE-PROVISIONING 2026-08-30 by Codex] Added typed atomic
 //!   resolution for complete policy-issued aggregate provisioning evidence.
+//! - [BLIND-VAULT-REPLACEMENT-WRITE-LIFETIME 2026-08-30 by Codex] Bound each
+//!   replacement write receipt to its signed admission lease window.
 //!
 //! ## Main Functionality
 //!

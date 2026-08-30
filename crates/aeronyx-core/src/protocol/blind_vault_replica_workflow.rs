@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.41.0-DurableProvisioningCompletion - Added a typed atomic
+//! Last Modified: v1.42.0-ReplacementWriteLifetime - Bound replacement write
+//! receipts to their exact signed admission lifecycle.
+//! v1.41.0-DurableProvisioningCompletion - Added a typed atomic
 //! resolution path for policy-issued aggregate provisioning completion.
 //! v1.40.0-ProvisioningReplyPolicy - Added an exact-count,
 //! attempt-bound aggregate admission/write/inventory reply state machine.
