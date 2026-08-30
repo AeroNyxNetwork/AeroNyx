@@ -37,7 +37,9 @@
 //! - The process fence prevents concurrent writers, not privileged rollback.
 //! - Never return to path-based state I/O after the directory FD is pinned.
 //!
-//! Last Modified: v1.2.0-OwnerFence - Rejected recovery directories and files
+//! Last Modified: v1.3.0-ComponentWalk - Rejected symlinks in every configured
+//! path component through descriptor-relative creation and traversal.
+//! v1.2.0-OwnerFence - Rejected recovery directories and files
 //! not owned by the process effective user.
 //! v1.1.0-DirectoryFdFence - Bound lock, reads, temporary files,
 //! cleanup, replacement, and fsync to one opened private directory inode.
@@ -47,16 +49,17 @@
 
 #![cfg(unix)]
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path};
 
 use nix::dir::{Dir, Type as DirectoryEntryType};
 use nix::fcntl::{openat, renameat, AtFlags, Flock, FlockArg, OFlag};
-use nix::sys::stat::{fstatat, Mode, SFlag};
+use nix::sys::stat::{fstatat, mkdirat, Mode, SFlag};
 use nix::unistd::{dup, unlinkat, UnlinkatFlags};
 use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
@@ -100,8 +103,7 @@ pub(crate) struct PrivateAtomicRecoveryFile {
 impl PrivateAtomicRecoveryFile {
     /// Opens one single-writer private recovery namespace.
     pub(crate) fn open(directory: &Path) -> Result<Self, PrivateRecoveryIoError> {
-        prepare_private_directory(directory)?;
-        let directory = open_private_directory(directory)?;
+        let directory = open_or_create_private_directory(directory)?;
         let lock_file =
             open_private_regular_file_at(&directory, LOCK_FILE_NAME, true, false, true)?;
         let fence =
@@ -210,40 +212,89 @@ impl fmt::Debug for PrivateAtomicRecoveryFile {
     }
 }
 
-fn prepare_private_directory(directory: &Path) -> Result<(), PrivateRecoveryIoError> {
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(PrivateRecoveryIoError::UnsafePath);
-            }
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            let mut builder = DirBuilder::new();
-            builder.recursive(true).mode(PRIVATE_DIRECTORY_MODE);
-            builder.create(directory)?;
-        }
-        Err(error) => return Err(error.into()),
-    }
-    Ok(())
-}
-
-fn open_private_directory(path: &Path) -> Result<File, PrivateRecoveryIoError> {
-    let directory = OpenOptions::new()
+fn open_or_create_private_directory(path: &Path) -> Result<File, PrivateRecoveryIoError> {
+    let components = private_directory_components(path)?;
+    let anchor = if path.is_absolute() { "/" } else { "." };
+    let mut directory = OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY)
-        .open(path)?;
-    directory.set_permissions(fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
+        .open(anchor)?;
+
+    // [BLIND-VAULT-RECOVERY-COMPONENT-WALK 2026-08-30 by Codex] Resolve and
+    // create every component relative to a previously opened directory FD.
+    // This closes the parent-symlink and path-swap window left by recursive
+    // path creation while retaining support for absolute and relative paths.
+    for component in components {
+        directory = open_or_create_directory_at(&directory, &component)?;
+    }
+
     let metadata = directory.metadata()?;
     // [BLIND-VAULT-RECOVERY-OWNER-FENCE 2026-08-30 by Codex] Private mode bits
     // are insufficient when a privileged process opens an attacker-owned
     // directory. Ownership is checked on the pinned inode and every child.
-    if !metadata.is_dir()
-        || metadata.uid() != effective_user_id()
-        || metadata.permissions().mode() & 0o077 != 0
-    {
+    if !metadata.is_dir() || metadata.uid() != effective_user_id() {
+        return Err(PrivateRecoveryIoError::UnsafePath);
+    }
+    directory.set_permissions(fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
+    if directory.metadata()?.permissions().mode() & 0o077 != 0 {
         return Err(PrivateRecoveryIoError::UnsafePath);
     }
     Ok(directory)
+}
+
+fn private_directory_components(path: &Path) -> Result<Vec<OsString>, PrivateRecoveryIoError> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => components.push(name.to_os_string()),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(PrivateRecoveryIoError::UnsafePath)
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err(PrivateRecoveryIoError::UnsafePath);
+    }
+    Ok(components)
+}
+
+fn open_or_create_directory_at(
+    parent: &File,
+    name: &OsStr,
+) -> Result<File, PrivateRecoveryIoError> {
+    match open_directory_at(parent, name) {
+        Ok(directory) => Ok(directory),
+        Err(PrivateRecoveryIoError::Filesystem(error)) if error.kind() == ErrorKind::NotFound => {
+            match mkdirat(
+                Some(parent.as_raw_fd()),
+                name,
+                Mode::from_bits_truncate(PRIVATE_DIRECTORY_MODE),
+            ) {
+                Ok(()) | Err(nix::errno::Errno::EEXIST) => open_directory_at(parent, name),
+                Err(error) => Err(PrivateRecoveryIoError::Filesystem(nix_filesystem_error(
+                    error,
+                ))),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn open_directory_at(parent: &File, name: &OsStr) -> Result<File, PrivateRecoveryIoError> {
+    let raw_fd = openat(
+        Some(parent.as_raw_fd()),
+        name,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY,
+        Mode::empty(),
+    )
+    .map_err(|error| match error {
+        nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR => PrivateRecoveryIoError::UnsafePath,
+        _ => PrivateRecoveryIoError::Filesystem(nix_filesystem_error(error)),
+    })?;
+    // SAFETY: `openat` returned a new owned descriptor and this is its sole
+    // owner. `File` closes it exactly once when dropped.
+    Ok(unsafe { File::from_raw_fd(raw_fd) })
 }
 
 fn open_private_regular_file_at(
