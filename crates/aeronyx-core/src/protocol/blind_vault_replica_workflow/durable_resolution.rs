@@ -19,6 +19,7 @@
 //! - Accepts typed aggregate-provisioning completion capabilities.
 //! - Accepts typed inventory-reconciliation completion capabilities.
 //! - Unifies all policy-issued capabilities under one closed action enum.
+//! - Unifies verified completion and bounded failure under one resolution enum.
 //! - Records bounded failure and retry disposition through the same boundary.
 //! - Resolves the exact journal and snapshot in one recovery-store operation.
 //! - Restores the prior in-memory state after sealing or persistence failure.
@@ -47,7 +48,9 @@
 //!   exact idempotent retry is required and is supported by the store contract.
 //! - Do not split evidence acceptance and store resolution in new callers.
 //!
-//! Last Modified: v1.9.0-ReplyOutcomeConversion - Added idiomatic terminal
+//! Last Modified: v1.10.0-UnifiedAttemptResolution - Added one closed adapter
+//! outcome spanning verified completion and bounded failure.
+//! v1.9.0-ReplyOutcomeConversion - Added idiomatic terminal
 //! extraction from every action-specific reply outcome.
 //! v1.8.0-CompletionBindingGate - Required every typed
 //! completion to match the exact committed work id and attempt before mutation.
@@ -364,6 +367,43 @@ impl TryFrom<BlindVaultReplicaProvisioningReplyOutcome> for BlindVaultReplicaCom
     }
 }
 
+/// Closed terminal resolution accepted by the durable adapter boundary.
+///
+/// [BLIND-VAULT-ATTEMPT-RESOLUTION 2026-08-30 by Codex] Successful variants
+/// can contain only reply-policy-issued completion capabilities. Failure
+/// variants retain the source-owned timestamp and retry disposition that the
+/// workflow validates before any snapshot or journal mutation is persisted.
+#[derive(Clone, PartialEq, Eq)]
+pub enum BlindVaultReplicaAttemptResolution {
+    /// Exact authenticated reply policy completed the planner action.
+    Completed(BlindVaultReplicaCompletedAction),
+    /// Attempt ended with one bounded privacy-safe failure disposition.
+    Failed(BlindVaultReplicaAttemptFailure),
+}
+
+impl fmt::Debug for BlindVaultReplicaAttemptResolution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Completed(completed) => {
+                formatter.debug_tuple("Completed").field(completed).finish()
+            }
+            Self::Failed(_) => formatter.write_str("Failed([REDACTED])"),
+        }
+    }
+}
+
+impl From<BlindVaultReplicaCompletedAction> for BlindVaultReplicaAttemptResolution {
+    fn from(completed: BlindVaultReplicaCompletedAction) -> Self {
+        Self::Completed(completed)
+    }
+}
+
+impl From<BlindVaultReplicaAttemptFailure> for BlindVaultReplicaAttemptResolution {
+    fn from(failure: BlindVaultReplicaAttemptFailure) -> Self {
+        Self::Failed(failure)
+    }
+}
+
 /// Fail-closed errors before one attempt resolution becomes durable.
 #[derive(Debug)]
 pub enum BlindVaultReplicaDurableResolutionError<StoreError> {
@@ -424,6 +464,41 @@ impl BlindVaultReplicaAttemptJournal {
 }
 
 impl BlindVaultReplicaExecution {
+    /// Atomically resolves one committed attempt through a single adapter API.
+    ///
+    /// Completion remains capability-gated and attempt-bound. Failure remains
+    /// workflow-validated for time ordering, retryability, exhaustion, and
+    /// backoff. Both paths seal the resulting snapshot and resolve only the
+    /// exact committed journal in one recovery-store operation.
+    pub fn resolve_attempt_durably<Store>(
+        &mut self,
+        identity: &IdentityKeyPair,
+        store: &mut Store,
+        binding: &BlindVaultReplicaCommittedAttemptBinding,
+        resolution: &BlindVaultReplicaAttemptResolution,
+        snapshot_sequence: u64,
+    ) -> Result<
+        BlindVaultReplicaDurableResolution,
+        BlindVaultReplicaDurableResolutionError<Store::Error>,
+    >
+    where
+        Store: BlindVaultReplicaRecoveryStore,
+    {
+        match resolution {
+            BlindVaultReplicaAttemptResolution::Completed(completed) => self
+                .accept_completed_action_durably(
+                    identity,
+                    store,
+                    binding,
+                    completed,
+                    snapshot_sequence,
+                ),
+            BlindVaultReplicaAttemptResolution::Failed(failure) => {
+                self.record_failure_durably(identity, store, binding, *failure, snapshot_sequence)
+            }
+        }
+    }
+
     /// Atomically resolves any reply-policy-issued completed action.
     ///
     /// This is the preferred generic adapter boundary. Action-specific methods

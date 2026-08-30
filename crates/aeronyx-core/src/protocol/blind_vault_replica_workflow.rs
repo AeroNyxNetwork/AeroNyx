@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.54.0-ReplyOutcomeConversion - Added standard typed
+//! Last Modified: v1.55.0-UnifiedAttemptResolution - Added one closed durable
+//! adapter outcome for verified completion and bounded failure.
+//! v1.54.0-ReplyOutcomeConversion - Added standard typed
 //! conversion from action reply outcomes into unified completion.
 //! v1.53.0-CompletionBindingGate - Rejected typed completion
 //! capabilities from any other work id or attempt before durable mutation.
@@ -242,9 +244,9 @@ pub use durable_dispatch::{
     BlindVaultReplicaDurableDispatchError, BlindVaultReplicaPersistedAttemptJournal,
 };
 pub use durable_resolution::{
-    BlindVaultReplicaAttemptFailure, BlindVaultReplicaCommittedAttemptBinding,
-    BlindVaultReplicaCompletedAction, BlindVaultReplicaDurableResolution,
-    BlindVaultReplicaDurableResolutionError,
+    BlindVaultReplicaAttemptFailure, BlindVaultReplicaAttemptResolution,
+    BlindVaultReplicaCommittedAttemptBinding, BlindVaultReplicaCompletedAction,
+    BlindVaultReplicaDurableResolution, BlindVaultReplicaDurableResolutionError,
 };
 pub use durable_snapshot::{
     BlindVaultReplicaDurableSnapshot, BlindVaultReplicaDurableSnapshotError,

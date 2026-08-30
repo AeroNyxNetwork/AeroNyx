@@ -83,6 +83,8 @@
 //!   resolution for complete policy-issued aggregate provisioning evidence.
 //! - [BLIND-VAULT-REPLACEMENT-WRITE-LIFETIME 2026-08-30 by Codex] Bound each
 //!   replacement write receipt to its signed admission lease window.
+//! - [BLIND-VAULT-ATTEMPT-RESOLUTION 2026-08-30 by Codex] Re-exported one
+//!   closed durable adapter outcome for verified completion or bounded failure.
 //!
 //! ## Main Functionality
 //!
@@ -120,6 +122,9 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.40.0-BlindVaultAttemptResolution - Added one closed durable adapter
+//! outcome spanning verified completion and bounded failure
+//! [BLIND-VAULT-ATTEMPT-RESOLUTION 2026-08-30 by Codex]
 //! v1.39.0-BlindVaultReplyOutcomeConversion - Added standard conversion from
 //! action reply outcomes into unified typed completion
 //! [BLIND-VAULT-REPLY-OUTCOME-CONVERSION 2026-08-30 by Codex]
@@ -266,20 +271,20 @@ pub use blind_vault_replica_workflow::{
     BlindVaultReplicaActionEvidence, BlindVaultReplicaAttemptContinuation,
     BlindVaultReplicaAttemptDurabilityPhase, BlindVaultReplicaAttemptFailure,
     BlindVaultReplicaAttemptJournal, BlindVaultReplicaAttemptJournalError,
-    BlindVaultReplicaAuthenticatedPreparedAttempt, BlindVaultReplicaBoundAttemptContinuation,
-    BlindVaultReplicaBoundContinuationError, BlindVaultReplicaBoundRuntimeError,
-    BlindVaultReplicaCommittedAttemptBinding, BlindVaultReplicaCommittedAttemptDispatch,
-    BlindVaultReplicaCommittedAttemptRecord, BlindVaultReplicaCommittedBoundAttemptDispatch,
-    BlindVaultReplicaCompletedAction, BlindVaultReplicaCompletedObservation,
-    BlindVaultReplicaCompletedProvisioning, BlindVaultReplicaCompletedReconciliation,
-    BlindVaultReplicaCompletedRenewal, BlindVaultReplicaCompletedReplacement,
-    BlindVaultReplicaConvergence, BlindVaultReplicaDispatchContract,
-    BlindVaultReplicaDispatchFailure, BlindVaultReplicaDispatchReadiness,
-    BlindVaultReplicaDurableAttemptDispatch, BlindVaultReplicaDurableBoundAttemptDispatch,
-    BlindVaultReplicaDurableDispatchError, BlindVaultReplicaDurableResolution,
-    BlindVaultReplicaDurableResolutionError, BlindVaultReplicaDurableSnapshot,
-    BlindVaultReplicaDurableSnapshotError, BlindVaultReplicaExecution,
-    BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
+    BlindVaultReplicaAttemptResolution, BlindVaultReplicaAuthenticatedPreparedAttempt,
+    BlindVaultReplicaBoundAttemptContinuation, BlindVaultReplicaBoundContinuationError,
+    BlindVaultReplicaBoundRuntimeError, BlindVaultReplicaCommittedAttemptBinding,
+    BlindVaultReplicaCommittedAttemptDispatch, BlindVaultReplicaCommittedAttemptRecord,
+    BlindVaultReplicaCommittedBoundAttemptDispatch, BlindVaultReplicaCompletedAction,
+    BlindVaultReplicaCompletedObservation, BlindVaultReplicaCompletedProvisioning,
+    BlindVaultReplicaCompletedReconciliation, BlindVaultReplicaCompletedRenewal,
+    BlindVaultReplicaCompletedReplacement, BlindVaultReplicaConvergence,
+    BlindVaultReplicaDispatchContract, BlindVaultReplicaDispatchFailure,
+    BlindVaultReplicaDispatchReadiness, BlindVaultReplicaDurableAttemptDispatch,
+    BlindVaultReplicaDurableBoundAttemptDispatch, BlindVaultReplicaDurableDispatchError,
+    BlindVaultReplicaDurableResolution, BlindVaultReplicaDurableResolutionError,
+    BlindVaultReplicaDurableSnapshot, BlindVaultReplicaDurableSnapshotError,
+    BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
     BlindVaultReplicaLoadedRecovery, BlindVaultReplicaObservationReplyOutcome,
     BlindVaultReplicaObservationReplyPolicy, BlindVaultReplicaObservationReplyPolicyBuildError,
     BlindVaultReplicaObservationReplyPolicyError, BlindVaultReplicaOnionDispatchPlan,
