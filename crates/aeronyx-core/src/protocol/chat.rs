@@ -77,6 +77,9 @@
 //! - [BOUNDED-WIRE-CODEC 2026-07-23 by Codex] Chat and blind-relay encoders
 //!   share the same byte ceilings as their decoders. Keep legacy small trailing
 //!   bytes only for `ChatEnvelope`; blind-relay frames remain canonical.
+//! - [BLIND-RELAY-SIZE-PREFLIGHT 2026-08-30 by Codex] Admission callers can
+//!   validate the exact canonical blind-envelope size without allocating a
+//!   second ciphertext-sized encoding buffer.
 //! - [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] `CustodyAuditAnchorV1` is a
 //!   fixed-size, node-signed commitment to one opaque relay-custody checkpoint.
 //!   It contains no audit MAC, path, message metadata, identity relationship,
@@ -91,6 +94,8 @@
 //!   disclosure explicit; it still contains no user- or message-level data.
 //!
 //! ## Last Modified
+//! v1.11.0-BlindRelaySizePreflight - Added allocation-free canonical envelope
+//! size validation while preserving existing encode/decode limits
 //! v1.10.0-ChatSessionSenderBinding - Centralized authenticated transport
 //! identity binding on `ChatEnvelope` without changing wire bytes
 //! v1.9.0-CustodyAnchorMetadataAccuracy - Correct the documented aggregate
@@ -111,7 +116,10 @@ use sha2::{Digest, Sha256};
 
 use crate::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 use crate::error::CoreError;
-use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
+use crate::protocol::codec::{
+    decode_bincode_bounded, encode_bincode_bounded, encoded_size_bincode_bounded,
+    TrailingBytesPolicy,
+};
 use crate::protocol::onion::OnionRoutePurpose;
 
 // ============================================
@@ -1477,14 +1485,32 @@ pub fn decode_custody_audit_witness_receipt(
 /// protocol class, or `CoreError::MalformedMessage` when bounded serialization
 /// fails.
 pub fn encode_blind_relay_envelope(envelope: &BlindRelayEnvelope) -> Result<Vec<u8>, CoreError> {
+    validate_blind_relay_blob_size(envelope)?;
+    encode_bincode_bounded(envelope, MAX_BLIND_RELAY_ENVELOPE_BYTES)
+        .map_err(|err| CoreError::malformed(format!("blind relay envelope encode: {err}")))
+}
+
+/// Validates blind-relay blob and canonical frame ceilings without encoding.
+///
+/// # Errors
+/// Returns `CoreError::MessageTooLarge` when the opaque blob exceeds its
+/// protocol class, or `CoreError::MalformedMessage` when the canonical frame
+/// would exceed the bounded wire class.
+pub fn validate_blind_relay_envelope_size(envelope: &BlindRelayEnvelope) -> Result<(), CoreError> {
+    validate_blind_relay_blob_size(envelope)?;
+    encoded_size_bincode_bounded(envelope, MAX_BLIND_RELAY_ENVELOPE_BYTES)
+        .map(|_| ())
+        .map_err(|err| CoreError::malformed(format!("blind relay envelope size: {err}")))
+}
+
+fn validate_blind_relay_blob_size(envelope: &BlindRelayEnvelope) -> Result<(), CoreError> {
     if envelope.encrypted_blob.len() > MAX_BLIND_RELAY_BLOB_BYTES {
         return Err(CoreError::MessageTooLarge {
             max: MAX_BLIND_RELAY_BLOB_BYTES,
             actual: envelope.encrypted_blob.len(),
         });
     }
-    encode_bincode_bounded(envelope, MAX_BLIND_RELAY_ENVELOPE_BYTES)
-        .map_err(|err| CoreError::malformed(format!("blind relay envelope encode: {err}")))
+    Ok(())
 }
 
 /// Decodes a blind relay envelope with size bounds and blob cap checks.

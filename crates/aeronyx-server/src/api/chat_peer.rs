@@ -338,6 +338,8 @@
 //!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.75.0-EnvelopeSizePreflight - Validate canonical blind-envelope bounds
+//! without allocating another ciphertext-sized encoding buffer
 //! v0.74.0-StreamingRequestCommitment - Preserve canonical replay commitments
 //! while hashing large authenticated requests without a second payload buffer
 //! v0.73.0-AuthenticatedOnwardDomain - Remove duplicate onion-middle signature
@@ -475,8 +477,9 @@ use aeronyx_core::crypto::transport::{
 };
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::chat::{
-    decode_envelope, encode_blind_relay_envelope, encode_envelope, BlindRelayDeliveryReceipt,
-    BlindRelayEnvelope, BlindRelayFailureReceipt, BlindRelaySuccessReceipt, ChatEnvelope,
+    decode_envelope, encode_envelope, validate_blind_relay_envelope_size,
+    BlindRelayDeliveryReceipt, BlindRelayEnvelope, BlindRelayFailureReceipt,
+    BlindRelaySuccessReceipt, ChatEnvelope,
 };
 use aeronyx_core::protocol::codec::encode_data_packet;
 use aeronyx_core::protocol::discovery::{NodeProtocolFeature, SignedNodeDescriptor};
@@ -4025,7 +4028,7 @@ fn validate_blind_relay_metadata(
     now: u64,
 ) -> Result<(), BlindRelayError> {
     validate_blind_relay_timestamp(envelope.timestamp, now)?;
-    encode_blind_relay_envelope(envelope).map_err(|_| BlindRelayError::EnvelopeTooLarge)?;
+    validate_blind_relay_envelope_size(envelope).map_err(|_| BlindRelayError::EnvelopeTooLarge)?;
     Ok(())
 }
 

@@ -11,6 +11,8 @@
 //! - v0.2.0-BoundedBincode: Centralised bounded bincode encoding and decoding
 //!   so protocol senders cannot create frames that receivers must reject, and
 //!   input byte limits cannot be bypassed with ignored trailing padding.
+//! - v0.3.0-BoundedEncodedSize: Added allocation-free canonical size checks for
+//!   admission paths that do not need encoded payload bytes.
 //!
 //! ## Main Functionality
 //! - `Codec` trait: Generic encode/decode interface
@@ -37,6 +39,7 @@
 //!   not account for ignored trailing bytes.
 //!
 //! ## Last Modified
+//! v0.3.0-BoundedEncodedSize - Added fixed-integer encoded-size validation
 //! v0.2.0-BoundedBincode - Added symmetric bounded bincode helpers
 //! v0.1.0 - Initial codec implementation
 
@@ -80,6 +83,20 @@ pub(crate) fn encode_bincode_bounded<T: Serialize>(
         .with_fixint_encoding()
         .with_limit(limit)
         .serialize(value)
+}
+
+/// Computes canonical fixed-integer bincode size under the wire byte ceiling.
+///
+/// [BOUNDED-ENCODED-SIZE 2026-08-30 by Codex] Admission and validation paths
+/// use the exact encoder options without allocating an output-sized `Vec`.
+pub(crate) fn encoded_size_bincode_bounded<T: Serialize>(
+    value: &T,
+    limit: u64,
+) -> std::result::Result<u64, bincode::Error> {
+    bincode::options()
+        .with_fixint_encoding()
+        .with_limit(limit)
+        .serialized_size(value)
 }
 
 /// Deserializes one application-layer value after enforcing the ceiling against
