@@ -137,6 +137,9 @@
 //! - [BLIND-RESPONSE-CRYPTO-COMPLETION 2026-08-30 by Codex] Evaluates bounded
 //!   downstream ACKs and verifies their hop-local receipts outside Tokio I/O,
 //!   with fair completion admission after an outbound route effect is armed
+//! - [BLIND-SUCCESS-SIGNING-COMPLETION 2026-08-30 by Codex] Signs hop-local
+//!   success receipts in the same fair completion domain without cloning the
+//!   opaque request envelope or response carrier
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -341,6 +344,8 @@
 //!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.77.0-SuccessSigningCompletion - Move success receipt hashing and Ed25519
+//! signing outside Tokio while preserving durable completion ordering
 //! v0.76.0-ResponseCryptoCompletion - Move downstream response policy and
 //! receipt verification into bounded fair crypto completion workers
 //! v0.75.0-EnvelopeSizePreflight - Validate canonical blind-envelope bounds
@@ -2553,42 +2558,48 @@ fn build_forwarded_onion_envelope_from_seed(
 /// allowed to sign outbound success ACKs. It binds the exact request envelope,
 /// response shape, TTL, legacy delivery evidence, and opaque response while
 /// ensuring a relay never propagates a deeper hop's success signature.
-fn attach_blind_relay_success_receipt(
-    envelope: &BlindRelayEnvelope,
+async fn attach_blind_relay_success_receipt(
+    envelope: Arc<BlindRelayEnvelope>,
     mut response: PeerBlindRelayResponse,
     accepted_at: u64,
-    responder: &IdentityKeyPair,
+    responder: Arc<IdentityKeyPair>,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
-    if !response.accepted || response.failure_receipt.is_some() {
-        return Err(BlindRelayError::ForwardFailed);
-    }
-    let opaque_response = response
-        .opaque_terminal_response_b64
-        .as_deref()
-        .map(str::as_bytes);
-    let receipt = match (response.terminal, response.forwarded) {
-        (true, false) => BlindRelaySuccessReceipt::terminal(
-            envelope,
-            response.ttl_remaining,
-            response.reason.as_deref(),
-            response.delivery_receipt.as_ref(),
-            opaque_response,
-            accepted_at,
-            responder,
-        ),
-        (false, true) => BlindRelaySuccessReceipt::forwarded(
-            envelope,
-            response.ttl_remaining,
-            response.reason.as_deref(),
-            response.delivery_receipt.as_ref(),
-            opaque_response,
-            accepted_at,
-            responder,
-        ),
-        _ => return Err(BlindRelayError::ForwardFailed),
-    };
-    response.success_receipt = Some(receipt);
-    Ok(response)
+    complete_blind_relay_crypto(move || {
+        // [BLIND-SUCCESS-SIGNING-COMPLETION 2026-08-30 by Codex] The request
+        // and possibly large opaque response move into the worker by ownership;
+        // `Arc` avoids a ciphertext clone while durable completion waits.
+        if !response.accepted || response.failure_receipt.is_some() {
+            return Err(BlindRelayError::ForwardFailed);
+        }
+        let opaque_response = response
+            .opaque_terminal_response_b64
+            .as_deref()
+            .map(str::as_bytes);
+        let receipt = match (response.terminal, response.forwarded) {
+            (true, false) => BlindRelaySuccessReceipt::terminal(
+                envelope.as_ref(),
+                response.ttl_remaining,
+                response.reason.as_deref(),
+                response.delivery_receipt.as_ref(),
+                opaque_response,
+                accepted_at,
+                responder.as_ref(),
+            ),
+            (false, true) => BlindRelaySuccessReceipt::forwarded(
+                envelope.as_ref(),
+                response.ttl_remaining,
+                response.reason.as_deref(),
+                response.delivery_receipt.as_ref(),
+                opaque_response,
+                accepted_at,
+                responder.as_ref(),
+            ),
+            _ => return Err(BlindRelayError::ForwardFailed),
+        };
+        response.success_receipt = Some(receipt);
+        Ok(response)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -2669,6 +2680,7 @@ async fn process_authenticated_peer_blind_relay(
             )
             .await;
         }
+        let envelope = Arc::new(envelope);
         let route_lease = match begin_blind_relay_route(
             &state,
             envelope.route_id,
@@ -2679,15 +2691,16 @@ async fn process_authenticated_peer_blind_relay(
             BlindRelayRouteStart::Acquired(lease) => lease,
             BlindRelayRouteStart::Completed(response) => {
                 return attach_blind_relay_success_receipt(
-                    &envelope,
+                    Arc::clone(&envelope),
                     response,
                     now,
-                    state.node_identity.as_ref(),
+                    Arc::clone(&state.node_identity),
                 )
+                .await
             }
         };
         let response = attach_blind_relay_success_receipt(
-            &envelope,
+            Arc::clone(&envelope),
             PeerBlindRelayResponse {
                 accepted: true,
                 terminal: true,
@@ -2700,8 +2713,9 @@ async fn process_authenticated_peer_blind_relay(
                 opaque_terminal_response_b64: None,
             },
             now,
-            state.node_identity.as_ref(),
-        )?;
+            Arc::clone(&state.node_identity),
+        )
+        .await?;
         complete_blind_relay_route(&state, route_lease, now, response.clone())?;
         record_blind_relay_previous_hop_success(&state, previous_hop_node_id);
         state.peer_store.record_blind_relay_terminal(
@@ -2763,9 +2777,10 @@ async fn process_authenticated_peer_blind_relay(
         BlindRelayError::InvalidEndpoint
     })?;
 
+    let original_envelope = Arc::new(envelope);
     let mut route_lease = match begin_blind_relay_route(
         &state,
-        envelope.route_id,
+        original_envelope.route_id,
         request_commitment,
         previous_hop_node_id,
         now,
@@ -2773,15 +2788,15 @@ async fn process_authenticated_peer_blind_relay(
         BlindRelayRouteStart::Acquired(lease) => lease,
         BlindRelayRouteStart::Completed(response) => {
             return attach_blind_relay_success_receipt(
-                &envelope,
+                Arc::clone(&original_envelope),
                 response,
                 now,
-                state.node_identity.as_ref(),
+                Arc::clone(&state.node_identity),
             )
+            .await
         }
     };
 
-    let original_envelope = Arc::new(envelope);
     let envelope_for_forwarding = Arc::clone(&original_envelope);
     let onward_envelope_for_forwarding = request.onward_envelope;
     let forwarding_identity = Arc::clone(&state.node_identity);
@@ -2827,7 +2842,7 @@ async fn process_authenticated_peer_blind_relay(
     };
 
     let response = attach_blind_relay_success_receipt(
-        original_envelope.as_ref(),
+        original_envelope,
         PeerBlindRelayResponse {
             accepted: true,
             terminal: false,
@@ -2840,8 +2855,9 @@ async fn process_authenticated_peer_blind_relay(
             opaque_terminal_response_b64: None,
         },
         observed_at,
-        state.node_identity.as_ref(),
-    )?;
+        Arc::clone(&state.node_identity),
+    )
+    .await?;
     complete_blind_relay_route(&state, route_lease, observed_at, response.clone())?;
     let _ = state
         .peer_store
@@ -2886,11 +2902,12 @@ async fn process_onion_blind_relay(
         BlindRelayRouteStart::Acquired(lease) => lease,
         BlindRelayRouteStart::Completed(response) => {
             return attach_blind_relay_success_receipt(
-                &envelope,
+                Arc::clone(&envelope),
                 response,
                 now,
-                state.node_identity.as_ref(),
+                Arc::clone(&state.node_identity),
             )
+            .await
         }
     };
 
@@ -2978,7 +2995,7 @@ async fn process_onion_blind_relay(
                 OnionReplyProofMode::SourceSealedTerminalProof => None,
             };
             let response = attach_blind_relay_success_receipt(
-                &envelope,
+                Arc::clone(&envelope),
                 PeerBlindRelayResponse {
                     accepted: true,
                     terminal: true,
@@ -2991,8 +3008,9 @@ async fn process_onion_blind_relay(
                     opaque_terminal_response_b64: terminal_delivery.opaque_response_b64,
                 },
                 accepted_at,
-                state.node_identity.as_ref(),
-            )?;
+                Arc::clone(&state.node_identity),
+            )
+            .await?;
             complete_blind_relay_route(&state, route_lease, accepted_at, response.clone())?;
             record_blind_relay_previous_hop_success(&state, previous_hop_node_id);
             state.peer_store.record_blind_relay_terminal(
@@ -3110,7 +3128,7 @@ async fn process_onion_blind_relay(
             let next_hop_ack = next_hop_forward.response;
 
             let response = attach_blind_relay_success_receipt(
-                &envelope,
+                Arc::clone(&envelope),
                 PeerBlindRelayResponse {
                     accepted: true,
                     terminal: false,
@@ -3123,8 +3141,9 @@ async fn process_onion_blind_relay(
                     opaque_terminal_response_b64: next_hop_ack.opaque_terminal_response_b64,
                 },
                 observed_at,
-                state.node_identity.as_ref(),
-            )?;
+                Arc::clone(&state.node_identity),
+            )
+            .await?;
             complete_blind_relay_route(&state, route_lease, observed_at, response.clone())?;
             let _ = state
                 .peer_store
@@ -3352,6 +3371,7 @@ async fn process_onion_middle_blind_relay(
     now: u64,
     route_started_at: &Instant,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+    let outer_envelope = Arc::new(outer_envelope);
     // [AUTHENTICATED-ONWARD-DOMAIN 2026-08-30 by Codex] The private
     // `AuthenticatedPeerBlindRelayRequest` constructor already verified the
     // onward signature inside bounded blocking admission. Repeating that work
@@ -3420,11 +3440,12 @@ async fn process_onion_middle_blind_relay(
         BlindRelayRouteStart::Acquired(lease) => lease,
         BlindRelayRouteStart::Completed(response) => {
             return attach_blind_relay_success_receipt(
-                &outer_envelope,
+                Arc::clone(&outer_envelope),
                 response,
                 now,
-                state.node_identity.as_ref(),
+                Arc::clone(&state.node_identity),
             )
+            .await
         }
     };
 
@@ -3463,7 +3484,7 @@ async fn process_onion_middle_blind_relay(
     let next_hop_ack = next_hop_forward.response;
 
     let response = attach_blind_relay_success_receipt(
-        &outer_envelope,
+        outer_envelope,
         PeerBlindRelayResponse {
             accepted: true,
             terminal: false,
@@ -3476,8 +3497,9 @@ async fn process_onion_middle_blind_relay(
             opaque_terminal_response_b64: next_hop_ack.opaque_terminal_response_b64,
         },
         observed_at,
-        state.node_identity.as_ref(),
-    )?;
+        Arc::clone(&state.node_identity),
+    )
+    .await?;
     complete_blind_relay_route(&state, route_lease, observed_at, response.clone())?;
     let _ = state
         .peer_store
