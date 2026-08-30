@@ -37,7 +37,9 @@
 //! - Keep node fan-out out of this module; clients choose unrelated replicas
 //!   and routes so one node cannot reconstruct a logical replica set.
 //!
-//! Last Modified: v1.9.0-BlindVaultLargePull - Carried every v1 ciphertext
+//! Last Modified: v1.10.0-BlindVaultPreparedEffect - Separates pure request
+//! validation from read-only or mutating terminal execution.
+//! v1.9.0-BlindVaultLargePull - Carried every v1 ciphertext
 //! class through one negotiated maximum fixed-size response.
 //! v1.8.0-BlindVaultEncryptedFailure - Moved valid-request
 //! workload failures inside source-only authenticated onion replies.
@@ -113,14 +115,98 @@ pub(super) struct TerminalReply {
     pub(super) opaque_response_b64: String,
 }
 
-/// Executes one reply-capable Blind Vault request and seals its fixed-size ACK.
-pub(super) fn execute_blind_vault_inline_reply(
-    vault: &BlindVaultService,
-    terminal_identity: &IdentityKeyPair,
-    route_id: [u8; 16],
+/// External-effect class for one validated terminal reply operation.
+///
+/// [BLIND-VAULT-PREPARED-EFFECT 2026-08-30 by Codex] Relay recovery must arm a
+/// durable route only for operations that can mutate replica state. Keeping
+/// this decision next to the exhaustive frame match prevents a newly added
+/// operation from silently inheriting the wrong cancellation semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TerminalReplyEffect {
+    /// The operation observes one stable replica snapshot without mutating it.
+    ReadOnly,
+    /// The operation may commit a durable Blind Vault state transition.
+    Mutation,
+}
+
+impl TerminalReplyEffect {
+    pub(super) const fn requires_durable_guard(self) -> bool {
+        matches!(self, Self::Mutation)
+    }
+}
+
+/// Fully decoded terminal request ready for guarded execution.
+///
+/// This type intentionally does not implement `Debug`: both the reply carrier
+/// and the Blind Vault frame contain private capabilities or ciphertext.
+pub(super) struct PreparedTerminalReply {
+    reply_request: aeronyx_core::protocol::OnionReplyRequest,
+    frame: BlindVaultFrame,
+    purpose: OnionRoutePurpose,
+    operation: BlindVaultTerminalOperation,
+    effect: TerminalReplyEffect,
+}
+
+impl PreparedTerminalReply {
+    pub(super) const fn effect(&self) -> TerminalReplyEffect {
+        self.effect
+    }
+
+    /// Executes a request whose wire shape and operation class were validated.
+    pub(super) fn execute(
+        self,
+        vault: &BlindVaultService,
+        terminal_identity: &IdentityKeyPair,
+        route_id: [u8; 16],
+        now_ms: u64,
+    ) -> Result<TerminalReply, TerminalReplyFailure> {
+        let Self {
+            reply_request,
+            frame,
+            purpose,
+            operation,
+            effect: _,
+        } = self;
+        let response = execute_prepared_frame(vault, terminal_identity, frame, now_ms);
+
+        // [BLIND-VAULT-ENCRYPTED-FAILURE 2026-08-28 by Codex] Once a valid
+        // reply-capable workload request is identified, every workload failure
+        // is sealed to the source. Upstream relays receive the same fixed-size
+        // opaque success carrier and cannot use rejection/capacity as an oracle.
+        let encoded_response = match response {
+            Ok(encoded) => encoded,
+            Err(failure) => encode_terminal_failure(operation, failure)?,
+        };
+        let sealed = match seal_onion_reply(
+            route_id,
+            &reply_request,
+            &encoded_response,
+            terminal_identity,
+        ) {
+            Ok(sealed) => sealed,
+            Err(aeronyx_core::protocol::OnionReplyError::ResponsePayloadTooLarge) => {
+                let failure =
+                    encode_terminal_failure(operation, TerminalReplyFailure::ResponseTooLarge)?;
+                seal_onion_reply(route_id, &reply_request, &failure, terminal_identity)
+                    .map_err(|_| TerminalReplyFailure::Unavailable)?
+            }
+            Err(_) => return Err(TerminalReplyFailure::Unavailable),
+        };
+        let encoded_sealed =
+            encode_onion_sealed_response(&sealed).map_err(|_| TerminalReplyFailure::Unavailable)?;
+        Ok(TerminalReply {
+            purpose,
+            proof_mode: reply_request.proof_mode(),
+            opaque_response_b64: BASE64.encode(encoded_sealed),
+        })
+    }
+}
+
+/// Decodes and classifies one reply-capable Blind Vault request without
+/// reading or mutating replica storage.
+pub(super) fn prepare_blind_vault_inline_reply(
     encoded_request: &[u8],
-    now_ms: u64,
-) -> Result<TerminalReply, TerminalReplyFailure> {
+) -> Result<PreparedTerminalReply, TerminalReplyFailure> {
     let reply_request =
         decode_onion_reply_request(encoded_request).map_err(|_| TerminalReplyFailure::Rejected)?;
     let response_size_class = usize::try_from(reply_request.response_size_class)
@@ -128,6 +214,7 @@ pub(super) fn execute_blind_vault_inline_reply(
 
     let frame = decode_blind_vault_frame(&reply_request.payload)
         .map_err(|_| TerminalReplyFailure::Rejected)?;
+    let (purpose, operation, effect) = classify_prepared_frame(&frame)?;
     let is_pull = matches!(&frame, BlindVaultFrame::PullRequest(_));
     let current_size_class = if is_pull {
         BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS
@@ -142,157 +229,159 @@ pub(super) fn execute_blind_vault_inline_reply(
     if response_size_class != current_size_class && !legacy_pull_size {
         return Err(TerminalReplyFailure::Rejected);
     }
-    let (purpose, operation, response) = match frame {
+
+    // Reject operation-specific wire-shape errors before relay recovery marks
+    // a route as having crossed an external-effect boundary.
+    match &frame {
+        BlindVaultFrame::Put(request)
+            if request.ciphertext.len() != BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES[0] =>
+        {
+            return Err(TerminalReplyFailure::Rejected);
+        }
+        BlindVaultFrame::PullRequest(request) => {
+            request
+                .validate()
+                .map_err(|_| TerminalReplyFailure::Rejected)?;
+            if request.limit != 1 {
+                return Err(TerminalReplyFailure::Rejected);
+            }
+        }
+        _ => {}
+    }
+
+    Ok(PreparedTerminalReply {
+        reply_request,
+        frame,
+        purpose,
+        operation,
+        effect,
+    })
+}
+
+fn classify_prepared_frame(
+    frame: &BlindVaultFrame,
+) -> Result<
+    (
+        OnionRoutePurpose,
+        BlindVaultTerminalOperation,
+        TerminalReplyEffect,
+    ),
+    TerminalReplyFailure,
+> {
+    match frame {
+        BlindVaultFrame::Put(_) => Ok((
+            OnionRoutePurpose::BlindVaultPutReceipt,
+            BlindVaultTerminalOperation::Put,
+            TerminalReplyEffect::Mutation,
+        )),
+        BlindVaultFrame::PullRequest(_) => Ok((
+            OnionRoutePurpose::BlindVaultPull,
+            BlindVaultTerminalOperation::Pull,
+            TerminalReplyEffect::ReadOnly,
+        )),
+        BlindVaultFrame::Delete(_) => Ok((
+            OnionRoutePurpose::BlindVaultDelete,
+            BlindVaultTerminalOperation::Delete,
+            TerminalReplyEffect::Mutation,
+        )),
+        BlindVaultFrame::BlindLeaseAdmission(_) => Ok((
+            OnionRoutePurpose::BlindVaultLeaseAdmission,
+            BlindVaultTerminalOperation::LeaseAdmission,
+            TerminalReplyEffect::Mutation,
+        )),
+        BlindVaultFrame::BlindLeaseRenewal(_) => Ok((
+            OnionRoutePurpose::BlindVaultLeaseRenewal,
+            BlindVaultTerminalOperation::LeaseRenewal,
+            TerminalReplyEffect::Mutation,
+        )),
+        BlindVaultFrame::LeaseStatus(_) => Ok((
+            OnionRoutePurpose::BlindVaultLeaseStatus,
+            BlindVaultTerminalOperation::LeaseStatus,
+            TerminalReplyEffect::ReadOnly,
+        )),
+        BlindVaultFrame::LeaseInventory(_) => Ok((
+            OnionRoutePurpose::BlindVaultLeaseInventory,
+            BlindVaultTerminalOperation::LeaseInventory,
+            TerminalReplyEffect::ReadOnly,
+        )),
+        BlindVaultFrame::LeaseRetire(_) => Ok((
+            OnionRoutePurpose::BlindVaultLeaseRetire,
+            BlindVaultTerminalOperation::LeaseRetire,
+            TerminalReplyEffect::Mutation,
+        )),
+        _ => Err(TerminalReplyFailure::Rejected),
+    }
+}
+
+fn execute_prepared_frame(
+    vault: &BlindVaultService,
+    terminal_identity: &IdentityKeyPair,
+    frame: BlindVaultFrame,
+    now_ms: u64,
+) -> Result<Vec<u8>, TerminalReplyFailure> {
+    match frame {
         BlindVaultFrame::Put(put_request) => {
-            let response = (|| {
-                if put_request.ciphertext.len() != BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES[0] {
-                    return Err(TerminalReplyFailure::Rejected);
-                }
-                let receipt = vault
-                    .put(&put_request, now_ms)
-                    .map_err(classify_put_failure)?;
-                encode_blind_vault_frame(&BlindVaultFrame::StoredReceipt(receipt))
-                    .map_err(|_| TerminalReplyFailure::Unavailable)
-            })();
-            (
-                OnionRoutePurpose::BlindVaultPutReceipt,
-                BlindVaultTerminalOperation::Put,
-                response,
-            )
+            let receipt = vault
+                .put(&put_request, now_ms)
+                .map_err(classify_put_failure)?;
+            encode_blind_vault_frame(&BlindVaultFrame::StoredReceipt(receipt))
+                .map_err(|_| TerminalReplyFailure::Unavailable)
         }
         BlindVaultFrame::PullRequest(pull_request) => {
-            let response = execute_pull_response(vault, terminal_identity, pull_request, now_ms);
-            (
-                OnionRoutePurpose::BlindVaultPull,
-                BlindVaultTerminalOperation::Pull,
-                response,
-            )
+            execute_pull_response(vault, terminal_identity, pull_request, now_ms)
         }
-        BlindVaultFrame::Delete(delete_request) => {
-            let response = vault
-                .delete(&delete_request, now_ms)
-                .map_err(classify_delete_failure)
-                .and_then(|receipt| {
-                    encode_blind_vault_frame(&BlindVaultFrame::DeletedReceipt(receipt))
-                        .map_err(|_| TerminalReplyFailure::Unavailable)
-                });
-            (
-                OnionRoutePurpose::BlindVaultDelete,
-                BlindVaultTerminalOperation::Delete,
-                response,
-            )
-        }
-        BlindVaultFrame::BlindLeaseAdmission(admission_request) => {
-            let response = (|| {
-                vault
-                    .provision_lease_with_blind_admission(&admission_request, now_ms)
-                    .map_err(classify_admission_failure)?;
-                let mut receipt = BlindVaultBlindLeaseAcceptedReceipt::new(
-                    &admission_request,
-                    now_ms,
-                    terminal_identity.public_key_bytes(),
-                );
-                receipt
-                    .sign(terminal_identity)
-                    .map_err(|_| TerminalReplyFailure::Unavailable)?;
-                encode_blind_vault_frame(&BlindVaultFrame::BlindLeaseAccepted(receipt))
+        BlindVaultFrame::Delete(delete_request) => vault
+            .delete(&delete_request, now_ms)
+            .map_err(classify_delete_failure)
+            .and_then(|receipt| {
+                encode_blind_vault_frame(&BlindVaultFrame::DeletedReceipt(receipt))
                     .map_err(|_| TerminalReplyFailure::Unavailable)
-            })();
-            (
-                OnionRoutePurpose::BlindVaultLeaseAdmission,
-                BlindVaultTerminalOperation::LeaseAdmission,
-                response,
-            )
-        }
-        BlindVaultFrame::BlindLeaseRenewal(renewal_request) => {
-            let response = vault
-                .renew_lease_with_blind_admission(&renewal_request, now_ms)
-                .map_err(classify_lease_renew_failure)
-                .and_then(|receipt| {
-                    encode_blind_vault_frame(&BlindVaultFrame::BlindLeaseRenewed(receipt))
-                        .map_err(|_| TerminalReplyFailure::Unavailable)
-                });
-            (
-                OnionRoutePurpose::BlindVaultLeaseRenewal,
-                BlindVaultTerminalOperation::LeaseRenewal,
-                response,
-            )
-        }
-        BlindVaultFrame::LeaseStatus(status_request) => {
-            let response = vault
-                .lease_status(&status_request, now_ms)
-                .map_err(classify_lease_status_failure)
-                .and_then(|receipt| {
-                    encode_blind_vault_frame(&BlindVaultFrame::LeaseStatusReceipt(receipt))
-                        .map_err(|_| TerminalReplyFailure::Unavailable)
-                });
-            (
-                OnionRoutePurpose::BlindVaultLeaseStatus,
-                BlindVaultTerminalOperation::LeaseStatus,
-                response,
-            )
-        }
-        BlindVaultFrame::LeaseInventory(inventory_request) => {
-            let response = vault
-                .lease_inventory(&inventory_request, now_ms)
-                .map_err(classify_lease_inventory_failure)
-                .and_then(|receipt| {
-                    encode_blind_vault_frame(&BlindVaultFrame::LeaseInventoryReceipt(receipt))
-                        .map_err(|_| TerminalReplyFailure::Unavailable)
-                });
-            (
-                OnionRoutePurpose::BlindVaultLeaseInventory,
-                BlindVaultTerminalOperation::LeaseInventory,
-                response,
-            )
-        }
-        BlindVaultFrame::LeaseRetire(retire_request) => {
-            let response = vault
-                .retire_lease(&retire_request, now_ms)
-                .map_err(classify_lease_retire_failure)
-                .and_then(|receipt| {
-                    encode_blind_vault_frame(&BlindVaultFrame::LeaseRetiredReceipt(receipt))
-                        .map_err(|_| TerminalReplyFailure::Unavailable)
-                });
-            (
-                OnionRoutePurpose::BlindVaultLeaseRetire,
-                BlindVaultTerminalOperation::LeaseRetire,
-                response,
-            )
-        }
-        _ => return Err(TerminalReplyFailure::Rejected),
-    };
-
-    // [BLIND-VAULT-ENCRYPTED-FAILURE 2026-08-28 by Codex] Once a valid
-    // reply-capable workload request is identified, every workload failure is
-    // sealed to the source. Upstream relays receive the same fixed-size opaque
-    // success carrier and cannot use rejection/capacity as a lease oracle.
-    let encoded_response = match response {
-        Ok(encoded) => encoded,
-        Err(failure) => encode_terminal_failure(operation, failure)?,
-    };
-    let sealed = match seal_onion_reply(
-        route_id,
-        &reply_request,
-        &encoded_response,
-        terminal_identity,
-    ) {
-        Ok(sealed) => sealed,
-        Err(aeronyx_core::protocol::OnionReplyError::ResponsePayloadTooLarge) => {
-            let failure =
-                encode_terminal_failure(operation, TerminalReplyFailure::ResponseTooLarge)?;
-            seal_onion_reply(route_id, &reply_request, &failure, terminal_identity)
-                .map_err(|_| TerminalReplyFailure::Unavailable)?
-        }
-        Err(_) => return Err(TerminalReplyFailure::Unavailable),
-    };
-    let encoded_sealed =
-        encode_onion_sealed_response(&sealed).map_err(|_| TerminalReplyFailure::Unavailable)?;
-    Ok(TerminalReply {
-        purpose,
-        proof_mode: reply_request.proof_mode(),
-        opaque_response_b64: BASE64.encode(encoded_sealed),
-    })
+            }),
+        BlindVaultFrame::BlindLeaseAdmission(admission_request) => (|| {
+            vault
+                .provision_lease_with_blind_admission(&admission_request, now_ms)
+                .map_err(classify_admission_failure)?;
+            let mut receipt = BlindVaultBlindLeaseAcceptedReceipt::new(
+                &admission_request,
+                now_ms,
+                terminal_identity.public_key_bytes(),
+            );
+            receipt
+                .sign(terminal_identity)
+                .map_err(|_| TerminalReplyFailure::Unavailable)?;
+            encode_blind_vault_frame(&BlindVaultFrame::BlindLeaseAccepted(receipt))
+                .map_err(|_| TerminalReplyFailure::Unavailable)
+        })(),
+        BlindVaultFrame::BlindLeaseRenewal(renewal_request) => vault
+            .renew_lease_with_blind_admission(&renewal_request, now_ms)
+            .map_err(classify_lease_renew_failure)
+            .and_then(|receipt| {
+                encode_blind_vault_frame(&BlindVaultFrame::BlindLeaseRenewed(receipt))
+                    .map_err(|_| TerminalReplyFailure::Unavailable)
+            }),
+        BlindVaultFrame::LeaseStatus(status_request) => vault
+            .lease_status(&status_request, now_ms)
+            .map_err(classify_lease_status_failure)
+            .and_then(|receipt| {
+                encode_blind_vault_frame(&BlindVaultFrame::LeaseStatusReceipt(receipt))
+                    .map_err(|_| TerminalReplyFailure::Unavailable)
+            }),
+        BlindVaultFrame::LeaseInventory(inventory_request) => vault
+            .lease_inventory(&inventory_request, now_ms)
+            .map_err(classify_lease_inventory_failure)
+            .and_then(|receipt| {
+                encode_blind_vault_frame(&BlindVaultFrame::LeaseInventoryReceipt(receipt))
+                    .map_err(|_| TerminalReplyFailure::Unavailable)
+            }),
+        BlindVaultFrame::LeaseRetire(retire_request) => vault
+            .retire_lease(&retire_request, now_ms)
+            .map_err(classify_lease_retire_failure)
+            .and_then(|receipt| {
+                encode_blind_vault_frame(&BlindVaultFrame::LeaseRetiredReceipt(receipt))
+                    .map_err(|_| TerminalReplyFailure::Unavailable)
+            }),
+        _ => Err(TerminalReplyFailure::Rejected),
+    }
 }
 
 fn encode_terminal_failure(

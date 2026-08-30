@@ -119,6 +119,9 @@
 //!   through a pure policy while orchestration owns I/O and aggregate effects
 //! - [BLIND-FORWARD-OBSERVER 2026-08-26 by Codex] Emits write-only aggregate
 //!   forwarding observations through a replaceable persistence capability
+//! - [PREPARED-TERMINAL-EFFECT 2026-08-30 by Codex] Decodes and authenticates
+//!   terminal payloads before arming durable effect recovery; read-only Blind
+//!   Vault replies never consume mutation-recovery capacity
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -323,6 +326,8 @@
 //!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.69.0-PreparedTerminalEffect - Separate terminal parsing, authentication,
+//! effect arming, and execution so malformed work remains safely releasable
 //! v0.68.0-OnionDeleteReply - Dispatch signed Blind Vault deletion requests
 //! and propagate their fixed-size encrypted terminal receipts
 //! v0.67.0-OnionTerminalReply - Propagate fixed-size encrypted terminal
@@ -456,7 +461,7 @@ use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
 use aeronyx_core::protocol::onion::{is_onion_blob, try_open_onion_layer, OnionRoutePurpose};
 use aeronyx_core::protocol::{
     decode_blind_vault_frame, is_blind_vault_frame, is_onion_reply_request, BlindVaultFrame,
-    DataPacket, NodeCapability, OnionReplyProofMode,
+    BlindVaultPutRequest, DataPacket, NodeCapability, OnionReplyProofMode,
 };
 use aeronyx_transport::traits::Transport;
 use aeronyx_transport::UdpTransport;
@@ -506,7 +511,9 @@ use super::chat_peer_retry::{
     BlindRelayDownstreamFailure, BlindRelayRetryContext, BlindRelayRetryDomain,
     BlindRelayRetryPolicy,
 };
-use super::chat_peer_terminal_reply::{execute_blind_vault_inline_reply, TerminalReplyFailure};
+use super::chat_peer_terminal_reply::{
+    prepare_blind_vault_inline_reply, PreparedTerminalReply, TerminalReplyFailure,
+};
 use super::chat_peer_transport::{BlindRelayTransport, ReqwestBlindRelayTransport};
 use crate::api::{canonical_peer_http_url, peer_endpoint_is_public_ip, InFlightRequestGuard};
 use crate::config_chat_relay::{
@@ -700,9 +707,21 @@ struct BlindRelayRouteLease {
     durable_relay: Option<Arc<ChatRelayService>>,
     route_id: [u8; 16],
     request_commitment: [u8; 32],
-    effect_started: bool,
+    state: BlindRelayRouteLeaseState,
     recovered: bool,
-    active: bool,
+}
+
+/// Lifecycle of one replay-fenced route ownership claim.
+///
+/// [BLIND-ROUTE-LEASE-STATE 2026-08-30 by Codex] One enum replaces the former
+/// `active`/`effect_started` booleans so impossible combinations cannot weaken
+/// Drop recovery. Acquired work is releasable, armed work is fail-closed, and
+/// completed work owns a durable exact ACK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlindRelayRouteLeaseState {
+    Acquired,
+    Armed,
+    Completed,
 }
 
 impl BlindRelayRouteLease {
@@ -718,9 +737,8 @@ impl BlindRelayRouteLease {
             durable_relay: None,
             route_id,
             request_commitment,
-            effect_started: false,
+            state: BlindRelayRouteLeaseState::Acquired,
             recovered: false,
-            active: true,
         }
     }
 
@@ -741,25 +759,29 @@ impl BlindRelayRouteLease {
             durable_relay: Some(durable_relay),
             route_id,
             request_commitment,
-            effect_started,
+            state: if effect_started {
+                BlindRelayRouteLeaseState::Armed
+            } else {
+                BlindRelayRouteLeaseState::Acquired
+            },
             recovered,
-            active: true,
         }
     }
 
     fn arm_effect(&mut self, now: u64) -> Result<(), BlindRelayError> {
-        if !self.active {
-            return Err(BlindRelayError::ReplayProtectionUnavailable);
-        }
-        if self.effect_started {
-            return Ok(());
+        match self.state {
+            BlindRelayRouteLeaseState::Completed => {
+                return Err(BlindRelayError::ReplayProtectionUnavailable);
+            }
+            BlindRelayRouteLeaseState::Armed => return Ok(()),
+            BlindRelayRouteLeaseState::Acquired => {}
         }
         if let Some(relay) = self.durable_relay.as_ref() {
             relay
                 .arm_blind_relay_route_effect(&self.route_id, &self.request_commitment, now)
                 .map_err(|_| BlindRelayError::ReplayProtectionUnavailable)?;
         }
-        self.effect_started = true;
+        self.state = BlindRelayRouteLeaseState::Armed;
         Ok(())
     }
 
@@ -768,6 +790,9 @@ impl BlindRelayRouteLease {
         now: u64,
         response: PeerBlindRelayResponse,
     ) -> Result<(), BlindRelayError> {
+        if self.state == BlindRelayRouteLeaseState::Completed {
+            return Err(BlindRelayError::ReplayProtectionUnavailable);
+        }
         if let Some(relay) = self.durable_relay.as_ref() {
             let encoded = encode_durable_blind_relay_response(&response)
                 .map_err(|_| BlindRelayError::ReplayProtectionUnavailable)?;
@@ -796,7 +821,7 @@ impl BlindRelayRouteLease {
                 return Err(BlindRelayError::ReplayProtectionUnavailable);
             }
         }
-        self.active = false;
+        self.state = BlindRelayRouteLeaseState::Completed;
         if self.recovered {
             if let Some(relay) = self.durable_relay.as_ref() {
                 relay.record_blind_route_recovery_completed(now);
@@ -808,7 +833,7 @@ impl BlindRelayRouteLease {
 
 impl Drop for BlindRelayRouteLease {
     fn drop(&mut self) {
-        if !self.active {
+        if self.state == BlindRelayRouteLeaseState::Completed {
             return;
         }
         // [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] An armed route is
@@ -816,15 +841,21 @@ impl Drop for BlindRelayRouteLease {
         // owner has not crossed an external boundary, so release only the
         // exact process-fenced claim; storage failure safely leaves it pending.
         if let Some(relay) = self.durable_relay.as_ref() {
-            if !self.effect_started {
-                let _ = relay
-                    .release_unarmed_blind_relay_route(&self.route_id, &self.request_commitment);
-            } else if self.recovered {
-                relay.record_blind_route_recovery_deferred(now_secs());
+            match self.state {
+                BlindRelayRouteLeaseState::Acquired => {
+                    let _ = relay.release_unarmed_blind_relay_route(
+                        &self.route_id,
+                        &self.request_commitment,
+                    );
+                }
+                BlindRelayRouteLeaseState::Armed if self.recovered => {
+                    relay.record_blind_route_recovery_deferred(now_secs());
+                }
+                BlindRelayRouteLeaseState::Armed | BlindRelayRouteLeaseState::Completed => {}
             }
             return;
         }
-        if self.effect_started {
+        if self.state == BlindRelayRouteLeaseState::Armed {
             return;
         }
         if let (Some(registry), Some(owner_generation)) =
@@ -1945,7 +1976,22 @@ async fn process_peer_relay(
     envelope: ChatEnvelope,
 ) -> Result<PeerChatRelayResponse, ChatPeerRelayError> {
     let now = now_secs();
-    if let Err(error) = validate_peer_envelope(&envelope, now) {
+    validate_peer_envelope_for_relay(&state, &envelope, now)?;
+    process_authenticated_peer_relay(state, envelope, now).await
+}
+
+/// Verifies one end-to-end sender envelope and records only a coarse rejection.
+///
+/// [PREPARED-TERMINAL-EFFECT 2026-08-30 by Codex] Onion terminal dispatch uses
+/// this same boundary before arming durable route recovery. That prevents an
+/// invalid sender signature or replay timestamp from pinning an ambiguous
+/// effect claim while keeping direct and onion telemetry semantics aligned.
+fn validate_peer_envelope_for_relay(
+    state: &ChatPeerState,
+    envelope: &ChatEnvelope,
+    now: u64,
+) -> Result<(), ChatPeerRelayError> {
+    if let Err(error) = validate_peer_envelope(envelope, now) {
         if let Some(relay) = state.chat_relay.as_ref() {
             relay.record_peer_relay_inbound_rejected_typed(
                 now,
@@ -1954,7 +2000,15 @@ async fn process_peer_relay(
         }
         return Err(error);
     }
+    Ok(())
+}
 
+/// Establishes durable custody for an already authenticated sender envelope.
+async fn process_authenticated_peer_relay(
+    state: ChatPeerState,
+    envelope: ChatEnvelope,
+    now: u64,
+) -> Result<PeerChatRelayResponse, ChatPeerRelayError> {
     let Some(relay) = state.chat_relay else {
         return Err(ChatPeerRelayError::RelayUnavailable);
     };
@@ -2452,38 +2506,44 @@ async fn process_onion_blind_relay(
     };
 
     match peel.next_hop {
-        // Terminal hop: `inner` is either a legacy ChatEnvelope or one signed
-        // Blind Vault Put frame. The fixed protocol magic selects the parser;
-        // declared-but-malformed Blind Vault bytes never fall back to chat.
+        // Terminal hop: `inner` is a ChatEnvelope, legacy signed Blind Vault
+        // Put, or reply-capable Blind Vault request. Fixed protocol magic
+        // selects the parser; malformed declared frames never fall back.
         None => {
-            // [BLIND-VAULT-ONION-DISPATCH 2026-08-10 by Codex] This is the hard
-            // terminal ACK boundary for both delivery models. A successful
-            // peel is insufficient: chat must reach its pending queue, while a
-            // Blind Vault Put must pass its signature, lease, quota, TTL,
-            // idempotency, and durable SQLite transaction before we sign ACK.
-            route_lease
-                .arm_effect(now)
-                .map_err(|_| record_blind_relay_replay_protection_failure(&state, now))?;
-            let terminal_delivery =
-                match deliver_onion_terminal_payload(&state, envelope.route_id, &peel.inner, now)
-                    .await
-                {
-                    Ok(delivery) => delivery,
-                    Err(error) => {
-                        let failed_at = blind_relay_response_observed_at(now, route_started_at);
-                        debug!(
-                            reason = error.reason_bucket(),
-                            "[BLIND_RELAY] Onion terminal delivery failed"
-                        );
-                        reject_blind_relay_previous_hop(
-                            &state,
-                            previous_hop_node_id,
-                            failed_at,
-                            "onion_terminal_delivery_failed",
-                        );
-                        return Err(error);
-                    }
-                };
+            // [PREPARED-TERMINAL-EFFECT 2026-08-30 by Codex] Parsing, response
+            // negotiation, and chat sender authentication must finish before
+            // mutation recovery is armed. Read-only vault observations stay
+            // unarmed, so cancellation can release and safely retry the route.
+            let prepared = prepare_onion_terminal_payload(&state, &peel.inner, now)?;
+            if prepared.requires_durable_guard() {
+                route_lease
+                    .arm_effect(now)
+                    .map_err(|_| record_blind_relay_replay_protection_failure(&state, now))?;
+            }
+            let terminal_delivery = match execute_onion_terminal_payload(
+                &state,
+                envelope.route_id,
+                prepared,
+                now,
+            )
+            .await
+            {
+                Ok(delivery) => delivery,
+                Err(error) => {
+                    let failed_at = blind_relay_response_observed_at(now, route_started_at);
+                    debug!(
+                        reason = error.reason_bucket(),
+                        "[BLIND_RELAY] Onion terminal delivery failed"
+                    );
+                    reject_blind_relay_previous_hop(
+                        &state,
+                        previous_hop_node_id,
+                        failed_at,
+                        "onion_terminal_delivery_failed",
+                    );
+                    return Err(error);
+                }
+            };
             let route_purpose = terminal_delivery.purpose;
 
             let accepted_at = blind_relay_response_observed_at(now, route_started_at);
@@ -2675,48 +2735,40 @@ struct OnionTerminalDelivery {
     opaque_response_b64: Option<String>,
 }
 
-async fn deliver_onion_terminal_payload(
+/// Validated terminal workload whose effect class is known before execution.
+///
+/// This enum deliberately has no `Debug` implementation because every variant
+/// contains either ciphertext, private capabilities, or sender routing data.
+enum PreparedOnionTerminalPayload {
+    BlindVaultReply(PreparedTerminalReply),
+    LegacyBlindVaultPut(BlindVaultPutRequest),
+    Message(ChatEnvelope),
+}
+
+impl PreparedOnionTerminalPayload {
+    const fn requires_durable_guard(&self) -> bool {
+        match self {
+            Self::BlindVaultReply(reply) => reply.effect().requires_durable_guard(),
+            Self::LegacyBlindVaultPut(_) | Self::Message(_) => true,
+        }
+    }
+}
+
+/// Performs terminal wire parsing and sender authentication without touching
+/// Blind Vault or pending-message storage.
+fn prepare_onion_terminal_payload(
     state: &ChatPeerState,
-    route_id: [u8; 16],
     payload: &[u8],
     now_secs: u64,
-) -> Result<OnionTerminalDelivery, BlindRelayError> {
+) -> Result<PreparedOnionTerminalPayload, BlindRelayError> {
     if is_onion_reply_request(payload) {
-        let vault = Arc::clone(
-            state
-                .blind_vault
-                .as_ref()
-                .ok_or(BlindRelayError::ForwardFailed)?,
-        );
-        let terminal_identity = Arc::clone(&state.node_identity);
-        let encoded_request = payload.to_vec();
-        let now_ms = now_secs.saturating_mul(1_000);
-        let reply = tokio::task::spawn_blocking(move || {
-            execute_blind_vault_inline_reply(
-                vault.as_ref(),
-                terminal_identity.as_ref(),
-                route_id,
-                &encoded_request,
-                now_ms,
-            )
-        })
-        .await
-        .map_err(|_| BlindRelayError::ForwardFailed)?
-        .map_err(|failure| match failure {
-            TerminalReplyFailure::Rejected | TerminalReplyFailure::ResponseTooLarge => {
-                BlindRelayError::OnionTerminalPayloadRejected
-            }
-            // [BLIND-VAULT-ENCRYPTED-FAILURE 2026-08-28 by Codex] Valid
-            // workload failures are sealed inside opaque replies. This branch
-            // remains fail-closed for any pre-sealing capacity failure.
-            TerminalReplyFailure::Capacity => BlindRelayError::OnionTerminalCapacityExhausted,
-            TerminalReplyFailure::Unavailable => BlindRelayError::ForwardFailed,
-        })?;
-        return Ok(OnionTerminalDelivery {
-            purpose: reply.purpose,
-            proof_mode: reply.proof_mode,
-            opaque_response_b64: Some(reply.opaque_response_b64),
-        });
+        state
+            .blind_vault
+            .as_ref()
+            .ok_or(BlindRelayError::ForwardFailed)?;
+        let reply =
+            prepare_blind_vault_inline_reply(payload).map_err(map_terminal_reply_failure)?;
+        return Ok(PreparedOnionTerminalPayload::BlindVaultReply(reply));
     }
 
     if is_blind_vault_frame(payload) {
@@ -2724,33 +2776,89 @@ async fn deliver_onion_terminal_payload(
             .map_err(|_| BlindRelayError::OnionTerminalPayloadRejected)?;
         let BlindVaultFrame::Put(request) = frame else {
             // Lease admission, pull, delete, issuer, and response frames retain
-            // their dedicated bounded client API. The relay path is append-only.
+            // their dedicated bounded client API. The legacy path is Put-only.
             return Err(BlindRelayError::OnionTerminalPayloadRejected);
         };
-        let vault = state
+        state
             .blind_vault
             .as_ref()
             .ok_or(BlindRelayError::ForwardFailed)?;
-        vault
-            .put(&request, now_secs.saturating_mul(1_000))
-            .map_err(|error| map_blind_vault_put_error(&error))?;
-        return Ok(OnionTerminalDelivery {
-            purpose: OnionRoutePurpose::BlindVaultPut,
-            proof_mode: OnionReplyProofMode::RelayVisibleTerminalReceipt,
-            opaque_response_b64: None,
-        });
+        return Ok(PreparedOnionTerminalPayload::LegacyBlindVaultPut(request));
     }
 
     let envelope =
         decode_envelope(payload).map_err(|_| BlindRelayError::OnionTerminalPayloadRejected)?;
-    process_peer_relay(state.clone(), envelope)
-        .await
-        .map(|_| OnionTerminalDelivery {
-            purpose: OnionRoutePurpose::MessageRelay,
-            proof_mode: OnionReplyProofMode::RelayVisibleTerminalReceipt,
-            opaque_response_b64: None,
-        })
-        .map_err(|_| BlindRelayError::ForwardFailed)
+    validate_peer_envelope_for_relay(state, &envelope, now_secs)
+        .map_err(|_| BlindRelayError::ForwardFailed)?;
+    Ok(PreparedOnionTerminalPayload::Message(envelope))
+}
+
+async fn execute_onion_terminal_payload(
+    state: &ChatPeerState,
+    route_id: [u8; 16],
+    prepared: PreparedOnionTerminalPayload,
+    now_secs: u64,
+) -> Result<OnionTerminalDelivery, BlindRelayError> {
+    match prepared {
+        PreparedOnionTerminalPayload::BlindVaultReply(reply) => {
+            let vault = Arc::clone(
+                state
+                    .blind_vault
+                    .as_ref()
+                    .ok_or(BlindRelayError::ForwardFailed)?,
+            );
+            let terminal_identity = Arc::clone(&state.node_identity);
+            let now_ms = now_secs.saturating_mul(1_000);
+            let reply = tokio::task::spawn_blocking(move || {
+                reply.execute(vault.as_ref(), terminal_identity.as_ref(), route_id, now_ms)
+            })
+            .await
+            .map_err(|_| BlindRelayError::ForwardFailed)?
+            .map_err(map_terminal_reply_failure)?;
+            Ok(OnionTerminalDelivery {
+                purpose: reply.purpose,
+                proof_mode: reply.proof_mode,
+                opaque_response_b64: Some(reply.opaque_response_b64),
+            })
+        }
+        PreparedOnionTerminalPayload::LegacyBlindVaultPut(request) => {
+            let vault = state
+                .blind_vault
+                .as_ref()
+                .ok_or(BlindRelayError::ForwardFailed)?;
+            vault
+                .put(&request, now_secs.saturating_mul(1_000))
+                .map_err(|error| map_blind_vault_put_error(&error))?;
+            Ok(OnionTerminalDelivery {
+                purpose: OnionRoutePurpose::BlindVaultPut,
+                proof_mode: OnionReplyProofMode::RelayVisibleTerminalReceipt,
+                opaque_response_b64: None,
+            })
+        }
+        PreparedOnionTerminalPayload::Message(envelope) => {
+            process_authenticated_peer_relay(state.clone(), envelope, now_secs)
+                .await
+                .map(|_| OnionTerminalDelivery {
+                    purpose: OnionRoutePurpose::MessageRelay,
+                    proof_mode: OnionReplyProofMode::RelayVisibleTerminalReceipt,
+                    opaque_response_b64: None,
+                })
+                .map_err(|_| BlindRelayError::ForwardFailed)
+        }
+    }
+}
+
+fn map_terminal_reply_failure(failure: TerminalReplyFailure) -> BlindRelayError {
+    match failure {
+        TerminalReplyFailure::Rejected | TerminalReplyFailure::ResponseTooLarge => {
+            BlindRelayError::OnionTerminalPayloadRejected
+        }
+        // [BLIND-VAULT-ENCRYPTED-FAILURE 2026-08-28 by Codex] Valid workload
+        // failures are sealed inside opaque replies. This remains fail-closed
+        // for any capacity failure that occurs before response sealing.
+        TerminalReplyFailure::Capacity => BlindRelayError::OnionTerminalCapacityExhausted,
+        TerminalReplyFailure::Unavailable => BlindRelayError::ForwardFailed,
+    }
 }
 
 fn map_blind_vault_put_error(error: &BlindVaultServiceError) -> BlindRelayError {
@@ -5952,7 +6060,7 @@ mod tests {
         );
 
         assert!(matches!(
-            deliver_onion_terminal_payload(&state, [0xA1; 16], b"ANBV", now).await,
+            prepare_onion_terminal_payload(&state, b"ANBV", now),
             Err(BlindRelayError::OnionTerminalPayloadRejected)
         ));
     }
