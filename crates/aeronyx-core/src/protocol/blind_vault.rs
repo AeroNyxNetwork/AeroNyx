@@ -67,7 +67,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.17.0-BlindVaultEncryptedFailure - Added typed,
+//! Last Modified: v1.18.0-PrivacySafeLifecycleDebug - Redacted replica action,
+//! target, and plan topology from diagnostic formatting.
+//! v1.17.0-BlindVaultEncryptedFailure - Added typed,
 //! source-only terminal failure replies inside the fixed-size onion carrier.
 //! v1.16.0-BlindVaultReplicaWorkflow - Exposed local-only
 //! manifest expectation fields for exact, stale-plan-safe execution evidence.
@@ -3283,7 +3285,7 @@ pub enum BlindVaultReplicaPlanHealth {
 }
 
 /// One declarative source-side lifecycle action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BlindVaultReplicaAction {
     /// Renew one still-live lease before its current generation expires.
     RenewLease {
@@ -3316,15 +3318,40 @@ pub enum BlindVaultReplicaAction {
     ProvisionReplicas { count: u8 },
 }
 
+impl std::fmt::Debug for BlindVaultReplicaAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // [BLIND-VAULT-PRIVACY-SAFE-DEBUG 2026-08-30 by Codex] Lifecycle
+        // diagnostics expose only the operation class. Topology identifiers,
+        // inventory commitments, and replica measurements remain source-local.
+        formatter.write_str(match self {
+            Self::RenewLease { .. } => "RenewLease",
+            Self::ReconcileInventory { .. } => "ReconcileInventory",
+            Self::RetryObservation { .. } => "RetryObservation",
+            Self::ReplaceReplica { .. } => "ReplaceReplica",
+            Self::ProvisionReplicas { .. } => "ProvisionReplicas",
+        })
+    }
+}
+
 /// Replica-local terminal target shared by lifecycle actions.
 ///
 /// [BLIND-VAULT-REPLICA-TARGET 2026-08-29 by Codex] Keeping this identity in
 /// the domain model lets workflow schedulers enforce per-lease single-flight
 /// without duplicating action matching or exposing any user-level identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlindVaultReplicaTarget {
     node_id: [u8; 32],
     lease_id: [u8; 32],
+}
+
+impl std::fmt::Debug for BlindVaultReplicaTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlindVaultReplicaTarget")
+            .field("node_id", &"[REDACTED]")
+            .field("lease_id", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl BlindVaultReplicaTarget {
@@ -3364,7 +3391,7 @@ impl BlindVaultReplicaAction {
 }
 
 /// Deterministic, declarative result of one replica lifecycle evaluation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BlindVaultReplicaPlan {
     /// Safety state after evaluating the supplied evidence.
     pub health: BlindVaultReplicaPlanHealth,
@@ -3376,6 +3403,20 @@ pub struct BlindVaultReplicaPlan {
     pub live_matching_replicas: u8,
     /// Deterministic local actions; no repair source is selected here.
     pub actions: Vec<BlindVaultReplicaAction>,
+}
+
+impl std::fmt::Debug for BlindVaultReplicaPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlindVaultReplicaPlan")
+            .field("health", &self.health)
+            .field("configured_replicas", &self.configured_replicas)
+            .field("live_verified_replicas", &self.live_verified_replicas)
+            .field("live_matching_replicas", &self.live_matching_replicas)
+            .field("action_count", &self.actions.len())
+            .field("actions", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl BlindVaultReplicaPlan {

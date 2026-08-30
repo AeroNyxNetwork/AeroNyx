@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.58.0-RetryBoundaryDerivation - Added overflow-safe retry
+//! Last Modified: v1.59.0-PrivacySafeDomainDebug - Replaced topology-bearing
+//! derived diagnostics with bounded redacted workflow summaries.
+//! v1.58.0-RetryBoundaryDerivation - Added overflow-safe retry
 //! scheduling for detailed terminal runtime failures.
 //! v1.57.0-TerminalFailureDistillation - Connected detailed
 //! runtime failures to bounded durable attempt outcomes.
@@ -281,6 +283,8 @@ pub use recovery_loader::{
     BlindVaultReplicaRecoveryLoadError,
 };
 
+use std::fmt;
+
 use thiserror::Error;
 
 use super::blind_vault::{
@@ -334,10 +338,21 @@ impl BlindVaultReplicaExecutionPolicy {
 }
 
 /// Stable source-local identity for one planned work item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlindVaultReplicaWorkId {
     pub(super) workflow_id: [u8; 16],
     pub(super) sequence: u16,
+}
+
+impl fmt::Debug for BlindVaultReplicaWorkId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // [BLIND-VAULT-WORKFLOW-PRIVACY-SAFE-DEBUG 2026-08-30 by Codex]
+        formatter
+            .debug_struct("BlindVaultReplicaWorkId")
+            .field("workflow_id", &"[REDACTED]")
+            .field("sequence", &self.sequence)
+            .finish()
+    }
 }
 
 impl BlindVaultReplicaWorkId {
@@ -462,12 +477,39 @@ pub enum BlindVaultReplicaWorkState {
     Cancelled { cancelled_at_ms: u64 },
 }
 
+fn work_state_name(state: BlindVaultReplicaWorkState) -> &'static str {
+    match state {
+        BlindVaultReplicaWorkState::AwaitingAuthorization => "AwaitingAuthorization",
+        BlindVaultReplicaWorkState::Authorized { .. } => "Authorized",
+        BlindVaultReplicaWorkState::AwaitingEvidence { .. } => "AwaitingEvidence",
+        BlindVaultReplicaWorkState::EvidenceAccepted { .. } => "EvidenceAccepted",
+        BlindVaultReplicaWorkState::RetryableFailure { .. } => "RetryableFailure",
+        BlindVaultReplicaWorkState::PermanentFailure { .. } => "PermanentFailure",
+        BlindVaultReplicaWorkState::Exhausted { .. } => "Exhausted",
+        BlindVaultReplicaWorkState::Cancelled { .. } => "Cancelled",
+    }
+}
+
 /// One source-local action and its execution state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BlindVaultReplicaWorkItem {
     pub(super) id: BlindVaultReplicaWorkId,
     pub(super) action: BlindVaultReplicaAction,
     pub(super) state: BlindVaultReplicaWorkState,
+}
+
+impl fmt::Debug for BlindVaultReplicaWorkItem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // [BLIND-VAULT-WORKFLOW-PRIVACY-SAFE-DEBUG 2026-08-30 by Codex]
+        // Diagnostics retain scheduling state without exposing topology,
+        // source timing, workflow identity, lease identity, or commitments.
+        formatter
+            .debug_struct("BlindVaultReplicaWorkItem")
+            .field("sequence", &self.id.sequence)
+            .field("action", &self.action)
+            .field("state", &work_state_name(self.state))
+            .finish()
+    }
 }
 
 impl BlindVaultReplicaWorkItem {
@@ -886,13 +928,13 @@ impl BlindVaultVerifiedProvisionedReplica {
 
 /// Action-specific evidence with private variants so only verification
 /// constructors can produce an acceptable value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BlindVaultReplicaActionEvidence {
     pub(super) kind: BlindVaultReplicaActionEvidenceKind,
     pub(super) verified_at_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) enum BlindVaultReplicaActionEvidenceKind {
     LeaseRenewed {
         node_id: [u8; 32],
@@ -925,12 +967,36 @@ pub(super) enum BlindVaultReplicaActionEvidenceKind {
     },
 }
 
+impl fmt::Debug for BlindVaultReplicaActionEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // [BLIND-VAULT-WORKFLOW-PRIVACY-SAFE-DEBUG 2026-08-30 by Codex]
+        formatter
+            .debug_struct("BlindVaultReplicaActionEvidence")
+            .field("kind", &self.kind)
+            .field("verified", &true)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for BlindVaultReplicaActionEvidenceKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::LeaseRenewed { .. } => "LeaseRenewed",
+            Self::InventoryReconciled { .. } => "InventoryReconciled",
+            Self::ObservationRecovered { .. } => "ObservationRecovered",
+            Self::ReplicaReplaced { .. } => "ReplicaReplaced",
+            Self::ReplicaReplacedWithPermit { .. } => "ReplicaReplacedWithPermit",
+            Self::ReplicasProvisioned { .. } => "ReplicasProvisioned",
+        })
+    }
+}
+
 /// Client-owned execution state for one immutable planner generation.
 ///
 /// [BLIND-VAULT-REPLICA-WORKFLOW 2026-08-28 by Codex] The workflow stores no
 /// cross-replica repair material. The App remains responsible for independently
 /// wrapping data and constructing each encrypted terminal request.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct BlindVaultReplicaExecution {
     pub(super) workflow_id: [u8; 16],
     pub(super) created_at_ms: u64,
@@ -943,6 +1009,29 @@ pub struct BlindVaultReplicaExecution {
     pub(super) items: Vec<BlindVaultReplicaWorkItem>,
 }
 
+impl fmt::Debug for BlindVaultReplicaExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // [BLIND-VAULT-WORKFLOW-PRIVACY-SAFE-DEBUG 2026-08-30 by Codex]
+        formatter
+            .debug_struct("BlindVaultReplicaExecution")
+            .field("phase", &self.phase())
+            .field("plan_health", &self.source_plan_health)
+            .field("configured_replicas", &self.source_configured_replicas)
+            .field(
+                "live_verified_replicas",
+                &self.source_live_verified_replicas,
+            )
+            .field(
+                "live_matching_replicas",
+                &self.source_live_matching_replicas,
+            )
+            .field("item_count", &self.items.len())
+            .field("in_flight_count", &self.in_flight_count())
+            .field("workflow", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Authenticated local workflow state recovered after restart.
 ///
 /// [BLIND-VAULT-RESTART-ROLLBACK-GUARD 2026-08-29 by Codex] The persistence
@@ -950,10 +1039,20 @@ pub struct BlindVaultReplicaExecution {
 /// `snapshot_sequence` after accepting this value. Keeping the sequence out of
 /// `BlindVaultReplicaExecution` avoids confusing persistence order with the
 /// immutable planner generation or network protocol state.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct BlindVaultReplicaRestoredExecution {
     pub(super) execution: BlindVaultReplicaExecution,
     pub(super) snapshot_sequence: u64,
+}
+
+impl fmt::Debug for BlindVaultReplicaRestoredExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlindVaultReplicaRestoredExecution")
+            .field("snapshot_sequence", &self.snapshot_sequence)
+            .field("execution", &self.execution)
+            .finish()
+    }
 }
 
 impl BlindVaultReplicaRestoredExecution {
