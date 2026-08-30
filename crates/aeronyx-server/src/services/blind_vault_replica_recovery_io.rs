@@ -10,6 +10,7 @@
 //!
 //! ## Main Functionality
 //! - Creates/verifies a private `0700` recovery directory.
+//! - Pins the opened directory inode for every subsequent filesystem action.
 //! - Holds one non-blocking exclusive process fence for the store lifetime.
 //! - Reads only bounded regular `0600` files without following symlinks.
 //! - Publishes a temp file through file fsync, rename, and directory fsync.
@@ -33,8 +34,11 @@
 //! - Never include private paths or file bytes in errors, Debug, or telemetry.
 //! - Do not clean unknown files; only the exact temp prefix belongs to us.
 //! - The process fence prevents concurrent writers, not privileged rollback.
+//! - Never return to path-based state I/O after the directory FD is pinned.
 //!
-//! Last Modified: v1.0.0-PrivateAtomicRecoveryIo - Initial restrictive atomic
+//! Last Modified: v1.1.0-DirectoryFdFence - Bound lock, reads, temporary files,
+//! cleanup, replacement, and fsync to one opened private directory inode.
+//! v1.0.0-PrivateAtomicRecoveryIo - Initial restrictive atomic
 //! generation file and process-fence implementation.
 //! ============================================
 
@@ -43,10 +47,14 @@
 use std::fmt;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use nix::fcntl::{Flock, FlockArg};
+use nix::dir::{Dir, Type as DirectoryEntryType};
+use nix::fcntl::{openat, renameat, AtFlags, Flock, FlockArg, OFlag};
+use nix::sys::stat::{fstatat, Mode, SFlag};
+use nix::unistd::{dup, unlinkat, UnlinkatFlags};
 use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
 
@@ -76,9 +84,13 @@ impl From<std::io::Error> for PrivateRecoveryIoError {
 }
 
 /// One privately fenced atomic state file.
+///
+/// [BLIND-VAULT-RECOVERY-DIRECTORY-FD 2026-08-30 by Codex] The directory
+/// descriptor, lock, state file, and temporary files share one inode-rooted
+/// namespace. Renaming or replacing the configured path cannot create a second
+/// writer namespace behind the already-held process fence.
 pub(crate) struct PrivateAtomicRecoveryFile {
-    directory: PathBuf,
-    state_path: PathBuf,
+    directory: File,
     _fence: Flock<File>,
 }
 
@@ -86,8 +98,9 @@ impl PrivateAtomicRecoveryFile {
     /// Opens one single-writer private recovery namespace.
     pub(crate) fn open(directory: &Path) -> Result<Self, PrivateRecoveryIoError> {
         prepare_private_directory(directory)?;
-        let lock_path = directory.join(LOCK_FILE_NAME);
-        let lock_file = open_private_regular_file(&lock_path, true, false, true)?;
+        let directory = open_private_directory(directory)?;
+        let lock_file =
+            open_private_regular_file_at(&directory, LOCK_FILE_NAME, true, false, true)?;
         let fence =
             Flock::lock(lock_file, FlockArg::LockExclusiveNonblock).map_err(|(_file, error)| {
                 if matches!(error, nix::errno::Errno::EWOULDBLOCK) {
@@ -98,10 +111,9 @@ impl PrivateAtomicRecoveryFile {
                     ))
                 }
             })?;
-        cleanup_owned_temp_files(directory)?;
+        cleanup_owned_temp_files(&directory)?;
         Ok(Self {
-            directory: directory.to_path_buf(),
-            state_path: directory.join(STATE_FILE_NAME),
+            directory,
             _fence: fence,
         })
     }
@@ -111,12 +123,21 @@ impl PrivateAtomicRecoveryFile {
         &self,
         maximum_bytes: usize,
     ) -> Result<Option<Vec<u8>>, PrivateRecoveryIoError> {
-        match fs::symlink_metadata(&self.state_path) {
-            Ok(metadata) => validate_private_regular_metadata(&metadata)?,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        }
-        let mut file = open_private_regular_file(&self.state_path, false, false, false)?;
+        let mut file = match open_private_regular_file_at(
+            &self.directory,
+            STATE_FILE_NAME,
+            false,
+            false,
+            false,
+        ) {
+            Ok(file) => file,
+            Err(PrivateRecoveryIoError::Filesystem(error))
+                if error.kind() == ErrorKind::NotFound =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
         let length = usize::try_from(file.metadata()?.len())
             .map_err(|_| PrivateRecoveryIoError::TooLarge)?;
         if length == 0 || length > maximum_bytes {
@@ -140,29 +161,39 @@ impl PrivateAtomicRecoveryFile {
         if bytes.is_empty() || bytes.len() > maximum_bytes {
             return Err(PrivateRecoveryIoError::TooLarge);
         }
-        reject_unsafe_existing_state(&self.state_path)?;
+        validate_existing_state_at(&self.directory)?;
 
-        let temp_path = self.unique_temp_path();
+        let temp_name = self.unique_temp_name();
         let result = (|| {
-            let mut temporary = open_private_regular_file(&temp_path, true, true, true)?;
+            let mut temporary =
+                open_private_regular_file_at(&self.directory, &temp_name, true, true, true)?;
             temporary.write_all(bytes)?;
             temporary.sync_all()?;
             drop(temporary);
-            fs::rename(&temp_path, &self.state_path)?;
-            File::open(&self.directory)?.sync_all()?;
+            renameat(
+                Some(self.directory.as_raw_fd()),
+                temp_name.as_str(),
+                Some(self.directory.as_raw_fd()),
+                STATE_FILE_NAME,
+            )
+            .map_err(nix_filesystem_error)?;
+            self.directory.sync_all()?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
+            let _ = unlinkat(
+                Some(self.directory.as_raw_fd()),
+                temp_name.as_str(),
+                UnlinkatFlags::NoRemoveDir,
+            );
         }
         result
     }
 
-    fn unique_temp_path(&self) -> PathBuf {
+    fn unique_temp_name(&self) -> String {
         let mut random = [0u8; 16];
         OsRng.fill_bytes(&mut random);
-        self.directory
-            .join(format!("{TEMP_FILE_PREFIX}{}", hex::encode(random)))
+        format!("{TEMP_FILE_PREFIX}{}", hex::encode(random))
     }
 }
 
@@ -170,8 +201,7 @@ impl fmt::Debug for PrivateAtomicRecoveryFile {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PrivateAtomicRecoveryFile")
-            .field("directory", &"<redacted>")
-            .field("state_path", &"<redacted>")
+            .field("directory_fd", &"<redacted>")
             .field("process_fence", &"held")
             .finish_non_exhaustive()
     }
@@ -191,35 +221,57 @@ fn prepare_private_directory(directory: &Path) -> Result<(), PrivateRecoveryIoEr
         }
         Err(error) => return Err(error.into()),
     }
-    fs::set_permissions(
-        directory,
-        fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
-    )?;
-    let metadata = fs::symlink_metadata(directory)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(PrivateRecoveryIoError::UnsafePath);
-    }
     Ok(())
 }
 
-fn open_private_regular_file(
-    path: &Path,
+fn open_private_directory(path: &Path) -> Result<File, PrivateRecoveryIoError> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY)
+        .open(path)?;
+    directory.set_permissions(fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(PrivateRecoveryIoError::UnsafePath);
+    }
+    Ok(directory)
+}
+
+fn open_private_regular_file_at(
+    directory: &File,
+    name: &str,
     create: bool,
     create_new: bool,
     writable: bool,
 ) -> Result<File, PrivateRecoveryIoError> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(writable)
-        .create(create)
-        .create_new(create_new)
-        .mode(PRIVATE_FILE_MODE)
-        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
-    let file = options.open(path)?;
+    let mut flags = OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW;
+    flags |= if writable {
+        OFlag::O_RDWR
+    } else {
+        OFlag::O_RDONLY
+    };
+    if create {
+        flags |= OFlag::O_CREAT;
+    }
+    if create_new {
+        flags |= OFlag::O_EXCL;
+    }
+    let raw_fd = openat(
+        Some(directory.as_raw_fd()),
+        name,
+        flags,
+        Mode::from_bits_truncate(PRIVATE_FILE_MODE),
+    )
+    .map_err(|error| {
+        if error == nix::errno::Errno::ELOOP {
+            PrivateRecoveryIoError::UnsafePath
+        } else {
+            PrivateRecoveryIoError::Filesystem(nix_filesystem_error(error))
+        }
+    })?;
+    // SAFETY: `openat` returned a new owned descriptor and this is its sole
+    // owner. `File` closes it exactly once when dropped.
+    let file = unsafe { File::from_raw_fd(raw_fd) };
     if writable {
         file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
     }
@@ -236,32 +288,57 @@ fn validate_private_regular_metadata(
     Ok(())
 }
 
-fn reject_unsafe_existing_state(path: &Path) -> Result<(), PrivateRecoveryIoError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => validate_private_regular_metadata(&metadata),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+fn validate_existing_state_at(directory: &File) -> Result<(), PrivateRecoveryIoError> {
+    match open_private_regular_file_at(directory, STATE_FILE_NAME, false, false, false) {
+        Ok(_) => Ok(()),
+        Err(PrivateRecoveryIoError::Filesystem(error)) if error.kind() == ErrorKind::NotFound => {
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
-fn cleanup_owned_temp_files(directory: &Path) -> Result<(), PrivateRecoveryIoError> {
+fn cleanup_owned_temp_files(directory: &File) -> Result<(), PrivateRecoveryIoError> {
     // [BLIND-VAULT-RECOVERY-TEMP-CLEANUP 2026-08-29 by Codex] Cleanup runs
     // only while holding the exclusive fence and only for our exact prefix.
     // Unknown files and directories are never touched.
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
+    let duplicated = dup(directory.as_raw_fd()).map_err(nix_filesystem_error)?;
+    let mut entries = Dir::from_fd(duplicated).map_err(nix_filesystem_error)?;
+    for entry in entries.iter() {
+        let entry = entry.map_err(nix_filesystem_error)?;
+        let Some(name) = entry.file_name().to_str().ok() else {
             continue;
         };
         if !name.starts_with(TEMP_FILE_PREFIX) {
             continue;
         }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() || metadata.is_file() {
-            fs::remove_file(entry.path())?;
+        let removable = match entry.file_type() {
+            Some(DirectoryEntryType::File | DirectoryEntryType::Symlink) => true,
+            Some(_) => false,
+            None => {
+                let metadata = fstatat(
+                    Some(directory.as_raw_fd()),
+                    entry.file_name(),
+                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                )
+                .map_err(nix_filesystem_error)?;
+                let kind = SFlag::from_bits_truncate(metadata.st_mode);
+                kind == SFlag::S_IFREG || kind == SFlag::S_IFLNK
+            }
+        };
+        if removable {
+            unlinkat(
+                Some(directory.as_raw_fd()),
+                entry.file_name(),
+                UnlinkatFlags::NoRemoveDir,
+            )
+            .map_err(nix_filesystem_error)?;
         }
     }
-    File::open(directory)?.sync_all()?;
+    directory.sync_all()?;
     Ok(())
+}
+
+fn nix_filesystem_error(error: nix::errno::Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(error as i32)
 }
