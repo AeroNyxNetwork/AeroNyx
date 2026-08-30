@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.40.0-ProvisioningReplyPolicy - Added an exact-count,
+//! Last Modified: v1.41.0-DurableProvisioningCompletion - Added a typed atomic
+//! resolution path for policy-issued aggregate provisioning completion.
+//! v1.40.0-ProvisioningReplyPolicy - Added an exact-count,
 //! attempt-bound aggregate admission/write/inventory reply state machine.
 //! v1.39.0-ProvisioningLeaseLifetime - Required every newly
 //! provisioned replica lease to remain live at aggregate evidence creation.

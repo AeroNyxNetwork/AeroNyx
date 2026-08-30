@@ -79,6 +79,8 @@
 //!   source-time trait at the common private reply-policy boundary.
 //! - [BLIND-VAULT-PROVISIONING-REPLY-POLICY 2026-08-30 by Codex] Added an
 //!   exact-count state machine for aggregate admission, writes, and inventory.
+//! - [BLIND-VAULT-DURABLE-PROVISIONING 2026-08-30 by Codex] Added typed atomic
+//!   resolution for complete policy-issued aggregate provisioning evidence.
 //!
 //! ## Main Functionality
 //!
