@@ -13045,7 +13045,6 @@ impl Server {
             } else {
                 None
             };
-            attempted += 1;
             let stop_after_delivery = delivery_permit
                 .is_some_and(|permit| permit.is_half_open());
             let mut circuit_allows_more = true;
@@ -13074,15 +13073,15 @@ impl Server {
                             relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
                         }
                         let reason = error.reason_bucket().to_string();
-                        let _ = peer_store.record_route_forward_failure_for_descriptor(
-                            &peer,
-                            now,
-                            reason.clone(),
-                        );
                         last_failure_reason = Some(reason);
                         break;
                     }
                 };
+                // [DIRECT-RELAY-ATTEMPT-BOUNDARY 2026-08-31 by Codex] Local
+                // request preparation cannot affect peer reputation. Count an
+                // attempt only after the exact signed request is ready and the
+                // HTTP transport is about to observe it.
+                attempted += 1;
                 let outcome = Self::send_and_validate_target_bound_peer_relay(
                     client,
                     &url,
@@ -13114,11 +13113,6 @@ impl Server {
                 let (response, expected_request_commitment) = if use_authenticated_relay {
                     let Some(prepared) = authenticated_request.as_ref() else {
                         let reason = "peer_relay_auth_encode_failed".to_string();
-                        let _ = peer_store.record_route_forward_failure_for_descriptor(
-                            &peer,
-                            now,
-                            reason.clone(),
-                        );
                         last_failure_reason = Some(reason);
                         continue;
                     };
@@ -13126,20 +13120,17 @@ impl Server {
                         Ok(prepared) => prepared,
                         Err(error) => {
                             let reason = error.reason_bucket().to_string();
-                            let _ = peer_store.record_route_forward_failure_for_descriptor(
-                                &peer,
-                                now,
-                                reason.clone(),
-                            );
                             last_failure_reason = Some(reason);
                             continue;
                         }
                     };
+                    attempted += 1;
                     (
                         client.post(&url).json(request).send().await,
                         Some(*request_commitment),
                     )
                 } else {
+                    attempted += 1;
                     (
                         client
                             .post(&url)
