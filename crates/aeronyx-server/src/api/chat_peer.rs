@@ -152,6 +152,9 @@
 //! - [SINGLE-PASS-DIRECT-REQUEST-COMMITMENT 2026-08-31 by Codex] Derives
 //!   direct request signatures and replay commitments from one canonical
 //!   envelope encoding instead of serializing large ciphertext twice
+//! - [OUTBOUND-DIRECT-REQUEST-PREPARATION 2026-08-31 by Codex] Prepares
+//!   authenticated v2/v3 outbound requests behind fail-fast bounded crypto
+//!   admission, leaving peer selection and HTTP I/O in the server runtime
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -1236,6 +1239,29 @@ enum DirectPeerAuthenticationFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectRelayCryptoFailure {
     Unavailable,
+}
+
+/// Privacy-safe local failure while preparing an outbound direct request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectRelayRequestPreparationFailure {
+    Encoding,
+    Backpressure,
+    Unavailable,
+}
+
+impl DirectRelayRequestPreparationFailure {
+    /// Closed aggregate label safe for route-health telemetry.
+    #[must_use]
+    pub(crate) const fn reason_bucket(self) -> &'static str {
+        match self {
+            Self::Encoding => "peer_relay_auth_encode_failed",
+            // Keep the established closed telemetry vocabulary during rolling
+            // upgrades. The typed variant still controls local recovery, while
+            // aggregate route evidence avoids inventing a label older nodes
+            // would sanitize to `unknown`.
+            Self::Backpressure | Self::Unavailable => "peer_relay_auth_encode_failed",
+        }
+    }
 }
 
 impl DirectPeerAuthenticationFailure {
@@ -2644,6 +2670,54 @@ where
         warn!("[CHAT_PEER] Direct relay crypto worker failed closed");
         DirectRelayCryptoFailure::Unavailable
     })
+}
+
+/// Prepares one authenticated v2 request outside the asynchronous I/O runtime.
+pub(crate) async fn prepare_peer_chat_relay_request_v2(
+    envelope: ChatEnvelope,
+    node_identity: Arc<IdentityKeyPair>,
+) -> Result<(PeerChatRelayRequestV2, [u8; 32]), DirectRelayRequestPreparationFailure> {
+    prepare_direct_peer_relay_request(move || {
+        PeerChatRelayRequestV2::sign_with_commitment(envelope, node_identity.as_ref())
+    })
+    .await
+}
+
+/// Prepares one target-bound v3 request outside the async I/O runtime.
+pub(crate) async fn prepare_peer_chat_relay_request_v3(
+    envelope: ChatEnvelope,
+    target_node_id: [u8; 32],
+    node_identity: Arc<IdentityKeyPair>,
+) -> Result<(PeerChatRelayRequestV3, [u8; 32]), DirectRelayRequestPreparationFailure> {
+    prepare_direct_peer_relay_request(move || {
+        PeerChatRelayRequestV3::sign_with_commitment(
+            envelope,
+            target_node_id,
+            node_identity.as_ref(),
+        )
+    })
+    .await
+}
+
+async fn prepare_direct_peer_relay_request<T, F>(
+    work: F,
+) -> Result<T, DirectRelayRequestPreparationFailure>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, bincode::Error> + Send + 'static,
+{
+    // [OUTBOUND-DIRECT-REQUEST-PREPARATION 2026-08-31 by Codex] Outbound
+    // fallback is optional and always has local durable custody behind it.
+    // Fail fast instead of queueing unbounded signature work under fanout.
+    let permit = direct_relay_signature_admission()
+        .try_acquire_owned()
+        .map_err(|_| DirectRelayRequestPreparationFailure::Backpressure)?;
+    execute_direct_relay_crypto(permit, work)
+        .await
+        .map_err(|DirectRelayCryptoFailure::Unavailable| {
+            DirectRelayRequestPreparationFailure::Unavailable
+        })?
+        .map_err(|_| DirectRelayRequestPreparationFailure::Encoding)
 }
 
 async fn authenticate_peer_blind_relay_request(
