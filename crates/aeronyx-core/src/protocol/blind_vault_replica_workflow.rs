@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.38.0-AuthorizedRetirementDispatch - Joined active
+//! Last Modified: v1.39.0-ProvisioningLeaseLifetime - Required every newly
+//! provisioned replica lease to remain live at aggregate evidence creation.
+//! v1.38.0-AuthorizedRetirementDispatch - Joined active
 //! workflow authority, permit-gated transport, and exact reply verification.
 //! v1.37.0-ReplacementLeaseLifetime - Preserved and enforced
 //! the verified replacement lease window through retirement completion.

@@ -73,6 +73,8 @@
 //!   authorization, retry, or completion after replacement lease expiry.
 //! - [BLIND-VAULT-AUTHORIZED-RETIREMENT-DISPATCH 2026-08-30 by Codex] Joined
 //!   active workflow authority to permit-gated transport and reply validation.
+//! - [BLIND-VAULT-PROVISIONING-LEASE-LIFETIME 2026-08-30 by Codex] Prevented
+//!   expired new leases from satisfying aggregate replica provisioning.
 //!
 //! ## Main Functionality
 //!

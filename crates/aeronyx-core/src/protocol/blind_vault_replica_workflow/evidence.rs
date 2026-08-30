@@ -8,7 +8,9 @@
 //! exact request binding, live lease state, and source-owned manifests without
 //! retaining credentials, ciphertext, object identifiers, or social metadata.
 //!
-//! Last Modified: v1.2.0-ReplacementLeaseLifetime - Carried the verified
+//! Last Modified: v1.3.0-ProvisioningLeaseLifetime - Rejected aggregate
+//! provisioning evidence containing an already expired replica lease.
+//! v1.2.0-ReplacementLeaseLifetime - Carried the verified
 //! replacement lease window into retirement authorization and evidence.
 //! v1.1.0-DistilledAdmissionEvidence - Split admission and
 //! inventory verification so one-time credentials can be discarded early.
@@ -324,7 +326,11 @@ impl BlindVaultReplicaActionEvidence {
         let mut node_ids = BTreeSet::new();
         let mut lease_ids = BTreeSet::new();
         for replica in replicas {
+            // [BLIND-VAULT-PROVISIONING-LEASE-LIFETIME 2026-08-30 by Codex]
+            // Every member must still be usable when aggregate evidence is
+            // created; a once-live observation cannot restore replica floor.
             if replica.observed_at_ms > now_ms
+                || replica.lease_expires_at_ms <= now_ms
                 || !node_ids.insert(replica.node_id)
                 || !lease_ids.insert(replica.lease_id)
             {
