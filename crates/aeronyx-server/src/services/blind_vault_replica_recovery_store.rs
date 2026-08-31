@@ -36,7 +36,9 @@
 //! - Never permit normal snapshots to cross unresolved attempt phases.
 //! - Never weaken exact work/attempt/sequence/commitment comparisons.
 //!
-//! Last Modified: v1.3.0-IdempotentDurabilityConfirmation - Re-synchronized
+//! Last Modified: v1.4.0-CrashRecoveryFormatHardening - Added fail-closed V1
+//! corruption, restart-phase, rollback, conflict, and exact-retry coverage.
+//! v1.3.0-IdempotentDurabilityConfirmation - Re-synchronized
 //! the current file and directory before exact retry success.
 //! v1.2.0-PreparedAbort - Added idempotent exact cleanup for a
 //! journal proven not to have reached committed dispatch state.
@@ -613,4 +615,341 @@ fn recovery_options() -> impl Options {
         .with_fixint_encoding()
         .with_limit(MAX_RECOVERY_FILE_BYTES as u64)
         .reject_trailing_bytes()
+}
+
+// [BLIND-VAULT-RECOVERY-HARDENING 2026-08-31 by Codex] These tests freeze V1
+// fail-closed corruption checks and crash-restart transition invariants using
+// only opaque sealed byte containers.
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    const WORKFLOW_ID: [u8; 16] = [0x61; 16];
+    const SEALED_SNAPSHOT_A: &[u8] = &[0xa1, 0x00, 0x7f, 0x93, 0x28];
+    const SEALED_SNAPSHOT_B: &[u8] = &[0xb2, 0x10, 0x6e, 0x84, 0x39];
+    const SEALED_SNAPSHOT_C: &[u8] = &[0xc3, 0x20, 0x5d, 0x75, 0x4a];
+    const SEALED_JOURNAL: &[u8] = &[0xd4, 0x30, 0x4c, 0x66, 0x5b, 0xe1];
+    const STATE_FILE_NAME: &str = "recovery-state-v1.bin";
+
+    fn resolved_state(
+        snapshot_sequence: u64,
+        accepted_journal_sequence: u64,
+        last_resolved_attempt: Option<StoredResolvedAttemptV1>,
+    ) -> StoredRecoveryStateV1 {
+        StoredRecoveryStateV1 {
+            workflow_id: WORKFLOW_ID,
+            phase: StoredAttemptPhaseV1::Resolved,
+            snapshot_sequence,
+            accepted_journal_sequence,
+            last_resolved_attempt,
+            snapshot_commitment: sealed_record_commitment(SEALED_SNAPSHOT_A),
+            sealed_snapshot: SEALED_SNAPSHOT_A.to_vec(),
+            attempt: None,
+        }
+    }
+
+    fn unresolved_state(
+        phase: StoredAttemptPhaseV1,
+        snapshot_sequence: u64,
+        journal_sequence: u64,
+    ) -> StoredRecoveryStateV1 {
+        StoredRecoveryStateV1 {
+            workflow_id: WORKFLOW_ID,
+            phase,
+            snapshot_sequence,
+            accepted_journal_sequence: journal_sequence,
+            last_resolved_attempt: None,
+            snapshot_commitment: sealed_record_commitment(SEALED_SNAPSHOT_A),
+            sealed_snapshot: SEALED_SNAPSHOT_A.to_vec(),
+            attempt: Some(StoredAttemptV1 {
+                work_sequence: 3,
+                attempt: 2,
+                journal_sequence,
+                retain_until_ms: 1_900_000_000_000,
+                journal_commitment: sealed_record_commitment(SEALED_JOURNAL),
+                sealed_journal: SEALED_JOURNAL.to_vec(),
+            }),
+        }
+    }
+
+    fn recovery_directory(root: &TempDir) -> PathBuf {
+        root.path().join("recovery")
+    }
+
+    fn publish_then_reopen(
+        directory: &Path,
+        state: &StoredRecoveryStateV1,
+    ) -> FileBlindVaultReplicaRecoveryStore {
+        {
+            let store = FileBlindVaultReplicaRecoveryStore::open(directory)
+                .expect("open recovery generation for publication");
+            store.publish(state).expect("publish recovery generation");
+        }
+        FileBlindVaultReplicaRecoveryStore::open(directory)
+            .expect("reopen published recovery generation")
+    }
+
+    fn assert_corrupt(encoded: &[u8]) {
+        assert!(matches!(
+            decode_state(encoded),
+            Err(BlindVaultReplicaRecoveryStoreError::CorruptState)
+        ));
+    }
+
+    fn rewrite_checksum(encoded: &mut [u8]) {
+        let checksum_offset = encoded.len() - RECOVERY_FILE_CHECKSUM_BYTES;
+        let checksum = recovery_file_checksum(&encoded[..checksum_offset]);
+        encoded[checksum_offset..].copy_from_slice(&checksum);
+    }
+
+    #[test]
+    fn v1_decoder_rejects_header_length_checksum_trailing_body_and_commitment_damage() {
+        // Every V1 structural layer fails closed independently; commitment
+        // cases retain a valid outer checksum so that inner check is exercised.
+        let state = resolved_state(7, 0, None);
+        let encoded = encode_state(&state).expect("encode valid V1 generation");
+        decode_state(encoded.as_slice()).expect("decode valid V1 generation");
+        assert_corrupt(&encoded[..RECOVERY_FILE_HEADER_BYTES]);
+
+        let mut damaged_magic = encoded.to_vec();
+        damaged_magic[0] ^= 0xff;
+        assert_corrupt(&damaged_magic);
+
+        let mut unsupported_version = encoded.to_vec();
+        unsupported_version[4..6]
+            .copy_from_slice(&RECOVERY_FILE_VERSION_V1.saturating_add(1).to_be_bytes());
+        assert_corrupt(&unsupported_version);
+
+        let mut invalid_length = encoded.to_vec();
+        let body_length = u32::from_be_bytes(invalid_length[6..10].try_into().unwrap());
+        invalid_length[6..10].copy_from_slice(&body_length.saturating_add(1).to_be_bytes());
+        assert_corrupt(&invalid_length);
+
+        let mut damaged_checksum = encoded.to_vec();
+        let checksum_byte = damaged_checksum.len() - 1;
+        damaged_checksum[checksum_byte] ^= 0x01;
+        assert_corrupt(&damaged_checksum);
+
+        let mut trailing_bytes = encoded.to_vec();
+        trailing_bytes.push(0);
+        assert_corrupt(&trailing_bytes);
+
+        let mut invalid_body = resolved_state(7, 0, None);
+        invalid_body.workflow_id = [0; 16];
+        assert_corrupt(
+            encode_state(&invalid_body)
+                .expect("encode checksummed invalid body")
+                .as_slice(),
+        );
+
+        let mut stale_snapshot_commitment = resolved_state(7, 0, None);
+        stale_snapshot_commitment.sealed_snapshot[0] ^= 0x80;
+        assert_corrupt(
+            encode_state(&stale_snapshot_commitment)
+                .expect("encode stale snapshot commitment")
+                .as_slice(),
+        );
+
+        let mut stale_journal_commitment = unresolved_state(StoredAttemptPhaseV1::Prepared, 7, 11);
+        stale_journal_commitment
+            .attempt
+            .as_mut()
+            .unwrap()
+            .sealed_journal[0] ^= 0x40;
+        assert_corrupt(
+            encode_state(&stale_journal_commitment)
+                .expect("encode stale journal commitment")
+                .as_slice(),
+        );
+
+        let mut malformed_body = encoded.to_vec();
+        malformed_body[RECOVERY_FILE_HEADER_BYTES + 16] = 0xff;
+        rewrite_checksum(&mut malformed_body);
+        assert_corrupt(&malformed_body);
+    }
+
+    #[test]
+    fn restart_load_preserves_prepared_committed_and_resolved_phases() {
+        let cases = [
+            (
+                unresolved_state(StoredAttemptPhaseV1::Prepared, 7, 11),
+                BlindVaultReplicaAttemptDurabilityPhase::Prepared,
+                7,
+                Some(SEALED_JOURNAL),
+            ),
+            (
+                unresolved_state(StoredAttemptPhaseV1::Committed, 8, 11),
+                BlindVaultReplicaAttemptDurabilityPhase::Committed,
+                8,
+                Some(SEALED_JOURNAL),
+            ),
+            (
+                resolved_state(
+                    9,
+                    11,
+                    Some(StoredResolvedAttemptV1 {
+                        journal_sequence: 11,
+                        journal_commitment: sealed_record_commitment(SEALED_JOURNAL),
+                    }),
+                ),
+                BlindVaultReplicaAttemptDurabilityPhase::Resolved,
+                9,
+                None,
+            ),
+        ];
+
+        for (state, expected_phase, expected_snapshot_sequence, expected_journal) in cases {
+            let root = tempfile::tempdir().expect("temporary recovery root");
+            let directory = recovery_directory(&root);
+            let mut reopened = publish_then_reopen(&directory, &state);
+            let loaded = reopened
+                .load_recovery_state()
+                .expect("load recovery state after restart")
+                .expect("published recovery state");
+
+            assert_eq!(loaded.phase(), expected_phase);
+            assert_eq!(
+                loaded.accepted_snapshot_sequence(),
+                expected_snapshot_sequence
+            );
+            assert_eq!(loaded.accepted_journal_sequence(), 11);
+            assert_eq!(loaded.sealed_snapshot(), SEALED_SNAPSHOT_A);
+            assert_eq!(loaded.sealed_attempt_journal(), expected_journal);
+        }
+    }
+
+    #[test]
+    fn exact_retries_are_idempotent_while_conflicts_and_rollbacks_fail_closed() {
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let directory = recovery_directory(&root);
+        let mut store =
+            FileBlindVaultReplicaRecoveryStore::open(&directory).expect("open recovery generation");
+        let snapshot =
+            BlindVaultReplicaSnapshotRecord::new(WORKFLOW_ID, 7, SEALED_SNAPSHOT_A).unwrap();
+        store.persist_snapshot(&snapshot).expect("persist snapshot");
+        store
+            .persist_snapshot(&snapshot)
+            .expect("exact snapshot retry is idempotent");
+
+        let conflicting_snapshot =
+            BlindVaultReplicaSnapshotRecord::new(WORKFLOW_ID, 7, SEALED_SNAPSHOT_B).unwrap();
+        assert!(matches!(
+            store.persist_snapshot(&conflicting_snapshot),
+            Err(BlindVaultReplicaRecoveryStoreError::RollbackDetected)
+        ));
+        let rollback_snapshot =
+            BlindVaultReplicaSnapshotRecord::new(WORKFLOW_ID, 6, SEALED_SNAPSHOT_A).unwrap();
+        assert!(matches!(
+            store.persist_snapshot(&rollback_snapshot),
+            Err(BlindVaultReplicaRecoveryStoreError::RollbackDetected)
+        ));
+        drop(store);
+
+        let committed = unresolved_state(StoredAttemptPhaseV1::Committed, 8, 11);
+        let journal_commitment = committed.attempt.as_ref().unwrap().journal_commitment;
+        let mut store = publish_then_reopen(&directory, &committed);
+        let resolved_snapshot =
+            BlindVaultReplicaSnapshotRecord::new(WORKFLOW_ID, 9, SEALED_SNAPSHOT_C).unwrap();
+        store
+            .resolve_attempt(&resolved_snapshot, 11, journal_commitment)
+            .expect("resolve committed attempt");
+        drop(store);
+
+        let mut reopened = FileBlindVaultReplicaRecoveryStore::open(&directory)
+            .expect("reopen resolved generation");
+        reopened
+            .resolve_attempt(&resolved_snapshot, 11, journal_commitment)
+            .expect("exact resolution retry is idempotent");
+        assert!(matches!(
+            reopened.resolve_attempt(&resolved_snapshot, 11, [0x55; 32]),
+            Err(BlindVaultReplicaRecoveryStoreError::RollbackDetected)
+        ));
+    }
+
+    #[test]
+    fn journal_commitment_phase_and_attempt_inconsistencies_fail_closed() {
+        let mut prepared = unresolved_state(StoredAttemptPhaseV1::Prepared, 7, 11);
+        let correct_commitment = prepared.attempt.as_ref().unwrap().journal_commitment;
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let directory = recovery_directory(&root);
+        let mut store = publish_then_reopen(&directory, &prepared);
+        assert!(matches!(
+            store.abort_prepared_attempt(11, [0x66; 32]),
+            Err(BlindVaultReplicaRecoveryStoreError::StateConflict)
+        ));
+        store
+            .abort_prepared_attempt(11, correct_commitment)
+            .expect("abort exact prepared attempt");
+        store
+            .abort_prepared_attempt(11, correct_commitment)
+            .expect("exact abort retry is idempotent");
+
+        let mut resolved_with_attempt = resolved_state(7, 0, None);
+        resolved_with_attempt.attempt = prepared.attempt.take();
+        assert_corrupt(
+            encode_state(&resolved_with_attempt)
+                .expect("encode resolved state with attempt")
+                .as_slice(),
+        );
+
+        let mut prepared_without_attempt = resolved_state(7, 11, None);
+        prepared_without_attempt.phase = StoredAttemptPhaseV1::Prepared;
+        assert_corrupt(
+            encode_state(&prepared_without_attempt)
+                .expect("encode prepared state without attempt")
+                .as_slice(),
+        );
+
+        let mut attempt_sequence_mismatch =
+            unresolved_state(StoredAttemptPhaseV1::Committed, 8, 11);
+        attempt_sequence_mismatch
+            .attempt
+            .as_mut()
+            .unwrap()
+            .journal_sequence = 10;
+        assert_corrupt(
+            encode_state(&attempt_sequence_mismatch)
+                .expect("encode mismatched attempt sequence")
+                .as_slice(),
+        );
+
+        let committed = unresolved_state(StoredAttemptPhaseV1::Committed, 8, 12);
+        let committed_commitment = committed.attempt.as_ref().unwrap().journal_commitment;
+        let root = tempfile::tempdir().expect("temporary committed root");
+        let directory = recovery_directory(&root);
+        let mut committed_store = publish_then_reopen(&directory, &committed);
+        assert!(matches!(
+            committed_store.abort_prepared_attempt(12, committed_commitment),
+            Err(BlindVaultReplicaRecoveryStoreError::StateConflict)
+        ));
+    }
+
+    #[test]
+    fn open_rejects_a_checksummed_but_commitment_corrupt_generation() {
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let directory = recovery_directory(&root);
+        let state = resolved_state(7, 0, None);
+        {
+            let store = FileBlindVaultReplicaRecoveryStore::open(&directory)
+                .expect("open recovery generation");
+            store.publish(&state).expect("publish recovery generation");
+        }
+
+        let state_path = directory.join(STATE_FILE_NAME);
+        let mut stale_commitment = state;
+        stale_commitment.sealed_snapshot[0] ^= 0x20;
+        let corrupted = encode_state(&stale_commitment)
+            .expect("encode checksummed commitment-corrupt generation");
+        fs::write(&state_path, corrupted).expect("write corrupt recovery generation");
+
+        assert!(matches!(
+            FileBlindVaultReplicaRecoveryStore::open(&directory),
+            Err(BlindVaultReplicaRecoveryStoreError::CorruptState)
+        ));
+    }
 }
