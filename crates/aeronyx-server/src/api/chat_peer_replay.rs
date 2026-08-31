@@ -13,6 +13,8 @@
 //! - Retains exact bounded ACKs from their completion boundary.
 //! - Fences release and completion by route, commitment, and owner generation.
 //! - Owns the versioned restart-durable ACK codec and legacy read compatibility.
+//! - Bounds durable ACK bytes and rejects trailing data before allocation-heavy
+//!   deserialization.
 //! - Bounds both live entries and stale queue generations without evicting
 //!   unexpired at-most-once evidence.
 //!
@@ -33,8 +35,11 @@
 //!   route-only or route-plus-commitment check.
 //! - Do not retain payloads, endpoints, users, receivers, or source addresses.
 //! - Keep serialized HTTP contracts and durable replay rows backward compatible.
+//! - Preserve fixed-int little-endian bincode settings for every legacy row.
 //!
 //! ## Last Modified
+//! v2.8.36-DurableAckBounds - Bound all durable ACK codec paths and reject
+//! trailing bytes without changing their versioned or legacy representation.
 //! v2.8.35-OnionReplyReplay - Persist optional opaque terminal replies while
 //! retaining versioned reads for earlier durable ACK formats.
 //! v2.8.34-ChatPeerReplayCodec - Own durable ACK encoding and validation.
@@ -48,9 +53,10 @@ use std::{
 use aeronyx_core::protocol::chat::{
     BlindRelayDeliveryReceipt, BlindRelayFailureReceipt, BlindRelaySuccessReceipt,
 };
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 
-use super::chat_peer::PeerBlindRelayResponse;
+use super::{chat_peer::PeerBlindRelayResponse, BLIND_RELAY_ACK_RESPONSE_MAX_BYTES};
 use crate::services::chat_relay::{
     BLIND_RELAY_ROUTE_REPLAY_CAPACITY, BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
 };
@@ -63,14 +69,65 @@ const DURABLE_RESPONSE_MAGIC: &[u8; 5] = b"ANBR\x03";
 const LEGACY_DURABLE_RESPONSE_VERSION: u8 = 1;
 const LEGACY_DURABLE_RESPONSE_V2_VERSION: u8 = 2;
 const DURABLE_RESPONSE_VERSION: u8 = 3;
+/// Maximum bincode body inherited from the bounded public Blind Relay ACK.
+const MAX_DURABLE_RESPONSE_BODY_BYTES: usize = BLIND_RELAY_ACK_RESPONSE_MAX_BYTES;
+/// Maximum stored v3 frame, including its unchanged five-byte magic prefix.
+const MAX_DURABLE_RESPONSE_BYTES: usize =
+    DURABLE_RESPONSE_MAGIC.len() + MAX_DURABLE_RESPONSE_BODY_BYTES;
 
 /// Failure class for the private restart-durable response representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BlindRelayReplayCodecError {
     Encode,
     Decode,
+    TooLarge,
     UnsupportedVersion,
     InvalidCompletedState,
+}
+
+/// Historical bincode settings plus an allocation-aware hard byte limit.
+///
+/// [CHAT-PEER-DURABLE-ACK-BOUNDS 2026-08-31 by Codex] The bincode crate's
+/// convenience functions use fixed-width integers and little endian. Spell
+/// those settings out before adding a limit and trailing-byte rejection so
+/// already-persisted v1/v2/v3 and unversioned rows retain identical bytes.
+fn durable_response_bincode_options() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_little_endian()
+        .with_limit(MAX_DURABLE_RESPONSE_BODY_BYTES as u64)
+        .reject_trailing_bytes()
+}
+
+fn encode_durable_response_body<T: Serialize>(
+    value: &T,
+) -> Result<Vec<u8>, BlindRelayReplayCodecError> {
+    durable_response_bincode_options()
+        .serialize(value)
+        .map_err(|error| {
+            if matches!(error.as_ref(), bincode::ErrorKind::SizeLimit) {
+                BlindRelayReplayCodecError::TooLarge
+            } else {
+                BlindRelayReplayCodecError::Encode
+            }
+        })
+}
+
+fn decode_durable_response_body<'de, T: Deserialize<'de>>(
+    encoded: &'de [u8],
+) -> Result<T, BlindRelayReplayCodecError> {
+    if encoded.len() > MAX_DURABLE_RESPONSE_BODY_BYTES {
+        return Err(BlindRelayReplayCodecError::TooLarge);
+    }
+    durable_response_bincode_options()
+        .deserialize(encoded)
+        .map_err(|error| {
+            if matches!(error.as_ref(), bincode::ErrorKind::SizeLimit) {
+                BlindRelayReplayCodecError::TooLarge
+            } else {
+                BlindRelayReplayCodecError::Decode
+            }
+        })
 }
 
 /// Private, versioned representation of one restart-durable route ACK.
@@ -214,8 +271,13 @@ pub(super) fn encode_durable_blind_relay_response(
     response: &PeerBlindRelayResponse,
 ) -> Result<Vec<u8>, BlindRelayReplayCodecError> {
     let frame = DurableBlindRelayResponseV3::from(response);
-    let body = bincode::serialize(&frame).map_err(|_| BlindRelayReplayCodecError::Encode)?;
-    let mut encoded = Vec::with_capacity(DURABLE_RESPONSE_MAGIC.len() + body.len());
+    let body = encode_durable_response_body(&frame)?;
+    let encoded_len = DURABLE_RESPONSE_MAGIC
+        .len()
+        .checked_add(body.len())
+        .filter(|length| *length <= MAX_DURABLE_RESPONSE_BYTES)
+        .ok_or(BlindRelayReplayCodecError::TooLarge)?;
+    let mut encoded = Vec::with_capacity(encoded_len);
     encoded.extend_from_slice(DURABLE_RESPONSE_MAGIC);
     encoded.extend_from_slice(&body);
     Ok(encoded)
@@ -224,25 +286,27 @@ pub(super) fn encode_durable_blind_relay_response(
 pub(super) fn decode_durable_blind_relay_response(
     encoded: &[u8],
 ) -> Result<PeerBlindRelayResponse, BlindRelayReplayCodecError> {
+    // [CHAT-PEER-DURABLE-ACK-BOUNDS 2026-08-31 by Codex] Reject oversized
+    // storage rows before inspecting a magic prefix or any bincode length.
+    if encoded.len() > MAX_DURABLE_RESPONSE_BYTES {
+        return Err(BlindRelayReplayCodecError::TooLarge);
+    }
     if let Some(body) = encoded.strip_prefix(DURABLE_RESPONSE_MAGIC) {
-        let frame: DurableBlindRelayResponseV3 =
-            bincode::deserialize(body).map_err(|_| BlindRelayReplayCodecError::Decode)?;
+        let frame: DurableBlindRelayResponseV3 = decode_durable_response_body(body)?;
         if frame.version != DURABLE_RESPONSE_VERSION {
             return Err(BlindRelayReplayCodecError::UnsupportedVersion);
         }
         return Ok(frame.into());
     }
     if let Some(body) = encoded.strip_prefix(LEGACY_DURABLE_RESPONSE_V2_MAGIC) {
-        let frame: DurableBlindRelayResponseV2 =
-            bincode::deserialize(body).map_err(|_| BlindRelayReplayCodecError::Decode)?;
+        let frame: DurableBlindRelayResponseV2 = decode_durable_response_body(body)?;
         if frame.version != LEGACY_DURABLE_RESPONSE_V2_VERSION {
             return Err(BlindRelayReplayCodecError::UnsupportedVersion);
         }
         return Ok(frame.into());
     }
     if let Some(body) = encoded.strip_prefix(LEGACY_DURABLE_RESPONSE_MAGIC) {
-        let frame: DurableBlindRelayResponseV1 =
-            bincode::deserialize(body).map_err(|_| BlindRelayReplayCodecError::Decode)?;
+        let frame: DurableBlindRelayResponseV1 = decode_durable_response_body(body)?;
         if frame.version != LEGACY_DURABLE_RESPONSE_VERSION {
             return Err(BlindRelayReplayCodecError::UnsupportedVersion);
         }
@@ -262,8 +326,15 @@ pub(super) fn decode_durable_blind_relay_response(
         delivery_receipt,
         failure_receipt,
         opaque_terminal_response_b64,
-    )) = bincode::deserialize::<LegacyResponseWithOpaqueReply>(encoded)
+    )) = decode_durable_response_body::<LegacyResponseWithOpaqueReply>(encoded)
     {
+        // [CHAT-PEER-DURABLE-ACK-BOUNDS 2026-08-31 by Codex] An unversioned
+        // row reaches this longest historical shape only when the appended
+        // opaque field is present. Requiring it prevents zero trailing bytes
+        // on a shorter legacy row from masquerading as absent optional fields.
+        if opaque_terminal_response_b64.is_none() {
+            return Err(BlindRelayReplayCodecError::Decode);
+        }
         return Ok(PeerBlindRelayResponse {
             accepted,
             terminal,
@@ -278,8 +349,11 @@ pub(super) fn decode_durable_blind_relay_response(
     }
 
     if let Ok((accepted, terminal, forwarded, ttl_remaining, reason, delivery_receipt)) =
-        bincode::deserialize::<LegacyResponseWithDelivery>(encoded)
+        decode_durable_response_body::<LegacyResponseWithDelivery>(encoded)
     {
+        if delivery_receipt.is_none() {
+            return Err(BlindRelayReplayCodecError::Decode);
+        }
         return Ok(PeerBlindRelayResponse {
             accepted,
             terminal,
@@ -294,8 +368,7 @@ pub(super) fn decode_durable_blind_relay_response(
     }
 
     let (accepted, terminal, forwarded, ttl_remaining, reason) =
-        bincode::deserialize::<LegacyResponseWithoutReceipts>(encoded)
-            .map_err(|_| BlindRelayReplayCodecError::Decode)?;
+        decode_durable_response_body::<LegacyResponseWithoutReceipts>(encoded)?;
     Ok(PeerBlindRelayResponse {
         accepted,
         terminal,
@@ -624,6 +697,12 @@ mod tests {
         }
     }
 
+    fn versioned_fixture<T: Serialize>(magic: &[u8; 5], frame: &T) -> Vec<u8> {
+        let mut encoded = magic.to_vec();
+        encoded.extend_from_slice(&bincode::serialize(frame).expect("encode durable fixture"));
+        encoded
+    }
+
     fn begin_generation(
         state: &mut BlindRelayReplayState,
         route_id: [u8; 16],
@@ -638,8 +717,8 @@ mod tests {
 
     #[test]
     fn durable_response_codec_round_trips_and_reads_legacy_rows() {
-        // [DURABLE-BLIND-RELAY-RESPONSE-CODEC 2026-08-25 by Codex] Protect
-        // both the storage-only frame and already-sealed public-Serde rows.
+        // [CHAT-PEER-DURABLE-ACK-BOUNDS 2026-08-31 by Codex] Keep current and
+        // every historical durable shape byte-compatible under bounded decode.
         let terminal = IdentityKeyPair::generate();
         let response_with_receipt = PeerBlindRelayResponse {
             accepted: true,
@@ -661,37 +740,111 @@ mod tests {
             .expect("encode versioned durable response");
         assert!(encoded.starts_with(DURABLE_RESPONSE_MAGIC));
         assert_eq!(
+            &encoded[DURABLE_RESPONSE_MAGIC.len()..],
+            bincode::serialize(&DurableBlindRelayResponseV3::from(&response_with_receipt))
+                .expect("encode historical v3 body")
+        );
+        assert_eq!(
             decode_durable_blind_relay_response(&encoded)
                 .expect("decode versioned durable response"),
-            response_with_receipt
+            response_with_receipt.clone()
         );
 
-        let legacy_with_receipt = bincode::serialize(&response_with_receipt)
-            .expect("encode legacy response with receipt");
+        let v1 = DurableBlindRelayResponseV1 {
+            version: LEGACY_DURABLE_RESPONSE_VERSION,
+            accepted: response_with_receipt.accepted,
+            terminal: response_with_receipt.terminal,
+            forwarded: response_with_receipt.forwarded,
+            ttl_remaining: response_with_receipt.ttl_remaining,
+            reason: response_with_receipt.reason.clone(),
+            delivery_receipt: response_with_receipt.delivery_receipt.clone(),
+            failure_receipt: None,
+        };
         assert_eq!(
-            decode_durable_blind_relay_response(&legacy_with_receipt)
-                .expect("decode legacy response with receipt"),
-            response_with_receipt
+            decode_durable_blind_relay_response(&versioned_fixture(
+                LEGACY_DURABLE_RESPONSE_MAGIC,
+                &v1,
+            ))
+            .expect("decode v1 durable response"),
+            response_with_receipt.clone()
         );
 
-        let legacy_without_receipts = PeerBlindRelayResponse {
+        let response_with_opaque = PeerBlindRelayResponse {
             accepted: true,
             terminal: true,
             forwarded: false,
-            ttl_remaining: 2,
-            reason: Some("terminal_next_hop".to_string()),
-            delivery_receipt: None,
+            ttl_remaining: 1,
+            reason: Some("onion_terminal_delivered".to_string()),
+            delivery_receipt: response_with_receipt.delivery_receipt.clone(),
             success_receipt: None,
             failure_receipt: None,
-            opaque_terminal_response_b64: None,
+            opaque_terminal_response_b64: Some("QUJDRA==".to_string()),
         };
-        let legacy_without_receipts = bincode::serialize(&legacy_without_receipts)
-            .expect("encode legacy response without receipts");
+        let v2 = DurableBlindRelayResponseV2 {
+            version: LEGACY_DURABLE_RESPONSE_V2_VERSION,
+            accepted: response_with_opaque.accepted,
+            terminal: response_with_opaque.terminal,
+            forwarded: response_with_opaque.forwarded,
+            ttl_remaining: response_with_opaque.ttl_remaining,
+            reason: response_with_opaque.reason.clone(),
+            delivery_receipt: response_with_opaque.delivery_receipt.clone(),
+            failure_receipt: None,
+            opaque_terminal_response_b64: response_with_opaque.opaque_terminal_response_b64.clone(),
+        };
         assert_eq!(
-            decode_durable_blind_relay_response(&legacy_without_receipts)
-                .expect("decode legacy response without receipts")
-                .reason
-                .as_deref(),
+            decode_durable_blind_relay_response(&versioned_fixture(
+                LEGACY_DURABLE_RESPONSE_V2_MAGIC,
+                &v2,
+            ))
+            .expect("decode v2 durable response"),
+            response_with_opaque.clone()
+        );
+
+        let legacy_with_opaque: LegacyResponseWithOpaqueReply = (
+            response_with_opaque.accepted,
+            response_with_opaque.terminal,
+            response_with_opaque.forwarded,
+            response_with_opaque.ttl_remaining,
+            response_with_opaque.reason.clone(),
+            response_with_opaque.delivery_receipt.clone(),
+            None,
+            response_with_opaque.opaque_terminal_response_b64.clone(),
+        );
+        assert_eq!(
+            decode_durable_blind_relay_response(
+                &bincode::serialize(&legacy_with_opaque).expect("encode opaque legacy response")
+            )
+            .expect("decode opaque legacy response"),
+            response_with_opaque
+        );
+
+        let legacy_with_delivery: LegacyResponseWithDelivery = (
+            response_with_receipt.accepted,
+            response_with_receipt.terminal,
+            response_with_receipt.forwarded,
+            response_with_receipt.ttl_remaining,
+            response_with_receipt.reason.clone(),
+            response_with_receipt.delivery_receipt.clone(),
+        );
+        assert_eq!(
+            decode_durable_blind_relay_response(
+                &bincode::serialize(&legacy_with_delivery)
+                    .expect("encode delivery legacy response")
+            )
+            .expect("decode delivery legacy response"),
+            response_with_receipt
+        );
+
+        let legacy_without_receipts: LegacyResponseWithoutReceipts =
+            (true, true, false, 2, Some("terminal_next_hop".to_string()));
+        assert_eq!(
+            decode_durable_blind_relay_response(
+                &bincode::serialize(&legacy_without_receipts)
+                    .expect("encode receipt-free legacy response")
+            )
+            .expect("decode receipt-free legacy response")
+            .reason
+            .as_deref(),
             Some("terminal_next_hop")
         );
     }
@@ -705,6 +858,115 @@ mod tests {
             decode_durable_blind_relay_response(&encoded),
             Err(BlindRelayReplayCodecError::UnsupportedVersion)
         );
+    }
+
+    #[test]
+    fn durable_response_codec_enforces_protocol_derived_size_bound() {
+        // [CHAT-PEER-DURABLE-ACK-BOUNDS 2026-08-31 by Codex] The maximum core
+        // opaque-response class fits below the ACK-derived durable ceiling.
+        let mut maximum_opaque_response = forwarded_response();
+        maximum_opaque_response.terminal = true;
+        maximum_opaque_response.forwarded = false;
+        maximum_opaque_response.reason = Some("onion_terminal_delivered".to_string());
+        maximum_opaque_response.opaque_terminal_response_b64 =
+            Some("A".repeat(aeronyx_core::protocol::MAX_ONION_SEALED_RESPONSE_BASE64_BYTES));
+        let encoded = encode_durable_blind_relay_response(&maximum_opaque_response)
+            .expect("maximum protocol-bounded opaque ACK must fit");
+        assert!(encoded.len() <= MAX_DURABLE_RESPONSE_BYTES);
+
+        let mut oversized_response = forwarded_response();
+        oversized_response.opaque_terminal_response_b64 =
+            Some("A".repeat(MAX_DURABLE_RESPONSE_BODY_BYTES));
+        assert_eq!(
+            encode_durable_blind_relay_response(&oversized_response),
+            Err(BlindRelayReplayCodecError::TooLarge)
+        );
+
+        assert_eq!(
+            decode_durable_blind_relay_response(&vec![0; MAX_DURABLE_RESPONSE_BODY_BYTES]),
+            Err(BlindRelayReplayCodecError::Decode)
+        );
+        assert_eq!(
+            decode_durable_blind_relay_response(&vec![0; MAX_DURABLE_RESPONSE_BODY_BYTES + 1]),
+            Err(BlindRelayReplayCodecError::TooLarge)
+        );
+        assert_eq!(
+            decode_durable_blind_relay_response(&vec![0; MAX_DURABLE_RESPONSE_BYTES + 1]),
+            Err(BlindRelayReplayCodecError::TooLarge)
+        );
+
+        let mut malicious_length = DURABLE_RESPONSE_MAGIC.to_vec();
+        malicious_length.extend_from_slice(&[DURABLE_RESPONSE_VERSION, 1, 1, 0, 1, 1]);
+        malicious_length.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(
+            decode_durable_blind_relay_response(&malicious_length),
+            Err(BlindRelayReplayCodecError::Decode)
+        );
+    }
+
+    #[test]
+    fn durable_response_codec_rejects_trailing_bytes_for_every_shape() {
+        let terminal = IdentityKeyPair::generate();
+        let delivery_receipt =
+            BlindRelayDeliveryReceipt::accepted([0xE1; 16], [0xE2; 32], 1_800_000_200, &terminal);
+        let v1 = DurableBlindRelayResponseV1 {
+            version: LEGACY_DURABLE_RESPONSE_VERSION,
+            accepted: true,
+            terminal: true,
+            forwarded: false,
+            ttl_remaining: 1,
+            reason: Some("onion_terminal_delivered".to_string()),
+            delivery_receipt: Some(delivery_receipt.clone()),
+            failure_receipt: None,
+        };
+        let v2 = DurableBlindRelayResponseV2 {
+            version: LEGACY_DURABLE_RESPONSE_V2_VERSION,
+            accepted: true,
+            terminal: true,
+            forwarded: false,
+            ttl_remaining: 1,
+            reason: Some("onion_terminal_delivered".to_string()),
+            delivery_receipt: Some(delivery_receipt.clone()),
+            failure_receipt: None,
+            opaque_terminal_response_b64: Some("QUJDRA==".to_string()),
+        };
+        let legacy_with_opaque: LegacyResponseWithOpaqueReply = (
+            true,
+            true,
+            false,
+            1,
+            Some("onion_terminal_delivered".to_string()),
+            Some(delivery_receipt.clone()),
+            None,
+            Some("QUJDRA==".to_string()),
+        );
+        let legacy_with_delivery: LegacyResponseWithDelivery = (
+            true,
+            true,
+            false,
+            1,
+            Some("onion_terminal_delivered".to_string()),
+            Some(delivery_receipt),
+        );
+        let legacy_without_receipts: LegacyResponseWithoutReceipts =
+            (true, true, false, 1, Some("terminal_next_hop".to_string()));
+        let fixtures = [
+            encode_durable_blind_relay_response(&forwarded_response()).expect("encode v3 fixture"),
+            versioned_fixture(LEGACY_DURABLE_RESPONSE_V2_MAGIC, &v2),
+            versioned_fixture(LEGACY_DURABLE_RESPONSE_MAGIC, &v1),
+            bincode::serialize(&legacy_with_opaque).expect("encode opaque legacy fixture"),
+            bincode::serialize(&legacy_with_delivery).expect("encode delivery legacy fixture"),
+            bincode::serialize(&legacy_without_receipts)
+                .expect("encode receipt-free legacy fixture"),
+        ];
+
+        for mut fixture in fixtures {
+            fixture.push(0);
+            assert_eq!(
+                decode_durable_blind_relay_response(&fixture),
+                Err(BlindRelayReplayCodecError::Decode)
+            );
+        }
     }
 
     #[test]
