@@ -1,9 +1,11 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.81.0-PendingCursorTestSeam
+// Version: 3.82.0-BlindRouteResponseSchemaV4
 //
 // Modification Reason:
+//   [BLIND-ROUTE-RESPONSE-SCHEMA-V4 2026-08-31 by Codex] Version the atomic
+//   SQLite CHECK rebuild that binds durable ciphertext to the crypto ceiling.
 //   [CHAT-PENDING-CURSOR-SEAM-DOMAIN 2026-08-28 by Codex] Moved the test-only
 //   v2 cursor decoder beside pending delivery so the composition root contains
 //   no operational inherent methods.
@@ -458,6 +460,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.82.0-BlindRouteResponseSchemaV4 - Versioned the bounded CHECK rebuild
 //   v3.81.0-PendingCursorTestSeam - Co-located test-only cursor decoding
 //   v3.80.0-BackupSupportBoundary - Extracted private backup support methods
 //   v3.79.0-BootstrapFacade - Extracted runtime and schema bootstrap boundary
@@ -585,15 +588,13 @@ use aeronyx_core::protocol::memchain::{
 
 use crate::config::ChatRelayConfig;
 #[cfg(test)]
-use crate::services::chat_relay_backup_audit_io::BACKUP_AUDIT_CHECKPOINT_TEMP_PREFIX
-    as CHAT_RELAY_BACKUP_AUDIT_CHECKPOINT_TEMP_PREFIX;
+use crate::services::chat_relay_backup_audit_io::BACKUP_AUDIT_CHECKPOINT_TEMP_PREFIX as CHAT_RELAY_BACKUP_AUDIT_CHECKPOINT_TEMP_PREFIX;
+#[cfg(test)]
+use crate::services::chat_relay_backup_audit_io::BACKUP_AUDIT_FILE_NAME as CHAT_RELAY_BACKUP_AUDIT_FILE_NAME;
 use crate::services::chat_relay_backup_audit_io::{
     BACKUP_AUDIT_MAX_BYTES as CHAT_RELAY_BACKUP_AUDIT_MAX_BYTES,
     BACKUP_AUDIT_MAX_SEGMENTS as CHAT_RELAY_BACKUP_AUDIT_MAX_SEGMENTS,
 };
-#[cfg(test)]
-use crate::services::chat_relay_backup_audit_io::BACKUP_AUDIT_FILE_NAME
-    as CHAT_RELAY_BACKUP_AUDIT_FILE_NAME;
 #[cfg(test)]
 use crate::services::chat_relay_backup_audit_rotation::ChatRelayBackupAuditSegmentRange;
 pub use crate::services::chat_relay_backup_audit_verification::ChatRelayBackupAuditVerificationReceipt;
@@ -603,11 +604,12 @@ pub use crate::services::chat_relay_backup_contract::{
     ChatRelayRestoreReadinessReceipt, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
 };
 pub(crate) use crate::services::chat_relay_blind_route::BlindRelayRouteAdmission;
-use crate::services::chat_relay_blind_route_coordinator::BlindRouteCoordinator;
 #[cfg(test)]
-use crate::services::chat_relay_blind_route::RESPONSE_NONCE_BYTES
-    as BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES;
+use crate::services::chat_relay_blind_route::RESPONSE_NONCE_BYTES as BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES;
+use crate::services::chat_relay_blind_route_coordinator::BlindRouteCoordinator;
 use crate::services::chat_relay_blob_custody::EncryptedBlobCustodyDomain;
+#[cfg(test)]
+use crate::services::chat_relay_cleanup::CLEANUP_MESSAGE_BATCH_SIZE;
 use crate::services::chat_relay_cleanup_execution::BoundedRelayCleanupExecutor;
 pub use crate::services::chat_relay_custody_anchor_guard::ChatRelayCustodyAuditAnchorGuard;
 pub(crate) use crate::services::chat_relay_direct_peer_circuit::ChatRelayDirectPeerPermit;
@@ -616,25 +618,23 @@ use crate::services::chat_relay_direct_peer_circuit::DirectPeerCircuitDomain;
 use crate::services::chat_relay_direct_peer_circuit::{
     DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION, DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE,
 };
-#[cfg(test)]
-use crate::services::chat_relay_cleanup::CLEANUP_MESSAGE_BATCH_SIZE;
 pub use crate::services::chat_relay_expired_contract::ExpiredNotification;
 pub(crate) use crate::services::chat_relay_expired_contract::{
     MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION, MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES,
 };
 use crate::services::chat_relay_expired_delivery::ExpiredNotificationDelivery;
-use crate::services::chat_relay_message_dedup::BoundedOnlineMessageDedup as MessageDedup;
-pub use crate::services::chat_relay_node_secret::derive_node_secret;
 pub use crate::services::chat_relay_maintenance_telemetry::ChatRelayMaintenanceStatus;
 use crate::services::chat_relay_maintenance_telemetry::RelayMaintenanceTelemetry;
+use crate::services::chat_relay_message_dedup::BoundedOnlineMessageDedup as MessageDedup;
+pub use crate::services::chat_relay_node_secret::derive_node_secret;
 use crate::services::chat_relay_peer_telemetry::PeerRelayTelemetryDomain;
 pub(crate) use crate::services::chat_relay_peer_telemetry::{
     ChatRelayInboundFailureReason, ChatRelayOutboundFailureReason, VerifiedSubmitRecoveryOutcome,
 };
+pub use crate::services::chat_relay_pending_contract::{PendingMessage, PendingMessagePageV2};
 #[cfg(test)]
 use crate::services::chat_relay_pending_custody::allocate_queue_sequence;
 use crate::services::chat_relay_pending_custody::PendingMessageCustodyDomain;
-pub use crate::services::chat_relay_pending_contract::{PendingMessage, PendingMessagePageV2};
 use crate::services::chat_relay_pending_delivery::PendingMessageDeliveryDomain;
 #[cfg(test)]
 use crate::services::chat_relay_pull_cursor::ENCODED_CURSOR_BYTES as CHAT_PULL_CURSOR_V2_BYTES;
@@ -645,17 +645,17 @@ use crate::services::chat_relay_quarantine::{
     QUARANTINE_SOURCE_PENDING_MESSAGE,
 };
 pub use crate::services::chat_relay_restore_plan::ChatRelayRestorePlanReceipt;
+use crate::services::chat_relay_restore_plan::RESTORE_PLAN_VALIDITY_SECS;
 #[cfg(test)]
 use crate::services::chat_relay_restore_plan::{RESTORE_PLAN_NONCE_BYTES, RESTORE_PLAN_VERSION};
-use crate::services::chat_relay_restore_plan::RESTORE_PLAN_VALIDITY_SECS;
 #[cfg(unix)]
 use crate::services::chat_relay_runtime_fence::ChatRelayRuntimeFence;
+pub use crate::services::chat_relay_storage_usage::ChatRelayStorageUsage;
+use crate::services::chat_relay_storage_usage::SqliteRelayStorageUsageRepository;
 pub(crate) use crate::services::chat_relay_verified_submit::{
     VerifiedSubmitAdmission, VerifiedSubmitCacheLookup,
 };
 use crate::services::chat_relay_verified_submit_coordinator::VerifiedSubmitCoordinator;
-pub use crate::services::chat_relay_storage_usage::ChatRelayStorageUsage;
-use crate::services::chat_relay_storage_usage::SqliteRelayStorageUsageRepository;
 use crate::services::wallet_routes::WalletRouteCache;
 
 // ============================================
@@ -676,7 +676,8 @@ const VERIFIED_SUBMIT_RESPONSE_TTL_SECS: u64 = TIMESTAMP_WINDOW_SECS * 2 + 1;
 pub(crate) const BLIND_RELAY_ROUTE_REPLAY_CAPACITY: usize = 8192;
 /// Route evidence outlives the signed envelope acceptance window by one second.
 pub(crate) const BLIND_RELAY_ROUTE_REPLAY_TTL_SECS: u64 = 10 * 60;
-const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION: i64 = 3;
+const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION: i64 = 4;
+const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION: i64 = 3;
 const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION: i64 = 2;
 const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION: i64 = 1;
 const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE: &str = "blind_relay_route_replay";
@@ -684,11 +685,9 @@ const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE: &str = "blind_relay_route_replay"
 const REPLAY_PROCESS_EPOCH_BYTES: usize = 16;
 const REPLAY_OWNER_TAKEOVER_GRACE_SECS: u64 = 5;
 /// Grace period before a replacement process may recover verified entry custody.
-pub(crate) const VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS: u64 =
-    REPLAY_OWNER_TAKEOVER_GRACE_SECS;
+pub(crate) const VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS: u64 = REPLAY_OWNER_TAKEOVER_GRACE_SECS;
 /// Grace period before another process may own and reconcile an exact claim.
-pub(crate) const BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS: u64 =
-    REPLAY_OWNER_TAKEOVER_GRACE_SECS;
+pub(crate) const BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS: u64 = REPLAY_OWNER_TAKEOVER_GRACE_SECS;
 /// Minimum SQLite synchronous level permitted for acknowledged relay custody.
 const CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL: i64 = 2;
 /// Pages copied per online-backup step before SQLite releases its read lock.
@@ -725,9 +724,9 @@ const CHAT_RELAY_BACKUP_AUDIT_TOTAL_MAX_BYTES: u64 =
 
 pub use crate::services::chat_relay_status::{
     ChatRelayBlindRouteRecoveryStatus, ChatRelayCustodyDurabilityStatus,
-    ChatRelayDirectPeerCircuitStatus, ChatRelayDirectPeerRetryStatus,
-    ChatRelayDirectPeerSloStatus, ChatRelayOutboundRouteStatus, ChatRelayPeerStatus,
-    ChatRelayVerifiedSubmitRecoveryStatus, ChatRelayVerifiedSubmitStatus,
+    ChatRelayDirectPeerCircuitStatus, ChatRelayDirectPeerRetryStatus, ChatRelayDirectPeerSloStatus,
+    ChatRelayOutboundRouteStatus, ChatRelayPeerStatus, ChatRelayVerifiedSubmitRecoveryStatus,
+    ChatRelayVerifiedSubmitStatus,
 };
 #[cfg(test)]
 use crate::services::chat_relay_status::{

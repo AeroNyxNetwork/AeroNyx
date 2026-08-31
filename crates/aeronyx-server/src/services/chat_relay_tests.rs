@@ -1,13 +1,15 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_tests.rs
 // ============================================
-// Version: 1.4.0-ExplicitExtractedDomainDependencies
+// Version: 1.5.0-BlindRouteResponseSchemaV4
 //
 // Creation Reason:
 //   [CHAT-RELAY-TEST-MODULE-SPLIT 2026-08-27 by Codex] Move the complete
 //   `chat_relay` in-crate test module out of the production implementation.
 //
 // Modification Reason:
+//   [BLIND-ROUTE-RESPONSE-SCHEMA-V4 2026-08-31 by Codex] Pins shared-ceiling
+//   DDL, byte-preserving v3 migration, rollback, retry, and writer locking.
 //   [CHAT-RELAY-TEST-IMPORTS 2026-08-31 by Codex] Imports the cursor value and
 //   dedup capability from their extracted owner modules explicitly.
 //   [CHAT-RELAY-CLEANUP-EXECUTION-DOMAIN 2026-08-28 by Codex] Declared the
@@ -41,6 +43,7 @@
 //   - New relay tests belong here or in a focused extracted domain module.
 //
 // Last Modified:
+//   v1.5.0-BlindRouteResponseSchemaV4 - Covered bounded atomic CHECK migration
 //   v1.4.0-ExplicitExtractedDomainDependencies - Restored test compilation
 //   v1.3.0-ExplicitTransactionDependency - Removed parent-import coupling
 //   v1.2.0-ExplicitCollectionDependency - Removed parent-import coupling
@@ -49,8 +52,13 @@
 // ============================================
 
 use super::*;
+use crate::services::chat_relay_blind_route::MAX_PROTECTED_BLIND_ROUTE_RESPONSE_BYTES;
 use crate::services::chat_relay_message_dedup::OnlineMessageDeduplication;
 use crate::services::chat_relay_pull_cursor::PullCursorV2;
+use crate::services::chat_relay_replay_schema::{
+    ChatRelayReplaySchemaMigration, ReplaySchemaContract, ReplaySchemaVersion,
+    SqliteChatRelayReplaySchemaMigrator,
+};
 use aeronyx_common::types::SessionId;
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::chat::ChatContentType;
@@ -60,6 +68,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Barrier;
+use std::time::Duration;
 
 fn test_config() -> ChatRelayConfig {
     ChatRelayConfig {
@@ -92,6 +101,60 @@ fn make_service() -> ChatRelayService {
 fn make_service_with_config(config: ChatRelayConfig) -> ChatRelayService {
     let secret = derive_node_secret(&[0x42u8; 32]);
     ChatRelayService::new(config, secret).expect("init")
+}
+
+fn test_replay_schema_migrator(blind_route_capacity: usize) -> SqliteChatRelayReplaySchemaMigrator {
+    SqliteChatRelayReplaySchemaMigrator::new(ReplaySchemaContract::new(
+        ReplaySchemaVersion::new(
+            VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
+            VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION,
+            VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION,
+            VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
+            VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
+        ),
+        ReplaySchemaVersion::new(
+            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
+            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION,
+            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION,
+            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION,
+            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION,
+        ),
+        VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
+        BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
+        REPLAY_PROCESS_EPOCH_BYTES,
+        blind_route_capacity,
+    ))
+}
+
+fn replace_blind_route_response_table_with_v3(connection: &Connection) {
+    // Test-only fixture for the exact production v3 CHECK that P4 replaces.
+    connection
+        .execute_batch(
+            "DROP TABLE relay_blind_route_responses;
+             CREATE TABLE relay_blind_route_responses (
+                cache_key           BLOB    PRIMARY KEY CHECK(LENGTH(cache_key) = 32),
+                request_fingerprint BLOB    NOT NULL CHECK(LENGTH(request_fingerprint) = 32),
+                response_nonce      BLOB    NOT NULL CHECK(LENGTH(response_nonce) = 24),
+                response_ciphertext BLOB    NOT NULL CHECK(
+                    LENGTH(response_ciphertext) > 16
+                    AND LENGTH(response_ciphertext) <= 2064
+                ),
+                completed_at        INTEGER NOT NULL CHECK(completed_at >= 0)
+             );
+             CREATE INDEX idx_blind_route_response_retention
+                ON relay_blind_route_responses(completed_at);",
+        )
+        .expect("replace response table with v3 fixture");
+    connection
+        .execute(
+            "UPDATE relay_schema_features SET schema_version = ?1
+             WHERE feature = ?2",
+            params![
+                BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION,
+                BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
+            ],
+        )
+        .expect("mark blind-route response fixture as v3");
 }
 
 fn complete_direct_peer_test_delivery(
@@ -2973,6 +3036,472 @@ fn blind_route_release_only_removes_owned_unarmed_claim() {
 }
 
 #[test]
+fn blind_route_schema_v4_fresh_check_uses_shared_crypto_ceiling() {
+    // [BLIND-ROUTE-RESPONSE-SCHEMA-V4 2026-08-31 by Codex] Prove the active
+    // SQLite CHECK accepts the shared maximum and rejects the next byte and
+    // non-BLOB storage without duplicating the ceiling in this fixture.
+    let service = make_service();
+    let connection = service.conn.lock();
+    let schema_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'relay_blind_route_responses'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read fresh blind-route response schema");
+    assert!(schema_sql.contains(&format!(
+        "LENGTH(response_ciphertext) <= {MAX_PROTECTED_BLIND_ROUTE_RESPONSE_BYTES}"
+    )));
+    assert!(schema_sql.contains("TYPEOF(response_ciphertext) = 'blob'"));
+
+    connection
+        .execute(
+            "INSERT INTO relay_blind_route_responses (
+                cache_key, request_fingerprint, response_nonce,
+                response_ciphertext, completed_at
+             ) VALUES (zeroblob(32), zeroblob(32), zeroblob(24), zeroblob(?1), 1)",
+            params![i64::try_from(MAX_PROTECTED_BLIND_ROUTE_RESPONSE_BYTES)
+                .expect("shared response ceiling fits SQLite")],
+        )
+        .expect("accept exact shared ciphertext ceiling");
+    connection
+        .execute("DELETE FROM relay_blind_route_responses", [])
+        .expect("remove boundary fixture");
+    assert!(connection
+        .execute(
+            "INSERT INTO relay_blind_route_responses (
+                cache_key, request_fingerprint, response_nonce,
+                response_ciphertext, completed_at
+             ) VALUES (zeroblob(32), zeroblob(32), zeroblob(24), zeroblob(?1), 1)",
+            params![i64::try_from(MAX_PROTECTED_BLIND_ROUTE_RESPONSE_BYTES + 1)
+                .expect("oversized response fixture fits SQLite")],
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            "INSERT INTO relay_blind_route_responses (
+                cache_key, request_fingerprint, response_nonce,
+                response_ciphertext, completed_at
+             ) VALUES (zeroblob(32), zeroblob(32), ?1, zeroblob(17), 1)",
+            params!["N".repeat(BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES)],
+        )
+        .is_err());
+}
+
+#[test]
+fn blind_route_schema_v3_migrates_bytes_and_owner_state_idempotently() {
+    let db_path = unique_test_db_path("blind-route-v3-response-migration");
+    let mut config = test_config();
+    config.db_path = db_path.to_string_lossy().into_owned();
+    let secret = [0x91; 32];
+    let route_id = [0x92; 16];
+    let request_commitment = [0x93; 32];
+    let cache_key = [0x94; 32];
+    let request_fingerprint = [0x95; 32];
+    let nonce = vec![0x96; BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES];
+    let ciphertext = vec![0x97; 2064];
+    let completed_at = now_secs();
+    let reservation_before;
+
+    {
+        let service = ChatRelayService::new(config.clone(), secret)
+            .expect("install blind-route response schema v4 fixture");
+        assert_eq!(
+            service
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .expect("seed v3 owner-fenced reservation"),
+            BlindRelayRouteAdmission::Reserved
+        );
+        let connection = service.conn.lock();
+        reservation_before = connection
+            .query_row(
+                "SELECT owner_epoch, owner_acquired_at, effect_started_at
+                 FROM relay_blind_route_reservations",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .expect("snapshot v3 reservation state");
+        replace_blind_route_response_table_with_v3(&connection);
+        connection
+            .execute(
+                "INSERT INTO relay_blind_route_responses (
+                    cache_key, request_fingerprint, response_nonce,
+                    response_ciphertext, completed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    cache_key.as_slice(),
+                    request_fingerprint.as_slice(),
+                    nonce.as_slice(),
+                    ciphertext.as_slice(),
+                    i64::try_from(completed_at).expect("completion time fits SQLite"),
+                ],
+            )
+            .expect("seed maximum v3 response");
+    }
+
+    let migrated = ChatRelayService::new(config.clone(), secret)
+        .expect("atomically migrate blind-route response v3 to v4");
+    let connection = migrated.conn.lock();
+    let migrated_row = connection
+        .query_row(
+            "SELECT cache_key, request_fingerprint, response_nonce,
+                    response_ciphertext, completed_at
+             FROM relay_blind_route_responses",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .expect("read migrated response bytes");
+    assert_eq!(migrated_row.0, cache_key);
+    assert_eq!(migrated_row.1, request_fingerprint);
+    assert_eq!(migrated_row.2, nonce);
+    assert_eq!(migrated_row.3, ciphertext);
+    assert_eq!(migrated_row.4, completed_at as i64);
+    let reservation_after = connection
+        .query_row(
+            "SELECT owner_epoch, owner_acquired_at, effect_started_at
+             FROM relay_blind_route_reservations",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .expect("read preserved v3 reservation state");
+    assert_eq!(reservation_after, reservation_before);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT schema_version FROM relay_schema_features WHERE feature = ?1",
+                params![BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read migrated marker"),
+        BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_blind_route_response_retention'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("verify migrated retention index"),
+        1
+    );
+    drop(connection);
+    drop(migrated);
+
+    let reopened = ChatRelayService::new(config, secret).expect("repeat v4 migration idempotently");
+    assert_eq!(
+        reopened
+            .conn
+            .lock()
+            .query_row(
+                "SELECT response_ciphertext FROM relay_blind_route_responses",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .expect("read response after idempotent reopen"),
+        ciphertext
+    );
+    drop(reopened);
+    remove_test_database(&db_path);
+}
+
+#[test]
+fn blind_route_schema_v4_marker_failure_rolls_back_and_retries() {
+    let db_path = unique_test_db_path("blind-route-v4-marker-rollback");
+    let mut config = test_config();
+    config.db_path = db_path.to_string_lossy().into_owned();
+    let secret = [0xA1; 32];
+    {
+        let service =
+            ChatRelayService::new(config.clone(), secret).expect("install rollback fixture schema");
+        let connection = service.conn.lock();
+        replace_blind_route_response_table_with_v3(&connection);
+        connection
+            .execute(
+                "INSERT INTO relay_blind_route_responses VALUES (
+                    zeroblob(32), zeroblob(32), zeroblob(24), zeroblob(17), ?1
+                 )",
+                params![i64::try_from(now_secs()).expect("test time fits SQLite")],
+            )
+            .expect("seed rollback response");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_blind_route_v4_marker
+                 BEFORE UPDATE OF schema_version ON relay_schema_features
+                 WHEN OLD.feature = 'blind_relay_route_replay'
+                 BEGIN
+                    SELECT RAISE(ABORT, 'test marker failure');
+                 END;",
+            )
+            .expect("install deterministic marker failure");
+    }
+
+    assert!(matches!(
+        ChatRelayService::new(config.clone(), secret),
+        Err(ChatRelayError::Sqlite(_))
+    ));
+    let connection = Connection::open(&db_path).expect("open rolled-back v3 database");
+    let (version, response_count, candidate_exists, schema_sql) = connection
+        .query_row(
+            "SELECT
+                (SELECT schema_version FROM relay_schema_features WHERE feature = ?1),
+                (SELECT COUNT(*) FROM relay_blind_route_responses),
+                EXISTS(SELECT 1 FROM sqlite_master
+                       WHERE type = 'table' AND name = 'relay_blind_route_responses_v4'),
+                (SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'relay_blind_route_responses')",
+            params![BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .expect("inspect rolled-back migration");
+    assert_eq!(version, BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION);
+    assert_eq!(response_count, 1);
+    assert_eq!(candidate_exists, 0);
+    assert!(schema_sql.contains("LENGTH(response_ciphertext) <= 2064"));
+    connection
+        .execute("DROP TRIGGER fail_blind_route_v4_marker", [])
+        .expect("remove deterministic marker failure");
+    drop(connection);
+
+    let retried = ChatRelayService::new(config, secret).expect("retry rolled-back v4 migration");
+    assert_eq!(
+        retried
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM relay_blind_route_responses",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .expect("count response after retry"),
+        1
+    );
+    drop(retried);
+    remove_test_database(&db_path);
+}
+
+#[test]
+fn blind_route_schema_v4_unknown_version_and_candidate_fail_closed() {
+    for (label, prepare, expected_field) in [
+        (
+            "unknown-version",
+            "UPDATE relay_schema_features SET schema_version = 99
+             WHERE feature = 'blind_relay_route_replay'",
+            "blind_relay_route_replay_installation_version",
+        ),
+        (
+            "candidate-residue",
+            "CREATE TABLE relay_blind_route_responses_v4 (unexpected INTEGER)",
+            "blind_relay_route_response_migration_candidate",
+        ),
+    ] {
+        let db_path = unique_test_db_path(label);
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        let secret = [0xB1; 32];
+        drop(
+            ChatRelayService::new(config.clone(), secret)
+                .expect("install fail-closed fixture schema"),
+        );
+        Connection::open(&db_path)
+            .expect("open fail-closed fixture")
+            .execute_batch(prepare)
+            .expect("prepare fail-closed schema state");
+
+        assert!(matches!(
+            ChatRelayService::new(config, secret),
+            Err(ChatRelayError::CorruptStoredData { field }) if field == expected_field
+        ));
+        remove_test_database(&db_path);
+    }
+}
+
+#[test]
+fn blind_route_schema_v3_binary_contract_rejects_committed_v4() {
+    // [BLIND-ROUTE-RESPONSE-SCHEMA-V4 2026-08-31 by Codex] A downgraded
+    // binary must not reinterpret the widened CHECK as v3.
+    let service = make_service();
+    let mut connection = service.conn.lock();
+    let v3_migrator = SqliteChatRelayReplaySchemaMigrator::new(ReplaySchemaContract::new(
+        ReplaySchemaVersion::new(
+            VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
+            VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION,
+            VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION,
+            VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
+            VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
+        ),
+        ReplaySchemaVersion::new(
+            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
+            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION,
+            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION,
+            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION,
+            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION,
+        ),
+        VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
+        BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
+        REPLAY_PROCESS_EPOCH_BYTES,
+        BLIND_RELAY_ROUTE_REPLAY_CAPACITY,
+    ));
+    assert!(matches!(
+        v3_migrator.migrate_blind_route(&mut connection, now_secs()),
+        Err(ChatRelayError::CorruptStoredData {
+            field: "blind_relay_route_replay_installation_version"
+        })
+    ));
+}
+
+#[test]
+fn blind_route_schema_v3_polluted_row_rolls_back_without_candidate() {
+    let db_path = unique_test_db_path("blind-route-v3-polluted-row");
+    let mut config = test_config();
+    config.db_path = db_path.to_string_lossy().into_owned();
+    let secret = [0xC1; 32];
+    {
+        let service = ChatRelayService::new(config.clone(), secret)
+            .expect("install polluted-row fixture schema");
+        let connection = service.conn.lock();
+        replace_blind_route_response_table_with_v3(&connection);
+        connection
+            .execute(
+                "INSERT INTO relay_blind_route_responses VALUES (
+                    zeroblob(32), zeroblob(32), ?1, zeroblob(17), ?2
+                 )",
+                params![
+                    "N".repeat(BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES),
+                    i64::try_from(now_secs()).expect("test time fits SQLite"),
+                ],
+            )
+            .expect("seed non-BLOB v3 nonce");
+    }
+
+    assert!(matches!(
+        ChatRelayService::new(config.clone(), secret),
+        Err(ChatRelayError::CorruptStoredData {
+            field: "blind_relay_route_replay_row_shape"
+        })
+    ));
+    let connection = Connection::open(&db_path).expect("inspect polluted v3 database");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT schema_version FROM relay_schema_features WHERE feature = ?1",
+                params![BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read unchanged v3 marker"),
+        BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'relay_blind_route_responses_v4')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("inspect absent migration candidate"),
+        0
+    );
+    drop(connection);
+    remove_test_database(&db_path);
+}
+
+#[test]
+fn blind_route_schema_v4_capacity_is_checked_before_activation() {
+    let service = make_service();
+    let mut connection = service.conn.lock();
+    connection
+        .execute_batch(
+            "INSERT INTO relay_blind_route_responses VALUES (
+                zeroblob(32), zeroblob(32), zeroblob(24), zeroblob(17), 1
+             );
+             INSERT INTO relay_blind_route_responses VALUES (
+                CAST('11111111111111111111111111111111' AS BLOB),
+                zeroblob(32), zeroblob(24), zeroblob(17), 1
+             );",
+        )
+        .expect("seed responses above test capacity");
+    assert!(matches!(
+        test_replay_schema_migrator(1).migrate_blind_route(&mut connection, now_secs()),
+        Err(ChatRelayError::CorruptStoredData {
+            field: "blind_relay_route_replay_capacity"
+        })
+    ));
+}
+
+#[test]
+fn blind_route_schema_v3_writer_contention_fails_then_retries() {
+    let db_path = unique_test_db_path("blind-route-v3-writer-contention");
+    let mut config = test_config();
+    config.db_path = db_path.to_string_lossy().into_owned();
+    let secret = [0xD1; 32];
+    {
+        let service = ChatRelayService::new(config, secret)
+            .expect("install writer-contention fixture schema");
+        replace_blind_route_response_table_with_v3(&service.conn.lock());
+    }
+    let mut blocker = Connection::open(&db_path).expect("open blocking writer");
+    let blocking_tx = blocker
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("acquire blocking writer transaction");
+    let mut contender = Connection::open(&db_path).expect("open migration contender");
+    contender
+        .busy_timeout(Duration::ZERO)
+        .expect("disable contender wait");
+    assert!(matches!(
+        test_replay_schema_migrator(BLIND_RELAY_ROUTE_REPLAY_CAPACITY)
+            .migrate_blind_route(&mut contender, now_secs()),
+        Err(ChatRelayError::Sqlite(_))
+    ));
+    blocking_tx.rollback().expect("release blocking writer");
+    test_replay_schema_migrator(BLIND_RELAY_ROUTE_REPLAY_CAPACITY)
+        .migrate_blind_route(&mut contender, now_secs())
+        .expect("retry migration after writer release");
+    assert_eq!(
+        contender
+            .query_row(
+                "SELECT schema_version FROM relay_schema_features WHERE feature = ?1",
+                params![BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read retried v4 marker"),
+        BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION
+    );
+    drop(blocker);
+    drop(contender);
+    remove_test_database(&db_path);
+}
+
+#[test]
 fn blind_route_schema_v1_migrates_claims_as_armed() {
     // [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Version 1 did
     // not persist an effect boundary. Migration must classify every legacy
@@ -3023,7 +3552,7 @@ fn blind_route_schema_v1_migrates_claims_as_armed() {
     }
 
     let migrated =
-        ChatRelayService::new(config, secret).expect("migrate blind-route replay schema v1 to v3");
+        ChatRelayService::new(config, secret).expect("migrate blind-route replay schema v1 to v4");
     let (version, owner_epoch, reserved_at, owner_acquired_at, effect_started_at) = migrated
         .conn
         .lock()
@@ -3067,18 +3596,25 @@ fn blind_route_schema_v3_missing_claim_column_fails_closed() {
     let mut config = test_config();
     config.db_path = db_path.to_string_lossy().into_owned();
     let secret = [0xA1; 32];
-    drop(
-        ChatRelayService::new(config.clone(), secret)
-            .expect("install blind-route replay schema v3"),
-    );
-    Connection::open(&db_path)
-        .expect("open blind-route replay database")
+    drop(ChatRelayService::new(config.clone(), secret).expect("install blind-route schema v4"));
+    let connection = Connection::open(&db_path).expect("open blind-route replay database");
+    connection
+        .execute(
+            "UPDATE relay_schema_features SET schema_version = ?1 WHERE feature = ?2",
+            params![
+                BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION,
+                BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
+            ],
+        )
+        .expect("mark fixture as v3");
+    connection
         .execute(
             "ALTER TABLE relay_blind_route_reservations
              DROP COLUMN effect_started_at",
             [],
         )
         .expect("remove required v3 claim column");
+    drop(connection);
 
     assert!(matches!(
         ChatRelayService::new(config, secret),
@@ -3129,7 +3665,7 @@ fn blind_route_schema_v2_preserves_explicit_unarmed_state() {
     }
 
     let migrated = ChatRelayService::new(config.clone(), secret)
-        .expect("migrate blind-route replay schema v2 to v3");
+        .expect("migrate blind-route replay schema v2 to v4");
     let (version, reserved_at, owner_acquired_at, effect_started_at) = migrated
         .conn
         .lock()

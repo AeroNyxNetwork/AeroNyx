@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_bootstrap.rs
 // ============================================
-// Version: 1.0.0-RelayBootstrap
+// Version: 1.1.0-BlindRouteResponseSchemaV4
 //
 // Creation Reason:
 //   [CHAT-BOOTSTRAP-FACADE-DOMAIN 2026-08-28 by Codex] Move fail-closed
@@ -13,6 +13,7 @@
 //   - Verifies SQLite integrity and minimum acknowledgement durability.
 //   - Composes the relay's narrowly scoped domain capabilities.
 //   - Migrates schemas, reconciles counters, and restores restart state.
+//   - Supplies explicit replay history and capacity to schema migration.
 //
 // Dependencies:
 //   - Parent `chat_relay.rs` owns constants, fields, and stable public paths.
@@ -32,6 +33,8 @@
 //   - New durable domains must install and reconcile before service exposure.
 //
 // Last Modified:
+//   [BLIND-ROUTE-RESPONSE-SCHEMA-V4 2026-08-31 by Codex]
+//   v1.1.0-BlindRouteResponseSchemaV4 - Bound v1-v4 migration composition
 //   v1.0.0-RelayBootstrap - Initial runtime and schema bootstrap extraction
 // ============================================
 
@@ -72,12 +75,12 @@ use super::{
     RelayMaintenanceTelemetry, SqliteRelayStorageUsageRepository, VerifiedSubmitCoordinator,
     WalletRouteCache, BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS, BLIND_RELAY_ROUTE_REPLAY_CAPACITY,
     BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE, BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION,
-    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION, BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION,
-    BLIND_RELAY_ROUTE_REPLAY_TTL_SECS, CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL,
-    REPLAY_PROCESS_EPOCH_BYTES, VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS,
-    VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE, VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION,
-    VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION, VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
-    VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
+    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION, BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION,
+    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION, BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
+    CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL, REPLAY_PROCESS_EPOCH_BYTES,
+    VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS, VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
+    VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION, VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION,
+    VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION, VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
 };
 
 impl ChatRelayService {
@@ -210,16 +213,19 @@ impl ChatRelayService {
                 VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION,
                 VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION,
                 VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
+                VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
             ),
             ReplaySchemaVersion::new(
                 BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
                 BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION,
                 BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION,
+                BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION,
                 BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION,
             ),
             VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
             BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
             REPLAY_PROCESS_EPOCH_BYTES,
+            BLIND_RELAY_ROUTE_REPLAY_CAPACITY,
         ));
         replay_schema.migrate_verified_submit(&mut conn, now_secs())?;
         replay_schema.migrate_blind_route(&mut conn, now_secs())?;
