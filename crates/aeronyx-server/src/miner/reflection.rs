@@ -84,8 +84,11 @@
 //!   periodic reconciliation remains the authoritative recovery path.
 //! v2.8.59-AuthorityScheduledPacking - Stop obsolete coordinators before record
 //!   selection while retaining atomic storage enforcement as final authority.
+//! v2.8.60-MinerOwnerContext - Separated tenant storage ownership from node
+//!   cryptographic identity for SaaS cognitive mining.
 //!
 //! ## Last Modified
+//! v2.8.60-MinerOwnerContext - Bound tenant-scoped miner state to the scheduler owner.
 //! v2.8.59-AuthorityScheduledPacking - Enforced next-height authority before packing.
 //! v2.7.22-EventDrivenCheckpoint - Added local commitment-tip notification.
 //! v2.7.21-TrustedDivergenceHalt - Honor the storage production safety latch.
@@ -222,12 +225,59 @@ const SUPERNODE_MAX_RETRIES: i64 = 3;
 // ReflectionMiner
 // ============================================
 
+/// Typed ownership boundary for miner persistence and vector partitions.
+///
+/// The node identity remains the only source of private-key operations. This
+/// context carries no secret material and must never be used for signing or
+/// raw-log key derivation.
+// [MINER-OWNER-CONTEXT 2026-08-31 by Codex] Keep tenant persistence ownership
+// structurally separate from the node's cryptographic identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MinerOwnerContext {
+    storage_owner: [u8; 32],
+}
+
+impl MinerOwnerContext {
+    fn local(node_identity: &IdentityKeyPair) -> Self {
+        Self {
+            storage_owner: node_identity.public_key_bytes(),
+        }
+    }
+
+    pub(crate) const fn for_storage_owner(storage_owner: [u8; 32]) -> Self {
+        Self { storage_owner }
+    }
+
+    const fn storage_owner(&self) -> [u8; 32] {
+        self.storage_owner
+    }
+
+    fn node_can_sign_owner_records(&self, node_identity: &IdentityKeyPair) -> bool {
+        self.storage_owner == node_identity.public_key_bytes()
+    }
+}
+
+/// Retryable reason why a miner tick could not complete all requested work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MinerTickSkipReason {
+    TenantRecordSignatureUnavailable,
+}
+
+/// Internal detailed result used by the SaaS scheduler for truthful quota
+/// accounting. The public `run_one_tick()` compatibility wrapper is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MinerTickOutcome {
+    Completed,
+    RetryableSkip(MinerTickSkipReason),
+}
+
 pub struct ReflectionMiner {
     interval: Duration,
     compaction_threshold: u64,
     storage: Arc<MemoryStorage>,
     vector_index: Arc<VectorIndex>,
-    identity: IdentityKeyPair,
+    node_identity: IdentityKeyPair,
+    owner_context: MinerOwnerContext,
     mempool: Arc<MemPool>,
     aof_writer: Arc<TokioMutex<AofWriter>>,
     sessions: Arc<SessionManager>,
@@ -254,12 +304,14 @@ impl ReflectionMiner {
         sessions: Arc<SessionManager>,
         udp: Arc<UdpTransport>,
     ) -> Self {
+        let owner_context = MinerOwnerContext::local(&identity);
         Self {
             interval: Duration::from_secs(interval_secs),
             compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
             storage,
             vector_index,
-            identity,
+            node_identity: identity,
+            owner_context,
             mempool,
             aof_writer,
             sessions,
@@ -272,6 +324,14 @@ impl ReflectionMiner {
             commitment_coordinator_enabled: false,
             commitment_tip_notifier: None,
         }
+    }
+
+    /// Overrides only tenant-scoped persistence and vector ownership.
+    /// Cryptographic operations continue to use the node identity.
+    #[must_use]
+    pub(crate) const fn with_owner_context(mut self, owner_context: MinerOwnerContext) -> Self {
+        self.owner_context = owner_context;
+        self
     }
 
     #[must_use]
@@ -344,32 +404,27 @@ impl ReflectionMiner {
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => { info!("[MINER] Shutdown"); break; }
-                _ = timer.tick() => {
-                    self.step_0_positive_feedback().await;
-                    self.step_05_backfill_embeddings().await;
-                    self.step_06_correction_chaining().await;
-                    self.pack_commitment_blocks(RECORD_COMMITMENT_BLOCKS_PER_TICK).await;
-                    self.step_1_5_legacy_compaction().await;
-
-                    if self.ner_engine.is_some() {
-                        self.step_7_entity_extraction().await;
-                        self.step_8_community_detection().await;
-                        self.step_9_recursive_merge().await;
-                        self.step_10_session_summary().await;
-                        self.step_11_episode_ingestion().await;
-                    }
-                }
+                _ = timer.tick() => self.run_one_tick().await,
             }
         }
     }
 
+    /// Compatibility entry point for local-mode callers.
     pub async fn run_one_tick(&self) {
+        if let MinerTickOutcome::RetryableSkip(reason) = self.run_one_tick_with_outcome().await {
+            warn!(?reason, "[MINER] Tick requires retry");
+        }
+    }
+
+    /// Detailed tick result used by SaaS scheduling to avoid charging quota
+    /// for a run whose signed-record compaction was intentionally skipped.
+    pub(crate) async fn run_one_tick_with_outcome(&self) -> MinerTickOutcome {
         self.step_0_positive_feedback().await;
         self.step_05_backfill_embeddings().await;
         self.step_06_correction_chaining().await;
         self.pack_commitment_blocks(RECORD_COMMITMENT_BLOCKS_PER_TICK)
             .await;
-        self.step_1_5_legacy_compaction().await;
+        let compaction_outcome = self.step_1_5_legacy_compaction().await;
 
         if self.ner_engine.is_some() {
             self.step_7_entity_extraction().await;
@@ -378,6 +433,8 @@ impl ReflectionMiner {
             self.step_10_session_summary().await;
             self.step_11_episode_ingestion().await;
         }
+
+        compaction_outcome
     }
 
     // ============================================
@@ -391,7 +448,7 @@ impl ReflectionMiner {
             return;
         }
 
-        let owner = self.identity.public_key_bytes();
+        let owner = self.owner_context.storage_owner();
         let owner_hex = hex::encode(owner);
 
         let mut sessions: std::collections::HashMap<String, Vec<_>> =
@@ -418,8 +475,9 @@ impl ReflectionMiner {
                 }
 
                 let content = if row.encrypted == 1 {
-                    let key =
-                        crate::services::memchain::derive_rawlog_key(&self.identity.to_bytes());
+                    let key = crate::services::memchain::derive_rawlog_key(
+                        &self.node_identity.to_bytes(),
+                    );
                     String::from_utf8(
                         crate::services::memchain::decrypt_rawlog_content_pub(&key, &row.content)
                             .unwrap_or_default(),
@@ -585,7 +643,7 @@ impl ReflectionMiner {
             return;
         }
 
-        let owner = self.identity.public_key_bytes();
+        let owner = self.owner_context.storage_owner();
         let mut filled = 0u32;
 
         for record in &records {
@@ -633,7 +691,7 @@ impl ReflectionMiner {
             return;
         }
 
-        let owner = self.identity.public_key_bytes();
+        let owner = self.owner_context.storage_owner();
         let mut chained = 0u32;
 
         for correction in &corrections {
@@ -704,7 +762,7 @@ impl ReflectionMiner {
             // canonical decision if state changes after this preflight.
             match self.storage.record_commitment_authority_state().await {
                 Ok(Some(authority))
-                    if authority.coordinator == self.identity.public_key_bytes() => {}
+                    if authority.coordinator == self.node_identity.public_key_bytes() => {}
                 Ok(Some(_)) => {
                     debug!(
                         "[MEMCHAIN_BLOCK] Commitment packing skipped: local node is not active authority"
@@ -770,7 +828,7 @@ impl ReflectionMiner {
                 timestamp,
                 tip_hash,
                 record_ids,
-                &self.identity,
+                &self.node_identity,
             );
 
             match self
@@ -837,24 +895,41 @@ impl ReflectionMiner {
     // Step 1-5: Legacy Compaction
     // ============================================
 
-    async fn step_1_5_legacy_compaction(&self) {
-        self.smart_compact().await;
+    async fn step_1_5_legacy_compaction(&self) -> MinerTickOutcome {
+        let outcome = self.smart_compact().await;
         self.legacy_mine().await;
+        outcome
     }
 
-    async fn smart_compact(&self) {
+    async fn smart_compact(&self) -> MinerTickOutcome {
         let ep_count = self.storage.count_by_layer(MemoryLayer::Episode).await;
         if ep_count < self.compaction_threshold {
-            return;
+            return MinerTickOutcome::Completed;
         }
 
-        let owner = self.identity.public_key_bytes();
+        // [MINER-OWNER-CONTEXT 2026-08-31 by Codex] A SaaS node possesses no
+        // tenant private key. Fail before archiving any Episode instead of
+        // creating a tenant-owned MemoryRecord with a node-owned signature.
+        if !self
+            .owner_context
+            .node_can_sign_owner_records(&self.node_identity)
+        {
+            warn!(
+                reason = ?MinerTickSkipReason::TenantRecordSignatureUnavailable,
+                "[MINER] Signed compaction skipped; retryable owner credentials unavailable"
+            );
+            return MinerTickOutcome::RetryableSkip(
+                MinerTickSkipReason::TenantRecordSignatureUnavailable,
+            );
+        }
+
+        let owner = self.owner_context.storage_owner();
         let episodes = self
             .storage
             .compact_episodes_to_archive(&owner, MAX_COMPACTION_BATCH)
             .await;
         if episodes.is_empty() {
-            return;
+            return MinerTickOutcome::Completed;
         }
 
         info!(count = episodes.len(), "[MINER] Compacting episodes");
@@ -863,7 +938,7 @@ impl ReflectionMiner {
             Some(s) => s,
             None => {
                 warn!("[MINER] Compaction summary skipped: no local compaction LLM configured");
-                return;
+                return MinerTickOutcome::Completed;
             }
         };
 
@@ -885,17 +960,18 @@ impl ReflectionMiner {
             summary.as_bytes().to_vec(),
             vec![],
         );
-        knowledge.signature = self.identity.sign(&knowledge.record_id);
+        knowledge.signature = self.node_identity.sign(&knowledge.record_id);
 
         if !self.storage.insert(&knowledge, "miner-compaction").await {
             error!("[MINER] Failed to insert Knowledge record");
-            return;
+            return MinerTickOutcome::Completed;
         }
 
         info!(
             episodes = episodes.len(),
             "[MINER] Local cognitive compaction complete"
         );
+        MinerTickOutcome::Completed
     }
 
     #[allow(deprecated)]
@@ -955,9 +1031,10 @@ impl ReflectionMiner {
             None => return,
         };
 
-        let owner = self.identity.public_key_bytes();
+        let owner = self.owner_context.storage_owner();
         let owner_hex = hex::encode(owner);
-        let rawlog_key = crate::services::memchain::derive_rawlog_key(&self.identity.to_bytes());
+        let rawlog_key =
+            crate::services::memchain::derive_rawlog_key(&self.node_identity.to_bytes());
 
         let pending = self
             .storage
@@ -1158,7 +1235,7 @@ impl ReflectionMiner {
     }
 
     async fn step_8_community_detection(&self) {
-        let owner = self.identity.public_key_bytes();
+        let owner = self.owner_context.storage_owner();
 
         let labels = {
             let conn = self.storage.conn_lock().await;
@@ -1304,7 +1381,7 @@ impl ReflectionMiner {
             .collect();
 
         if !small_communities.is_empty() && !large_communities.is_empty() {
-            for (small_cid, small_members) in &small_communities {
+            for (_small_cid, small_members) in &small_communities {
                 let mut edge_counts: HashMap<String, usize> = HashMap::new();
                 for eid in small_members {
                     let edges = self.storage.get_edges_for_entity(eid, &owner).await;
@@ -1366,7 +1443,7 @@ impl ReflectionMiner {
     }
 
     async fn step_9_recursive_merge(&self) {
-        let owner = self.identity.public_key_bytes();
+        let owner = self.owner_context.storage_owner();
         let entities = self
             .storage
             .get_entities_with_embedding(&owner, MINER_MERGE_BATCH)
@@ -1492,7 +1569,7 @@ impl ReflectionMiner {
     /// 3. Skips if content_hash already exists (unchanged file).
     /// 4. Stores filename, new_version, parent_id in `insert_artifact()`.
     async fn step_10_session_summary(&self) {
-        let owner = self.identity.public_key_bytes();
+        let owner = self.owner_context.storage_owner();
 
         let pending = self
             .storage
@@ -1517,7 +1594,8 @@ impl ReflectionMiner {
             .unwrap_or_else(|_| regex::Regex::new(r"```(\w*)\n([\s\S]*?)```").unwrap());
 
         // BUG-FIX-2: Derive rawlog_key once per step tick, not per session.
-        let rawlog_key = crate::services::memchain::derive_rawlog_key(&self.identity.to_bytes());
+        let rawlog_key =
+            crate::services::memchain::derive_rawlog_key(&self.node_identity.to_bytes());
 
         let mut total_summaries = 0u32;
         let mut total_artifacts = 0u32;
@@ -1761,18 +1839,15 @@ impl ReflectionMiner {
         }
 
         if self.llm_router.is_some() {
-            let owner = self.identity.public_key_bytes();
+            let owner = self.owner_context.storage_owner();
             self.enqueue_session_title_tasks(&owner).await;
         }
     }
 
     async fn step_11_episode_ingestion(&self) {
-        let owner = self.identity.public_key_bytes();
-        let rawlog_key = crate::services::memchain::derive_rawlog_key(&self.identity.to_bytes());
-        let now_ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let owner = self.owner_context.storage_owner();
+        let rawlog_key =
+            crate::services::memchain::derive_rawlog_key(&self.node_identity.to_bytes());
         let mut episodes_created = 0u32;
 
         let processed_sessions = {
@@ -2239,6 +2314,83 @@ mod commitment_tip_notification_tests {
         assert_eq!(
             notify_commitment_tip(Some(&sender), 34),
             CommitmentTipNotificationOutcome::Closed
+        );
+    }
+}
+
+#[cfg(test)]
+mod miner_owner_context_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    async fn test_miner(
+        storage: Arc<MemoryStorage>,
+        node_identity: IdentityKeyPair,
+        temp_dir: &TempDir,
+    ) -> ReflectionMiner {
+        let aof = AofWriter::open(&temp_dir.path().join("miner-owner-context.aof"))
+            .await
+            .unwrap();
+        let udp = UdpTransport::bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        ReflectionMiner::new(
+            1,
+            storage,
+            Arc::new(VectorIndex::new()),
+            node_identity,
+            Arc::new(MemPool::new()),
+            Arc::new(TokioMutex::new(aof)),
+            Arc::new(SessionManager::new(0, Duration::from_secs(60))),
+            Arc::new(udp),
+        )
+    }
+
+    #[test]
+    fn local_constructor_preserves_node_owned_storage_context() {
+        // [MINER-OWNER-CONTEXT 2026-08-31 by Codex] Existing local callers
+        // continue to get a signable node-owned context without a new argument.
+        let node_identity = IdentityKeyPair::generate();
+        let context = MinerOwnerContext::local(&node_identity);
+
+        assert_eq!(context.storage_owner(), node_identity.public_key_bytes());
+        assert!(context.node_can_sign_owner_records(&node_identity));
+    }
+
+    #[tokio::test]
+    async fn saas_compaction_skips_before_archiving_or_forging_tenant_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let node_identity = IdentityKeyPair::generate();
+        let tenant_identity = IdentityKeyPair::generate();
+        let tenant_owner = tenant_identity.public_key_bytes();
+
+        let mut episode = MemoryRecord::new(
+            tenant_owner,
+            1_700_000_000,
+            MemoryLayer::Episode,
+            vec!["tenant".into()],
+            "test".into(),
+            b"opaque tenant episode".to_vec(),
+            vec![],
+        );
+        episode.signature = tenant_identity.sign(&episode.record_id);
+        assert!(storage.insert(&episode, "test").await);
+
+        let miner = test_miner(Arc::clone(&storage), node_identity, &temp_dir)
+            .await
+            .with_owner_context(MinerOwnerContext::for_storage_owner(tenant_owner))
+            .with_compaction_threshold(1);
+
+        assert_eq!(
+            miner.smart_compact().await,
+            MinerTickOutcome::RetryableSkip(MinerTickSkipReason::TenantRecordSignatureUnavailable)
+        );
+        assert_eq!(storage.count_by_layer(MemoryLayer::Episode).await, 1);
+        assert_eq!(storage.count_by_layer(MemoryLayer::Knowledge).await, 0);
+        assert_eq!(
+            storage.get(&episode.record_id).await.unwrap().layer,
+            MemoryLayer::Episode
         );
     }
 }

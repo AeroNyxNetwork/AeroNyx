@@ -59,8 +59,13 @@
 //! - Managed-volume reads and vector rebuild happen before byte-growth
 //!   admission. The permit then covers the complete mutation-bearing miner
 //!   tick; a failed admission does not consume the owner's hourly quota.
+//! - [MINER-OWNER-CONTEXT 2026-08-31 by Codex] `ActiveOwner.pubkey` is the
+//!   authoritative tenant storage owner. It never replaces the node identity
+//!   used for decryption, commitment authority, or signatures.
 //!
 //! ## Last Modified
+//! v1.0.3-MinerOwnerContext - Inject authoritative tenant ownership and account
+//!                            retryable signed-compaction skips explicitly.
 //! v1.0.2-ManagedVolumeGrowth - Fail closed before per-owner miner mutations.
 //! v1.0.1-MinerStartupError - Made stub AOF/socket initialization fallible and
 //!                            covered inaccessible state paths.
@@ -79,6 +84,7 @@ use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_transport::UdpTransport;
 
 use crate::error::{Result as ServerResult, ServerError};
+use crate::miner::reflection::{MinerOwnerContext, MinerTickOutcome};
 use crate::miner::ReflectionMiner;
 use crate::services::memchain::{
     AofWriter, EmbedEngine, LlmRouter, MemPool, NerEngine, StoragePool, SystemDb, VectorIndex,
@@ -293,17 +299,25 @@ impl MinerScheduler {
 
         let tick_start = Instant::now();
         let mut succeeded = 0u32;
+        let mut retryable_skipped = 0u32;
         let mut failed = 0u32;
 
         // ── 3. Process each owner (sequential — LLM calls can be slow) ─
         for owner in &selected {
             match self.run_owner_tick(owner).await {
-                Ok(()) => {
+                Ok(MinerTickOutcome::Completed) => {
                     let mut quotas = self.quotas.lock().await;
                     if let Some(q) = quotas.get_mut(owner) {
                         q.record_round();
                     }
                     succeeded += 1;
+                }
+                Ok(MinerTickOutcome::RetryableSkip(reason)) => {
+                    // [MINER-OWNER-CONTEXT 2026-08-31 by Codex] The work is
+                    // intentionally retryable and must not consume quota or be
+                    // reported as successful distillation.
+                    warn!(?reason, "[MINER_SCHED] Owner tick deferred (retryable)");
+                    retryable_skipped += 1;
                 }
                 Err(e) => {
                     warn!(
@@ -317,6 +331,7 @@ impl MinerScheduler {
 
         info!(
             succeeded,
+            retryable_skipped,
             failed,
             elapsed_ms = tick_start.elapsed().as_millis(),
             "[MINER_SCHED] Tick complete"
@@ -328,7 +343,7 @@ impl MinerScheduler {
     // ============================================
 
     /// Run one cognitive step cycle for a single owner.
-    async fn run_owner_tick(&self, owner: &[u8; 32]) -> Result<(), String> {
+    async fn run_owner_tick(&self, owner: &[u8; 32]) -> Result<MinerTickOutcome, String> {
         // Get or open this owner's MemoryStorage.
         let storage = self
             .storage_pool
@@ -368,12 +383,10 @@ impl MinerScheduler {
             .map_err(|error| format!("Storage growth admission failed: {error}"))?;
 
         // Construct a per-tick ReflectionMiner (cheap — only Arc clones).
-        let miner = self.build_per_owner_miner(storage, vector_index);
+        let miner = self.build_per_owner_miner(storage, vector_index, *owner);
 
         // Run one complete cognitive cycle.
-        miner.run_one_tick().await;
-
-        Ok(())
+        Ok(miner.run_one_tick_with_outcome().await)
     }
 
     /// Build a lightweight per-tick `ReflectionMiner` for one owner.
@@ -383,8 +396,11 @@ impl MinerScheduler {
         &self,
         storage: Arc<crate::services::memchain::MemoryStorage>,
         vector_index: Arc<VectorIndex>,
+        storage_owner: [u8; 32],
     ) -> ReflectionMiner {
         // interval=1 is irrelevant — we call run_one_tick(), not run().
+        // [MINER-OWNER-CONTEXT 2026-08-31 by Codex] The selected ActiveOwner
+        // owns every tenant-scoped DB row and vector partition in this tick.
         let miner = ReflectionMiner::new(
             1,
             storage,
@@ -394,7 +410,8 @@ impl MinerScheduler {
             Arc::clone(&self.stub_aof),
             Arc::clone(&self.stub_sessions),
             Arc::clone(&self.stub_udp),
-        );
+        )
+        .with_owner_context(MinerOwnerContext::for_storage_owner(storage_owner));
 
         let miner = match &self.embed_engine {
             Some(ee) => miner.with_embed_engine(Arc::clone(ee)),
@@ -432,6 +449,7 @@ mod tests {
     use crate::services::memchain::storage_pool::StoragePool;
     use crate::services::memchain::volume_router::{VolumeUsageProbe, VolumeUsageProbeError};
     use crate::services::memchain::{SystemDb, VolumeRouter};
+    use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
     use tempfile::TempDir;
 
     fn make_owner(seed: u8) -> [u8; 32] {
@@ -574,6 +592,122 @@ mod tests {
 
         let quotas = scheduler.quotas.lock().await;
         assert_eq!(quotas.get(&owner).unwrap().rounds_this_hour, 0);
+    }
+
+    #[tokio::test]
+    async fn saas_tick_binds_feedback_and_vector_queries_to_scheduled_owner() {
+        // [MINER-OWNER-CONTEXT 2026-08-31 by Codex] Reproduces the former
+        // cross-owner write: the scheduler node and authenticated tenant are
+        // deliberately different identities.
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml(dir.path());
+        let router = VolumeRouter::new(&config_path, Arc::clone(&db))
+            .await
+            .unwrap();
+        let pool = StoragePool::new(
+            Arc::clone(&router),
+            Arc::clone(&db),
+            10,
+            Duration::from_secs(3600),
+        );
+        let node_identity = IdentityKeyPair::generate();
+        let node_owner = node_identity.public_key_bytes();
+        let tenant_identity = IdentityKeyPair::generate();
+        let tenant_owner = tenant_identity.public_key_bytes();
+
+        db.assign_volume(&tenant_owner, "vol-001").await.unwrap();
+        db.update_last_active(&tenant_owner).await.unwrap();
+        let storage = pool.get_or_create(&tenant_owner).await.unwrap();
+
+        let mut recalled = MemoryRecord::new(
+            tenant_owner,
+            1_700_000_000,
+            MemoryLayer::Episode,
+            vec!["reference".into()],
+            "test".into(),
+            b"recalled tenant record".to_vec(),
+            vec![1.0, 0.0],
+        );
+        recalled.signature = tenant_identity.sign(&recalled.record_id);
+        assert!(storage.insert(&recalled, "minilm-l6-v2").await);
+
+        let mut correction = MemoryRecord::new(
+            tenant_owner,
+            1_700_000_001,
+            MemoryLayer::Episode,
+            vec!["_correction".into()],
+            "test".into(),
+            b"corrected tenant record".to_vec(),
+            vec![1.0, 0.0],
+        );
+        correction.signature = tenant_identity.sign(&correction.record_id);
+        assert!(storage.insert(&correction, "minilm-l6-v2").await);
+
+        let recall_context = serde_json::json!([{
+            "id": hex::encode(recalled.record_id),
+            "score": 0.99
+        }])
+        .to_string();
+        storage
+            .insert_raw_log(
+                "tenant-session",
+                1,
+                "user",
+                "this recalled answer was genuinely useful",
+                "test",
+                Some(&recall_context),
+                1,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let scheduler =
+            MinerScheduler::new(pool, Arc::clone(&db), 1, 6, node_identity, None, None, None)
+                .await
+                .unwrap();
+        scheduler.tick().await;
+
+        let (feedback_owner, node_feedback_count, recalled_status) = {
+            let conn = storage.conn_lock().await;
+            let feedback_owner: Vec<u8> = conn
+                .query_row("SELECT owner FROM memory_feedback LIMIT 1", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let node_feedback_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_feedback WHERE owner = ?1",
+                    rusqlite::params![node_owner.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let recalled_status: i64 = conn
+                .query_row(
+                    "SELECT status FROM records WHERE record_id = ?1",
+                    rusqlite::params![recalled.record_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (feedback_owner, node_feedback_count, recalled_status)
+        };
+
+        assert_eq!(feedback_owner, tenant_owner);
+        assert_eq!(node_feedback_count, 0);
+        // Superseding proves Step 0.6 searched the tenant vector partition.
+        assert_eq!(recalled_status, 1);
+        assert_eq!(
+            scheduler
+                .quotas
+                .lock()
+                .await
+                .get(&tenant_owner)
+                .unwrap()
+                .rounds_this_hour,
+            1
+        );
     }
 
     // ── Quota filtering ───────────────────────────────────────────────
