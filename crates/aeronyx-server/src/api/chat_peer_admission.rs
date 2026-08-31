@@ -1,12 +1,17 @@
 // ============================================
 // File: crates/aeronyx-server/src/api/chat_peer_admission.rs
 // ============================================
-// Version: 1.0.0-DirectPeerAdmissionDomain
+// Version: 1.1.0-ReplaySaturation
 //
 // Creation Reason:
 //   [CHAT-PEER-ADMISSION-DOMAIN 2026-08-26 by Codex] Extract authenticated
 //   direct-relay admission, fairness, and exact ACK replay ownership from the
 //   oversized public HTTP orchestration module.
+//
+// Modification Reason:
+//   [CHAT-PEER-REPLAY-SATURATION 2026-08-31 by Codex] Preserve every unexpired
+//   in-flight owner and completed ACK under capacity pressure so authenticated
+//   retries cannot reacquire ownership and repeat relay side effects.
 //
 // Main Functionality:
 //   - Enforces one identity-independent monotonic request window.
@@ -14,6 +19,7 @@
 //   - Owns exact request commitments through generation-fenced RAII leases.
 //   - Replays a completed privacy-normalized ACK without repeating effects.
 //   - Starts completed ACK retention at durable completion, not request start.
+//   - Fails closed with saturation when all replay slots retain live evidence.
 //
 // Dependencies:
 //   - `chat_peer.rs` owns the stable HTTP and serialized response contracts.
@@ -24,18 +30,20 @@
 //   1. Admit aggregate parser work through a fixed monotonic window.
 //   2. After signature verification, apply a bounded per-node fair window.
 //   3. Reserve the exact request commitment or replay its completed ACK.
-//   4. Publish completion under a new generation and completion-time TTL.
-//   5. Release only the matching in-flight generation on cancellation.
+//   4. Reject new commitments when every bounded slot contains live evidence.
+//   5. Publish completion under a new generation and completion-time TTL.
+//   6. Release only the matching in-flight generation on cancellation.
 //
 // Important Note for Next Developer:
 //   - Never key aggregate admission with user, wallet, receiver, source IP,
 //     endpoint, message id, or payload-derived data.
 //   - A replay entry contains only a SHA-256 request commitment and ACK.
-//   - Do not evict unexpired in-flight owners to admit newer work.
+//   - Do not evict any unexpired in-flight owner or completed ACK to admit work.
 //   - Preserve generation fencing; stale leases must not mutate newer owners.
 //   - Keep HTTP routes and JSON fields in `chat_peer.rs` backward compatible.
 //
 // Last Modified:
+//   v1.1.0-ReplaySaturation - Fail closed instead of evicting live ACK evidence
 //   v1.0.0-DirectPeerAdmissionDomain - Initial trait-based composition
 // ============================================
 
@@ -253,6 +261,14 @@ impl AuthenticatedPeerRelayReplayCache {
             };
         }
 
+        // [CHAT-PEER-REPLAY-SATURATION 2026-08-31 by Codex] Expiry and exact
+        // replay are resolved before this hard-cap check. Every remaining entry
+        // is live at-most-once evidence, so new work must fail closed rather
+        // than evicting either an in-flight owner or a completed exact ACK.
+        if self.entries.len() >= MAX_AUTHENTICATED_PEER_RELAY_REPLAYS {
+            return AuthenticatedPeerRelayReplayDecision::Saturated;
+        }
+
         let generation = self.allocate_generation();
         self.entries.insert(
             request_commitment,
@@ -263,13 +279,8 @@ impl AuthenticatedPeerRelayReplayCache {
             },
         );
         self.order.push_back((request_commitment, generation));
-        let retained = self.evict_over_capacity(request_commitment, generation);
         self.compact_stale_generations();
-        if retained {
-            AuthenticatedPeerRelayReplayDecision::New(generation)
-        } else {
-            AuthenticatedPeerRelayReplayDecision::Saturated
-        }
+        AuthenticatedPeerRelayReplayDecision::New(generation)
     }
 
     fn complete(
@@ -332,31 +343,6 @@ impl AuthenticatedPeerRelayReplayCache {
             self.order.pop_front();
             self.entries.remove(&request_commitment);
         }
-    }
-
-    fn evict_over_capacity(
-        &mut self,
-        new_request_commitment: [u8; 32],
-        new_generation: u64,
-    ) -> bool {
-        while self.entries.len() > MAX_AUTHENTICATED_PEER_RELAY_REPLAYS {
-            let completed_position = self.order.iter().position(|(commitment, generation)| {
-                self.entries.get(commitment).is_some_and(|entry| {
-                    entry.generation == *generation
-                        && matches!(entry.state, AuthenticatedPeerRelayReplayState::Completed(_))
-                })
-            });
-            let Some(completed_position) = completed_position else {
-                self.forget(&new_request_commitment, new_generation);
-                return false;
-            };
-            let Some((commitment, generation)) = self.order.remove(completed_position) else {
-                self.forget(&new_request_commitment, new_generation);
-                return false;
-            };
-            self.forget(&commitment, generation);
-        }
-        true
     }
 
     fn compact_stale_generations(&mut self) {
@@ -543,49 +529,51 @@ mod tests {
     }
 
     #[test]
-    fn replay_capacity_preserves_in_flight_owner() {
+    fn replay_capacity_preserves_all_live_evidence_until_ttl_expiry() {
         let now = Instant::now();
         let response = accepted_response();
-        let mut cache = AuthenticatedPeerRelayReplayCache::default();
+        let domain = DirectPeerAdmissionDomain::new(u32::MAX, u32::MAX);
+
+        // [CHAT-PEER-REPLAY-SATURATION 2026-08-31 by Codex] Fill every slot
+        // with a completed ACK through the production lease boundary.
         for index in 0..MAX_AUTHENTICATED_PEER_RELAY_REPLAYS {
             let mut commitment = [0u8; 32];
             commitment[..8].copy_from_slice(&(index as u64).to_be_bytes());
-            let generation = (index as u64).saturating_add(1);
-            let state = if index == 0 {
-                AuthenticatedPeerRelayReplayState::InFlight
-            } else {
-                AuthenticatedPeerRelayReplayState::Completed(response.clone())
+            let AuthenticatedPeerRelayReplayStart::Acquired(lease) =
+                domain.begin_replay(commitment, now)
+            else {
+                panic!("replay slot must be available while filling capacity");
             };
-            cache.entries.insert(
-                commitment,
-                AuthenticatedPeerRelayReplayEntry {
-                    observed_at: now,
-                    generation,
-                    state,
-                },
-            );
-            cache.order.push_back((commitment, generation));
+            lease.complete(response.clone());
         }
 
-        let oldest_in_flight = cache.order.front().copied().unwrap();
-        let evicted_completed = cache.order.get(1).copied().unwrap();
+        let oldest_commitment = [0u8; 32];
         let new_commitment = [0xFF; 32];
-        let new_generation = u64::MAX;
-        cache.entries.insert(
-            new_commitment,
-            AuthenticatedPeerRelayReplayEntry {
-                observed_at: now,
-                generation: new_generation,
-                state: AuthenticatedPeerRelayReplayState::InFlight,
-            },
-        );
-        cache.order.push_back((new_commitment, new_generation));
+        assert!(matches!(
+            domain.begin_replay(new_commitment, now),
+            AuthenticatedPeerRelayReplayStart::Saturated
+        ));
+        {
+            let cache = domain
+                .authenticated_replays
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(cache.entries.len(), MAX_AUTHENTICATED_PEER_RELAY_REPLAYS);
+            assert!(!cache.entries.contains_key(&new_commitment));
+        }
+        match domain.begin_replay(oldest_commitment, now) {
+            AuthenticatedPeerRelayReplayStart::Completed(replayed) => {
+                assert_eq!(replayed, response);
+            }
+            _ => panic!("oldest unexpired ACK must remain exactly replayable"),
+        }
 
-        assert!(cache.evict_over_capacity(new_commitment, new_generation));
-        assert_eq!(cache.order.front().copied(), Some(oldest_in_flight));
-        assert!(!cache.entries.contains_key(&evicted_completed.0));
-        assert!(cache.entries.contains_key(&oldest_in_flight.0));
-        assert!(cache.entries.contains_key(&new_commitment));
+        let after_ttl =
+            Instant::now() + AUTHENTICATED_PEER_RELAY_REPLAY_TTL + Duration::from_millis(1);
+        assert!(matches!(
+            domain.begin_replay(new_commitment, after_ttl),
+            AuthenticatedPeerRelayReplayStart::Acquired(_)
+        ));
     }
 
     #[test]
