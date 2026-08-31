@@ -34,6 +34,8 @@
 //   - Keep backup policy, artifact names, payloads, and service state elsewhere.
 //
 // Last Modified:
+//   v1.2.0-DirectoryIdentity - Pinned and validated the effective-user-owned
+//     directory inode before normalizing its private mode
 //   v1.1.0-ControlFileIdentity - Rejected foreign-owned and multiply-linked
 //     control files before callers can mutate their shared inode
 //   v1.0.0-BackupFilesystemDomain - Initial filesystem capability extraction
@@ -159,19 +161,68 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn restrict_directory_permissions(path: &Path) -> ChatRelayResult<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|_| {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY)
+        .open(path)
+        .map_err(|_| {
+            backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "relay backup boundary is not a private directory",
+            )
+        })?;
+    let metadata = directory.metadata().map_err(|_| {
         backup_io_error(
-            rusqlite::ffi::SQLITE_PERM,
-            "unable to restrict relay backup directory permissions",
+            rusqlite::ffi::SQLITE_IOERR,
+            "unable to inspect private relay backup directory",
         )
-    })
+    })?;
+    // [CHAT-RELAY-BACKUP-DIRECTORY-IDENTITY 2026-08-31 by Codex] Pin and
+    // validate the directory inode before changing permissions. Path-based
+    // chmod could otherwise mutate a foreign or raced replacement directory.
+    if !metadata.is_dir() || metadata.uid() != effective_user_id() {
+        return Err(backup_io_error(
+            rusqlite::ffi::SQLITE_PERM,
+            "relay backup boundary is not an owner-private directory",
+        ));
+    }
+    directory
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| {
+            backup_io_error(
+                rusqlite::ffi::SQLITE_PERM,
+                "unable to restrict relay backup directory permissions",
+            )
+        })?;
+    let normalized = directory.metadata().map_err(|_| {
+        backup_io_error(
+            rusqlite::ffi::SQLITE_IOERR,
+            "unable to re-inspect private relay backup directory",
+        )
+    })?;
+    if !normalized.is_dir()
+        || normalized.uid() != effective_user_id()
+        || normalized.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(backup_io_error(
+            rusqlite::ffi::SQLITE_PERM,
+            "relay backup directory permission normalization was not retained",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
 fn restrict_directory_permissions(_path: &Path) -> ChatRelayResult<()> {
     Ok(())
+}
+
+#[cfg(unix)]
+fn effective_user_id() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and does not access memory.
+    unsafe { nix::libc::geteuid() }
 }
 
 fn validate_private_control_file(file: &File) -> ChatRelayResult<()> {
@@ -194,9 +245,7 @@ fn validate_private_control_file(file: &File) -> ChatRelayResult<()> {
         // [CHAT-RELAY-BACKUP-FILE-IDENTITY 2026-08-31 by Codex] A private
         // mode does not prove exclusive ownership of an inode. Reject foreign
         // ownership and hard links before a caller receives a writable handle.
-        // SAFETY: `geteuid` has no preconditions and does not access memory.
-        let effective_user_id = unsafe { nix::libc::geteuid() };
-        if metadata.uid() != effective_user_id
+        if metadata.uid() != effective_user_id()
             || metadata.nlink() != 1
             || metadata.permissions().mode() & 0o077 != 0
         {
@@ -476,6 +525,28 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o700);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_owned_directory_is_normalized_through_its_opened_inode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary directory");
+        let backup = root.path().join(".aeronyx-relay-backups");
+        std::fs::create_dir(&backup).expect("backup directory");
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o755))
+            .expect("permissive backup mode");
+
+        LocalBackupFilesystem
+            .ensure_private_directory(&backup)
+            .expect("normalize owned backup directory");
+
+        let mode = std::fs::metadata(&backup)
+            .expect("normalized backup metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[test]
