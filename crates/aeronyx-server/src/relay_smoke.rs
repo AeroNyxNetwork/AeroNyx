@@ -15,8 +15,8 @@
 //! - Sends random E2E ciphertext between two ephemeral identities.
 //! - Requires an idle, healthy, two-hop-ready node before execution.
 //! - Requires verified FULL encrypted-custody durability before protocol traffic.
-//! - Verifies exact mailbox bytes, E2E decryption, ACK deletion, and aggregate
-//!   verified-client onion-delivery evidence.
+//! - Verifies a request-bound terminal receipt, exact mailbox bytes, E2E
+//!   decryption, ACK deletion, and aggregate delivery-accounting consistency.
 //!
 //! ## Dependencies
 //! - `aeronyx-core`: production handshake, key, transport, chat, and codec APIs.
@@ -26,7 +26,8 @@
 //! ## Main Logical Flow
 //! 1. Verify the host-local health surface is idle and two-hop ready.
 //! 2. Open a pinned sender VPN session and submit one signed E2E envelope.
-//! 3. Wait for aggregate verified terminal-receipt evidence to advance.
+//! 3. Verify the private response and signed terminal receipt bind the exact
+//!    ephemeral request, route, purpose, and opaque envelope bytes.
 //! 4. Open the ephemeral receiver session, pull the exact envelope, decrypt it,
 //!    ACK it on the entry node, and prove the entry mailbox is empty.
 //!
@@ -41,11 +42,12 @@
 //! - [RELAY-SMOKE-LOOPBACK-SOURCE 2026-08-25 by Codex] Bind the UDP client to
 //!   the matching loopback family; this command is host-local by contract.
 //!
-//! Last Modified: v1.2.0-LoopbackSourceBinding - Uses an explicit loopback
-//! source address for portable host-local UDP handshake behavior.
+//! Last Modified: v1.3.0-RequestBoundTerminalProof - Requires the encrypted
+//! verified-submit response and exact terminal receipt before aggregate health
+//! may be used as a secondary consistency observation.
 //!
-//! Previous: v1.1.0-DurableCustodyPreflight - Requires verified FULL
-//! durability before authenticated relay traffic.
+//! Previous: v1.2.0-LoopbackSourceBinding - Uses an explicit loopback source
+//! address for portable host-local UDP handshake behavior.
 // ============================================
 
 use std::net::{IpAddr, SocketAddr};
@@ -67,6 +69,11 @@ use aeronyx_core::crypto::transport::{decrypt_packet, encrypt_packet};
 use aeronyx_core::crypto::{E2eSession, EphemeralKeyPair, IdentityKeyPair, SessionKey};
 use aeronyx_core::protocol::codec::{
     decode_data_packet, decode_server_hello, encode_client_hello, encode_data_packet,
+};
+use aeronyx_core::protocol::memchain::{
+    ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1,
+    CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1, CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1,
+    CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1, CHAT_VERIFIED_SUBMIT_REJECTED_V1,
 };
 use aeronyx_core::protocol::{
     decode_memchain, encode_memchain, ChatContentType, ChatEnvelope, DataPacket, MemChainMessage,
@@ -548,12 +555,16 @@ impl HealthClient {
             .map_err(|_| anyhow::anyhow!("health request exceeded phase deadline"))?
     }
 
-    async fn wait_for_client_delivery(
+    async fn wait_for_aggregate_delivery_consistency(
         &self,
         baseline: u64,
         baseline_outbound_rounds: Option<u64>,
         deadline: TokioInstant,
     ) -> Result<HealthSnapshot> {
+        // [RELAY-SMOKE-REQUEST-BOUND-PROOF 2026-08-31 by Codex] This aggregate
+        // counter is only a health-accounting consistency gate. The caller
+        // must already hold the exact encrypted verified-submit response and
+        // request-bound terminal receipt before entering this loop.
         loop {
             let snapshot = self.fetch_until(deadline).await?;
             anyhow::ensure!(
@@ -877,6 +888,105 @@ fn build_smoke_envelope(
     Ok((envelope, plaintext, receiver_e2e))
 }
 
+fn build_verified_submit_request(
+    sender: &IdentityKeyPair,
+    envelope: ChatEnvelope,
+) -> Result<ChatRelayVerifiedSubmitRequestV1> {
+    let mut request_id = [0u8; 16];
+    OsRng.fill_bytes(&mut request_id);
+    ChatRelayVerifiedSubmitRequestV1::signed(request_id, envelope, unix_now()?, sender)
+        .context("verified submit request construction failed")
+}
+
+/// Coarse failure vocabulary for one private request-bound terminal proof.
+///
+/// [RELAY-SMOKE-REQUEST-BOUND-PROOF 2026-08-31 by Codex] These outcomes never
+/// retain or render request ids, message ids, routes, node identities, receipt
+/// bytes, payload commitments, ciphertext, nonces, or endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestBoundTerminalProofFailure {
+    ResponseContractInvalid,
+    ResponseMismatch,
+    ResponseRejected,
+    EntryOnly,
+    OnionOnly,
+    TerminalReceiptInvalid,
+    ResponseUnavailableAmbiguous,
+    TimeoutAmbiguous,
+}
+
+impl RequestBoundTerminalProofFailure {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::ResponseContractInvalid => "verified submit response contract is invalid",
+            Self::ResponseMismatch => "verified submit response does not match this request",
+            Self::ResponseRejected => "verified submit response rejected the request",
+            Self::EntryOnly => "verified submit accepted entry custody without terminal delivery",
+            Self::OnionOnly => "verified submit proved terminal delivery without entry custody",
+            Self::TerminalReceiptInvalid => "verified submit terminal receipt is invalid",
+            Self::ResponseUnavailableAmbiguous => {
+                "verified submit response transport failed; delivery is ambiguous and must not be retried automatically"
+            }
+            Self::TimeoutAmbiguous => {
+                "verified submit timed out; delivery is ambiguous and must not be retried automatically"
+            }
+        }
+    }
+}
+
+fn validate_request_bound_terminal_proof(
+    request: &ChatRelayVerifiedSubmitRequestV1,
+    response: &ChatRelayVerifiedSubmitResponseV1,
+) -> std::result::Result<(), RequestBoundTerminalProofFailure> {
+    // [RELAY-SMOKE-TYPED-OUTCOMES 2026-08-31 by Codex] Keep every incomplete
+    // protocol result distinct and fail closed. In particular, neither global
+    // health movement nor one half of the delivery/custody contract may fall
+    // through to the exact terminal-receipt verifier.
+    response
+        .validate_shape()
+        .map_err(|_| RequestBoundTerminalProofFailure::ResponseContractInvalid)?;
+    if response.request_id != request.request_id
+        || response.message_id != request.envelope.message_id
+    {
+        return Err(RequestBoundTerminalProofFailure::ResponseMismatch);
+    }
+    match response.result {
+        CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1 => {}
+        CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1 => {
+            return Err(RequestBoundTerminalProofFailure::OnionOnly);
+        }
+        CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1 => {
+            return Err(RequestBoundTerminalProofFailure::EntryOnly);
+        }
+        CHAT_VERIFIED_SUBMIT_REJECTED_V1 => {
+            return Err(RequestBoundTerminalProofFailure::ResponseRejected);
+        }
+        _ => return Err(RequestBoundTerminalProofFailure::ResponseContractInvalid),
+    }
+    let receipt = response
+        .terminal_receipt
+        .as_ref()
+        .ok_or(RequestBoundTerminalProofFailure::ResponseContractInvalid)?;
+    // The pinned entry already verified this terminal against its current
+    // signed peer store. Passing the receipt identity here rechecks signature,
+    // route, MessageRelay purpose, and exact envelope bytes for corruption; it
+    // is not treated as an independent directory trust root.
+    response
+        .verify_terminal_receipt_for_request(request, &receipt.terminal_node_id)
+        .map_err(|_| RequestBoundTerminalProofFailure::TerminalReceiptInvalid)
+}
+
+fn classify_terminal_proof_receive_failure(
+    deadline: TokioInstant,
+    observed_at: TokioInstant,
+) -> RequestBoundTerminalProofFailure {
+    if observed_at >= deadline {
+        RequestBoundTerminalProofFailure::TimeoutAmbiguous
+    } else {
+        RequestBoundTerminalProofFailure::ResponseUnavailableAmbiguous
+    }
+}
+
 fn exact_envelope_match(left: &ChatEnvelope, right: &ChatEnvelope) -> bool {
     left.message_id == right.message_id
         && left.sender == right.sender
@@ -886,6 +996,32 @@ fn exact_envelope_match(left: &ChatEnvelope, right: &ChatEnvelope) -> bool {
         && left.nonce == right.nonce
         && left.content_type == right.content_type
         && left.signature == right.signature
+}
+
+async fn receive_request_bound_terminal_proof(
+    client: &mut RelaySmokeClient,
+    request: &ChatRelayVerifiedSubmitRequestV1,
+    deadline: TokioInstant,
+) -> std::result::Result<(), RequestBoundTerminalProofFailure> {
+    loop {
+        let response = match client.receive_memchain(deadline).await {
+            Ok(response) => response,
+            Err(_) => {
+                // [RELAY-SMOKE-AMBIGUOUS-TIMEOUT 2026-08-31 by Codex] The one
+                // submit may have reached entry or terminal before its private
+                // response became unavailable. Preserve timeout separately,
+                // but mark both outcomes ambiguous; never resend the request or
+                // consult aggregate health as fallback.
+                return Err(classify_terminal_proof_receive_failure(
+                    deadline,
+                    TokioInstant::now(),
+                ));
+            }
+        };
+        if let MemChainMessage::ChatRelayVerifiedSubmitResponseV1(response) = response {
+            return validate_request_bound_terminal_proof(request, &response);
+        }
+    }
 }
 
 async fn pull_page(
@@ -969,6 +1105,8 @@ pub async fn run(options: RelaySmokeOptions) -> Result<RelaySmokeReport> {
     let receiver_identity = IdentityKeyPair::generate();
     let (expected_envelope, expected_plaintext, receiver_e2e) =
         build_smoke_envelope(&sender_identity, &receiver_identity)?;
+    let verified_submit_request =
+        build_verified_submit_request(&sender_identity, expected_envelope.clone())?;
     let mut sender = None;
     let mut receiver = None;
 
@@ -986,12 +1124,23 @@ pub async fn run(options: RelaySmokeOptions) -> Result<RelaySmokeReport> {
             .as_mut()
             .context("sender session was not retained")?
             .send_memchain(
-                &MemChainMessage::ChatRelay(expected_envelope.clone()),
+                &MemChainMessage::ChatRelayVerifiedSubmitV1(verified_submit_request.clone()),
                 deadline,
             )
             .await?;
-        let delivery_health = health
-            .wait_for_client_delivery(deliveries_before, outbound_rounds_before, deadline)
+        receive_request_bound_terminal_proof(
+            sender.as_mut().context("sender session was not retained")?,
+            &verified_submit_request,
+            deadline,
+        )
+        .await
+        .map_err(|failure| anyhow::anyhow!(failure.reason()))?;
+        let consistency_health = health
+            .wait_for_aggregate_delivery_consistency(
+                deliveries_before,
+                outbound_rounds_before,
+                deadline,
+            )
             .await?;
 
         receiver = Some(
@@ -1034,7 +1183,7 @@ pub async fn run(options: RelaySmokeOptions) -> Result<RelaySmokeReport> {
         );
         anyhow::ensure!(
             final_health.verified_client_deliveries()
-                >= delivery_health.verified_client_deliveries(),
+                >= consistency_health.verified_client_deliveries(),
             "verified client delivery counter regressed after mailbox ACK"
         );
         Ok(final_health.verified_client_deliveries())
@@ -1073,7 +1222,7 @@ pub async fn run(options: RelaySmokeOptions) -> Result<RelaySmokeReport> {
         ephemeral_sessions_created: 2,
         session_cleanup: "explicit_authenticated_close",
         terminal_replica_cleanup: "node_ttl_managed",
-        evidence_scope: "idle_node_aggregate_terminal_receipt_plus_exact_entry_mailbox_round_trip",
+        evidence_scope: "request_bound_terminal_receipt_plus_aggregate_consistency_plus_exact_entry_mailbox_round_trip",
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         privacy_boundary: "aggregate smoke outcomes only; no identities, message ids, endpoints, nonces, ciphertext, plaintext, session ids, or keys",
     })
@@ -1107,7 +1256,9 @@ mod tests {
     use super::*;
     use aeronyx_core::crypto::handshake::DefaultHandshakeCrypto;
     use aeronyx_core::crypto::HandshakeCrypto;
+    use aeronyx_core::protocol::chat::BlindRelayDeliveryReceipt;
     use aeronyx_core::protocol::codec::decode_client_hello;
+    use aeronyx_core::protocol::{encode_envelope, OnionRoutePurpose};
 
     #[test]
     fn smoke_envelope_is_signed_and_e2e_decryptable() {
@@ -1121,6 +1272,193 @@ mod tests {
             .decrypt_raw(&envelope.ciphertext, &envelope.nonce)
             .expect("decrypt envelope");
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn request_bound_terminal_proof_accepts_exact_ephemeral_envelope() {
+        // [RELAY-SMOKE-REQUEST-BOUND-PROOF 2026-08-31 by Codex] Exercise the
+        // exact protocol evidence used by the live smoke without logging any
+        // request, route, message, identity, or payload material.
+        let sender = IdentityKeyPair::generate();
+        let receiver = IdentityKeyPair::generate();
+        let terminal = IdentityKeyPair::generate();
+        let (envelope, _, _) =
+            build_smoke_envelope(&sender, &receiver).expect("build smoke envelope");
+        let request = build_verified_submit_request(&sender, envelope.clone())
+            .expect("build verified submit request");
+        request
+            .verify_authentication()
+            .expect("verify submit request");
+        let payload = encode_envelope(&envelope).expect("encode envelope");
+        let receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
+            [0x61; 16],
+            &payload,
+            OnionRoutePurpose::MessageRelay,
+            unix_now().expect("current time"),
+            &terminal,
+        );
+        let response = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            request.request_id,
+            envelope.message_id,
+            true,
+            true,
+            Some(receipt),
+        );
+
+        assert_eq!(
+            validate_request_bound_terminal_proof(&request, &response),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn request_bound_terminal_proof_rejects_unrelated_or_partial_evidence() {
+        // [RELAY-SMOKE-REQUEST-BOUND-PROOF 2026-08-31 by Codex] Neither a
+        // correlated entry-only result nor a valid signature over different
+        // opaque bytes may satisfy terminal delivery for this smoke request.
+        let sender = IdentityKeyPair::generate();
+        let receiver = IdentityKeyPair::generate();
+        let terminal = IdentityKeyPair::generate();
+        let (envelope, _, _) =
+            build_smoke_envelope(&sender, &receiver).expect("build smoke envelope");
+        let request = build_verified_submit_request(&sender, envelope.clone())
+            .expect("build verified submit request");
+        let payload = encode_envelope(&envelope).expect("encode envelope");
+        let exact_receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
+            [0x62; 16],
+            &payload,
+            OnionRoutePurpose::MessageRelay,
+            unix_now().expect("current time"),
+            &terminal,
+        );
+        let exact_response = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            request.request_id,
+            envelope.message_id,
+            true,
+            true,
+            Some(exact_receipt.clone()),
+        );
+
+        let mut unrelated_response = exact_response.clone();
+        unrelated_response.request_id[0] ^= 0xff;
+        assert_eq!(
+            validate_request_bound_terminal_proof(&request, &unrelated_response),
+            Err(RequestBoundTerminalProofFailure::ResponseMismatch)
+        );
+
+        let mut malformed_response = exact_response.clone();
+        malformed_response.result = u8::MAX;
+        assert_eq!(
+            validate_request_bound_terminal_proof(&request, &malformed_response),
+            Err(RequestBoundTerminalProofFailure::ResponseContractInvalid)
+        );
+
+        let mut different_envelope = envelope.clone();
+        different_envelope.ciphertext[0] ^= 0xff;
+        let different_payload =
+            encode_envelope(&different_envelope).expect("encode different envelope");
+        let different_receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
+            [0x63; 16],
+            &different_payload,
+            OnionRoutePurpose::MessageRelay,
+            unix_now().expect("current time"),
+            &terminal,
+        );
+        let different_payload_response = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            request.request_id,
+            envelope.message_id,
+            true,
+            true,
+            Some(different_receipt),
+        );
+        assert_eq!(
+            validate_request_bound_terminal_proof(&request, &different_payload_response),
+            Err(RequestBoundTerminalProofFailure::TerminalReceiptInvalid)
+        );
+
+        let different_purpose_receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
+            [0x64; 16],
+            &payload,
+            OnionRoutePurpose::BlindVaultPut,
+            unix_now().expect("current time"),
+            &terminal,
+        );
+        let different_purpose_response = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            request.request_id,
+            envelope.message_id,
+            true,
+            true,
+            Some(different_purpose_receipt),
+        );
+        assert_eq!(
+            validate_request_bound_terminal_proof(&request, &different_purpose_response),
+            Err(RequestBoundTerminalProofFailure::TerminalReceiptInvalid)
+        );
+
+        let mut changed_route_receipt = exact_receipt.clone();
+        changed_route_receipt.route_id[0] ^= 0xff;
+        let changed_route_response = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            request.request_id,
+            envelope.message_id,
+            true,
+            true,
+            Some(changed_route_receipt),
+        );
+        assert_eq!(
+            validate_request_bound_terminal_proof(&request, &changed_route_response),
+            Err(RequestBoundTerminalProofFailure::TerminalReceiptInvalid)
+        );
+
+        let entry_only_response = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            request.request_id,
+            envelope.message_id,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(
+            validate_request_bound_terminal_proof(&request, &entry_only_response),
+            Err(RequestBoundTerminalProofFailure::EntryOnly)
+        );
+
+        let onion_only_response = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            request.request_id,
+            envelope.message_id,
+            true,
+            false,
+            Some(exact_receipt),
+        );
+        assert_eq!(
+            validate_request_bound_terminal_proof(&request, &onion_only_response),
+            Err(RequestBoundTerminalProofFailure::OnionOnly)
+        );
+
+        let rejected_response =
+            ChatRelayVerifiedSubmitResponseV1::rejected(request.request_id, envelope.message_id);
+        assert_eq!(
+            validate_request_bound_terminal_proof(&request, &rejected_response),
+            Err(RequestBoundTerminalProofFailure::ResponseRejected)
+        );
+    }
+
+    #[test]
+    fn request_bound_terminal_proof_timeout_is_typed_ambiguous_and_non_retryable() {
+        // [RELAY-SMOKE-AMBIGUOUS-TIMEOUT 2026-08-31 by Codex] Test the pure
+        // boundary used after the single submit. The static outcome explicitly
+        // forbids automatic resend and contains no request or receipt material.
+        let observed_at = TokioInstant::now();
+        let timeout = classify_terminal_proof_receive_failure(observed_at, observed_at);
+        assert_eq!(timeout, RequestBoundTerminalProofFailure::TimeoutAmbiguous);
+        assert_eq!(
+            timeout.reason(),
+            "verified submit timed out; delivery is ambiguous and must not be retried automatically"
+        );
+
+        let future_deadline = observed_at + Duration::from_secs(1);
+        assert_eq!(
+            classify_terminal_proof_receive_failure(future_deadline, observed_at),
+            RequestBoundTerminalProofFailure::ResponseUnavailableAmbiguous
+        );
     }
 
     #[test]
