@@ -377,6 +377,12 @@
 //!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.82.0-TerminalDecodeCpuDomain - Classify, decode, and validate terminal
+//! workloads in the blind CPU partition while preserving owned proof bytes
+//! v0.81.0-PreparedBlindForwardCarrier - Bound one serialized hop request
+//! before effect arming and reuse its immutable bytes across exact retries
+//! v0.80.0-BlindCryptoReservation - Reserve total blind CPU progress outside
+//! the public ingress sub-quota on multi-worker nodes
 //! v0.79.0-FailureSigningCompletion - Complete failure response fields and
 //! move authenticated receipt signing into bounded completion workers
 //! v0.78.0-TerminalProofCompletion - Co-locate terminal payload commitment and
