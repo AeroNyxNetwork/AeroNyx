@@ -947,7 +947,6 @@ use aeronyx_core::protocol::auth::{
 use aeronyx_core::protocol::chat::{
     custody_audit_anchor_frame_sha256, encode_envelope, BlindRelayDeliveryReceipt,
     BlindRelayEnvelope, ChatContentType, ChatEnvelope,
-    BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -989,10 +988,13 @@ use crate::api::chat_peer::{
     prepare_peer_chat_relay_request_v1,
     prepare_peer_chat_relay_request_v2,
     prepare_peer_chat_relay_request_v3, verify_peer_chat_relay_receipt,
+    verify_blind_relay_delivery_receipt, BlindRelayDeliveryReceiptVerificationFailure,
     BlindRelayRequestPreparationError, DirectRelayReceiptVerificationFailure,
     PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayResponse, PeerChatRelayResponseV2,
     PreparedAuthenticatedPeerChatRelayHttpRequest, PreparedPeerChatRelayHttpRequest,
 };
+#[cfg(test)]
+use crate::api::chat_peer::blind_relay_delivery_receipt_is_valid;
 use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica_and_runtime;
 use crate::api::directory_replica_status::{
     build_directory_replica_status_router_with_witness_carrier, DirectoryReplicaStatusScope,
@@ -1285,8 +1287,8 @@ const DIRECTORY_MIRROR_CARRIER_SMOKE_COOLDOWN_SECS: u64 = 30;
 /// multi-producer verification round, including descriptor hydration. Per-request
 /// HTTP timeouts alone cannot cap a paginated or multi-carrier smoke.
 const DIRECTORY_MIRROR_CARRIER_SMOKE_DEADLINE_SECS: u64 = 35;
+#[cfg(test)]
 const BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS: u64 = 120;
-const BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 30;
 /// Coalesce verified-delivery bursts before atomically refreshing peer cache.
 const CLIENT_DELIVERY_CACHE_FLUSH_DEBOUNCE_MILLIS: u64 = 250;
 /// First retry delay after a failed or witness-deferred peer-cache write.
@@ -11490,51 +11492,86 @@ impl Server {
                             )
                             .await
                             {
-                                Ok(ack)
-                                    if ack.accepted
-                                        && ack.forwarded
-                                        && Self::verified_delivery_receipt(
-                                            ack.delivery_receipt.as_ref(),
-                                            request.route_id(),
-                                            &payload_commitment,
-                                            &terminal_node_id,
-                                            observed_at,
-                                        ) =>
-                                {
-                                    if peer_store.record_verified_two_hop_probe_delivery(
-                                        &middle,
-                                        &terminal,
-                                        observed_at,
-                                        middle_candidate_count,
-                                        terminal_candidate_count,
-                                    ) {
-                                        return TwoHopBlindRelayProbeOutcome {
-                                            attempted: true,
-                                            route_accepted: true,
-                                            terminal_delivery_verified: true,
-                                        };
-                                    }
-                                    // A real receipt cannot authorize a path
-                                    // whose signed surface rotated in flight.
-                                    continue 'terminal_candidates;
-                                }
                                 Ok(ack) if ack.accepted && ack.forwarded => {
-                                    // Mixed-version nodes can still prove the
-                                    // legacy synthetic route, but are not
-                                    // eligible for authenticated App onion
-                                    // traffic until a signed receipt verifies.
-                                    // Keep the compatibility success as a
-                                    // fallback, then continue the bounded search
-                                    // so one legacy peer cannot hide a newer,
-                                    // receipt-capable path after restart.
-                                    legacy_delivery_contexts.push((
-                                        middle.clone(),
-                                        terminal.clone(),
-                                        middle_candidate_count,
-                                        terminal_candidate_count,
+                                    match verify_blind_relay_delivery_receipt(
+                                        ack.delivery_receipt,
+                                        *request.route_id(),
+                                        payload_commitment,
+                                        terminal_node_id,
                                         observed_at,
-                                    ));
-                                    continue 'terminal_candidates;
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {
+                                            if peer_store
+                                                .record_verified_two_hop_probe_delivery(
+                                                    &middle,
+                                                    &terminal,
+                                                    observed_at,
+                                                    middle_candidate_count,
+                                                    terminal_candidate_count,
+                                                )
+                                            {
+                                                return TwoHopBlindRelayProbeOutcome {
+                                                    attempted: true,
+                                                    route_accepted: true,
+                                                    terminal_delivery_verified: true,
+                                                };
+                                            }
+                                            // A real receipt cannot authorize a path
+                                            // whose signed surface rotated in flight.
+                                            continue 'terminal_candidates;
+                                        }
+                                        Err(BlindRelayDeliveryReceiptVerificationFailure::Missing) => {
+                                            // Only absence can prove a rolling-upgrade
+                                            // legacy path. Invalid v2 evidence must never
+                                            // downgrade into compatibility success.
+                                            legacy_delivery_contexts.push((
+                                                middle.clone(),
+                                                terminal.clone(),
+                                                middle_candidate_count,
+                                                terminal_candidate_count,
+                                                observed_at,
+                                            ));
+                                            continue 'terminal_candidates;
+                                        }
+                                        Err(BlindRelayDeliveryReceiptVerificationFailure::Invalid) => {
+                                            peer_store
+                                                .record_blind_relay_two_hop_probe_result_with_context(
+                                                    observed_at,
+                                                    false,
+                                                    "onion_receipt_unverified",
+                                                    middle_candidate_count,
+                                                    terminal_candidate_count,
+                                                    2,
+                                                    1,
+                                                );
+                                            let _ = Self::record_onion_route_failure(
+                                                peer_store,
+                                                &middle,
+                                                observed_at,
+                                                "delivery_receipt_invalid",
+                                                OnionRouteFailureAttribution::EndToEnd,
+                                            );
+                                            continue 'terminal_candidates;
+                                        }
+                                        Err(
+                                            BlindRelayDeliveryReceiptVerificationFailure::Backpressure
+                                            | BlindRelayDeliveryReceiptVerificationFailure::Unavailable,
+                                        ) => {
+                                            peer_store
+                                                .record_blind_relay_two_hop_probe_result_with_context(
+                                                    observed_at,
+                                                    false,
+                                                    "onion_receipt_verifier_unavailable",
+                                                    middle_candidate_count,
+                                                    terminal_candidate_count,
+                                                    2,
+                                                    1,
+                                            );
+                                            continue 'terminal_candidates;
+                                        }
+                                    }
                                 }
                                 Ok(_ack) => {
                                     peer_store
@@ -12045,51 +12082,73 @@ impl Server {
                             )
                             .await
                             {
-                                Ok(ack)
-                                    if ack.accepted
-                                        && ack.forwarded
-                                        && Self::verified_delivery_receipt(
-                                            ack.delivery_receipt.as_ref(),
-                                            request.route_id(),
-                                            &payload_commitment,
-                                            &terminal_node_id,
-                                            observed_at,
-                                        ) =>
-                                {
-                                    if peer_store.record_verified_three_hop_probe_delivery(
-                                        &first_middle,
-                                        &second_middle,
-                                        &terminal,
-                                        observed_at,
-                                        effective_middle_candidate_count,
-                                        terminal_candidate_count,
-                                    ) {
-                                        return TwoHopBlindRelayProbeOutcome {
-                                            attempted: true,
-                                            route_accepted: true,
-                                            terminal_delivery_verified: true,
-                                        };
-                                    }
-                                    continue;
-                                }
                                 Ok(ack) if ack.accepted && ack.forwarded => {
-                                    peer_store
-                                        .record_blind_relay_three_hop_probe_result_with_context(
-                                            observed_at,
-                                            false,
-                                            "onion_receipt_unverified",
-                                            effective_middle_candidate_count,
-                                            terminal_candidate_count,
-                                            3,
-                                            2,
-                                        );
-                                    let _ = Self::record_onion_route_failure(
-                                        peer_store,
-                                        &first_middle,
+                                    match verify_blind_relay_delivery_receipt(
+                                        ack.delivery_receipt,
+                                        *request.route_id(),
+                                        payload_commitment,
+                                        terminal_node_id,
                                         observed_at,
-                                        "delivery_receipt_invalid",
-                                        OnionRouteFailureAttribution::EndToEnd,
-                                    );
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {
+                                            if peer_store
+                                                .record_verified_three_hop_probe_delivery(
+                                                    &first_middle,
+                                                    &second_middle,
+                                                    &terminal,
+                                                    observed_at,
+                                                    effective_middle_candidate_count,
+                                                    terminal_candidate_count,
+                                                )
+                                            {
+                                                return TwoHopBlindRelayProbeOutcome {
+                                                    attempted: true,
+                                                    route_accepted: true,
+                                                    terminal_delivery_verified: true,
+                                                };
+                                            }
+                                            continue;
+                                        }
+                                        Err(
+                                            BlindRelayDeliveryReceiptVerificationFailure::Missing
+                                            | BlindRelayDeliveryReceiptVerificationFailure::Invalid,
+                                        ) => {
+                                            peer_store
+                                                .record_blind_relay_three_hop_probe_result_with_context(
+                                                    observed_at,
+                                                    false,
+                                                    "onion_receipt_unverified",
+                                                    effective_middle_candidate_count,
+                                                    terminal_candidate_count,
+                                                    3,
+                                                    2,
+                                                );
+                                            let _ = Self::record_onion_route_failure(
+                                                peer_store,
+                                                &first_middle,
+                                                observed_at,
+                                                "delivery_receipt_invalid",
+                                                OnionRouteFailureAttribution::EndToEnd,
+                                            );
+                                        }
+                                        Err(
+                                            BlindRelayDeliveryReceiptVerificationFailure::Backpressure
+                                            | BlindRelayDeliveryReceiptVerificationFailure::Unavailable,
+                                        ) => {
+                                            peer_store
+                                                .record_blind_relay_three_hop_probe_result_with_context(
+                                                    observed_at,
+                                                    false,
+                                                    "onion_receipt_verifier_unavailable",
+                                                    effective_middle_candidate_count,
+                                                    terminal_candidate_count,
+                                                    3,
+                                                    2,
+                                                );
+                                        }
+                                    }
                                 }
                                 Ok(_ack) => {
                                     peer_store
@@ -12352,6 +12411,7 @@ impl Server {
         ))
     }
 
+    #[cfg(test)]
     fn verified_delivery_receipt(
         receipt: Option<&BlindRelayDeliveryReceipt>,
         route_id: &[u8; 16],
@@ -12359,16 +12419,15 @@ impl Server {
         terminal_node_id: &[u8; 32],
         now: u64,
     ) -> bool {
-        let Some(receipt) = receipt else {
-            return false;
-        };
-        receipt.version == BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION
-            && receipt.delivered_at
-                <= now.saturating_add(BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS)
-            && now.saturating_sub(receipt.delivered_at) <= BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
-            && receipt
-                .verify_expected(route_id, payload_commitment, terminal_node_id)
-                .is_ok()
+        receipt.is_some_and(|receipt| {
+            blind_relay_delivery_receipt_is_valid(
+                receipt,
+                route_id,
+                payload_commitment,
+                terminal_node_id,
+                now,
+            )
+        })
     }
 
     /// Applies route-health penalties only when the source observed evidence
@@ -12857,34 +12916,55 @@ impl Server {
                             // a conservative retry/fallback signal, not route
                             // failure evidence against either replacement.
                             let observed_at = unix_now_secs();
-                            if !Self::verified_delivery_receipt(
-                                ack.delivery_receipt.as_ref(),
-                                &route_id,
-                                &payload_commitment,
-                                &terminal_node_id,
+                            match verify_blind_relay_delivery_receipt(
+                                ack.delivery_receipt,
+                                route_id,
+                                payload_commitment,
+                                terminal_node_id,
                                 observed_at,
-                            ) {
-                                last_failure_reason =
-                                    Some("onion_delivery_receipt_rejected".to_string());
-                                let _ = Self::record_onion_route_failure(
-                                    peer_store,
-                                    &middle,
-                                    observed_at,
-                                    "delivery_receipt_rejected",
-                                    OnionRouteFailureAttribution::EndToEnd,
-                                );
-                            } else if peer_store.record_verified_client_onion_route_delivery(
-                                &middle,
-                                &terminal,
-                                observed_at,
-                            ) {
-                                accepted = accepted.saturating_add(1);
-                                if first_terminal_receipt.is_none() {
-                                    first_terminal_receipt = ack.delivery_receipt;
+                            )
+                            .await
+                            {
+                                Ok(receipt)
+                                    if peer_store.record_verified_client_onion_route_delivery(
+                                        &middle,
+                                        &terminal,
+                                        observed_at,
+                                    ) =>
+                                {
+                                    accepted = accepted.saturating_add(1);
+                                    if first_terminal_receipt.is_none() {
+                                        first_terminal_receipt = Some(receipt);
+                                    }
                                 }
-                            } else {
-                                last_failure_reason =
-                                    Some("onion_delivery_route_surface_changed".to_string());
+                                Ok(_) => {
+                                    last_failure_reason =
+                                        Some("onion_delivery_route_surface_changed".to_string());
+                                }
+                                Err(
+                                    BlindRelayDeliveryReceiptVerificationFailure::Missing
+                                    | BlindRelayDeliveryReceiptVerificationFailure::Invalid,
+                                ) => {
+                                    last_failure_reason =
+                                        Some("onion_delivery_receipt_rejected".to_string());
+                                    let _ = Self::record_onion_route_failure(
+                                        peer_store,
+                                        &middle,
+                                        observed_at,
+                                        "delivery_receipt_rejected",
+                                        OnionRouteFailureAttribution::EndToEnd,
+                                    );
+                                }
+                                Err(
+                                    BlindRelayDeliveryReceiptVerificationFailure::Backpressure
+                                    | BlindRelayDeliveryReceiptVerificationFailure::Unavailable,
+                                ) => {
+                                    // The route was exposed, so direct fallback remains
+                                    // forbidden, but local verifier loss is not peer fault.
+                                    last_failure_reason = Some(
+                                        "onion_delivery_receipt_verifier_unavailable".to_string(),
+                                    );
+                                }
                             }
                         }
                         Ok(_) => {

@@ -121,6 +121,9 @@ impl ChatRelayOutboundFailureReason {
                 | "onion_route_policy_rejected"
                 | "onion_route_local_construction_failed"
                 | "onion_delivery_receipt_rejected"
+                // [OUTBOUND-BLIND-RECEIPT-VERIFICATION 2026-08-31 by Codex]
+                // Local verifier loss is operational health, not peer fault.
+                | "onion_delivery_receipt_verifier_unavailable"
                 | "onion_delivery_route_surface_changed"
                 | "onion_delivery_ack_response_too_large"
                 | "onion_delivery_ack_response_body_read_failed"

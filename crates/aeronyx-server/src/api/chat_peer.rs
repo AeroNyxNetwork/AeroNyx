@@ -161,6 +161,9 @@
 //! - [OUTBOUND-BLIND-REQUEST-PREPARATION 2026-08-31 by Codex] Serializes each
 //!   opaque blind-relay request once behind bounded CPU admission and carries
 //!   immutable HTTP bytes without retaining a second large request graph
+//! - [OUTBOUND-BLIND-RECEIPT-VERIFICATION 2026-08-31 by Codex] Verifies
+//!   terminal delivery receipts outside Tokio and distinguishes invalid peer
+//!   evidence from local verifier saturation or worker loss
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -568,7 +571,7 @@ use super::chat_peer_response::{
 use super::chat_peer_response::{
     BlindRelayInvalidResponseKind, BlindRelayResponseContext, BlindRelayResponseDecision,
     BlindRelayResponseDomain, BlindRelayResponsePolicy, BlindRelayResponseSource,
-    BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
+    BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS,
 };
 #[cfg(test)]
 use super::chat_peer_retry::DEFAULT_MAX_ATTEMPTS_FOR_TESTS as MAX_BLIND_RELAY_FORWARD_ATTEMPTS;
@@ -1288,6 +1291,15 @@ pub(crate) enum BlindRelayRequestPreparationFailure {
 pub(crate) enum BlindRelayRequestPreparationError<E> {
     Build(E),
     Local(BlindRelayRequestPreparationFailure),
+}
+
+/// Peer-invalid evidence or a local bounded-verifier failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlindRelayDeliveryReceiptVerificationFailure {
+    Missing,
+    Invalid,
+    Backpressure,
+    Unavailable,
 }
 
 impl BlindRelayRequestPreparationFailure {
@@ -2888,6 +2900,66 @@ fn encode_prepared_peer_blind_relay_request(
         body: Bytes::from(body),
         route_id,
     })
+}
+
+/// Verifies one terminal delivery receipt behind bounded CPU admission.
+pub(crate) async fn verify_blind_relay_delivery_receipt(
+    receipt: Option<BlindRelayDeliveryReceipt>,
+    expected_route_id: [u8; 16],
+    expected_payload_commitment: [u8; 32],
+    expected_terminal_node_id: [u8; 32],
+    observed_at: u64,
+) -> Result<BlindRelayDeliveryReceipt, BlindRelayDeliveryReceiptVerificationFailure> {
+    // Missing evidence is a peer/protocol outcome and must not be hidden by
+    // unrelated local saturation.
+    let receipt = receipt.ok_or(BlindRelayDeliveryReceiptVerificationFailure::Missing)?;
+    let permit = blind_relay_crypto_admission()
+        .try_acquire_owned()
+        .map_err(|_| BlindRelayDeliveryReceiptVerificationFailure::Backpressure)?;
+    tokio::task::spawn_blocking(move || {
+        // [OUTBOUND-BLIND-RECEIPT-VERIFICATION 2026-08-31 by Codex] Hold the
+        // permit until signature verification really stops after cancellation.
+        let _permit = permit;
+        if blind_relay_delivery_receipt_is_valid(
+            &receipt,
+            &expected_route_id,
+            &expected_payload_commitment,
+            &expected_terminal_node_id,
+            observed_at,
+        ) {
+            Ok(receipt)
+        } else {
+            Err(BlindRelayDeliveryReceiptVerificationFailure::Invalid)
+        }
+    })
+    .await
+    .map_err(|_| {
+        warn!("[CHAT_PEER] Outbound blind receipt verification worker failed closed");
+        BlindRelayDeliveryReceiptVerificationFailure::Unavailable
+    })?
+}
+
+/// Pure receipt contract shared by the bounded worker and focused unit tests.
+#[must_use]
+pub(crate) fn blind_relay_delivery_receipt_is_valid(
+    receipt: &BlindRelayDeliveryReceipt,
+    expected_route_id: &[u8; 16],
+    expected_payload_commitment: &[u8; 32],
+    expected_terminal_node_id: &[u8; 32],
+    observed_at: u64,
+) -> bool {
+    receipt.version == BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION
+        && receipt.delivered_at
+            <= observed_at.saturating_add(BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS)
+        && observed_at.saturating_sub(receipt.delivered_at)
+            <= BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
+        && receipt
+            .verify_expected(
+                expected_route_id,
+                expected_payload_commitment,
+                expected_terminal_node_id,
+            )
+            .is_ok()
 }
 
 fn encode_prepared_peer_chat_relay_request<T: Serialize>(
