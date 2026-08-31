@@ -143,6 +143,8 @@
 //!   even during the short interval between local persistence and witnessing.
 //!
 //! ## Last Modified
+//! v0.61.0-OnionCandidateExclusionTelemetry - Add k-anonymous aggregate
+//! candidate-exclusion buckets without changing route admission or ordering
 //! v0.60.0-CoreVerifiedRouteContract - Shared the core route hop ceiling and
 //! forwarding-capability contract with source-side onion construction
 //! v0.59.0-BlindVaultEncryptedFailureNegotiation - Required signed support for
@@ -292,6 +294,9 @@ const ONION_CANDIDATES_REFRESH_AFTER_SECONDS: u64 = 300;
 const ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS: u64 = 1_800;
 const ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES: usize = 2;
 const ONION_CANDIDATES_MAX_CLIENT_HOPS: u8 = MAX_VERIFIED_ONION_ROUTE_HOPS as u8;
+const ONION_CANDIDATE_EXCLUSION_TELEMETRY_CONTRACT_VERSION: &str = "onion_candidate_exclusions.v1";
+/// Minimum independent observations disclosed by one exclusion bucket.
+const ONION_CANDIDATE_EXCLUSION_MIN_BUCKET_SIZE: usize = 3;
 const ONION_RELAY_ADMISSION_STABILITY_MIN_PROOFS: u64 = 3;
 const ONION_RELAY_ADMISSION_STABILITY_SUCCESS_PERCENT: u8 = 80;
 const DISCOVERY_PUBLIC_CARD_CONTRACT_VERSION: &str = "discovery_public_card.v1";
@@ -601,6 +606,130 @@ pub struct OnionRelayCandidate {
     pub signed_descriptor: SignedNodeDescriptor,
 }
 
+/// K-anonymous aggregate observations explaining why public descriptors did
+/// not reach the onion candidate pool.
+///
+/// [ONION-CANDIDATE-EXCLUSION-TELEMETRY 2026-08-31 by Codex] Every positive
+/// bucket smaller than the fixed disclosure threshold is omitted. The
+/// diagnostic pass never returns identities, endpoints, keys, routes, hashes,
+/// timestamps, or enough bucket totals to reconstruct a suppressed value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnionCandidateExclusionTelemetry {
+    /// Independently versioned additive telemetry contract.
+    pub contract_version: String,
+    /// Whether every coarse bucket is publishable under the privacy contract.
+    pub status: OnionCandidateExclusionTelemetryStatus,
+    /// Fixed k-anonymity threshold applied independently to every bucket.
+    pub minimum_bucket_size: usize,
+    /// First matching exclusion reason is counted at most once per descriptor.
+    pub bucket_semantics: String,
+    /// Protected aggregate observations. Missing members were suppressed.
+    pub buckets: OnionCandidateExclusionBuckets,
+    /// Explicit privacy boundary for operators and downstream agents.
+    pub privacy_boundary: String,
+}
+
+/// Closed telemetry disclosure outcomes serialized as stable snake-case values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnionCandidateExclusionTelemetryStatus {
+    /// Every bucket is either zero or large enough to publish.
+    Ready,
+    /// At least one positive bucket or internal observation was suppressed.
+    Partial,
+    /// The bounded descriptor sample itself is smaller than k.
+    SuppressedSmallSample,
+}
+
+/// Optional counts in the versioned candidate-exclusion contract.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnionCandidateExclusionBuckets {
+    /// Missing relay capabilities or required signed protocol features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_or_feature: Option<usize>,
+    /// Missing or expired local routeability evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routeability_unknown_or_stale: Option<usize>,
+    /// Recent route failure or active route quarantine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routeability_failed_or_quarantined: Option<usize>,
+    /// Missing signed KEM material or public endpoint metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_kem_or_endpoint: Option<usize>,
+    /// Entry collocation, self exclusion, or pinned-domain policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anti_affinity_or_policy: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OnionCandidateExclusionCounts {
+    capability_or_feature: usize,
+    routeability_unknown_or_stale: usize,
+    routeability_failed_or_quarantined: usize,
+    missing_kem_or_endpoint: usize,
+    anti_affinity_or_policy: usize,
+    unclassified: usize,
+}
+
+impl OnionCandidateExclusionCounts {
+    fn protected_bucket(count: usize, sample_adequate: bool) -> Option<usize> {
+        (sample_adequate && (count == 0 || count >= ONION_CANDIDATE_EXCLUSION_MIN_BUCKET_SIZE))
+            .then_some(count)
+    }
+
+    fn into_telemetry(self, observed_descriptors: usize) -> OnionCandidateExclusionTelemetry {
+        let sample_adequate = observed_descriptors >= ONION_CANDIDATE_EXCLUSION_MIN_BUCKET_SIZE;
+        let suppressed_bucket = [
+            self.capability_or_feature,
+            self.routeability_unknown_or_stale,
+            self.routeability_failed_or_quarantined,
+            self.missing_kem_or_endpoint,
+            self.anti_affinity_or_policy,
+        ]
+        .into_iter()
+        .any(|count| count > 0 && count < ONION_CANDIDATE_EXCLUSION_MIN_BUCKET_SIZE);
+        let status = if !sample_adequate {
+            OnionCandidateExclusionTelemetryStatus::SuppressedSmallSample
+        } else if suppressed_bucket || self.unclassified > 0 {
+            OnionCandidateExclusionTelemetryStatus::Partial
+        } else {
+            OnionCandidateExclusionTelemetryStatus::Ready
+        };
+
+        OnionCandidateExclusionTelemetry {
+            contract_version: ONION_CANDIDATE_EXCLUSION_TELEMETRY_CONTRACT_VERSION.to_string(),
+            status,
+            minimum_bucket_size: ONION_CANDIDATE_EXCLUSION_MIN_BUCKET_SIZE,
+            bucket_semantics:
+                "bounded_public_descriptors; first_matching_reason; positive_counts_below_k_omitted"
+                    .to_string(),
+            buckets: OnionCandidateExclusionBuckets {
+                capability_or_feature: Self::protected_bucket(
+                    self.capability_or_feature,
+                    sample_adequate,
+                ),
+                routeability_unknown_or_stale: Self::protected_bucket(
+                    self.routeability_unknown_or_stale,
+                    sample_adequate,
+                ),
+                routeability_failed_or_quarantined: Self::protected_bucket(
+                    self.routeability_failed_or_quarantined,
+                    sample_adequate,
+                ),
+                missing_kem_or_endpoint: Self::protected_bucket(
+                    self.missing_kem_or_endpoint,
+                    sample_adequate,
+                ),
+                anti_affinity_or_policy: Self::protected_bucket(
+                    self.anti_affinity_or_policy,
+                    sample_adequate,
+                ),
+            },
+            privacy_boundary: "aggregate exclusion buckets only; no peer identifiers or prefixes, endpoints, public keys, routes, hashes, timestamps, payloads, or reconstructable small-sample details".to_string(),
+        }
+    }
+}
+
 fn onion_required_capabilities() -> Vec<NodeCapability> {
     ONION_REQUIRED_CAPABILITIES.to_vec()
 }
@@ -777,6 +906,12 @@ pub struct OnionCandidatesResponse {
     pub requested_terminal_capability_ready: bool,
     /// Number of candidates returned.
     pub count: usize,
+    /// Versioned, k-anonymous candidate-exclusion diagnostics.
+    ///
+    /// Missing on older responses and omitted when deserializing/re-serializing
+    /// a legacy response, preserving the v1 candidate contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_exclusion_telemetry: Option<OnionCandidateExclusionTelemetry>,
     /// Minimum unique candidates required for a client-planned two-hop path.
     ///
     /// The entry node is the local node serving this endpoint, so clients need
@@ -2775,6 +2910,100 @@ async fn snapshot_handler(
     ))
 }
 
+/// Observes first-matching exclusion reasons without changing the candidate
+/// vector, route ranking, or admission decision.
+fn onion_candidate_exclusion_counts(
+    peer_store: &PeerStore,
+    descriptors: &[SignedNodeDescriptor],
+    now: u64,
+    local_node_id: Option<[u8; 32]>,
+    local_descriptor: Option<&SignedNodeDescriptor>,
+    path_protocol_features: &[NodeProtocolFeature],
+    policy: &DiscoveryApiPolicy,
+    pinned_route_domain_required: bool,
+) -> OnionCandidateExclusionCounts {
+    // [ONION-CANDIDATE-EXCLUSION-TELEMETRY 2026-08-31 by Codex] Match the
+    // existing privacy-safe health rows only inside this process. Prefix
+    // collisions or bounded health-summary omissions remain unclassified and
+    // force `partial`; they are never guessed or serialized.
+    let mut routeability_by_prefix: HashMap<String, Option<String>> = HashMap::new();
+    for peer in peer_store.peer_health_summary(now).peers {
+        match routeability_by_prefix.entry(peer.node_id_prefix) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(peer.routeability_state));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+        }
+    }
+
+    let local_pinned_route_domain =
+        local_node_id.and_then(|node_id| policy.pinned_route_domain(&node_id));
+    let mut counts = OnionCandidateExclusionCounts::default();
+    for descriptor in descriptors {
+        let node_id = descriptor.node_id();
+        if local_node_id == Some(node_id) {
+            counts.anti_affinity_or_policy = counts.anti_affinity_or_policy.saturating_add(1);
+            continue;
+        }
+        if !ONION_REQUIRED_CAPABILITIES
+            .iter()
+            .all(|required| descriptor.descriptor.capabilities.contains(required))
+            || !path_protocol_features
+                .iter()
+                .all(|required| descriptor.descriptor.advertises_protocol_feature(*required))
+        {
+            counts.capability_or_feature = counts.capability_or_feature.saturating_add(1);
+            continue;
+        }
+        if descriptor.descriptor.x25519_kem_public().is_none()
+            || descriptor.descriptor.public_endpoint.is_none()
+        {
+            counts.missing_kem_or_endpoint = counts.missing_kem_or_endpoint.saturating_add(1);
+            continue;
+        }
+
+        let node_prefix = hex::encode(&node_id[..4]);
+        match routeability_by_prefix
+            .get(&node_prefix)
+            .and_then(Option::as_deref)
+        {
+            Some("unknown" | "stale") => {
+                counts.routeability_unknown_or_stale =
+                    counts.routeability_unknown_or_stale.saturating_add(1);
+                continue;
+            }
+            Some("unreachable" | "quarantined") => {
+                counts.routeability_failed_or_quarantined =
+                    counts.routeability_failed_or_quarantined.saturating_add(1);
+                continue;
+            }
+            Some("reachable") => {}
+            _ => {
+                counts.unclassified = counts.unclassified.saturating_add(1);
+                continue;
+            }
+        }
+
+        if local_descriptor.is_some_and(|local_descriptor| {
+            !PeerStore::route_endpoints_are_network_diverse(local_descriptor, descriptor)
+        }) {
+            counts.anti_affinity_or_policy = counts.anti_affinity_or_policy.saturating_add(1);
+            continue;
+        }
+        let candidate_route_domain = policy.pinned_route_domain(&node_id);
+        if local_pinned_route_domain
+            .zip(candidate_route_domain)
+            .is_some_and(|(local, candidate)| local == candidate)
+            || (pinned_route_domain_required && candidate_route_domain.is_none())
+        {
+            counts.anti_affinity_or_policy = counts.anti_affinity_or_policy.saturating_add(1);
+        }
+    }
+    counts
+}
+
 /// `GET /api/discovery/onion-candidates` — health-ranked onion relay candidates
 /// for client-side path selection.
 ///
@@ -2807,6 +3036,20 @@ async fn onion_candidates_handler(
     let local_descriptor = state
         .local_node_id
         .and_then(|node_id| state.peer_store.get_valid(&node_id, now));
+    let diagnostic_descriptors = state
+        .peer_store
+        .valid_public_descriptors(now, state.policy.max_snapshot_limit);
+    let candidate_exclusion_telemetry = onion_candidate_exclusion_counts(
+        state.peer_store.as_ref(),
+        &diagnostic_descriptors,
+        now,
+        state.local_node_id,
+        local_descriptor.as_ref(),
+        path_protocol_features,
+        &state.policy,
+        pinned_route_domain_required,
+    )
+    .into_telemetry(diagnostic_descriptors.len());
     // [ONION-CAPABILITY-GATE 2026-08-02 by Codex] Query the bounded policy
     // pool first, then apply every onion-hop eligibility rule before the
     // client limit and ranking. Limiting earlier can let ineligible high-rank
@@ -3048,6 +3291,7 @@ async fn onion_candidates_handler(
         terminal_candidate_count,
         requested_terminal_capability_ready,
         count: candidates.len(),
+        candidate_exclusion_telemetry: Some(candidate_exclusion_telemetry),
         min_candidates_for_two_hop: ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
         two_hop_ready,
         requested_privacy_mode: requested_privacy_mode.as_str().to_string(),
@@ -4219,6 +4463,247 @@ mod tests {
             max_pps: descriptor.capacity.max_pps,
             signed_descriptor,
         }
+    }
+
+    // [ONION-CANDIDATE-EXCLUSION-TELEMETRY 2026-08-31 by Codex] Deterministic
+    // identities let the tests exercise every coarse gate without serializing
+    // any identity, endpoint, or routeability evidence into the telemetry.
+    fn signed_candidate_exclusion_descriptor(
+        seed: u8,
+        now: u64,
+        endpoint: Option<&str>,
+        capabilities: &[NodeCapability],
+        with_kem: bool,
+    ) -> SignedNodeDescriptor {
+        let keypair = IdentityKeyPair::from_bytes(&[seed; 32]).unwrap();
+        let mut descriptor = NodeDescriptor::new(
+            keypair.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now + 300,
+            "candidate-exclusion-test",
+        );
+        descriptor.public_endpoint = endpoint.map(ToString::to_string);
+        descriptor.capabilities = capabilities.to_vec();
+        descriptor.capacity = NodeCapacity {
+            max_sessions: 128,
+            max_bps: Some(500_000_000),
+            max_pps: None,
+        };
+        descriptor.policy = NodePolicy::default();
+        if with_kem {
+            descriptor = descriptor.with_x25519_kem(keypair.x25519_public_key_bytes());
+        }
+        SignedNodeDescriptor::sign(descriptor, &keypair).unwrap()
+    }
+
+    #[test]
+    fn test_onion_candidate_exclusion_telemetry_suppresses_small_buckets() {
+        let telemetry = OnionCandidateExclusionCounts {
+            capability_or_feature: 3,
+            routeability_unknown_or_stale: 2,
+            routeability_failed_or_quarantined: 0,
+            missing_kem_or_endpoint: 1,
+            anti_affinity_or_policy: 4,
+            unclassified: 0,
+        }
+        .into_telemetry(10);
+
+        assert_eq!(
+            telemetry.contract_version,
+            ONION_CANDIDATE_EXCLUSION_TELEMETRY_CONTRACT_VERSION
+        );
+        assert_eq!(
+            telemetry.status,
+            OnionCandidateExclusionTelemetryStatus::Partial
+        );
+        assert_eq!(telemetry.buckets.capability_or_feature, Some(3));
+        assert_eq!(telemetry.buckets.routeability_unknown_or_stale, None);
+        assert_eq!(
+            telemetry.buckets.routeability_failed_or_quarantined,
+            Some(0)
+        );
+        assert_eq!(telemetry.buckets.missing_kem_or_endpoint, None);
+        assert_eq!(telemetry.buckets.anti_affinity_or_policy, Some(4));
+
+        let encoded = serde_json::to_value(&telemetry).unwrap();
+        assert!(encoded.get("observed_descriptors").is_none());
+        assert!(encoded.get("unclassified").is_none());
+        let buckets = encoded["buckets"].as_object().unwrap();
+        assert!(!buckets.contains_key("routeability_unknown_or_stale"));
+        assert!(!buckets.contains_key("missing_kem_or_endpoint"));
+
+        let small_sample = OnionCandidateExclusionCounts {
+            capability_or_feature: 2,
+            ..OnionCandidateExclusionCounts::default()
+        }
+        .into_telemetry(2);
+        assert_eq!(
+            small_sample.status,
+            OnionCandidateExclusionTelemetryStatus::SuppressedSmallSample
+        );
+        assert_eq!(
+            serde_json::to_value(&small_sample).unwrap()["buckets"],
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn test_onion_candidate_exclusion_observer_classifies_all_coarse_gates() {
+        let store = PeerStore::new();
+        let now = now_secs();
+        let relay_capabilities = [NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
+        let capability_limited = [NodeCapability::ChatRelay];
+
+        for seed in 1..=3 {
+            let endpoint = format!("https://198.18.2.{seed}:8422");
+            let descriptor = signed_candidate_exclusion_descriptor(
+                seed,
+                now,
+                Some(&endpoint),
+                &capability_limited,
+                true,
+            );
+            store.upsert_verified(descriptor, now).unwrap();
+        }
+        for seed in 4..=6 {
+            let endpoint = format!("https://198.51.100.{seed}:8422");
+            let descriptor = signed_candidate_exclusion_descriptor(
+                seed,
+                now,
+                Some(&endpoint),
+                &relay_capabilities,
+                true,
+            );
+            store.upsert_verified(descriptor, now).unwrap();
+        }
+        for seed in 7..=9 {
+            let endpoint = format!("https://203.0.113.{seed}:8422");
+            let descriptor = signed_candidate_exclusion_descriptor(
+                seed,
+                now,
+                Some(&endpoint),
+                &relay_capabilities,
+                true,
+            );
+            let node_id = descriptor.node_id();
+            store.upsert_verified(descriptor, now).unwrap();
+            for _ in 0..3 {
+                store.record_route_forward_failure(&node_id, now, "request_failed");
+            }
+        }
+        for seed in 10..=12 {
+            let endpoint = format!("https://198.18.1.{seed}:8422");
+            let descriptor = signed_candidate_exclusion_descriptor(
+                seed,
+                now,
+                Some(&endpoint),
+                &relay_capabilities,
+                false,
+            );
+            store.upsert_verified(descriptor, now).unwrap();
+        }
+        for seed in 13..=15 {
+            let endpoint = format!("https://192.0.2.{seed}:8422");
+            let descriptor = signed_candidate_exclusion_descriptor(
+                seed,
+                now,
+                Some(&endpoint),
+                &relay_capabilities,
+                true,
+            );
+            let node_id = descriptor.node_id();
+            store.upsert_verified(descriptor, now).unwrap();
+            store.record_route_forward_success(&node_id, now);
+        }
+
+        let local_descriptor = signed_candidate_exclusion_descriptor(
+            200,
+            now,
+            Some("https://192.0.2.5:8422"),
+            &relay_capabilities,
+            true,
+        );
+        let descriptors = store.valid_public_descriptors(now, 64);
+        let counts = onion_candidate_exclusion_counts(
+            &store,
+            &descriptors,
+            now,
+            Some(local_descriptor.node_id()),
+            Some(&local_descriptor),
+            &[],
+            &DiscoveryApiPolicy::default(),
+            false,
+        );
+
+        assert_eq!(
+            counts,
+            OnionCandidateExclusionCounts {
+                capability_or_feature: 3,
+                routeability_unknown_or_stale: 3,
+                routeability_failed_or_quarantined: 3,
+                missing_kem_or_endpoint: 3,
+                anti_affinity_or_policy: 3,
+                unclassified: 0,
+            }
+        );
+        let telemetry = counts.into_telemetry(descriptors.len());
+        assert_eq!(
+            telemetry.status,
+            OnionCandidateExclusionTelemetryStatus::Ready
+        );
+        assert_eq!(telemetry.buckets.capability_or_feature, Some(3));
+        assert_eq!(telemetry.buckets.routeability_unknown_or_stale, Some(3));
+        assert_eq!(
+            telemetry.buckets.routeability_failed_or_quarantined,
+            Some(3)
+        );
+        assert_eq!(telemetry.buckets.missing_kem_or_endpoint, Some(3));
+        assert_eq!(telemetry.buckets.anti_affinity_or_policy, Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_onion_candidate_exclusion_telemetry_is_additive_for_legacy_clients() {
+        let app = build_discovery_router(Arc::new(PeerStore::new()), DiscoveryApiPolicy::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut current: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            current["candidate_exclusion_telemetry"]["contract_version"],
+            ONION_CANDIDATE_EXCLUSION_TELEMETRY_CONTRACT_VERSION
+        );
+        assert_eq!(
+            current["candidate_exclusion_telemetry"]["status"],
+            "suppressed_small_sample"
+        );
+        assert_eq!(
+            current["candidate_exclusion_telemetry"]["buckets"],
+            serde_json::json!({})
+        );
+
+        current
+            .as_object_mut()
+            .unwrap()
+            .remove("candidate_exclusion_telemetry");
+        let legacy: OnionCandidatesResponse = serde_json::from_value(current).unwrap();
+        assert!(legacy.candidate_exclusion_telemetry.is_none());
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("candidate_exclusion_telemetry")
+            .is_none());
     }
 
     /// Records enough fresh aggregate evidence for the requested synthetic
