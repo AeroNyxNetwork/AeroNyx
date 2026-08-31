@@ -2837,21 +2837,6 @@ pub(crate) async fn prepare_peer_chat_relay_request_v3(
     .await
 }
 
-/// Prepares one blind-relay request outside the asynchronous I/O runtime.
-pub(crate) async fn prepare_peer_blind_relay_http_request(
-    request: PeerBlindRelayRequest,
-) -> Result<PreparedPeerBlindRelayHttpRequest, BlindRelayRequestPreparationFailure> {
-    match prepare_peer_blind_relay_http_request_with(move || {
-        Ok::<_, std::convert::Infallible>((request, ()))
-    })
-    .await
-    {
-        Ok((request, ())) => Ok(request),
-        Err(BlindRelayRequestPreparationError::Build(never)) => match never {},
-        Err(BlindRelayRequestPreparationError::Local(error)) => Err(error),
-    }
-}
-
 /// Builds and serializes one blind request as a single bounded CPU operation.
 ///
 /// [ATOMIC-OUTBOUND-BLIND-PREPARATION 2026-08-31 by Codex] Route planning,

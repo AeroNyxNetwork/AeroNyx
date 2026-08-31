@@ -985,8 +985,7 @@ use crate::api::auth::ensure_jwt_secret;
 use crate::api::blind_vault::build_blind_vault_router;
 use crate::api::chat_handlers::build_chat_router;
 use crate::api::chat_peer::{
-    build_chat_peer_router, prepare_peer_blind_relay_http_request,
-    prepare_peer_blind_relay_http_request_with,
+    build_chat_peer_router, prepare_peer_blind_relay_http_request_with,
     prepare_peer_chat_relay_request_v1,
     prepare_peer_chat_relay_request_v2,
     prepare_peer_chat_relay_request_v3, verify_peer_chat_relay_receipt,
@@ -11203,24 +11202,41 @@ impl Server {
             return;
         };
 
-        let envelope = BlindRelayEnvelope {
-            route_id: Self::blind_relay_probe_route_id(now, self_node_id, &next_hop),
-            next_hop,
-            ttl: 1,
-            encrypted_blob: Self::blind_relay_probe_blob(now, self_node_id, &next_hop),
-            timestamp: now,
-            signature: [0u8; 64],
-        }
-        .sign_with(identity);
-        let request = PeerBlindRelayRequest {
-            envelope,
-            previous_hop_node_id: *self_node_id,
-            onward_envelope: None,
-            onward_descriptor_hint: None,
-        };
-        let request = match prepare_peer_blind_relay_http_request(request).await {
-            Ok(request) => request,
-            Err(error) => {
+        let preparation_identity = (*identity).clone();
+        let preparation_self_node_id = *self_node_id;
+        let request = match prepare_peer_blind_relay_http_request_with(move || {
+            let envelope = BlindRelayEnvelope {
+                route_id: Self::blind_relay_probe_route_id(
+                    now,
+                    &preparation_self_node_id,
+                    &next_hop,
+                ),
+                next_hop,
+                ttl: 1,
+                encrypted_blob: Self::blind_relay_probe_blob(
+                    now,
+                    &preparation_self_node_id,
+                    &next_hop,
+                ),
+                timestamp: now,
+                signature: [0u8; 64],
+            }
+            .sign_with(&preparation_identity);
+            Ok::<_, std::convert::Infallible>((
+                PeerBlindRelayRequest {
+                    envelope,
+                    previous_hop_node_id: preparation_self_node_id,
+                    onward_envelope: None,
+                    onward_descriptor_hint: None,
+                },
+                (),
+            ))
+        })
+        .await
+        {
+            Ok((request, ())) => request,
+            Err(BlindRelayRequestPreparationError::Build(never)) => match never {},
+            Err(BlindRelayRequestPreparationError::Local(error)) => {
                 // [OUTBOUND-BLIND-REQUEST-PREPARATION 2026-08-31 by Codex]
                 // No peer observed this request. Keep local saturation visible
                 // to aggregate readiness without poisoning route reputation.
@@ -11405,22 +11421,38 @@ impl Server {
                 // request. The signed receipt remains the sole authority.
                 let purpose_bound_probe_allowed =
                     purpose_bound_terminal_advertisers.contains(&terminal_node_id);
-                if let Some((request, payload_commitment)) = purpose_bound_probe_allowed
-                    .then(|| {
+                let purpose_bound_probe_request = if purpose_bound_probe_allowed {
+                    request_count = request_count.saturating_add(1);
+                    let preparation_identity = (*identity).clone();
+                    let preparation_self_node_id = *self_node_id;
+                    let preparation_middle = middle.clone();
+                    let preparation_terminal = terminal.clone();
+                    match prepare_peer_blind_relay_http_request_with(move || {
                         Self::build_two_hop_onion_delivery_probe_request(
-                            identity,
-                            self_node_id,
-                            &middle,
-                            &terminal,
+                            &preparation_identity,
+                            &preparation_self_node_id,
+                            &preparation_middle,
+                            &preparation_terminal,
                             now,
                         )
+                        .ok_or(())
                     })
-                    .flatten()
-                {
-                    request_count = request_count.saturating_add(1);
-                    let request = match prepare_peer_blind_relay_http_request(request).await {
-                        Ok(request) => request,
-                        Err(error) => {
+                    .await
+                    {
+                        Ok(request) => Some(request),
+                        Err(BlindRelayRequestPreparationError::Build(())) => {
+                            peer_store.record_blind_relay_two_hop_probe_result_with_context(
+                                now,
+                                false,
+                                "onion_route_contract_rejected",
+                                middle_candidate_count,
+                                terminal_candidate_count,
+                                2,
+                                1,
+                            );
+                            None
+                        }
+                        Err(BlindRelayRequestPreparationError::Local(error)) => {
                             peer_store.record_blind_relay_two_hop_probe_result_with_context(
                                 now,
                                 false,
@@ -11430,11 +11462,13 @@ impl Server {
                                 2,
                                 1,
                             );
-                            // Request preparation is local and pre-network;
-                            // continue searching without penalizing this middle.
                             continue 'terminal_candidates;
                         }
-                    };
+                    }
+                } else {
+                    None
+                };
+                if let Some((request, payload_commitment)) = purpose_bound_probe_request {
                     let request_started_at = Instant::now();
                     match client
                         .post(&url)
@@ -11589,16 +11623,6 @@ impl Server {
                             );
                         }
                     }
-                } else if purpose_bound_probe_allowed {
-                    peer_store.record_blind_relay_two_hop_probe_result_with_context(
-                        now,
-                        false,
-                        "onion_route_contract_rejected",
-                        middle_candidate_count,
-                        terminal_candidate_count,
-                        2,
-                        1,
-                    );
                 }
 
                 if request_count >= TWO_HOP_PROBE_REQUEST_LIMIT {
@@ -11606,53 +11630,63 @@ impl Server {
                 }
                 request_count = request_count.saturating_add(1);
 
-                let outer_envelope = BlindRelayEnvelope {
-                    route_id: Self::blind_relay_two_hop_probe_route_id(
-                        now,
-                        self_node_id,
-                        &middle_node_id,
-                        &terminal_node_id,
-                        b"outer",
-                    ),
-                    next_hop: middle_node_id,
-                    ttl: 2,
-                    encrypted_blob: Self::blind_relay_probe_blob(
-                        now,
-                        self_node_id,
-                        &middle_node_id,
-                    ),
-                    timestamp: now,
-                    signature: [0u8; 64],
-                }
-                .sign_with(identity);
-                let onward_envelope = BlindRelayEnvelope {
-                    route_id: Self::blind_relay_two_hop_probe_route_id(
-                        now,
-                        self_node_id,
-                        &middle_node_id,
-                        &terminal_node_id,
-                        b"onward",
-                    ),
-                    next_hop: terminal_node_id,
-                    ttl: 1,
-                    encrypted_blob: Self::blind_relay_probe_blob(
-                        now,
-                        self_node_id,
-                        &terminal_node_id,
-                    ),
-                    timestamp: now,
-                    signature: [0u8; 64],
-                }
-                .sign_with(identity);
-                let request = PeerBlindRelayRequest {
-                    envelope: outer_envelope,
-                    previous_hop_node_id: *self_node_id,
-                    onward_envelope: Some(onward_envelope),
-                    onward_descriptor_hint: Some(terminal.clone()),
-                };
-                let request = match prepare_peer_blind_relay_http_request(request).await {
-                    Ok(request) => request,
-                    Err(error) => {
+                let preparation_identity = (*identity).clone();
+                let preparation_self_node_id = *self_node_id;
+                let preparation_terminal = terminal.clone();
+                let request = match prepare_peer_blind_relay_http_request_with(move || {
+                    let outer_envelope = BlindRelayEnvelope {
+                        route_id: Self::blind_relay_two_hop_probe_route_id(
+                            now,
+                            &preparation_self_node_id,
+                            &middle_node_id,
+                            &terminal_node_id,
+                            b"outer",
+                        ),
+                        next_hop: middle_node_id,
+                        ttl: 2,
+                        encrypted_blob: Self::blind_relay_probe_blob(
+                            now,
+                            &preparation_self_node_id,
+                            &middle_node_id,
+                        ),
+                        timestamp: now,
+                        signature: [0u8; 64],
+                    }
+                    .sign_with(&preparation_identity);
+                    let onward_envelope = BlindRelayEnvelope {
+                        route_id: Self::blind_relay_two_hop_probe_route_id(
+                            now,
+                            &preparation_self_node_id,
+                            &middle_node_id,
+                            &terminal_node_id,
+                            b"onward",
+                        ),
+                        next_hop: terminal_node_id,
+                        ttl: 1,
+                        encrypted_blob: Self::blind_relay_probe_blob(
+                            now,
+                            &preparation_self_node_id,
+                            &terminal_node_id,
+                        ),
+                        timestamp: now,
+                        signature: [0u8; 64],
+                    }
+                    .sign_with(&preparation_identity);
+                    Ok::<_, std::convert::Infallible>((
+                        PeerBlindRelayRequest {
+                            envelope: outer_envelope,
+                            previous_hop_node_id: preparation_self_node_id,
+                            onward_envelope: Some(onward_envelope),
+                            onward_descriptor_hint: Some(preparation_terminal),
+                        },
+                        (),
+                    ))
+                })
+                .await
+                {
+                    Ok((request, ())) => request,
+                    Err(BlindRelayRequestPreparationError::Build(never)) => match never {},
+                    Err(BlindRelayRequestPreparationError::Local(error)) => {
                         peer_store.record_blind_relay_two_hop_probe_result_with_context(
                             now,
                             false,
@@ -11947,43 +11981,52 @@ impl Server {
                     }
                     attempted = true;
                     let terminal_node_id = terminal.node_id();
-                    let Some((request, payload_commitment)) =
-                        Self::build_three_hop_onion_delivery_probe_request(
-                            identity,
-                            self_node_id,
-                            &first_middle,
-                            &second_middle,
-                            &terminal,
-                            now,
-                        )
-                    else {
-                        peer_store.record_blind_relay_three_hop_probe_result_with_context(
-                            now,
-                            false,
-                            "onion_route_contract_rejected",
-                            effective_middle_candidate_count,
-                            terminal_candidate_count,
-                            3,
-                            2,
-                        );
-                        continue;
-                    };
                     request_count = request_count.saturating_add(1);
-                    let request = match prepare_peer_blind_relay_http_request(request).await {
-                        Ok(request) => request,
-                        Err(error) => {
-                            peer_store.record_blind_relay_three_hop_probe_result_with_context(
+                    let preparation_identity = (*identity).clone();
+                    let preparation_self_node_id = *self_node_id;
+                    let preparation_first_middle = first_middle.clone();
+                    let preparation_second_middle = second_middle.clone();
+                    let preparation_terminal = terminal.clone();
+                    let (request, payload_commitment) =
+                        match prepare_peer_blind_relay_http_request_with(move || {
+                            Self::build_three_hop_onion_delivery_probe_request(
+                                &preparation_identity,
+                                &preparation_self_node_id,
+                                &preparation_first_middle,
+                                &preparation_second_middle,
+                                &preparation_terminal,
                                 now,
-                                false,
-                                error.reason_bucket(),
-                                effective_middle_candidate_count,
-                                terminal_candidate_count,
-                                3,
-                                2,
-                            );
-                            continue;
-                        }
-                    };
+                            )
+                            .ok_or(())
+                        })
+                        .await
+                        {
+                            Ok(request) => request,
+                            Err(BlindRelayRequestPreparationError::Build(())) => {
+                                peer_store.record_blind_relay_three_hop_probe_result_with_context(
+                                    now,
+                                    false,
+                                    "onion_route_contract_rejected",
+                                    effective_middle_candidate_count,
+                                    terminal_candidate_count,
+                                    3,
+                                    2,
+                                );
+                                continue;
+                            }
+                            Err(BlindRelayRequestPreparationError::Local(error)) => {
+                                peer_store.record_blind_relay_three_hop_probe_result_with_context(
+                                    now,
+                                    false,
+                                    error.reason_bucket(),
+                                    effective_middle_candidate_count,
+                                    terminal_candidate_count,
+                                    3,
+                                    2,
+                                );
+                                continue;
+                            }
+                        };
 
                     let request_started_at = Instant::now();
                     match client
