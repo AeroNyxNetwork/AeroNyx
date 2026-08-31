@@ -41,8 +41,14 @@
 //!   unverified custody durability must fail before ephemeral sessions exist.
 //! - [RELAY-SMOKE-LOOPBACK-SOURCE 2026-08-25 by Codex] Bind the UDP client to
 //!   the matching loopback family; this command is host-local by contract.
+//! - [RELAY-SMOKE-HEALTH-AUTHORITY 2026-09-01 by Codex] The health surface is
+//!   pinned to the configured API authority, matching loopback family, and exact
+//!   `/api/vpn/health` path before any smoke traffic is created.
 //!
-//! Last Modified: v1.3.0-RequestBoundTerminalProof - Requires the encrypted
+//! Last Modified: v1.4.0-HealthAuthority - Pins readiness evidence to the
+//! configured host-local API authority instead of trusting any loopback URL.
+//!
+//! Previous: v1.3.0-RequestBoundTerminalProof - Requires the encrypted
 //! verified-submit response and exact terminal receipt before aggregate health
 //! may be used as a secondary consistency observation.
 //!
@@ -91,12 +97,97 @@ const SMOKE_PLAINTEXT_BYTES: usize = 48;
 // after the proof deadline and duplicates the tiny UDP close frame once.
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_CLOSE_REDUNDANCY: usize = 2;
+const HEALTH_PATH: &str = "/api/vpn/health";
+
+/// Config-bound authority for the host-local readiness evidence surface.
+///
+/// [RELAY-SMOKE-HEALTH-AUTHORITY 2026-09-01 by Codex] Keeping these fields
+/// private prevents callers from manufacturing a trusted authority without
+/// first binding it to the selected UDP listener and configured API port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelaySmokeHealthAuthority {
+    server_addr: SocketAddr,
+    health_host: IpAddr,
+    health_port: u16,
+}
+
+impl RelaySmokeHealthAuthority {
+    /// Creates the only health authority accepted by one smoke invocation.
+    pub fn new(server_addr: SocketAddr, configured_api_addr: SocketAddr) -> Result<Self> {
+        anyhow::ensure!(
+            server_addr.ip().is_loopback(),
+            "relay smoke server must use a loopback address"
+        );
+        anyhow::ensure!(
+            configured_api_addr.ip().is_loopback(),
+            "configured health API must use a loopback address"
+        );
+        anyhow::ensure!(
+            configured_api_addr.port() != 0,
+            "configured health API port must be non-zero"
+        );
+        anyhow::ensure!(
+            server_addr.is_ipv4() == configured_api_addr.is_ipv4(),
+            "configured health API must match the relay smoke address family"
+        );
+        Ok(Self {
+            server_addr,
+            health_host: configured_api_addr.ip(),
+            health_port: configured_api_addr.port(),
+        })
+    }
+
+    fn validate_url(self, server_addr: SocketAddr, health_url: &str) -> Result<reqwest::Url> {
+        anyhow::ensure!(
+            server_addr == self.server_addr,
+            "relay smoke server does not match the pinned health authority"
+        );
+        let url = reqwest::Url::parse(health_url).context("invalid health URL")?;
+        anyhow::ensure!(
+            url.scheme() == "http",
+            "health URL must use host-local HTTP"
+        );
+        anyhow::ensure!(
+            url.username().is_empty() && url.password().is_none(),
+            "health URL must not contain credentials"
+        );
+        anyhow::ensure!(
+            url.query().is_none() && url.fragment().is_none(),
+            "health URL must not contain a query or fragment"
+        );
+        let host_literal = url.host_str().context("health URL must contain a host")?;
+        // `Url::host_str` retains brackets for IPv6 literals in the reqwest
+        // version pinned by this workspace. Strip only one exact bracket pair;
+        // domains and malformed literals still fail the IP parser below.
+        let host_literal = host_literal
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host_literal);
+        let host = host_literal
+            .parse::<IpAddr>()
+            .context("health URL host must be an IP address")?;
+        anyhow::ensure!(
+            host == self.health_host,
+            "health URL does not match the configured loopback address"
+        );
+        anyhow::ensure!(
+            url.port_or_known_default() == Some(self.health_port),
+            "health URL port does not match the configured node API"
+        );
+        anyhow::ensure!(
+            url.path() == HEALTH_PATH,
+            "health URL must use the canonical VPN health path"
+        );
+        Ok(url)
+    }
+}
 
 /// Host-local options for one authenticated live relay smoke run.
 #[derive(Debug, Clone)]
 pub struct RelaySmokeOptions {
     pub server_addr: SocketAddr,
     pub health_url: String,
+    pub health_authority: RelaySmokeHealthAuthority,
     pub expected_server_key: [u8; 32],
     pub timeout: Duration,
 }
@@ -116,26 +207,8 @@ impl RelaySmokeOptions {
             "relay smoke timeout must be between 5 and 120 seconds"
         );
 
-        let url = reqwest::Url::parse(&self.health_url).context("invalid health URL")?;
-        anyhow::ensure!(
-            url.scheme() == "http",
-            "health URL must use host-local HTTP"
-        );
-        anyhow::ensure!(
-            url.username().is_empty() && url.password().is_none(),
-            "health URL must not contain credentials"
-        );
-        anyhow::ensure!(
-            url.query().is_none() && url.fragment().is_none(),
-            "health URL must not contain a query or fragment"
-        );
-        let host = url
-            .host_str()
-            .context("health URL must contain a host")?
-            .parse::<IpAddr>()
-            .context("health URL host must be an IP address")?;
-        anyhow::ensure!(host.is_loopback(), "health URL must use a loopback address");
-        Ok(url)
+        self.health_authority
+            .validate_url(self.server_addr, &self.health_url)
     }
 }
 
@@ -1259,6 +1332,72 @@ mod tests {
     use aeronyx_core::protocol::chat::BlindRelayDeliveryReceipt;
     use aeronyx_core::protocol::codec::decode_client_hello;
     use aeronyx_core::protocol::{encode_envelope, OnionRoutePurpose};
+
+    #[test]
+    fn health_authority_accepts_only_the_configured_loopback_surface() {
+        // [RELAY-SMOKE-HEALTH-AUTHORITY 2026-09-01 by Codex] Cover both
+        // address families because the selected UDP tunnel and configured API
+        // must remain on one exact host-local address family.
+        let server_v4: SocketAddr = "127.0.0.1:51820".parse().unwrap();
+        let authority_v4 =
+            RelaySmokeHealthAuthority::new(server_v4, "127.0.0.1:8421".parse().unwrap()).unwrap();
+        assert_eq!(
+            authority_v4
+                .validate_url(server_v4, "http://127.0.0.1:8421/api/vpn/health")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:8421/api/vpn/health"
+        );
+
+        let server_v6: SocketAddr = "[::1]:51820".parse().unwrap();
+        let authority_v6 =
+            RelaySmokeHealthAuthority::new(server_v6, "[::1]:8421".parse().unwrap()).unwrap();
+        assert_eq!(
+            authority_v6
+                .validate_url(server_v6, "http://[::1]:8421/api/vpn/health")
+                .unwrap()
+                .as_str(),
+            "http://[::1]:8421/api/vpn/health"
+        );
+    }
+
+    #[test]
+    fn health_authority_rejects_unpinned_or_ambiguous_urls() {
+        let server: SocketAddr = "127.0.0.1:51820".parse().unwrap();
+        let authority =
+            RelaySmokeHealthAuthority::new(server, "127.0.0.1:8421".parse().unwrap()).unwrap();
+
+        for rejected in [
+            "https://127.0.0.1:8421/api/vpn/health",
+            "http://user:secret@127.0.0.1:8421/api/vpn/health",
+            "http://127.0.0.1:8421/api/vpn/health?fresh=true",
+            "http://127.0.0.1:8421/api/vpn/health#latest",
+            "http://127.0.0.1:8422/api/vpn/health",
+            "http://127.0.0.1:8421/api/vpn/health/",
+            "http://127.0.0.1:8421/api/vpn/status",
+            "http://127.0.0.2:8421/api/vpn/health",
+            "http://[::1]:8421/api/vpn/health",
+            "http://192.0.2.1:8421/api/vpn/health",
+        ] {
+            assert!(
+                authority.validate_url(server, rejected).is_err(),
+                "unexpectedly accepted {rejected}"
+            );
+        }
+        assert!(authority
+            .validate_url(
+                "127.0.0.1:51821".parse().unwrap(),
+                "http://127.0.0.1:8421/api/vpn/health",
+            )
+            .is_err());
+        assert!(RelaySmokeHealthAuthority::new(
+            "192.0.2.1:51820".parse().unwrap(),
+            "127.0.0.1:8421".parse().unwrap(),
+        )
+        .is_err());
+        assert!(RelaySmokeHealthAuthority::new(server, "127.0.0.1:0".parse().unwrap()).is_err());
+        assert!(RelaySmokeHealthAuthority::new(server, "[::1]:8421".parse().unwrap(),).is_err());
+    }
 
     #[test]
     fn smoke_envelope_is_signed_and_e2e_decryptable() {

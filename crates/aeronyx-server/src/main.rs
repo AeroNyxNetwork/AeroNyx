@@ -822,11 +822,18 @@ async fn cmd_relay_smoke(
         server_addr.port() == config.listen_addr().port(),
         "relay smoke UDP port does not match the configured node listener"
     );
+    // [RELAY-SMOKE-HEALTH-AUTHORITY 2026-09-01 by Codex] Bind readiness and
+    // active-session evidence to the same configured node before opening any
+    // ephemeral protocol session. An arbitrary loopback HTTP server is not a
+    // valid substitute for the running node's aggregate health surface.
+    let health_authority =
+        relay_smoke::RelaySmokeHealthAuthority::new(server_addr, config.memchain.api_listen_addr)?;
     let key_path = PathBuf::from(&config.server_key.key_file);
     let expected_server_key = relay_smoke::load_expected_server_public_key(&key_path).await?;
     let report = relay_smoke::run(relay_smoke::RelaySmokeOptions {
         server_addr,
         health_url,
+        health_authority,
         expected_server_key,
         timeout: std::time::Duration::from_secs(timeout_seconds),
     })
