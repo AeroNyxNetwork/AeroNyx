@@ -257,9 +257,11 @@ impl HealthSnapshot {
     }
 
     fn authenticated_onion_outbound_diagnostic(&self, baseline_rounds: Option<u64>) -> String {
-        // [RELAY-HEALTH-DIAGNOSTICS 2026-08-15 by Codex] Only serialize the
-        // service's allow-listed aggregate buckets. Never include peer IDs,
-        // endpoints, message IDs, sessions, wallets, or payload material.
+        // [RELAY-SMOKE-DIAGNOSTIC-ALLOWLIST 2026-08-31 by Codex] Treat the
+        // host-local health document as untrusted at the final output boundary.
+        // The relay service normally publishes typed aggregate buckets, but a
+        // mixed-version or corrupted runtime must not make this privileged CLI
+        // echo an endpoint, route id, message id, or payload-adjacent string.
         let Some(status) = self
             .chat_relay_status
             .as_ref()
@@ -272,11 +274,8 @@ impl HealthSnapshot {
         }
         format!(
             "authenticated_onion_status={}, failure_reason={}, attempted={}, accepted={}, failed={}",
-            status.last_status.as_deref().unwrap_or("unobserved"),
-            status
-                .last_failure_reason
-                .as_deref()
-                .unwrap_or("none"),
+            safe_authenticated_onion_status(status.last_status.as_deref()),
+            safe_authenticated_onion_failure(status.last_failure_reason.as_deref()),
             status.last_attempted,
             status.last_accepted,
             status.last_failed,
@@ -320,7 +319,8 @@ impl HealthSnapshot {
         anyhow::ensure!(
             path.authenticated_delivery_path_ready,
             "authenticated delivery path is not ready: {}",
-            path.authenticated_delivery_path_reason
+            AuthenticatedDeliveryPathFailure::from_reason(&path.authenticated_delivery_path_reason)
+                .as_str()
         );
         anyhow::ensure!(
             path.delivery_receipt_capable_peers >= 2,
@@ -354,6 +354,137 @@ impl HealthSnapshot {
         );
         Ok(())
     }
+}
+
+// [RELAY-SMOKE-TYPED-PATH-FAILURE 2026-08-31 by Codex] Keep the preflight
+// failure surface closed even when a mixed-version or corrupted host-local
+// health response supplies an arbitrary string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthenticatedDeliveryPathFailure {
+    NoReceiptCapableTerminal,
+    NoNetworkDiverseReceiptPath,
+    NoReceiptCapableMiddle,
+    Unknown,
+}
+
+impl AuthenticatedDeliveryPathFailure {
+    fn from_reason(reason: &str) -> Self {
+        match reason {
+            "no_receipt_capable_terminal" => Self::NoReceiptCapableTerminal,
+            "no_network_diverse_receipt_path" => Self::NoNetworkDiverseReceiptPath,
+            "no_receipt_capable_middle" => Self::NoReceiptCapableMiddle,
+            _ => Self::Unknown,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoReceiptCapableTerminal => "no_receipt_capable_terminal",
+            Self::NoNetworkDiverseReceiptPath => "no_network_diverse_receipt_path",
+            Self::NoReceiptCapableMiddle => "no_receipt_capable_middle",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+fn safe_authenticated_onion_status(status: Option<&str>) -> &'static str {
+    match status {
+        None => "unobserved",
+        Some("healthy") => "healthy",
+        Some("degraded") => "degraded",
+        Some("failed") => "failed",
+        Some("idle") => "idle",
+        Some(_) => "unknown",
+    }
+}
+
+// [RELAY-SMOKE-TYPED-OUTBOUND-FAILURE 2026-08-31 by Codex] Store only
+// explicit static literals in the accepted variant. This makes the privacy
+// boundary compile-time visible and cannot accidentally return the borrowed
+// health-document string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthenticatedOnionFailure {
+    None,
+    Allowlisted(&'static str),
+    HttpStatus,
+    Unknown,
+}
+
+static AUTHENTICATED_ONION_FAILURE_ALLOWLIST: &[&str] = &[
+    "peer_http_client_unavailable",
+    "no_receipt_capable_terminal",
+    "no_network_diverse_receipt_path",
+    "no_receipt_capable_middle",
+    "onion_terminal_selection_changed",
+    "onion_terminal_diversity_exhausted",
+    "onion_middle_candidate_unavailable",
+    "onion_middle_endpoint_missing",
+    "onion_middle_endpoint_invalid",
+    "onion_request_build_failed",
+    "onion_payload_encoding_failed",
+    "onion_route_refresh_required",
+    "onion_route_policy_rejected",
+    "onion_route_local_construction_failed",
+    "onion_delivery_receipt_rejected",
+    "onion_delivery_receipt_verifier_unavailable",
+    "onion_delivery_route_surface_changed",
+    "onion_delivery_ack_response_too_large",
+    "onion_delivery_ack_response_body_read_failed",
+    "onion_delivery_ack_response_json_decode_failed",
+    "onion_delivery_request_timeout",
+    "onion_delivery_request_connect",
+    "onion_delivery_request_http_status",
+    "onion_delivery_request_decode",
+    "onion_delivery_request_body",
+    "onion_delivery_request_request",
+    "onion_delivery_request_unknown",
+    "unknown",
+];
+
+impl AuthenticatedOnionFailure {
+    fn from_reason(reason: Option<&str>) -> Self {
+        let Some(reason) = reason else {
+            return Self::None;
+        };
+        if let Some(safe) = AUTHENTICATED_ONION_FAILURE_ALLOWLIST
+            .iter()
+            .copied()
+            .find(|safe| *safe == reason)
+        {
+            return Self::Allowlisted(safe);
+        }
+        if is_bounded_http_status_bucket(reason, "onion_delivery_http_")
+            || is_bounded_http_status_bucket(reason, "onion_delivery_request_http_")
+        {
+            Self::HttpStatus
+        } else {
+            Self::Unknown
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Allowlisted(reason) => reason,
+            Self::HttpStatus => "onion_delivery_http_status",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+fn safe_authenticated_onion_failure(reason: Option<&str>) -> &'static str {
+    AuthenticatedOnionFailure::from_reason(reason).as_str()
+}
+
+fn is_bounded_http_status_bucket(reason: &str, prefix: &str) -> bool {
+    let Some(status) = reason.strip_prefix(prefix) else {
+        return false;
+    };
+    status.len() == 3
+        && status.bytes().all(|byte| byte.is_ascii_digit())
+        && status
+            .parse::<u16>()
+            .is_ok_and(|status| (100..=599).contains(&status))
 }
 
 struct HealthClient {
@@ -1074,6 +1205,71 @@ mod tests {
     }
 
     #[test]
+    fn relay_failure_diagnostic_redacts_untrusted_health_strings() {
+        // [RELAY-SMOKE-DIAGNOSTIC-ALLOWLIST 2026-08-31 by Codex] A local
+        // mixed-version response is still an input boundary. Prove that values
+        // shaped like endpoint or route material never reach operator output.
+        let snapshot: HealthSnapshot = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "active_sessions": 1,
+            "privacy_protocol_health": { "failed_checks": 0 },
+            "discovery_status": {
+                "peer_store": {
+                    "blind_relay_quality": {
+                        "verified_client_onion_deliveries": 4,
+                        "delivery_receipt_capable_peers": 2,
+                        "authenticated_delivery_path_ready": true,
+                        "authenticated_delivery_path_reason": "authenticated_receipt_path_ready"
+                    },
+                    "peer_quorum": { "quorum_ready": true },
+                    "route_governance": { "route_pool_ready": true },
+                    "network_story": { "chat_two_hop_onion_ready": true }
+                }
+            },
+            "chat_relay_status": {
+                "peer_relay": {
+                    "authenticated_onion_outbound": {
+                        "rounds": 8,
+                        "last_attempted": 1,
+                        "last_accepted": 0,
+                        "last_failed": 1,
+                        "last_status": "endpoint=http://sensitive.invalid",
+                        "last_failure_reason": "route_id=00112233445566778899aabbccddeeff"
+                    }
+                }
+            }
+        }))
+        .expect("parse health fixture");
+
+        let diagnostic = snapshot.authenticated_onion_outbound_diagnostic(Some(7));
+        assert_eq!(
+            diagnostic,
+            "authenticated_onion_status=unknown, failure_reason=unknown, attempted=1, accepted=0, failed=1"
+        );
+        assert!(!diagnostic.contains("sensitive.invalid"));
+        assert!(!diagnostic.contains("00112233445566778899aabbccddeeff"));
+    }
+
+    #[test]
+    fn relay_failure_diagnostic_coarsens_dynamic_http_status() {
+        // [RELAY-SMOKE-DIAGNOSTIC-ALLOWLIST 2026-08-31 by Codex] Both
+        // producer prefixes accept only bounded status codes and collapse to
+        // one route-independent operator bucket.
+        assert_eq!(
+            safe_authenticated_onion_failure(Some("onion_delivery_http_503")),
+            "onion_delivery_http_status"
+        );
+        assert_eq!(
+            safe_authenticated_onion_failure(Some("onion_delivery_request_http_429")),
+            "onion_delivery_http_status"
+        );
+        assert_eq!(
+            safe_authenticated_onion_failure(Some("onion_delivery_http_999")),
+            "unknown"
+        );
+    }
+
+    #[test]
     fn idle_two_hop_preflight_rejects_existing_sessions() {
         let snapshot: HealthSnapshot = serde_json::from_value(serde_json::json!({
             "status": "ok",
@@ -1161,6 +1357,42 @@ mod tests {
             .ensure_idle_two_hop_ready()
             .expect_err("zero receipt peers must fail closed");
         assert!(error.to_string().contains("no_receipt_capable_terminal"));
+    }
+
+    #[test]
+    fn idle_two_hop_preflight_redacts_untrusted_path_reason() {
+        // [RELAY-SMOKE-TYPED-PATH-FAILURE 2026-08-31 by Codex] The host-local
+        // preflight must not echo endpoint or route-shaped material from an
+        // untrusted health response before any live session is created.
+        let snapshot: HealthSnapshot = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "active_sessions": 0,
+            "privacy_protocol_health": { "failed_checks": 0 },
+            "discovery_status": {
+                "peer_store": {
+                    "blind_relay_quality": {
+                        "verified_client_onion_deliveries": 0,
+                        "delivery_receipt_capable_peers": 2,
+                        "authenticated_delivery_path_ready": false,
+                        "authenticated_delivery_path_reason": "endpoint=http://sensitive.invalid/route/00112233"
+                    },
+                    "peer_quorum": { "quorum_ready": true },
+                    "route_governance": { "route_pool_ready": true },
+                    "network_story": { "chat_two_hop_onion_ready": true }
+                }
+            }
+        }))
+        .expect("health fixture");
+
+        let error = snapshot
+            .ensure_idle_two_hop_ready()
+            .expect_err("untrusted path reason must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "authenticated delivery path is not ready: unknown"
+        );
+        assert!(!error.to_string().contains("sensitive.invalid"));
+        assert!(!error.to_string().contains("00112233"));
     }
 
     #[test]
