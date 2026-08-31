@@ -1265,7 +1265,6 @@ pub(crate) enum DirectRelayRequestPreparationFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectRelayReceiptVerificationFailure {
     Invalid(&'static str),
-    Backpressure,
     Unavailable,
 }
 
@@ -2996,14 +2995,10 @@ pub(crate) async fn verify_peer_chat_relay_receipt(
     expected_node_id: [u8; 32],
     observed_at: u64,
 ) -> Result<(), DirectRelayReceiptVerificationFailure> {
-    // [OUTBOUND-DIRECT-RECEIPT-VERIFICATION 2026-08-31 by Codex] A response
-    // body has already been bounded before this call. Fail fast when the local
-    // CPU partition is full; the caller may repeat the exact v3 request, but
-    // must not attribute local saturation to the selected peer.
-    let permit = direct_relay_cpu_admission()
-        .try_acquire_owned()
-        .map_err(|_| DirectRelayReceiptVerificationFailure::Backpressure)?;
-    execute_direct_relay_crypto(permit, move || {
+    // [DIRECT-RECEIPT-FAIR-COMPLETION 2026-08-31 by Codex] Durable custody may
+    // already exist at the selected target. Await bounded fair completion
+    // instead of repeating network I/O merely because local CPU is busy.
+    complete_direct_relay_crypto(move || {
         receipt.verify_expected_commitment(
             &expected_request_commitment,
             &expected_node_id,

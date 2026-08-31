@@ -1135,7 +1135,6 @@ enum DirectPeerRelayAckFailure {
     ReceiptRequestMissing,
     ReceiptMissing,
     ReceiptInvalid(&'static str),
-    VerificationBackpressure,
     VerificationUnavailable,
 }
 
@@ -1145,16 +1144,12 @@ impl DirectPeerRelayAckFailure {
             self,
             Self::Bounded(
                 BoundedHttpResponseError::BodyRead | BoundedHttpResponseError::JsonDecode
-            ) | Self::VerificationBackpressure
-                | Self::VerificationUnavailable
+            ) | Self::VerificationUnavailable
         )
     }
 
     const fn is_local_runtime_failure(self) -> bool {
-        matches!(
-            self,
-            Self::VerificationBackpressure | Self::VerificationUnavailable
-        )
+        matches!(self, Self::VerificationUnavailable)
     }
 
     fn privacy_safe_reason(self) -> String {
@@ -1166,7 +1161,7 @@ impl DirectPeerRelayAckFailure {
             Self::ReceiptInvalid(reason) => format!("peer_relay_{reason}"),
             // Preserve the existing closed aggregate vocabulary. Attribution
             // remains typed, so these local faults never affect peer health.
-            Self::VerificationBackpressure | Self::VerificationUnavailable => {
+            Self::VerificationUnavailable => {
                 "peer_relay_request_unknown".to_string()
             }
         }
@@ -13117,9 +13112,6 @@ impl Server {
             DirectRelayReceiptVerificationFailure::Invalid(reason) => {
                 DirectPeerRelayAckFailure::ReceiptInvalid(reason)
             }
-            DirectRelayReceiptVerificationFailure::Backpressure => {
-                DirectPeerRelayAckFailure::VerificationBackpressure
-            }
             DirectRelayReceiptVerificationFailure::Unavailable => {
                 DirectPeerRelayAckFailure::VerificationUnavailable
             }
@@ -13132,7 +13124,7 @@ impl Server {
     /// to one target and retains its signed ACK by opaque commitment. One
     /// attempt therefore spans send, status, bounded body read, and receipt
     /// verification. Retry remains limited to transport ambiguity, HTTP 425,
-    /// an incomplete/undecodable bounded ACK body, or local verifier pressure;
+    /// an incomplete/undecodable bounded ACK body, or verifier worker loss;
     /// deterministic remote protocol and cryptographic failures stop at once.
     async fn send_and_validate_target_bound_peer_relay(
         client: &reqwest::Client,
