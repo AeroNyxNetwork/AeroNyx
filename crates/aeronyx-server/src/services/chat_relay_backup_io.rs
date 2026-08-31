@@ -10,6 +10,7 @@
 // Main Functionality:
 //   - Creates and verifies owner-private backup directories and files.
 //   - Rejects symbolic links and non-regular control-file boundaries.
+//   - Rejects foreign-owned or multiply-linked private control files.
 //   - Acquires an exclusive, RAII-released cross-process maintenance lock.
 //   - Durably synchronizes backup publication boundaries.
 //
@@ -28,10 +29,13 @@
 // Important Note for Next Developer:
 //   - Do not weaken Unix `0700` directory or `0600` file requirements.
 //   - Never follow a symbolic link at a private backup boundary.
+//   - Validate file owner and link count before returning a writable handle.
 //   - Lock acquisition and publication durability must remain fail-closed.
 //   - Keep backup policy, artifact names, payloads, and service state elsewhere.
 //
 // Last Modified:
+//   v1.1.0-ControlFileIdentity - Rejected foreign-owned and multiply-linked
+//     control files before callers can mutate their shared inode
 //   v1.0.0-BackupFilesystemDomain - Initial filesystem capability extraction
 // ============================================
 
@@ -170,6 +174,41 @@ fn restrict_directory_permissions(_path: &Path) -> ChatRelayResult<()> {
     Ok(())
 }
 
+fn validate_private_control_file(file: &File) -> ChatRelayResult<()> {
+    let metadata = file.metadata().map_err(|_| {
+        backup_io_error(
+            rusqlite::ffi::SQLITE_IOERR,
+            "unable to inspect private relay backup control file",
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(backup_io_error(
+            rusqlite::ffi::SQLITE_PERM,
+            "relay backup control boundary is not a private regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // [CHAT-RELAY-BACKUP-FILE-IDENTITY 2026-08-31 by Codex] A private
+        // mode does not prove exclusive ownership of an inode. Reject foreign
+        // ownership and hard links before a caller receives a writable handle.
+        // SAFETY: `geteuid` has no preconditions and does not access memory.
+        let effective_user_id = unsafe { nix::libc::geteuid() };
+        if metadata.uid() != effective_user_id
+            || metadata.nlink() != 1
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(backup_io_error(
+                rusqlite::ffi::SQLITE_PERM,
+                "relay backup control file is not owner-private",
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl BackupFilesystem for LocalBackupFilesystem {
     fn reserve_private_file(&self, path: &Path) -> ChatRelayResult<()> {
         reserve_private_file(path)
@@ -246,7 +285,7 @@ impl BackupFilesystem for LocalBackupFilesystem {
         mode: PrivateBackupControlFileMode,
     ) -> ChatRelayResult<File> {
         #[cfg(unix)]
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
 
         #[cfg(not(unix))]
         if let Ok(metadata) = std::fs::symlink_metadata(path) {
@@ -275,31 +314,13 @@ impl BackupFilesystem for LocalBackupFilesystem {
                 "unable to open private relay backup control file",
             )
         })?;
-        let metadata = file.metadata().map_err(|_| {
-            backup_io_error(
-                rusqlite::ffi::SQLITE_IOERR,
-                "unable to inspect private relay backup control file",
-            )
-        })?;
-        if !metadata.is_file() {
-            return Err(backup_io_error(
-                rusqlite::ffi::SQLITE_PERM,
-                "relay backup control boundary is not a private regular file",
-            ));
-        }
-        #[cfg(unix)]
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(backup_io_error(
-                rusqlite::ffi::SQLITE_PERM,
-                "relay backup control file is not owner-private",
-            ));
-        }
+        validate_private_control_file(&file)?;
         Ok(file)
     }
 
     fn open_existing_control_file(&self, path: &Path) -> ChatRelayResult<Option<File>> {
         #[cfg(unix)]
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
 
         #[cfg(not(unix))]
         match std::fs::symlink_metadata(path) {
@@ -333,25 +354,7 @@ impl BackupFilesystem for LocalBackupFilesystem {
                 ));
             }
         };
-        let metadata = file.metadata().map_err(|_| {
-            backup_io_error(
-                rusqlite::ffi::SQLITE_IOERR,
-                "unable to inspect private relay backup control file",
-            )
-        })?;
-        if !metadata.is_file() {
-            return Err(backup_io_error(
-                rusqlite::ffi::SQLITE_PERM,
-                "relay backup control boundary is not a private regular file",
-            ));
-        }
-        #[cfg(unix)]
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(backup_io_error(
-                rusqlite::ffi::SQLITE_PERM,
-                "relay backup control file is not owner-private",
-            ));
-        }
+        validate_private_control_file(&file)?;
         Ok(Some(file))
     }
 
@@ -589,6 +592,41 @@ mod tests {
         assert_eq!(
             sqlite_extended_code(permission_error),
             rusqlite::ffi::SQLITE_PERM
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlinked_control_files_are_rejected_before_writable_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary directory");
+        let filesystem = LocalBackupFilesystem;
+        let external = root.path().join("external-control");
+        let linked = root.path().join("linked-control");
+        std::fs::write(&external, b"external").expect("external control file");
+        std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o600))
+            .expect("private external permissions");
+        std::fs::hard_link(&external, &linked).expect("hard-linked control boundary");
+
+        let writable_error = filesystem
+            .open_control_file(&linked, PrivateBackupControlFileMode::ReadWrite)
+            .expect_err("hard-linked writable control file must fail closed");
+        assert_eq!(
+            sqlite_extended_code(writable_error),
+            rusqlite::ffi::SQLITE_PERM
+        );
+
+        let existing_error = filesystem
+            .open_existing_control_file(&linked)
+            .expect_err("hard-linked existing control file must fail closed");
+        assert_eq!(
+            sqlite_extended_code(existing_error),
+            rusqlite::ffi::SQLITE_PERM
+        );
+        assert_eq!(
+            std::fs::read(&external).expect("external file remains readable"),
+            b"external"
         );
     }
 }
