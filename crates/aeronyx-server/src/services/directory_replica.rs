@@ -27,6 +27,9 @@
 //!   cryptographic audit per API read.
 //! - Exports bounded incident summaries and re-verified signed evidence for
 //!   authenticated operator review without adding an automatic recovery path.
+//! - [DIRECTORY-STREAMING-AUDIT 2026-08-31 by Codex] Audits each producer
+//!   block-by-block so restart and evidence export do not materialize the full
+//!   retained block, commitment, and descriptor history in memory at once.
 //! - Resolves quarantine only through a node-identity-signed, host-local,
 //!   compare-and-swap command while retaining the accepted prefix and every
 //!   incident and resolution as an append-only audit trail.
@@ -225,6 +228,8 @@
 //!   Never create one independent admission gate per listener.
 //!
 //! ## Last Modified
+//! v0.42.0-DirectoryStreamingProducerAudit - Bounded producer audit memory by
+//! streaming blocks and loading only one protocol-limited commitment set.
 //! v0.41.0-DirectoryAuditOwnership - Moved the full-history audit admission
 //! permit into the shared process runtime so listeners share one CPU boundary.
 //! v0.40.0-RouteDomainAttestorPolicyHistory - Added schema v12 canonical signed
@@ -325,8 +330,8 @@ use aeronyx_core::protocol::discovery::{
     AERONYX_DIRECTORY_MAINNET_CHAIN_ID, DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
     DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1, DIRECTORY_POLICY_ANCHOR_CONFLICT_V1,
     DIRECTORY_POLICY_ANCHOR_HISTORY_GAP_V1, DIRECTORY_POLICY_ANCHOR_ROLLBACK_V1,
-    MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES, MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1,
-    MAX_DIRECTORY_SYNC_BLOCKS_V1,
+    MAX_DIRECTORY_COMMITMENTS_PER_BLOCK, MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES,
+    MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1, MAX_DIRECTORY_SYNC_BLOCKS_V1,
 };
 use bincode::Options;
 use parking_lot::Mutex;
@@ -10390,13 +10395,29 @@ impl DirectoryReplicaStore {
                 ));
             }
         }
-        let rows = Self::load_block_rows(connection, &tip.producer)?;
-        let mut commitments = Self::load_commitment_index(connection, &tip.producer)?;
-        let mut objects = Self::load_descriptor_objects(connection, &tip.producer)?;
+        // [DIRECTORY-STREAMING-AUDIT 2026-08-31 by Codex] A full-node mirror
+        // retains an append-only history. Keep restart/export audit memory
+        // bounded by one protocol-limited block instead of collecting three
+        // complete producer indexes before verification.
+        let mut statement = connection.prepare(
+            "SELECT height, block_hash, prev_block_hash, produced_at,
+                    commitment_count, block_blob
+             FROM directory_replica_blocks WHERE producer = ?1 ORDER BY height ASC",
+        )?;
+        let mut rows = statement.query(params![tip.producer.as_slice()])?;
         let mut expected_height = 1u64;
         let mut previous_hash = [0u8; 32];
         let mut previous_timestamp = 0u64;
-        for row in rows {
+        let mut audited_commitments = 0u64;
+        while let Some(row) = rows.next()? {
+            let row = StoredReplicaBlockRow {
+                height: row.get(0)?,
+                block_hash: row.get(1)?,
+                prev_block_hash: row.get(2)?,
+                produced_at: row.get(3)?,
+                commitment_count: row.get(4)?,
+                block_blob: row.get(5)?,
+            };
             let block = decode_block(&row.block_blob)?;
             let height = positive_i64_to_u64(row.height, "replica block height")?;
             if block.header.producer != tip.producer
@@ -10421,36 +10442,48 @@ impl DirectoryReplicaStore {
                 previous_timestamp,
                 observed_at,
             )?;
-            let mut actual = commitments.remove(&row.height).unwrap_or_default();
+            let mut actual =
+                Self::load_verified_commitments_for_block(connection, &tip.producer, row.height)?;
             actual.sort_unstable();
             if actual != block.commitments {
                 return Err(DirectoryReplicaStoreError::Integrity(format!(
                     "replica block {height} commitment index mismatch"
                 )));
             }
-            for commitment in &block.commitments {
-                let actual = objects.remove(&commitment.descriptor_hash).ok_or_else(|| {
-                    DirectoryReplicaStoreError::Integrity(format!(
-                        "replica block {height} is missing a descriptor object"
-                    ))
-                })?;
-                if actual != *commitment {
-                    return Err(DirectoryReplicaStoreError::Integrity(format!(
-                        "replica block {height} descriptor object mismatch"
-                    )));
-                }
-            }
             report.blocks = report.blocks.saturating_add(1);
             report.commitments = report
                 .commitments
                 .saturating_add(u64::from(block.header.commitment_count));
+            audited_commitments = audited_commitments
+                .checked_add(u64::from(block.header.commitment_count))
+                .ok_or_else(|| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "replica producer commitment count exhausted".to_string(),
+                    )
+                })?;
             previous_hash = block.hash();
             previous_timestamp = block.header.timestamp;
             expected_height = expected_height.checked_add(1).ok_or_else(|| {
                 DirectoryReplicaStoreError::Integrity("replica height exhausted".to_string())
             })?;
         }
-        if !commitments.is_empty() || !objects.is_empty() {
+        drop(rows);
+        drop(statement);
+
+        let (stored_commitments, stored_objects): (i64, i64) = connection.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM directory_replica_commitments
+                 WHERE producer = ?1),
+                (SELECT COUNT(*) FROM directory_replica_descriptor_objects
+                 WHERE producer = ?1)",
+            params![tip.producer.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let stored_commitments =
+            nonnegative_i64_to_u64(stored_commitments, "replica stored commitment count")?;
+        let stored_objects =
+            nonnegative_i64_to_u64(stored_objects, "replica stored descriptor object count")?;
+        if stored_commitments != audited_commitments || stored_objects != audited_commitments {
             return Err(DirectoryReplicaStoreError::Integrity(
                 "replica contains orphaned commitment or descriptor indexes".to_string(),
             ));
@@ -10468,53 +10501,48 @@ impl DirectoryReplicaStore {
         Ok(())
     }
 
-    fn load_block_rows(
+    fn load_verified_commitments_for_block(
         connection: &Connection,
         producer: &[u8; 32],
-    ) -> Result<Vec<StoredReplicaBlockRow>, DirectoryReplicaStoreError> {
+        block_height: i64,
+    ) -> Result<Vec<DirectoryDescriptorCommitmentV1>, DirectoryReplicaStoreError> {
         let mut statement = connection.prepare(
-            "SELECT height, block_hash, prev_block_hash, produced_at,
-                    commitment_count, block_blob
-             FROM directory_replica_blocks WHERE producer = ?1 ORDER BY height ASC",
+            "SELECT c.commitment_hash, c.node_id, c.sequence_le, c.descriptor_hash,
+                    o.node_id, o.sequence_le, o.descriptor_blob
+             FROM directory_replica_commitments c
+             LEFT JOIN directory_replica_descriptor_objects o
+               ON o.producer = c.producer
+              AND o.descriptor_hash = c.descriptor_hash
+             WHERE c.producer = ?1 AND c.block_height = ?2
+             ORDER BY c.commitment_hash ASC",
         )?;
-        let rows = statement
-            .query_map(params![producer.as_slice()], |row| {
-                Ok(StoredReplicaBlockRow {
-                    height: row.get(0)?,
-                    block_hash: row.get(1)?,
-                    prev_block_hash: row.get(2)?,
-                    produced_at: row.get(3)?,
-                    commitment_count: row.get(4)?,
-                    block_blob: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(DirectoryReplicaStoreError::from)?;
-        Ok(rows)
-    }
-
-    fn load_commitment_index(
-        connection: &Connection,
-        producer: &[u8; 32],
-    ) -> Result<BTreeMap<i64, Vec<DirectoryDescriptorCommitmentV1>>, DirectoryReplicaStoreError>
-    {
-        let mut statement = connection.prepare(
-            "SELECT block_height, commitment_hash, node_id, sequence_le, descriptor_hash
-             FROM directory_replica_commitments WHERE producer = ?1
-             ORDER BY block_height ASC, commitment_hash ASC",
-        )?;
-        let rows = statement.query_map(params![producer.as_slice()], |row| {
+        let rows = statement.query_map(params![producer.as_slice(), block_height], |row| {
             Ok((
-                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
                 row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, Option<Vec<u8>>>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
             ))
         })?;
-        let mut index = BTreeMap::new();
+        let mut commitments = Vec::with_capacity(MAX_DIRECTORY_COMMITMENTS_PER_BLOCK);
         for row in rows {
-            let (height, hash, node_id, sequence, descriptor_hash) = row?;
+            let (
+                hash,
+                node_id,
+                sequence,
+                descriptor_hash,
+                object_node_id,
+                object_sequence,
+                object_blob,
+            ) = row?;
+            if commitments.len() >= MAX_DIRECTORY_COMMITMENTS_PER_BLOCK {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "replica block commitment index exceeds the protocol limit".to_string(),
+                ));
+            }
             let sequence: [u8; 8] = sequence.try_into().map_err(|_| {
                 DirectoryReplicaStoreError::Integrity(
                     "replica commitment sequence must contain 8 bytes".to_string(),
@@ -10530,55 +10558,41 @@ impl DirectoryReplicaStore {
                     "replica commitment content hash mismatch".to_string(),
                 ));
             }
-            index
-                .entry(height)
-                .or_insert_with(Vec::new)
-                .push(commitment);
-        }
-        Ok(index)
-    }
-
-    fn load_descriptor_objects(
-        connection: &Connection,
-        producer: &[u8; 32],
-    ) -> Result<HashMap<[u8; 32], DirectoryDescriptorCommitmentV1>, DirectoryReplicaStoreError>
-    {
-        let mut statement = connection.prepare(
-            "SELECT descriptor_hash, node_id, sequence_le, descriptor_blob
-             FROM directory_replica_descriptor_objects WHERE producer = ?1",
-        )?;
-        let rows = statement.query_map(params![producer.as_slice()], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-            ))
-        })?;
-        let mut objects = HashMap::new();
-        for row in rows {
-            let (hash, node_id, sequence, blob) = row?;
-            let descriptor = decode_descriptor_object(&blob)?;
-            let commitment =
+            let object_node_id = object_node_id.ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "replica commitment is missing its descriptor object".to_string(),
+                )
+            })?;
+            let object_sequence = object_sequence.ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "replica commitment is missing its descriptor sequence".to_string(),
+                )
+            })?;
+            let object_blob = object_blob.ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "replica commitment is missing its descriptor payload".to_string(),
+                )
+            })?;
+            let descriptor = decode_descriptor_object(&object_blob)?;
+            let object_commitment =
                 DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
                     .map_err(|error| DirectoryReplicaStoreError::Descriptor(error.to_string()))?;
-            let sequence: [u8; 8] = sequence.try_into().map_err(|_| {
+            let object_sequence: [u8; 8] = object_sequence.try_into().map_err(|_| {
                 DirectoryReplicaStoreError::Integrity(
                     "replica descriptor sequence must contain 8 bytes".to_string(),
                 )
             })?;
-            let hash = bytes32(&hash, "replica descriptor hash")?;
-            if hash != commitment.descriptor_hash
-                || bytes32(&node_id, "replica descriptor node id")? != commitment.node_id
-                || u64::from_le_bytes(sequence) != commitment.sequence
-                || objects.insert(hash, commitment).is_some()
+            if object_commitment != commitment
+                || bytes32(&object_node_id, "replica descriptor node id")? != commitment.node_id
+                || u64::from_le_bytes(object_sequence) != commitment.sequence
             {
                 return Err(DirectoryReplicaStoreError::Integrity(
                     "replica descriptor object index mismatch".to_string(),
                 ));
             }
+            commitments.push(commitment);
         }
-        Ok(objects)
+        Ok(commitments)
     }
 
     fn load_observation_checkpoint_row(
