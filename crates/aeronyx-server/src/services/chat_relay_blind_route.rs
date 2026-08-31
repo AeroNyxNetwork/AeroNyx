@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_blind_route.rs
 // ============================================
-// Version: 1.2.0-BlindRouteCoordinatorComposition
+// Version: 1.3.0-DurableResponseShape
 //
 // Creation Reason:
 //   [BLIND-ROUTE-REPLAY-DOMAIN 2026-08-25 by Codex] Extract blind-route replay
@@ -20,6 +20,7 @@
 //   - Derives node-private route keys and request fingerprints.
 //   - Protects exact opaque relay responses behind a replaceable trait.
 //   - Binds every sealed response to both private replay identifiers.
+//   - Exposes one shared protected-response shape for cryptography and storage.
 //
 // Dependencies:
 //   - `chat_relay_blind_route_coordinator.rs` composes this with storage.
@@ -40,6 +41,7 @@
 //   - Response plaintext is opaque here and must never be parsed or logged.
 //
 // Last Modified:
+//   v1.3.0-DurableResponseShape - Shared the AEAD storage shape with SQLite
 //   v1.2.0-BlindRouteCoordinatorComposition - Documented coordinator boundary
 //   v1.1.0-BlindRouteDurableStoreComposition - Documented repository boundary
 //   v1.0.0-BlindRouteReplayDomain - Initial trait/composition extraction
@@ -68,6 +70,8 @@ const MAX_RESPONSE_METADATA_BYTES: usize = 16 * 1024;
 // with the peer transport while retaining a hard allocation/decryption bound.
 const MAX_RESPONSE_BYTES: usize =
     aeronyx_core::protocol::MAX_ONION_SEALED_RESPONSE_BASE64_BYTES + MAX_RESPONSE_METADATA_BYTES;
+pub(crate) const MAX_PROTECTED_BLIND_ROUTE_RESPONSE_BYTES: usize =
+    MAX_RESPONSE_BYTES + RESPONSE_TAG_BYTES;
 const RESPONSE_HKDF_SALT: &[u8] = b"AeroNyx-BlindRelay-RouteResponse-v1-key";
 const RESPONSE_HKDF_INFO: &[u8] = b"XChaCha20-Poly1305";
 const RESPONSE_AAD_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-RouteResponse-v1";
@@ -98,6 +102,20 @@ pub(crate) enum BlindRelayRouteAdmission {
 pub(crate) struct ProtectedBlindRouteResponse {
     pub(crate) nonce: [u8; RESPONSE_NONCE_BYTES],
     pub(crate) ciphertext: Vec<u8>,
+}
+
+/// Validates the exact AEAD shape shared by recovery and durable storage.
+///
+/// [BLIND-ROUTE-STORED-RESPONSE-BOUNDS 2026-08-31 by Codex] Keep SQLite read
+/// and write admission aligned with the cryptographic ceiling without
+/// duplicating response metadata or authentication-tag constants.
+pub(crate) const fn is_valid_protected_blind_route_response_shape(
+    nonce_len: usize,
+    ciphertext_len: usize,
+) -> bool {
+    nonce_len == RESPONSE_NONCE_BYTES
+        && ciphertext_len > RESPONSE_TAG_BYTES
+        && ciphertext_len <= MAX_PROTECTED_BLIND_ROUTE_RESPONSE_BYTES
 }
 
 /// Replaceable exact-response protection capability.
@@ -183,10 +201,7 @@ impl BlindRouteResponseProtector for XChaChaBlindRouteResponseProtector {
         nonce: &[u8],
         ciphertext: &[u8],
     ) -> ChatRelayResult<Vec<u8>> {
-        if nonce.len() != RESPONSE_NONCE_BYTES
-            || ciphertext.len() <= RESPONSE_TAG_BYTES
-            || ciphertext.len() > MAX_RESPONSE_BYTES + RESPONSE_TAG_BYTES
-        {
+        if !is_valid_protected_blind_route_response_shape(nonce.len(), ciphertext.len()) {
             return Err(ChatRelayError::CorruptStoredData {
                 field: "blind_relay_route_response_shape",
             });
@@ -273,6 +288,32 @@ impl<P: BlindRouteResponseProtector> BlindRouteReplay<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_response_shape_matches_crypto_boundaries() {
+        // [BLIND-ROUTE-STORED-RESPONSE-BOUNDS 2026-08-31 by Codex] Guard the
+        // shared repository/protector contract at both inclusive boundaries.
+        assert!(!is_valid_protected_blind_route_response_shape(
+            RESPONSE_NONCE_BYTES - 1,
+            RESPONSE_TAG_BYTES + 1,
+        ));
+        assert!(!is_valid_protected_blind_route_response_shape(
+            RESPONSE_NONCE_BYTES,
+            RESPONSE_TAG_BYTES,
+        ));
+        assert!(is_valid_protected_blind_route_response_shape(
+            RESPONSE_NONCE_BYTES,
+            RESPONSE_TAG_BYTES + 1,
+        ));
+        assert!(is_valid_protected_blind_route_response_shape(
+            RESPONSE_NONCE_BYTES,
+            MAX_PROTECTED_BLIND_ROUTE_RESPONSE_BYTES,
+        ));
+        assert!(!is_valid_protected_blind_route_response_shape(
+            RESPONSE_NONCE_BYTES,
+            MAX_PROTECTED_BLIND_ROUTE_RESPONSE_BYTES + 1,
+        ));
+    }
 
     #[test]
     fn replay_identity_and_response_protection_are_domain_bound() {
