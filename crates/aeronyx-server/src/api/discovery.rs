@@ -4900,7 +4900,12 @@ mod tests {
             2,
             &DiscoveryApiPolicy::default(),
             false,
-            Some(NodeCapability::BlindVaultReplica),
+            // [ONION-TERMINAL-TEST-CONTRACT 2026-08-31 by Codex] Readiness
+            // consumes the same typed capability/feature contract as selection.
+            OnionTerminalRequirement {
+                capability: Some(NodeCapability::BlindVaultReplica),
+                protocol_features: &[],
+            },
         ));
     }
 

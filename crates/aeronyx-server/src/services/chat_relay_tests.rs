@@ -1,13 +1,15 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_tests.rs
 // ============================================
-// Version: 1.3.0-ExplicitTransactionDependency
+// Version: 1.4.0-ExplicitExtractedDomainDependencies
 //
 // Creation Reason:
 //   [CHAT-RELAY-TEST-MODULE-SPLIT 2026-08-27 by Codex] Move the complete
 //   `chat_relay` in-crate test module out of the production implementation.
 //
 // Modification Reason:
+//   [CHAT-RELAY-TEST-IMPORTS 2026-08-31 by Codex] Imports the cursor value and
+//   dedup capability from their extracted owner modules explicitly.
 //   [CHAT-RELAY-CLEANUP-EXECUTION-DOMAIN 2026-08-28 by Codex] Declared the
 //   test module's transaction behavior dependency explicitly after cleanup
 //   transaction ownership moved out of the parent relay implementation.
@@ -39,6 +41,7 @@
 //   - New relay tests belong here or in a focused extracted domain module.
 //
 // Last Modified:
+//   v1.4.0-ExplicitExtractedDomainDependencies - Restored test compilation
 //   v1.3.0-ExplicitTransactionDependency - Removed parent-import coupling
 //   v1.2.0-ExplicitCollectionDependency - Removed parent-import coupling
 //   v1.1.0-RestoreValidationSideEffectInvariant - Pinned pre-path rejection
@@ -46,6 +49,8 @@
 // ============================================
 
 use super::*;
+use crate::services::chat_relay_message_dedup::OnlineMessageDeduplication;
+use crate::services::chat_relay_pull_cursor::PullCursorV2;
 use aeronyx_common::types::SessionId;
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::chat::ChatContentType;
@@ -755,13 +760,8 @@ fn invalid_restore_plan_is_rejected_before_private_path_resolution() {
         commitment: "00".repeat(32),
     };
 
-    ChatRelayService::verify_latest_restore_plan_at(
-        &config,
-        &[0x42u8; 32],
-        &invalid,
-        1_000,
-    )
-    .expect_err("invalid public plan must fail before path resolution");
+    ChatRelayService::verify_latest_restore_plan_at(&config, &[0x42u8; 32], &invalid, 1_000)
+        .expect_err("invalid public plan must fail before path resolution");
     assert!(
         !unresolved_parent.exists(),
         "invalid plan must not create the configured custody parent"

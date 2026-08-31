@@ -616,6 +616,9 @@ mod tests {
             ttl_remaining: 1,
             reason: Some("forwarded".to_string()),
             delivery_receipt: None,
+            // [BLIND-RELAY-REPLAY-TEST-CONTRACT 2026-08-31 by Codex] Keep
+            // durable replay fixtures explicit as the signed response grows.
+            success_receipt: None,
             failure_receipt: None,
             opaque_terminal_response_b64: None,
         }
@@ -650,6 +653,7 @@ mod tests {
                 1_800_000_100,
                 &terminal,
             )),
+            success_receipt: None,
             failure_receipt: None,
             opaque_terminal_response_b64: None,
         };
@@ -677,6 +681,7 @@ mod tests {
             ttl_remaining: 2,
             reason: Some("terminal_next_hop".to_string()),
             delivery_receipt: None,
+            success_receipt: None,
             failure_receipt: None,
             opaque_terminal_response_b64: None,
         };
