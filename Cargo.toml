@@ -124,7 +124,9 @@ socket2 = { version = "0.5", features = ["all"] }
 # ============================================
 # System & Platform
 # ============================================
-nix = { version = "0.29", features = ["net", "ioctl", "fs"] }
+# [BLIND-VAULT-RECOVERY-IO-BUILD 2026-08-31 by Codex] The recovery adapter
+# enumerates only adapter-owned temporary entries through nix::dir.
+nix = { version = "0.29", features = ["net", "ioctl", "fs", "dir"] }
 libc = "0.2"
 
 # ============================================

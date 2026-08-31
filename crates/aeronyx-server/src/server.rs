@@ -4,6 +4,8 @@
 // Version: 1.0.0-Membership
 //
 // Modification Reason:
+//   [BLIND-VAULT-MANAGEMENT-RUNTIME 2026-08-31 by Codex] Passes the live
+//   Blind Vault service explicitly into management readiness reporting.
 //   [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Bound startup,
 //   gossip, and heartbeat replica advertisement to live admission readiness.
 //   Wired TrafficTracker into PacketHandler and HeartbeatReporter.
@@ -983,18 +985,17 @@ use rusqlite::OptionalExtension;
 use crate::api::auth::ensure_jwt_secret;
 use crate::api::blind_vault::build_blind_vault_router;
 use crate::api::chat_handlers::build_chat_router;
+#[cfg(test)]
+use crate::api::chat_peer::blind_relay_delivery_receipt_is_valid;
 use crate::api::chat_peer::{
     build_chat_peer_router, prepare_peer_blind_relay_http_request_with,
-    prepare_peer_chat_relay_request_v1,
-    prepare_peer_chat_relay_request_v2,
-    prepare_peer_chat_relay_request_v3, verify_peer_chat_relay_receipt,
-    verify_blind_relay_delivery_receipt, BlindRelayDeliveryReceiptVerificationFailure,
+    prepare_peer_chat_relay_request_v1, prepare_peer_chat_relay_request_v2,
+    prepare_peer_chat_relay_request_v3, verify_blind_relay_delivery_receipt,
+    verify_peer_chat_relay_receipt, BlindRelayDeliveryReceiptVerificationFailure,
     BlindRelayRequestPreparationError, DirectRelayReceiptVerificationFailure,
     PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayResponse, PeerChatRelayResponseV2,
     PreparedAuthenticatedPeerChatRelayHttpRequest, PreparedPeerChatRelayHttpRequest,
 };
-#[cfg(test)]
-use crate::api::chat_peer::blind_relay_delivery_receipt_is_valid;
 use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica_and_runtime;
 use crate::api::directory_replica_status::{
     build_directory_replica_status_router_with_witness_carrier, DirectoryReplicaStatusScope,
@@ -1161,9 +1162,7 @@ impl DirectPeerRelayAckFailure {
             Self::ReceiptInvalid(reason) => format!("peer_relay_{reason}"),
             // Preserve the existing closed aggregate vocabulary. Attribution
             // remains typed, so these local faults never affect peer health.
-            Self::VerificationUnavailable => {
-                "peer_relay_request_unknown".to_string()
-            }
+            Self::VerificationUnavailable => "peer_relay_request_unknown".to_string(),
         }
     }
 }
@@ -2025,8 +2024,7 @@ impl PeerStoreCacheDocument {
         }
         let quarantine_version_valid = match document.routeability_evidence_schema_version {
             ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION => {
-                document.route_quarantine_schema_version
-                    == ROUTE_QUARANTINE_CACHE_SCHEMA_VERSION
+                document.route_quarantine_schema_version == ROUTE_QUARANTINE_CACHE_SCHEMA_VERSION
             }
             _ => {
                 document.route_quarantine_schema_version == 0
@@ -2143,10 +2141,13 @@ impl PeerStoreCacheDocument {
                 self.route_quarantine_schema_version,
                 &self.route_quarantine_evidence,
             )),
-            version => return Err(format!("unsupported routeability evidence schema: {version}")),
+            version => {
+                return Err(format!(
+                    "unsupported routeability evidence schema: {version}"
+                ))
+            }
         };
-        encoded
-        .map_err(|error| format!("routeability evidence signing bytes: {error}"))
+        encoded.map_err(|error| format!("routeability evidence signing bytes: {error}"))
     }
 
     /// Returns an opaque digest of the exact independently signed route-state
@@ -2522,8 +2523,7 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
             self.contract_version.as_str(),
             VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT
                 | VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
-        )
-            && self.cache_generation == document.verified_client_delivery_generation
+        ) && self.cache_generation == document.verified_client_delivery_generation
             && self.cache_generated_at == document.descriptor_snapshot.generated_at
             && document.two_hop_path_proof_digest().is_ok_and(|digest| {
                 self.two_hop_path_proof_digest.as_deref() == Some(digest.as_str())
@@ -2535,8 +2535,7 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
             self.contract_version.as_str(),
             VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT
                 | VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
-        )
-            && self.cache_generation == document.verified_client_delivery_generation
+        ) && self.cache_generation == document.verified_client_delivery_generation
             && self.cache_generated_at == document.descriptor_snapshot.generated_at
             && document.three_hop_path_proof_digest().is_ok_and(|digest| {
                 self.three_hop_path_proof_digest.as_deref() == Some(digest.as_str())
@@ -2547,9 +2546,9 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
         self.contract_version == VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
             && self.cache_generation == document.verified_client_delivery_generation
             && self.cache_generated_at == document.descriptor_snapshot.generated_at
-            && document.route_state_digest().is_ok_and(|digest| {
-                self.route_state_digest.as_deref() == Some(digest.as_str())
-            })
+            && document
+                .route_state_digest()
+                .is_ok_and(|digest| self.route_state_digest.as_deref() == Some(digest.as_str()))
     }
 
     /// Returns a domain-separated opaque digest of the exact signed anchor.
@@ -3279,8 +3278,8 @@ impl CustodyWitnessRenewalRetryState {
             self.consecutive_failures,
         );
         self.exhausted_for_horizon = !retry_before_expiry;
-        self.retry_not_before = retry_before_expiry
-            .then_some(now + Duration::from_secs(delay_secs));
+        self.retry_not_before =
+            retry_before_expiry.then_some(now + Duration::from_secs(delay_secs));
         CustodyWitnessRenewalRetrySchedule {
             delay_secs,
             consecutive_failures: self.consecutive_failures,
@@ -3411,10 +3410,8 @@ fn custody_witness_renewal_retry_delay_secs(
         1 => 0i64,
         _ => 1i64,
     };
-    let delayed_ticks = (i128::from(nominal_ticks) + i128::from(jitter_ticks)).clamp(
-        1,
-        i128::from(maximum_ticks),
-    ) as u64;
+    let delayed_ticks = (i128::from(nominal_ticks) + i128::from(jitter_ticks))
+        .clamp(1, i128::from(maximum_ticks)) as u64;
     (
         audit_interval_secs.saturating_mul(delayed_ticks),
         retry_before_expiry,
@@ -3537,8 +3534,7 @@ async fn renew_chat_relay_custody_witness_state(
     )
     .await
     .map_err(CustodyWitnessRenewalAttemptError::Readiness)?;
-    let round = round
-        .map_err(|_| CustodyWitnessRenewalAttemptError::CollectionFailed(audit))?;
+    let round = round.map_err(|_| CustodyWitnessRenewalAttemptError::CollectionFailed(audit))?;
     Ok(CustodyWitnessRenewalAttempt { round, audit })
 }
 
@@ -4423,11 +4419,9 @@ impl Server {
         // [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Admission
         // readiness is an observed service state, not a config synonym. Run
         // the SQLite/filesystem observation off the async startup worker.
-        let blind_vault_runtime_ready = Self::observe_blind_vault_admission_readiness(
-            blind_vault.clone(),
-            unix_now_secs(),
-        )
-        .await;
+        let blind_vault_runtime_ready =
+            Self::observe_blind_vault_admission_readiness(blind_vault.clone(), unix_now_secs())
+                .await;
 
         let peer_store = self
             .init_peer_store_with_storage_runtime(
@@ -4620,6 +4614,7 @@ impl Server {
                 Arc::clone(&peer_store),
                 storage.clone(),
                 chat_relay.clone(),
+                blind_vault.clone(),
                 chat_relay_enabled,
             )
             .await?;
@@ -5537,10 +5532,11 @@ impl Server {
 
             let provider = provider_result.map_err(|error| {
                 let reason = error.reason_code();
-                warn!(reason, "[SUPERNODE] Required provider initialization rejected");
-                ServerError::startup_failed(format!(
-                    "SuperNode initialization failed ({reason})"
-                ))
+                warn!(
+                    reason,
+                    "[SUPERNODE] Required provider initialization rejected"
+                );
+                ServerError::startup_failed(format!("SuperNode initialization failed ({reason})"))
             })?;
 
             info!(type_ = ?provider_cfg.provider_type, model = %provider_cfg.model, "[SUPERNODE] Provider registered");
@@ -5619,11 +5615,7 @@ impl Server {
             self.config.discovery.custody_audit_witness_max_age_secs,
         )
         .ok_or_else(|| fail(CustodyWitnessReadinessBlockReason::ReceiptPolicyInvalid))?;
-        if self
-            .config
-            .discovery
-            .custody_audit_witness_runtime_required
-        {
+        if self.config.discovery.custody_audit_witness_runtime_required {
             // [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Strict runtime
             // mode has already completed a valid audit before listeners start.
             // Seed the process snapshot so heartbeat does not report a false
@@ -6047,9 +6039,7 @@ impl Server {
         storage
             .configure_record_commitment_authority_root(commitment_authority_root)
             .map_err(|error| {
-                ServerError::startup_failed(format!(
-                    "MemChain commitment authority root: {error}"
-                ))
+                ServerError::startup_failed(format!("MemChain commitment authority root: {error}"))
             })?;
         info!(
             enabled = commitment_authority_root.is_some(),
@@ -7051,6 +7041,7 @@ impl Server {
         peer_store: Arc<PeerStore>,
         memchain_storage: Option<Arc<MemoryStorage>>,
         chat_relay: Option<Arc<ChatRelayService>>,
+        blind_vault: Option<Arc<BlindVaultService>>,
         chat_relay_enabled: bool,
     ) -> Result<ManagementRuntime> {
         info!("Initializing management reporting...");
@@ -7468,12 +7459,11 @@ impl Server {
                 let status = peer_store.status(now);
                 let blind_vault_runtime_ready =
                     Self::observe_blind_vault_admission_readiness(blind_vault, now).await;
-                let local_capabilities =
-                    Self::discovery_local_capability_status_for_runtime_state(
-                        &config,
-                        discovery_chat_relay_runtime_ready,
-                        blind_vault_runtime_ready,
-                    );
+                let local_capabilities = Self::discovery_local_capability_status_for_runtime_state(
+                    &config,
+                    discovery_chat_relay_runtime_ready,
+                    blind_vault_runtime_ready,
+                );
                 let signed_peer_records = peer_store.export_signed_peer_records_for_heartbeat(
                     now,
                     Some(
@@ -7653,9 +7643,7 @@ impl Server {
     ) -> Result<Arc<PeerStore>> {
         self.init_peer_store_with_storage_runtime(
             chat_relay_runtime_ready,
-            self.config
-                .blind_vault
-                .replica_advertisement_configured(),
+            self.config.blind_vault.replica_advertisement_configured(),
             control_http_client,
         )
         .await
@@ -9829,8 +9817,7 @@ impl Server {
             // [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Handover
             // evidence uses independent process-only circuit state. A stale
             // proof carrier cannot cool block or certificate transport.
-            let mut authority_carrier_circuit =
-                CommitmentAuthorityCarrierCircuitBreaker::default();
+            let mut authority_carrier_circuit = CommitmentAuthorityCarrierCircuitBreaker::default();
             // [CERTIFICATE-CARRIER-CIRCUIT 2026-07-29 by Codex] Certificate
             // transport has an independent typed circuit. A block-page outage
             // cannot suppress certificate evidence recovery, or vice versa.
@@ -9895,8 +9882,7 @@ impl Server {
                     // discarded before backoff/retry and never enters status,
                     // persistence, routing policy, or trust decisions.
                     let mut block_carrier_cursor = CommitmentBlockCarrierCursor::default();
-                    let mut authority_carrier_cursor =
-                        CommitmentAuthorityCarrierCursor::default();
+                    let mut authority_carrier_cursor = CommitmentAuthorityCarrierCursor::default();
                     for _ in 0..max_pages_per_round {
                         // [AUTHORITY-HANDOVER-FOLLOWER 2026-08-14 by Codex]
                         // Pull exactly one proof before each block page. A
@@ -9915,9 +9901,7 @@ impl Server {
                                     &mut authority_carrier_circuit,
                                 )
                                 .await?;
-                            if authority.source
-                                == CommitmentAuthoritySyncSource::PinnedCarrier
-                            {
+                            if authority.source == CommitmentAuthoritySyncSource::PinnedCarrier {
                                 debug!(
                                     carrier_attempts = authority.carrier_attempts,
                                     "[MEMCHAIN_BLOCK] Recovered dual-signed authority proof through pinned transport"
@@ -10288,15 +10272,13 @@ impl Server {
                 // route fresh replicas to a node that is already fail-closed.
                 let blind_vault_runtime_ready =
                     Self::observe_blind_vault_admission_readiness(blind_vault.clone(), now).await;
-                let Ok(self_descriptor) =
-                    Self::build_self_discovery_descriptor_for_runtime_state(
-                        &config,
-                        &identity,
-                        now,
-                        chat_relay_runtime_ready,
-                        blind_vault_runtime_ready,
-                    )
-                else {
+                let Ok(self_descriptor) = Self::build_self_discovery_descriptor_for_runtime_state(
+                    &config,
+                    &identity,
+                    now,
+                    chat_relay_runtime_ready,
+                    blind_vault_runtime_ready,
+                ) else {
                     warn!("[DISCOVERY] Skipping outbound gossip; self descriptor build failed");
                     peer_store.record_gossip_round(
                         now,
@@ -11237,11 +11219,7 @@ impl Server {
                 // [OUTBOUND-BLIND-REQUEST-PREPARATION 2026-08-31 by Codex]
                 // No peer observed this request. Keep local saturation visible
                 // to aggregate readiness without poisoning route reputation.
-                peer_store.record_blind_relay_probe_result(
-                    now,
-                    false,
-                    error.reason_bucket(),
-                );
+                peer_store.record_blind_relay_probe_result(now, false, error.reason_bucket());
                 return;
             }
         };
@@ -12948,9 +12926,7 @@ impl Server {
                                         OnionRouteFailureAttribution::EndToEnd,
                                     );
                                 }
-                                Err(
-                                    BlindRelayDeliveryReceiptVerificationFailure::Unavailable,
-                                ) => {
+                                Err(BlindRelayDeliveryReceiptVerificationFailure::Unavailable) => {
                                     // The route was exposed, so direct fallback remains
                                     // forbidden, but local verifier loss is not peer fault.
                                     last_failure_reason = Some(
@@ -13239,19 +13215,14 @@ impl Server {
         // signing work when the selected candidates support only legacy v1.
         let signing_identity = (has_target_bound_candidate || has_authenticated_v2_candidate)
             .then(|| Arc::new(node_identity.clone()));
-        let authenticated_request = match (
-            has_authenticated_v2_candidate,
-            signing_identity.as_ref(),
-        ) {
-            (true, Some(identity)) => Some(
-                prepare_peer_chat_relay_request_v2(
-                    envelope.clone(),
-                    Arc::clone(identity),
-                )
-                .await,
-            ),
-            _ => None,
-        };
+        let authenticated_request =
+            match (has_authenticated_v2_candidate, signing_identity.as_ref()) {
+                (true, Some(identity)) => Some(
+                    prepare_peer_chat_relay_request_v2(envelope.clone(), Arc::clone(identity))
+                        .await,
+                ),
+                _ => None,
+            };
         let legacy_request = if has_legacy_candidate {
             Some(prepare_peer_chat_relay_request_v1(envelope.clone()).await)
         } else {
@@ -13290,18 +13261,14 @@ impl Server {
                 .descriptor
                 .advertises_protocol_feature(NodeProtocolFeature::DirectPeerRelayTargetBindingV3);
             if !use_target_bound_relay
-                && first_target_bound_permit
-                    .is_some_and(|permit| permit.is_half_open())
+                && first_target_bound_permit.is_some_and(|permit| permit.is_half_open())
             {
                 // Every v3 candidate failed local preflight before the reserved
                 // probe could run. Do not spend that recovery edge on v2/v1.
-                if let (Some(relay), Some(permit)) =
-                    (relay, first_target_bound_permit.take())
-                {
+                if let (Some(relay), Some(permit)) = (relay, first_target_bound_permit.take()) {
                     relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
                 }
-                last_failure_reason =
-                    Some("peer_relay_half_open_probe_unavailable".to_string());
+                last_failure_reason = Some("peer_relay_half_open_probe_unavailable".to_string());
                 break;
             }
             let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
@@ -13356,156 +13323,155 @@ impl Server {
             } else {
                 None
             };
-            let stop_after_delivery = delivery_permit
-                .is_some_and(|permit| permit.is_half_open());
+            let stop_after_delivery = delivery_permit.is_some_and(|permit| permit.is_half_open());
             let mut circuit_allows_more = true;
-            let delivery_result = if use_target_bound_relay {
-                // [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] Build
-                // inside the peer loop because the signed target differs for
-                // every candidate. Reusing one request would recreate the v2
-                // cross-node replay boundary this contract closes.
-                let Some(signing_identity) = signing_identity.as_ref() else {
-                    if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
-                        relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
-                    }
-                    last_failure_reason = Some("peer_relay_auth_encode_failed".to_string());
-                    break;
-                };
-                let prepared_request = prepare_peer_chat_relay_request_v3(
-                    envelope.clone(),
-                    peer.node_id(),
-                    Arc::clone(signing_identity),
-                )
-                .await;
-                let request = match prepared_request {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
+            let delivery_result =
+                if use_target_bound_relay {
+                    // [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] Build
+                    // inside the peer loop because the signed target differs for
+                    // every candidate. Reusing one request would recreate the v2
+                    // cross-node replay boundary this contract closes.
+                    let Some(signing_identity) = signing_identity.as_ref() else {
                         if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
                             relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
                         }
-                        let reason = error.reason_bucket().to_string();
-                        last_failure_reason = Some(reason);
+                        last_failure_reason = Some("peer_relay_auth_encode_failed".to_string());
                         break;
-                    }
-                };
-                let request_commitment = request.request_commitment();
-                // [DIRECT-RELAY-ATTEMPT-BOUNDARY 2026-08-31 by Codex] Local
-                // request preparation cannot affect peer reputation. Count an
-                // attempt only after the exact signed request is ready and the
-                // HTTP transport is about to observe it.
-                attempted += 1;
-                let outcome = Self::send_and_validate_target_bound_peer_relay(
-                    client,
-                    &url,
-                    &request,
-                    &request_commitment,
-                    &peer.node_id(),
-                    require_signed_receipt,
-                )
-                .await;
-                if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
-                    if outcome.local_runtime_failure() {
-                        // [DIRECT-RELAY-LOCAL-FAULT-ATTRIBUTION 2026-08-31 by
-                        // Codex] Local verifier capacity says nothing about the
-                        // selected peer. Release half-open ownership without
-                        // advancing outage evidence.
-                        relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
-                    } else {
-                        circuit_allows_more = relay.complete_direct_peer_delivery(
-                            unix_now_secs(),
-                            permit,
-                            outcome.retry_triggered(),
-                            outcome.delivery_succeeded(),
-                            outcome.final_failure_deterministic(),
-                        );
-                    }
-                }
-                outcome.result.map_err(|error| match error {
-                    TargetBoundPeerRelayFailure::Transport(error) => {
-                        DirectPeerRelayDeliveryFailure::selected_peer(
-                            Self::classify_reqwest_error("peer_relay_request", &error),
-                        )
-                    }
-                    TargetBoundPeerRelayFailure::Http(status) => {
-                        DirectPeerRelayDeliveryFailure::selected_peer(format!(
-                            "peer_relay_http_{}",
-                            status.as_u16()
-                        ))
-                    }
-                    TargetBoundPeerRelayFailure::Ack(error) => {
-                        DirectPeerRelayDeliveryFailure::from_ack(error)
-                    }
-                })
-            } else {
-                let (response, expected_request_commitment) = if use_authenticated_relay {
-                    let Some(prepared) = authenticated_request.as_ref() else {
-                        let reason = "peer_relay_auth_encode_failed".to_string();
-                        last_failure_reason = Some(reason);
-                        continue;
                     };
-                    let request = match prepared {
+                    let prepared_request = prepare_peer_chat_relay_request_v3(
+                        envelope.clone(),
+                        peer.node_id(),
+                        Arc::clone(signing_identity),
+                    )
+                    .await;
+                    let request = match prepared_request {
                         Ok(prepared) => prepared,
                         Err(error) => {
+                            if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
+                                relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
+                            }
                             let reason = error.reason_bucket().to_string();
                             last_failure_reason = Some(reason);
-                            continue;
+                            break;
                         }
                     };
                     let request_commitment = request.request_commitment();
+                    // [DIRECT-RELAY-ATTEMPT-BOUNDARY 2026-08-31 by Codex] Local
+                    // request preparation cannot affect peer reputation. Count an
+                    // attempt only after the exact signed request is ready and the
+                    // HTTP transport is about to observe it.
                     attempted += 1;
-                    (
-                        client
-                            .post(&url)
-                            .header(reqwest::header::CONTENT_TYPE, "application/json")
-                            .body(request.body())
-                            .send()
-                            .await,
-                        Some(request_commitment),
+                    let outcome = Self::send_and_validate_target_bound_peer_relay(
+                        client,
+                        &url,
+                        &request,
+                        &request_commitment,
+                        &peer.node_id(),
+                        require_signed_receipt,
                     )
-                } else {
-                    let Some(prepared) = legacy_request.as_ref() else {
-                        last_failure_reason = Some("peer_relay_auth_encode_failed".to_string());
-                        continue;
-                    };
-                    let request = match prepared {
-                        Ok(prepared) => prepared,
-                        Err(error) => {
-                            last_failure_reason = Some(error.reason_bucket().to_string());
-                            continue;
+                    .await;
+                    if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
+                        if outcome.local_runtime_failure() {
+                            // [DIRECT-RELAY-LOCAL-FAULT-ATTRIBUTION 2026-08-31 by
+                            // Codex] Local verifier capacity says nothing about the
+                            // selected peer. Release half-open ownership without
+                            // advancing outage evidence.
+                            relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
+                        } else {
+                            circuit_allows_more = relay.complete_direct_peer_delivery(
+                                unix_now_secs(),
+                                permit,
+                                outcome.retry_triggered(),
+                                outcome.delivery_succeeded(),
+                                outcome.final_failure_deterministic(),
+                            );
                         }
-                    };
-                    attempted += 1;
-                    (
-                        client
-                            .post(&url)
-                            .header(reqwest::header::CONTENT_TYPE, "application/json")
-                            .body(request.body())
-                            .send()
-                            .await,
-                        None,
-                    )
-                };
-                match response {
-                    Ok(response) if response.status().is_success() => {
-                        Self::validate_direct_peer_relay_ack_typed(
-                            response,
-                            expected_request_commitment.as_ref(),
-                            &peer.node_id(),
-                            require_signed_receipt,
-                            unix_now_secs(),
-                        )
-                        .await
-                        .map_err(DirectPeerRelayDeliveryFailure::from_ack)
                     }
-                    Ok(response) => Err(DirectPeerRelayDeliveryFailure::selected_peer(format!(
-                        "peer_relay_http_{}",
-                        response.status().as_u16()
-                    ))),
-                    Err(error) => Err(DirectPeerRelayDeliveryFailure::selected_peer(
-                        Self::classify_reqwest_error("peer_relay_request", &error),
-                    )),
-                }
-            };
+                    outcome.result.map_err(|error| match error {
+                        TargetBoundPeerRelayFailure::Transport(error) => {
+                            DirectPeerRelayDeliveryFailure::selected_peer(
+                                Self::classify_reqwest_error("peer_relay_request", &error),
+                            )
+                        }
+                        TargetBoundPeerRelayFailure::Http(status) => {
+                            DirectPeerRelayDeliveryFailure::selected_peer(format!(
+                                "peer_relay_http_{}",
+                                status.as_u16()
+                            ))
+                        }
+                        TargetBoundPeerRelayFailure::Ack(error) => {
+                            DirectPeerRelayDeliveryFailure::from_ack(error)
+                        }
+                    })
+                } else {
+                    let (response, expected_request_commitment) = if use_authenticated_relay {
+                        let Some(prepared) = authenticated_request.as_ref() else {
+                            let reason = "peer_relay_auth_encode_failed".to_string();
+                            last_failure_reason = Some(reason);
+                            continue;
+                        };
+                        let request = match prepared {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                let reason = error.reason_bucket().to_string();
+                                last_failure_reason = Some(reason);
+                                continue;
+                            }
+                        };
+                        let request_commitment = request.request_commitment();
+                        attempted += 1;
+                        (
+                            client
+                                .post(&url)
+                                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                                .body(request.body())
+                                .send()
+                                .await,
+                            Some(request_commitment),
+                        )
+                    } else {
+                        let Some(prepared) = legacy_request.as_ref() else {
+                            last_failure_reason = Some("peer_relay_auth_encode_failed".to_string());
+                            continue;
+                        };
+                        let request = match prepared {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                last_failure_reason = Some(error.reason_bucket().to_string());
+                                continue;
+                            }
+                        };
+                        attempted += 1;
+                        (
+                            client
+                                .post(&url)
+                                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                                .body(request.body())
+                                .send()
+                                .await,
+                            None,
+                        )
+                    };
+                    match response {
+                        Ok(response) if response.status().is_success() => {
+                            Self::validate_direct_peer_relay_ack_typed(
+                                response,
+                                expected_request_commitment.as_ref(),
+                                &peer.node_id(),
+                                require_signed_receipt,
+                                unix_now_secs(),
+                            )
+                            .await
+                            .map_err(DirectPeerRelayDeliveryFailure::from_ack)
+                        }
+                        Ok(response) => Err(DirectPeerRelayDeliveryFailure::selected_peer(
+                            format!("peer_relay_http_{}", response.status().as_u16()),
+                        )),
+                        Err(error) => Err(DirectPeerRelayDeliveryFailure::selected_peer(
+                            Self::classify_reqwest_error("peer_relay_request", &error),
+                        )),
+                    }
+                };
 
             let observed_at = unix_now_secs();
             match delivery_result {
@@ -13536,8 +13502,7 @@ impl Server {
 
         if let (Some(relay), Some(permit)) = (relay, first_target_bound_permit.take()) {
             if permit.is_half_open() && last_failure_reason.is_none() {
-                last_failure_reason =
-                    Some("peer_relay_half_open_probe_unavailable".to_string());
+                last_failure_reason = Some("peer_relay_half_open_probe_unavailable".to_string());
             }
             relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
         }
@@ -13889,9 +13854,7 @@ impl Server {
         self.build_self_discovery_descriptor_with_runtime_state(
             now,
             chat_relay_runtime_ready,
-            self.config
-                .blind_vault
-                .replica_advertisement_configured(),
+            self.config.blind_vault.replica_advertisement_configured(),
         )
     }
 
@@ -15158,10 +15121,7 @@ impl Server {
             Ok(VerifiedSubmitAdmission::ReservedForEntryRecovery) => true,
             Ok(VerifiedSubmitAdmission::Pending) => {
                 let response = rejected();
-                relay.record_verified_submit_pending_rejection(
-                    unix_now_secs(),
-                    response.result,
-                );
+                relay.record_verified_submit_pending_rejection(unix_now_secs(), response.result);
                 warn!(
                     reason = "verified_submit_request_pending",
                     "[CHAT_RELAY] Verified submit rejected"
@@ -15179,10 +15139,7 @@ impl Server {
             }
             Ok(VerifiedSubmitAdmission::CapacityExhausted) => {
                 let response = rejected();
-                relay.record_verified_submit_capacity_rejection(
-                    unix_now_secs(),
-                    response.result,
-                );
+                relay.record_verified_submit_capacity_rejection(unix_now_secs(), response.result);
                 warn!(
                     reason = "verified_submit_replay_capacity",
                     "[CHAT_RELAY] Verified submit rejected"
@@ -15282,10 +15239,8 @@ impl Server {
             // closes exactly once: successful custody plus durable replay is
             // completed; a durable no-custody result is failed; persistence
             // failure remains deferred for a later replacement process.
-            let recovery_outcome = VerifiedSubmitRecoveryOutcome::from_results(
-                entry_custody,
-                persistence.is_ok(),
-            );
+            let recovery_outcome =
+                VerifiedSubmitRecoveryOutcome::from_results(entry_custody, persistence.is_ok());
             relay.record_verified_submit_recovery_outcome(completed_at, recovery_outcome);
         }
         if let Err(error) = persistence {
@@ -17094,11 +17049,8 @@ mod tests {
         let mut disabled_memchain_config = ServerConfig::default();
         disabled_memchain_config.memchain.mode = crate::config_memchain::MemChainMode::Off;
         disabled_memchain_config.memchain.supernode.enabled = true;
-        let disabled_memchain_server = Server::new(
-            disabled_memchain_config,
-            IdentityKeyPair::generate(),
-            None,
-        );
+        let disabled_memchain_server =
+            Server::new(disabled_memchain_config, IdentityKeyPair::generate(), None);
         assert_eq!(
             disabled_memchain_server
                 .init_llm_router()
@@ -17108,8 +17060,7 @@ mod tests {
             "Server failed to start: SuperNode initialization failed (memchain_runtime_required)"
         );
 
-        let missing_environment =
-            "AERONYX_TEST_SUPERNODE_SECRET_MUST_NOT_EXIST_20260814";
+        let missing_environment = "AERONYX_TEST_SUPERNODE_SECRET_MUST_NOT_EXIST_20260814";
         let mut missing_secret_config = ServerConfig::default();
         missing_secret_config.memchain.supernode.enabled = true;
         missing_secret_config.memchain.supernode.providers =
@@ -17122,19 +17073,14 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
             }];
-        let missing_secret_server = Server::new(
-            missing_secret_config,
-            IdentityKeyPair::generate(),
-            None,
-        );
+        let missing_secret_server =
+            Server::new(missing_secret_config, IdentityKeyPair::generate(), None);
         let error = missing_secret_server
             .init_llm_router()
             .err()
             .expect("missing configured secret must reject startup");
         let rendered = error.to_string();
-        assert!(rendered.contains(
-            "SuperNode initialization failed (provider_secret_unavailable)"
-        ));
+        assert!(rendered.contains("SuperNode initialization failed (provider_secret_unavailable)"));
         assert!(!rendered.contains(missing_environment));
         assert!(!rendered.contains("private-provider-name"));
         assert!(!rendered.contains("private-provider.example.com"));
@@ -17151,11 +17097,8 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
             }];
-        let malformed_base_server = Server::new(
-            malformed_base_config,
-            IdentityKeyPair::generate(),
-            None,
-        );
+        let malformed_base_server =
+            Server::new(malformed_base_config, IdentityKeyPair::generate(), None);
         let malformed_error = malformed_base_server
             .init_llm_router()
             .err()
@@ -17177,11 +17120,8 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
             }];
-        let keyless_local_server = Server::new(
-            keyless_local_config,
-            IdentityKeyPair::generate(),
-            None,
-        );
+        let keyless_local_server =
+            Server::new(keyless_local_config, IdentityKeyPair::generate(), None);
         assert_eq!(
             keyless_local_server
                 .init_llm_router()
@@ -18474,10 +18414,7 @@ mod tests {
         assert!((300..=600).contains(&schedule.delay_secs));
         assert_eq!(schedule.delay_secs % 300, 0);
         assert_eq!(
-            state.action(
-                renewal,
-                now + Duration::from_secs(schedule.delay_secs - 1)
-            ),
+            state.action(renewal, now + Duration::from_secs(schedule.delay_secs - 1)),
             CustodyWitnessRenewalRetryAction::BackingOff {
                 retry_in_secs: 1,
                 consecutive_failures: 1,
@@ -19824,10 +19761,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(
-            saturated_response.result,
-            CHAT_VERIFIED_SUBMIT_REJECTED_V1
-        );
+        assert_eq!(saturated_response.result, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
         saturated_response
             .validate_for_request(&saturated_request)
             .expect("capacity rejection remains request-bound");
@@ -19839,7 +19773,10 @@ mod tests {
                 .pending_messages,
             0
         );
-        assert!(relay.wallet_routes.lookup(&sender.public_key_bytes()).is_empty());
+        assert!(relay
+            .wallet_routes
+            .lookup(&sender.public_key_bytes())
+            .is_empty());
         assert_eq!(relay.peer_status().outbound_rounds, 0);
         let verified_status = relay.peer_status().verified_submit;
         assert_eq!(verified_status.pending_rejected_total, 1);
@@ -19873,13 +19810,8 @@ mod tests {
             signature: [0_u8; 64],
         };
         envelope.signature = sender.sign(&envelope.sign_data());
-        let request = ChatRelayVerifiedSubmitRequestV1::signed(
-            [0x8D; 16],
-            envelope,
-            now,
-            &sender,
-        )
-        .expect("sign restart recovery request");
+        let request = ChatRelayVerifiedSubmitRequestV1::signed([0x8D; 16], envelope, now, &sender)
+            .expect("sign restart recovery request");
 
         {
             let predecessor = ChatRelayService::new(relay_config.clone(), secret)
@@ -19894,10 +19826,9 @@ mod tests {
                 .store_pending(&request.envelope)
                 .expect("persist predecessor entry custody");
         }
-        let aged_owner = i64::try_from(
-            now.saturating_sub(VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS + 1),
-        )
-        .expect("convert aged verified-submit owner timestamp");
+        let aged_owner =
+            i64::try_from(now.saturating_sub(VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS + 1))
+                .expect("convert aged verified-submit owner timestamp");
         rusqlite::Connection::open(&db_path)
             .expect("open restart recovery database")
             .execute(
@@ -19947,7 +19878,10 @@ mod tests {
             1
         );
         assert_eq!(relay.peer_status().outbound_rounds, 0);
-        assert!(relay.wallet_routes.lookup(&sender.public_key_bytes()).is_empty());
+        assert!(relay
+            .wallet_routes
+            .lookup(&sender.public_key_bytes())
+            .is_empty());
 
         let replay_response = Server::handle_verified_chat_submit(
             request,
@@ -22150,23 +22084,16 @@ mod tests {
         // opens the source-blind circuit, a compatibility-capable peer must not
         // turn an availability incident into a silent authentication downgrade.
         let directory = tempfile::tempdir().expect("direct circuit directory");
-        let source_relay = test_chat_relay_service(
-            &directory.path().join("direct-circuit.sqlite3"),
-            [0x74; 32],
-        );
+        let source_relay =
+            test_chat_relay_service(&directory.path().join("direct-circuit.sqlite3"), [0x74; 32]);
         let now = unix_now_secs();
         for offset in 0..3 {
             let observed_at = now.saturating_add(offset);
             let permit = source_relay
                 .begin_direct_peer_delivery(observed_at)
                 .expect("closed circuit should admit failure seed");
-            let allows_more = source_relay.complete_direct_peer_delivery(
-                observed_at,
-                permit,
-                false,
-                false,
-                true,
-            );
+            let allows_more =
+                source_relay.complete_direct_peer_delivery(observed_at, permit, false, false, true);
             assert_eq!(allows_more, offset < 2);
         }
 
@@ -22456,15 +22383,13 @@ mod tests {
         // exits without cancellation or completion. A fresh process must treat
         // the unknowable network outcome as failed and start a new cooldown.
         let directory = tempfile::tempdir().expect("half-open crash drill directory");
-        let db_path = directory.path().join("direct-relay-half-open-crash.sqlite3");
+        let db_path = directory
+            .path()
+            .join("direct-relay-half-open-crash.sqlite3");
 
-        let crashed = run_direct_relay_restart_drill_child(
-            "seed_half_open_crash",
-            &db_path,
-            None,
-            None,
-        )
-        .await;
+        let crashed =
+            run_direct_relay_restart_drill_child("seed_half_open_crash", &db_path, None, None)
+                .await;
         assert_restart_drill_child_crashed(&crashed);
 
         let restarted = run_direct_relay_restart_drill_child(
@@ -22483,7 +22408,9 @@ mod tests {
         // three processes so neither the first successful probe nor the final
         // closed state can be inherited from process-local memory.
         let directory = tempfile::tempdir().expect("half-open progress drill directory");
-        let db_path = directory.path().join("direct-relay-half-open-progress.sqlite3");
+        let db_path = directory
+            .path()
+            .join("direct-relay-half-open-progress.sqlite3");
 
         let crashed = run_direct_relay_restart_drill_child(
             "seed_half_open_progress_crash",
@@ -22494,22 +22421,14 @@ mod tests {
         .await;
         assert_restart_drill_child_crashed(&crashed);
 
-        let resumed = run_direct_relay_restart_drill_child(
-            "resume_half_open_progress",
-            &db_path,
-            None,
-            None,
-        )
-        .await;
+        let resumed =
+            run_direct_relay_restart_drill_child("resume_half_open_progress", &db_path, None, None)
+                .await;
         assert_restart_drill_child_succeeded("resumed half-open progress", &resumed);
 
-        let verified = run_direct_relay_restart_drill_child(
-            "verify_closed_restart",
-            &db_path,
-            None,
-            None,
-        )
-        .await;
+        let verified =
+            run_direct_relay_restart_drill_child("verify_closed_restart", &db_path, None, None)
+                .await;
         assert_restart_drill_child_succeeded("closed circuit restart", &verified);
     }
 
@@ -22520,7 +22439,9 @@ mod tests {
         // table, then exits abruptly. A new process must observe corruption
         // before constructing any active ChatRelayService.
         let directory = tempfile::tempdir().expect("checkpoint loss drill directory");
-        let db_path = directory.path().join("direct-relay-checkpoint-loss.sqlite3");
+        let db_path = directory
+            .path()
+            .join("direct-relay-checkpoint-loss.sqlite3");
 
         let crashed = run_direct_relay_restart_drill_child(
             "seed_checkpoint_table_loss_crash",
@@ -22541,22 +22462,14 @@ mod tests {
         assert_restart_drill_child_succeeded("missing checkpoint table restart", &rejected);
     }
 
-    fn open_direct_relay_restart_drill_circuit(
-        relay: &ChatRelayService,
-        first_failure_at: u64,
-    ) {
+    fn open_direct_relay_restart_drill_circuit(relay: &ChatRelayService, first_failure_at: u64) {
         for offset in 0..3 {
             let observed_at = first_failure_at.saturating_add(offset);
             let permit = relay
                 .begin_direct_peer_delivery(observed_at)
                 .expect("closed circuit should admit failure seed");
-            let allows_more = relay.complete_direct_peer_delivery(
-                observed_at,
-                permit,
-                false,
-                false,
-                true,
-            );
+            let allows_more =
+                relay.complete_direct_peer_delivery(observed_at, permit, false, false, true);
             assert_eq!(allows_more, offset < 2);
         }
     }
@@ -22692,10 +22605,10 @@ mod tests {
         assert_eq!(after_retry.len(), 1);
         assert!(!has_more);
 
-        let v3_endpoint = std::env::var(DIRECT_RELAY_RESTART_DRILL_V3_ENV)
-            .expect("restart drill v3 endpoint");
-        let v2_endpoint = std::env::var(DIRECT_RELAY_RESTART_DRILL_V2_ENV)
-            .expect("restart drill v2 endpoint");
+        let v3_endpoint =
+            std::env::var(DIRECT_RELAY_RESTART_DRILL_V3_ENV).expect("restart drill v3 endpoint");
+        let v2_endpoint =
+            std::env::var(DIRECT_RELAY_RESTART_DRILL_V2_ENV).expect("restart drill v2 endpoint");
         let now = unix_now_secs();
         let v3_descriptor = signed_chat_relay_peer_descriptor_for_identity(
             v3_endpoint,
@@ -26283,14 +26196,9 @@ mod tests {
             "aeronyx-peer-cache-generation-binding-{unique}.json"
         ));
         let path_str = path.to_string_lossy().to_string();
-        Server::persist_peer_store_cache_once(
-            &server.identity,
-            &peer_store,
-            &path_str,
-            now + 5,
-        )
-        .await
-        .unwrap();
+        Server::persist_peer_store_cache_once(&server.identity, &peer_store, &path_str, now + 5)
+            .await
+            .unwrap();
         assert_eq!(peer_store.peer_cache_recovery_generation(), 1);
 
         // The new cache generation became durable, but the old generation-one
@@ -26338,19 +26246,14 @@ mod tests {
                 .as_deref(),
             Some("unavailable")
         );
-        assert_eq!(
-            status.bootstrap.last_client_delivery_witness_generation,
-            2
-        );
+        assert_eq!(status.bootstrap.last_client_delivery_witness_generation, 2);
         assert_eq!(status.bootstrap.last_client_delivery_witness_attempted, 0);
         assert_eq!(status.bootstrap.last_client_delivery_witness_failed, 1);
 
         let _ = tokio::fs::remove_file(&path).await;
         let _ = tokio::fs::remove_file(Server::peer_cache_backup_path(&path_str)).await;
-        let _ = tokio::fs::remove_file(
-            Server::peer_cache_client_delivery_anchor_path(&path_str),
-        )
-        .await;
+        let _ =
+            tokio::fs::remove_file(Server::peer_cache_client_delivery_anchor_path(&path_str)).await;
     }
 
     #[tokio::test]

@@ -38,7 +38,9 @@
 //! - The process fence prevents concurrent writers, not privileged rollback.
 //! - Never return to path-based state I/O after the directory FD is pinned.
 //!
-//! Last Modified: v1.4.0-DurabilityConfirmation - Added descriptor-pinned file
+//! Last Modified: v1.5.0-PortableNixMode - Enabled directory enumeration and
+//! made fixed private modes portable across Unix `mode_t` widths.
+//! v1.4.0-DurabilityConfirmation - Added descriptor-pinned file
 //! and directory synchronization for exact idempotent transition retries.
 //! v1.3.0-ComponentWalk - Rejected symlinks in every configured
 //! path component through descriptor-relative creation and traversal.
@@ -286,7 +288,9 @@ fn open_or_create_directory_at(
             match mkdirat(
                 Some(parent.as_raw_fd()),
                 name,
-                Mode::from_bits_truncate(PRIVATE_DIRECTORY_MODE),
+                // [BLIND-VAULT-RECOVERY-IO-BUILD 2026-08-31 by Codex] These
+                // fixed literals fit every supported Unix `mode_t` width.
+                Mode::from_bits_truncate(PRIVATE_DIRECTORY_MODE as nix::libc::mode_t),
             ) {
                 Ok(()) | Err(nix::errno::Errno::EEXIST) => open_directory_at(parent, name),
                 Err(error) => Err(PrivateRecoveryIoError::Filesystem(nix_filesystem_error(
@@ -337,7 +341,7 @@ fn open_private_regular_file_at(
         Some(directory.as_raw_fd()),
         name,
         flags,
-        Mode::from_bits_truncate(PRIVATE_FILE_MODE),
+        Mode::from_bits_truncate(PRIVATE_FILE_MODE as nix::libc::mode_t),
     )
     .map_err(|error| {
         if error == nix::errno::Errno::ELOOP {

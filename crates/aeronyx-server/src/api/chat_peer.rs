@@ -532,7 +532,7 @@ use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::chat::{
     decode_envelope, encode_envelope, validate_blind_relay_envelope_size,
     BlindRelayDeliveryReceipt, BlindRelayEnvelope, BlindRelayFailureReceipt,
-    BlindRelaySuccessReceipt, ChatEnvelope,
+    BlindRelaySuccessReceipt, ChatEnvelope, BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION,
 };
 use aeronyx_core::protocol::codec::encode_data_packet;
 use aeronyx_core::protocol::discovery::{NodeProtocolFeature, SignedNodeDescriptor};
@@ -2671,10 +2671,16 @@ fn blind_relay_crypto_capacity() -> usize {
     signature_verification_capacity(MAX_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT)
 }
 
-const fn blind_relay_ingress_crypto_capacity(total_capacity: usize) -> usize {
+fn blind_relay_ingress_crypto_capacity(total_capacity: usize) -> usize {
     // A one-worker host cannot reserve a permit without disabling ingress.
     // Multi-worker hosts retain one total permit outside the ingress quota.
-    total_capacity.saturating_sub(1).max(1)
+    // [BLIND-RELAY-STABLE-CAPACITY 2026-08-31 by Codex] Keep this runtime-only
+    // policy on stable Rust; `Ord::max` is not a stable const-trait operation.
+    if total_capacity > 1 {
+        total_capacity - 1
+    } else {
+        1
+    }
 }
 
 fn blind_relay_crypto_admission() -> Arc<Semaphore> {
@@ -2997,12 +3003,15 @@ async fn prepare_blind_relay_forward_request(
     request: PeerBlindRelayRequest,
 ) -> Result<PreparedBlindRelayForwardRequest, BlindRelayError> {
     run_blind_relay_crypto(move || {
-        let http = encode_prepared_peer_blind_relay_request(&request).map_err(|error| match error {
-            BlindRelayRequestPreparationFailure::BodyTooLarge => BlindRelayError::EnvelopeTooLarge,
-            BlindRelayRequestPreparationFailure::Backpressure
-            | BlindRelayRequestPreparationFailure::Unavailable => BlindRelayError::Backpressure,
-            BlindRelayRequestPreparationFailure::Encoding => BlindRelayError::ForwardFailed,
-        })?;
+        let http =
+            encode_prepared_peer_blind_relay_request(&request).map_err(|error| match error {
+                BlindRelayRequestPreparationFailure::BodyTooLarge => {
+                    BlindRelayError::EnvelopeTooLarge
+                }
+                BlindRelayRequestPreparationFailure::Backpressure
+                | BlindRelayRequestPreparationFailure::Unavailable => BlindRelayError::Backpressure,
+                BlindRelayRequestPreparationFailure::Encoding => BlindRelayError::ForwardFailed,
+            })?;
         Ok(PreparedBlindRelayForwardRequest {
             request: Arc::new(request),
             http,
@@ -3711,30 +3720,26 @@ async fn process_onion_blind_relay(
                     .arm_effect(now)
                     .map_err(|_| record_blind_relay_replay_protection_failure(&state, now))?;
             }
-            let terminal_delivery = match execute_onion_terminal_payload(
-                &state,
-                envelope.route_id,
-                operation,
-                now,
-            )
-            .await
-            {
-                Ok(delivery) => delivery,
-                Err(error) => {
-                    let failed_at = blind_relay_response_observed_at(now, route_started_at);
-                    debug!(
-                        reason = error.reason_bucket(),
-                        "[BLIND_RELAY] Onion terminal delivery failed"
-                    );
-                    reject_blind_relay_previous_hop(
-                        &state,
-                        previous_hop_node_id,
-                        failed_at,
-                        "onion_terminal_delivery_failed",
-                    );
-                    return Err(error);
-                }
-            };
+            let terminal_delivery =
+                match execute_onion_terminal_payload(&state, envelope.route_id, operation, now)
+                    .await
+                {
+                    Ok(delivery) => delivery,
+                    Err(error) => {
+                        let failed_at = blind_relay_response_observed_at(now, route_started_at);
+                        debug!(
+                            reason = error.reason_bucket(),
+                            "[BLIND_RELAY] Onion terminal delivery failed"
+                        );
+                        reject_blind_relay_previous_hop(
+                            &state,
+                            previous_hop_node_id,
+                            failed_at,
+                            "onion_terminal_delivery_failed",
+                        );
+                        return Err(error);
+                    }
+                };
             let accepted_at = blind_relay_response_observed_at(now, route_started_at);
             // [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] Sign v2 only after
             // the selected terminal workload has crossed its durable acceptance
@@ -4005,9 +4010,7 @@ fn decode_onion_terminal_payload(
     }
     if is_blind_vault_frame(payload) {
         let frame = decode_blind_vault_frame(payload).map_err(|_| {
-            OnionTerminalDecodeFailure::Protocol(
-                BlindRelayError::OnionTerminalPayloadRejected,
-            )
+            OnionTerminalDecodeFailure::Protocol(BlindRelayError::OnionTerminalPayloadRejected)
         })?;
         let BlindVaultFrame::Put(request) = frame else {
             // Lease admission, pull, delete, issuer, and response frames retain
@@ -4017,9 +4020,7 @@ fn decode_onion_terminal_payload(
                 BlindRelayError::OnionTerminalPayloadRejected,
             ));
         };
-        return Ok(DecodedOnionTerminalPayload::LegacyBlindVaultPut(
-            request,
-        ));
+        return Ok(DecodedOnionTerminalPayload::LegacyBlindVaultPut(request));
     }
 
     let envelope = decode_envelope(payload).map_err(|_| {
