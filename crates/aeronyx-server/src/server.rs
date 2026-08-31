@@ -1125,9 +1125,9 @@ const HTTP_TOO_EARLY_STATUS_CODE: u16 = 425;
 ///
 /// [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] Keep this typed until the route
 /// health boundary so retry policy cannot depend on strings or peer-controlled
-/// response content. Body-read/JSON truncation and local verifier availability
-/// are retryable; remote rejection and invalid cryptographic evidence are
-/// deterministic protocol failures.
+/// response content. Body-read/JSON truncation is retryable because delivery
+/// remains ambiguous. Remote rejection, invalid cryptographic evidence, and a
+/// local verifier failure are terminal for this network attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectPeerRelayAckFailure {
     Bounded(BoundedHttpResponseError),
@@ -1144,7 +1144,7 @@ impl DirectPeerRelayAckFailure {
             self,
             Self::Bounded(
                 BoundedHttpResponseError::BodyRead | BoundedHttpResponseError::JsonDecode
-            ) | Self::VerificationUnavailable
+            )
         )
     }
 
@@ -13124,8 +13124,9 @@ impl Server {
     /// to one target and retains its signed ACK by opaque commitment. One
     /// attempt therefore spans send, status, bounded body read, and receipt
     /// verification. Retry remains limited to transport ambiguity, HTTP 425,
-    /// an incomplete/undecodable bounded ACK body, or verifier worker loss;
-    /// deterministic remote protocol and cryptographic failures stop at once.
+    /// or an incomplete/undecodable bounded ACK body. A verifier worker loss
+    /// is local and cannot be repaired by repeating remote custody I/O, so it
+    /// stops fail-closed without penalizing the selected peer.
     async fn send_and_validate_target_bound_peer_relay(
         client: &reqwest::Client,
         url: &str,
@@ -16936,6 +16937,10 @@ mod tests {
             DirectPeerRelayAckFailure::ReceiptRequestMissing,
             DirectPeerRelayAckFailure::ReceiptMissing,
             DirectPeerRelayAckFailure::ReceiptInvalid("receipt_signature_invalid"),
+            // [DIRECT-RECEIPT-LOCAL-FAILURE 2026-08-31 by Codex] A complete
+            // signed response already crossed the network boundary. Repeating
+            // the request cannot restore a failed local verifier worker.
+            DirectPeerRelayAckFailure::VerificationUnavailable,
         ] {
             assert!(!TargetBoundPeerRelayFailure::Ack(error).retryable_after_ambiguous_delivery());
         }
