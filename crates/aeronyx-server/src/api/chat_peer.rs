@@ -164,6 +164,12 @@
 //! - [OUTBOUND-BLIND-RECEIPT-VERIFICATION 2026-08-31 by Codex] Verifies
 //!   terminal delivery receipts outside Tokio and distinguishes invalid peer
 //!   evidence from local verifier shutdown or worker loss
+//! - [BLIND-RELAY-CPU-RESERVATION 2026-08-31 by Codex] Composes a process-wide
+//!   blind-crypto ceiling with an ingress-only sub-quota so public verification
+//!   and completion traffic cannot consume all outbound progress capacity
+//! - [PREPARED-BLIND-FORWARD-CARRIER 2026-08-31 by Codex] Serializes and
+//!   bounds each hop-to-hop request before arming route effects, then reuses
+//!   the same immutable body across exact transport retries
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -1379,6 +1385,17 @@ pub(crate) struct PreparedAuthenticatedPeerChatRelayHttpRequest {
 pub(crate) struct PreparedPeerBlindRelayHttpRequest {
     body: Bytes,
     route_id: [u8; 16],
+}
+
+/// Exact hop-to-hop request retained across bounded transport retries.
+///
+/// [PREPARED-BLIND-FORWARD-CARRIER 2026-08-31 by Codex] Response policy needs
+/// the typed request while HTTP needs only immutable bytes. Keeping both in one
+/// carrier guarantees every retry uses the same serialization without asking
+/// the asynchronous transport layer to encode ciphertext again.
+struct PreparedBlindRelayForwardRequest {
+    request: Arc<PeerBlindRelayRequest>,
+    http: PreparedPeerBlindRelayHttpRequest,
 }
 
 impl PreparedPeerBlindRelayHttpRequest {
@@ -2942,7 +2959,7 @@ where
         // has no I/O or effects, so abandoning the result is always retry-safe.
         let _permits = BlindRelayCryptoPermits::total_only(permit);
         let (request, context) = build().map_err(BlindRelayRequestPreparationError::Build)?;
-        let request = encode_prepared_peer_blind_relay_request(request)
+        let request = encode_prepared_peer_blind_relay_request(&request)
             .map_err(BlindRelayRequestPreparationError::Local)?;
         Ok((request, context))
     })
@@ -2954,11 +2971,11 @@ where
 }
 
 fn encode_prepared_peer_blind_relay_request(
-    request: PeerBlindRelayRequest,
+    request: &PeerBlindRelayRequest,
 ) -> Result<PreparedPeerBlindRelayHttpRequest, BlindRelayRequestPreparationFailure> {
     let route_id = request.envelope.route_id;
     let body =
-        serde_json::to_vec(&request).map_err(|_| BlindRelayRequestPreparationFailure::Encoding)?;
+        serde_json::to_vec(request).map_err(|_| BlindRelayRequestPreparationFailure::Encoding)?;
     if body.len() > PEER_BLIND_RELAY_REQUEST_BODY_MAX_BYTES {
         return Err(BlindRelayRequestPreparationFailure::BodyTooLarge);
     }
@@ -2966,6 +2983,24 @@ fn encode_prepared_peer_blind_relay_request(
         body: Bytes::from(body),
         route_id,
     })
+}
+
+async fn prepare_blind_relay_forward_request(
+    request: PeerBlindRelayRequest,
+) -> Result<PreparedBlindRelayForwardRequest, BlindRelayError> {
+    run_blind_relay_crypto(move || {
+        let http = encode_prepared_peer_blind_relay_request(&request).map_err(|error| match error {
+            BlindRelayRequestPreparationFailure::BodyTooLarge => BlindRelayError::EnvelopeTooLarge,
+            BlindRelayRequestPreparationFailure::Backpressure
+            | BlindRelayRequestPreparationFailure::Unavailable => BlindRelayError::Backpressure,
+            BlindRelayRequestPreparationFailure::Encoding => BlindRelayError::ForwardFailed,
+        })?;
+        Ok(PreparedBlindRelayForwardRequest {
+            request: Arc::new(request),
+            http,
+        })
+    })
+    .await
 }
 
 /// Verifies one terminal delivery receipt behind bounded CPU admission.
@@ -3534,6 +3569,14 @@ async fn process_authenticated_peer_blind_relay(
     let forwarded_onward_descriptor_hint = onward_descriptor_hint;
     let ttl_remaining = prepared_forward.envelope.ttl;
 
+    let prepared_forward = prepare_blind_relay_forward_request(PeerBlindRelayRequest {
+        envelope: prepared_forward.envelope,
+        previous_hop_node_id: self_node_id,
+        onward_envelope: prepared_forward.onward_envelope,
+        onward_descriptor_hint: forwarded_onward_descriptor_hint,
+    })
+    .await?;
+
     let forward_started_at = blind_relay_response_observed_at(now, &route_started_at);
     route_lease
         .arm_effect(forward_started_at)
@@ -3542,12 +3585,7 @@ async fn process_authenticated_peer_blind_relay(
         &state,
         &url,
         &descriptor,
-        PeerBlindRelayRequest {
-            envelope: prepared_forward.envelope,
-            previous_hop_node_id: self_node_id,
-            onward_envelope: prepared_forward.onward_envelope,
-            onward_descriptor_hint: forwarded_onward_descriptor_hint,
-        },
+        prepared_forward,
         forward_started_at,
     )
     .await
@@ -3822,6 +3860,14 @@ async fn process_onion_blind_relay(
             .await?;
             let ttl_remaining = forwarded_envelope.ttl;
 
+            let forwarded_request = prepare_blind_relay_forward_request(PeerBlindRelayRequest {
+                envelope: forwarded_envelope,
+                previous_hop_node_id: self_node_id,
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            })
+            .await?;
+
             let forward_started_at = blind_relay_response_observed_at(now, route_started_at);
             route_lease.arm_effect(forward_started_at).map_err(|_| {
                 record_blind_relay_replay_protection_failure(&state, forward_started_at)
@@ -3830,12 +3876,7 @@ async fn process_onion_blind_relay(
                 &state,
                 &url,
                 &descriptor,
-                PeerBlindRelayRequest {
-                    envelope: forwarded_envelope,
-                    previous_hop_node_id: self_node_id,
-                    onward_envelope: None,
-                    onward_descriptor_hint: None,
-                },
+                forwarded_request,
                 forward_started_at,
             )
             .await
@@ -4178,6 +4219,14 @@ async fn process_onion_middle_blind_relay(
     .await?;
     let ttl_remaining = forwarded_envelope.ttl;
 
+    let forwarded_request = prepare_blind_relay_forward_request(PeerBlindRelayRequest {
+        envelope: forwarded_envelope,
+        previous_hop_node_id: self_node_id,
+        onward_envelope: None,
+        onward_descriptor_hint: None,
+    })
+    .await?;
+
     let forward_started_at = blind_relay_response_observed_at(now, route_started_at);
     route_lease
         .arm_effect(forward_started_at)
@@ -4186,12 +4235,7 @@ async fn process_onion_middle_blind_relay(
         &state,
         &url,
         &descriptor,
-        PeerBlindRelayRequest {
-            envelope: forwarded_envelope,
-            previous_hop_node_id: self_node_id,
-            onward_envelope: None,
-            onward_descriptor_hint: None,
-        },
+        forwarded_request,
         forward_started_at,
     )
     .await
@@ -4519,7 +4563,7 @@ async fn forward_blind_relay_with_retry(
     state: &ChatPeerState,
     url: &str,
     descriptor: &SignedNodeDescriptor,
-    request: PeerBlindRelayRequest,
+    request: PreparedBlindRelayForwardRequest,
     now: u64,
 ) -> Result<BlindRelayForwardOutcome, BlindRelayError> {
     let transport = ReqwestBlindRelayTransport::new(Arc::clone(&state.http_client));
@@ -4545,11 +4589,11 @@ async fn forward_blind_relay_with_retry(
 async fn forward_blind_relay_with_components(
     url: &str,
     descriptor: &SignedNodeDescriptor,
-    request: PeerBlindRelayRequest,
+    request: PreparedBlindRelayForwardRequest,
     now: u64,
     components: BlindRelayForwardComponents<'_>,
 ) -> Result<BlindRelayForwardOutcome, BlindRelayError> {
-    let request = Arc::new(request);
+    let PreparedBlindRelayForwardRequest { request, http } = request;
     let next_hop = descriptor.node_id();
     let failure_receipt_required = blind_relay_failure_receipt_required(descriptor);
     let success_receipt_required = blind_relay_success_receipt_required(descriptor);
@@ -4559,7 +4603,7 @@ async fn forward_blind_relay_with_components(
     let request_started_at = Instant::now();
     for attempt in 1..=components.retry_policy.max_attempts().get() {
         let retry_context = blind_relay_retry_context(request.as_ref(), next_hop, attempt)?;
-        let transport_outcome = components.transport.send(url, request.as_ref()).await;
+        let transport_outcome = components.transport.send(url, http.body()).await;
         let observed_at = blind_relay_response_observed_at(now, &request_started_at);
         let request_for_validation = Arc::clone(&request);
         let response_policy = Arc::clone(&components.response_policy);
@@ -6974,7 +7018,9 @@ mod tests {
             &old_middle_state,
             &terminal_url,
             &terminal_descriptor,
-            first_forwarded_request.clone(),
+            prepare_blind_relay_forward_request(first_forwarded_request.clone())
+                .await
+                .expect("prepare recoverable terminal request"),
             now,
         )
         .await
@@ -9166,7 +9212,9 @@ mod tests {
             &state,
             &blind_peer_relay_url(&endpoint).unwrap(),
             &advertised_descriptor,
-            request,
+            prepare_blind_relay_forward_request(request)
+                .await
+                .expect("prepare downgraded failure receipt request"),
             now,
         )
         .await;
@@ -9277,7 +9325,9 @@ mod tests {
             &state,
             &blind_peer_relay_url(&endpoint).unwrap(),
             &descriptor,
-            request,
+            prepare_blind_relay_forward_request(request)
+                .await
+                .expect("prepare invalid failure receipt request"),
             now,
         )
         .await;

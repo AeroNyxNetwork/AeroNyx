@@ -20,7 +20,7 @@
 //! - Uses the shared peer response byte limit and bounded decoder in `api/mod.rs`.
 //!
 //! ## Main Logical Flow
-//! 1. Serialize and send one opaque blind-relay request to the selected URL.
+//! 1. Send one already-prepared opaque blind-relay body to the selected URL.
 //! 2. Classify request-layer failure without retaining endpoint or payload text.
 //! 3. For every HTTP response, consume JSON under the shared byte ceiling.
 //! 4. Return a typed transport outcome to the route orchestrator.
@@ -33,15 +33,18 @@
 //! - Keep the shared response size ceiling unchanged across rolling upgrades.
 //!
 //! ## Last Modified
+//! v2.8.37-PreparedBlindForwardBody - Reuse one immutable serialized body for
+//! every exact retry and keep ciphertext encoding outside async HTTP workers.
 //! v2.8.36-ChatPeerTransportDomain - Initial trait-based HTTP extraction.
 //! ============================================================================
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use reqwest::{Client, StatusCode};
 
-use super::chat_peer::{PeerBlindRelayRequest, PeerBlindRelayResponse};
+use super::chat_peer::PeerBlindRelayResponse;
 use super::chat_peer_retry::BlindRelayTransportFailureKind;
 use crate::api::{
     decode_bounded_json_response, BoundedHttpResponseError, BLIND_RELAY_ACK_RESPONSE_MAX_BYTES,
@@ -142,7 +145,7 @@ enum BlindRelayTransportErrorKind {
 /// Replaceable outbound blind-relay transport capability.
 #[async_trait]
 pub(super) trait BlindRelayTransport: Send + Sync {
-    async fn send(&self, url: &str, request: &PeerBlindRelayRequest) -> BlindRelayTransportOutcome;
+    async fn send(&self, url: &str, body: Bytes) -> BlindRelayTransportOutcome;
 }
 
 /// Production HTTP adapter backed by the server's shared reqwest client.
@@ -159,8 +162,18 @@ impl ReqwestBlindRelayTransport {
 
 #[async_trait]
 impl BlindRelayTransport for ReqwestBlindRelayTransport {
-    async fn send(&self, url: &str, request: &PeerBlindRelayRequest) -> BlindRelayTransportOutcome {
-        let response = match self.client.post(url).json(request).send().await {
+    async fn send(&self, url: &str, body: Bytes) -> BlindRelayTransportOutcome {
+        // [PREPARED-BLIND-FORWARD-CARRIER 2026-08-31 by Codex] The caller
+        // prepared and bounded these exact bytes before arming route effects.
+        // Transport retries clone only the reference-counted byte carrier.
+        let response = match self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+        {
             Ok(response) => response,
             Err(error) => {
                 return BlindRelayTransportOutcome::RequestFailed(
