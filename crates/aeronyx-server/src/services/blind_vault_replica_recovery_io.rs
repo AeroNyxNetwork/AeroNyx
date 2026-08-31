@@ -38,7 +38,9 @@
 //! - The process fence prevents concurrent writers, not privileged rollback.
 //! - Never return to path-based state I/O after the directory FD is pinned.
 //!
-//! Last Modified: v1.10.0-TypedPublicationCleanup - Bound failed-publish
+//! Last Modified: v1.11.0-NonBlockingSpecialFileRejection - Prevented FIFO
+//! peer waits before regular-file identity validation.
+//! v1.10.0-TypedPublicationCleanup - Bound failed-publish
 //! cleanup to the pinned inode and the pre-rename publication phase.
 //! v1.9.0-ValidatedTempOwnership - Required exact unfinished
 //! regular-file ownership proof before cleanup may unlink its directory entry.
@@ -493,7 +495,11 @@ fn open_private_regular_file_at(
     create_new: bool,
     writable: bool,
 ) -> Result<File, PrivateRecoveryIoError> {
-    let mut flags = OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW;
+    // [BLIND-VAULT-RECOVERY-NONBLOCK 2026-08-31 by Codex] A same-owner or
+    // privileged process can place a FIFO at a known recovery name. Opening it
+    // must not wait for a peer before the descriptor is rejected as non-regular.
+    // O_NONBLOCK has no read/write effect on the regular files returned here.
+    let mut flags = OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
     flags |= if writable {
         OFlag::O_RDWR
     } else {
@@ -692,7 +698,12 @@ fn effective_user_id() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, path::PathBuf};
+    use std::{
+        cell::Cell,
+        path::PathBuf,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use super::*;
 
@@ -754,6 +765,113 @@ mod tests {
             Err(error) if error.kind() == ErrorKind::NotFound => false,
             Err(error) => panic!("inspect recovery fixture entry: {error}"),
         }
+    }
+
+    const FIFO_PEER_RELEASE_DELAY: Duration = Duration::from_millis(750);
+
+    fn create_fifo(path: &Path, mode: u32) {
+        nix::unistd::mkfifo(path, Mode::from_bits_truncate(mode as nix::libc::mode_t))
+            .expect("create recovery FIFO fixture");
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .expect("set recovery FIFO fixture mode");
+    }
+
+    fn run_without_fifo_peer_wait<T>(fifo: &Path, operation: impl FnOnce() -> T) -> T {
+        let fifo = fifo.to_path_buf();
+        let peer = thread::spawn(move || {
+            thread::sleep(FIFO_PEER_RELEASE_DELAY);
+            // [BLIND-VAULT-RECOVERY-NONBLOCK 2026-08-31 by Codex] The watchdog
+            // is itself non-blocking. It releases a regressed reader, but exits
+            // without waiting when the production open has already returned.
+            let _peer = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(fifo)
+                .expect("open non-blocking FIFO watchdog peer");
+        });
+
+        let started = Instant::now();
+        let result = operation();
+        let elapsed = started.elapsed();
+        peer.join().expect("join FIFO watchdog peer");
+        assert!(
+            elapsed < FIFO_PEER_RELEASE_DELAY,
+            "recovery open waited for a FIFO peer before type validation"
+        );
+        result
+    }
+
+    #[test]
+    // [BLIND-VAULT-RECOVERY-NONBLOCK 2026-08-31 by Codex] State reads and
+    // pre-publication validation must reject a FIFO without waiting for writer.
+    fn state_fifo_is_rejected_without_waiting_for_peer() {
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let directory = fs::canonicalize(root.path())
+            .expect("canonical temporary recovery root")
+            .join("recovery");
+        let store = PrivateAtomicRecoveryFile::open(&directory).expect("open recovery fixture");
+        let state = directory.join(STATE_FILE_NAME);
+        create_fifo(&state, PRIVATE_FILE_MODE);
+
+        assert!(matches!(
+            run_without_fifo_peer_wait(&state, || store.read(64)),
+            Err(PrivateRecoveryIoError::UnsafePath)
+        ));
+        assert!(entry_exists(&state));
+    }
+
+    #[test]
+    // [BLIND-VAULT-RECOVERY-NONBLOCK 2026-08-31 by Codex] Lock acquisition
+    // must reject a FIFO before writable mode normalization or process fencing.
+    fn lock_fifo_is_rejected_without_waiting_for_peer_or_changing_mode() {
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let directory = fs::canonicalize(root.path())
+            .expect("canonical temporary recovery root")
+            .join("recovery");
+        fs::create_dir(&directory).expect("create recovery fixture directory");
+        let lock = directory.join(LOCK_FILE_NAME);
+        create_fifo(&lock, 0o640);
+
+        assert!(matches!(
+            run_without_fifo_peer_wait(&lock, || PrivateAtomicRecoveryFile::open(&directory)),
+            Err(PrivateRecoveryIoError::UnsafePath)
+        ));
+        assert_eq!(
+            fs::symlink_metadata(&lock)
+                .expect("lock FIFO metadata after rejection")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    // [BLIND-VAULT-RECOVERY-NONBLOCK 2026-08-31 by Codex] Even a stale
+    // readdir classification cannot make exact-temp validation wait on a FIFO;
+    // ordinary cleanup still leaves the unknown non-regular entry untouched.
+    fn temp_fifo_validation_is_bounded_and_cleanup_leaves_it_untouched() {
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let directory = fs::canonicalize(root.path())
+            .expect("canonical temporary recovery root")
+            .join("recovery");
+        let store = PrivateAtomicRecoveryFile::open(&directory).expect("open recovery fixture");
+        let temp_name = format!("{TEMP_FILE_PREFIX}{}", "b".repeat(TEMP_FILE_HEX_LENGTH));
+        let temp = directory.join(&temp_name);
+        create_fifo(&temp, PRIVATE_FILE_MODE);
+
+        let (validation, cleanup) = run_without_fifo_peer_wait(&temp, || {
+            let validation = ValidatedOwnedTempRegularFile::open_at(&store.directory, &temp_name);
+            let cleanup = cleanup_owned_temp_files(&store.directory);
+            (validation, cleanup)
+        });
+        assert!(matches!(
+            validation,
+            Err(PrivateRecoveryIoError::UnsafePath)
+        ));
+        cleanup.expect("skip exact non-regular temp fixture");
+        assert!(entry_exists(&temp));
     }
 
     #[test]
