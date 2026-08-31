@@ -1279,6 +1279,17 @@ pub(crate) enum BlindRelayRequestPreparationFailure {
     Unavailable,
 }
 
+/// Domain build failure or local carrier-preparation failure.
+///
+/// Keeping `Build(E)` generic lets the onion route planner preserve its typed
+/// refresh/policy/construction dispositions while this module owns only CPU
+/// admission and the wire carrier contract.
+#[derive(Debug)]
+pub(crate) enum BlindRelayRequestPreparationError<E> {
+    Build(E),
+    Local(BlindRelayRequestPreparationFailure),
+}
+
 impl BlindRelayRequestPreparationFailure {
     /// Closed aggregate label safe for relay-health telemetry.
     #[must_use]
@@ -2830,30 +2841,68 @@ pub(crate) async fn prepare_peer_chat_relay_request_v3(
 pub(crate) async fn prepare_peer_blind_relay_http_request(
     request: PeerBlindRelayRequest,
 ) -> Result<PreparedPeerBlindRelayHttpRequest, BlindRelayRequestPreparationFailure> {
+    match prepare_peer_blind_relay_http_request_with(move || {
+        Ok::<_, std::convert::Infallible>((request, ()))
+    })
+    .await
+    {
+        Ok((request, ())) => Ok(request),
+        Err(BlindRelayRequestPreparationError::Build(never)) => match never {},
+        Err(BlindRelayRequestPreparationError::Local(error)) => Err(error),
+    }
+}
+
+/// Builds and serializes one blind request as a single bounded CPU operation.
+///
+/// [ATOMIC-OUTBOUND-BLIND-PREPARATION 2026-08-31 by Codex] Route planning,
+/// onion KEM work, signing, and JSON encoding may be composed inside `build`
+/// without returning to a Tokio I/O worker between CPU-heavy stages. The
+/// context is carried beside the immutable body for receipt verification.
+pub(crate) async fn prepare_peer_blind_relay_http_request_with<T, E, F>(
+    build: F,
+) -> Result<(PreparedPeerBlindRelayHttpRequest, T), BlindRelayRequestPreparationError<E>>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    F: FnOnce() -> Result<(PeerBlindRelayRequest, T), E> + Send + 'static,
+{
     let permit = blind_relay_crypto_admission()
         .try_acquire_owned()
-        .map_err(|_| BlindRelayRequestPreparationFailure::Backpressure)?;
+        .map_err(|_| {
+            BlindRelayRequestPreparationError::Local(
+                BlindRelayRequestPreparationFailure::Backpressure,
+            )
+        })?;
     tokio::task::spawn_blocking(move || {
         // [OUTBOUND-BLIND-REQUEST-PREPARATION 2026-08-31 by Codex] Keep the
-        // permit in the worker after caller cancellation. Serialization has no
-        // I/O or effects, so abandoning the result is always retry-safe.
+        // permit in the worker after caller cancellation. The composed work
+        // has no I/O or effects, so abandoning the result is always retry-safe.
         let _permit = permit;
-        let route_id = request.envelope.route_id;
-        let body = serde_json::to_vec(&request)
-            .map_err(|_| BlindRelayRequestPreparationFailure::Encoding)?;
-        if body.len() > PEER_BLIND_RELAY_REQUEST_BODY_MAX_BYTES {
-            return Err(BlindRelayRequestPreparationFailure::BodyTooLarge);
-        }
-        Ok(PreparedPeerBlindRelayHttpRequest {
-            body: Bytes::from(body),
-            route_id,
-        })
+        let (request, context) = build().map_err(BlindRelayRequestPreparationError::Build)?;
+        let request = encode_prepared_peer_blind_relay_request(request)
+            .map_err(BlindRelayRequestPreparationError::Local)?;
+        Ok((request, context))
     })
     .await
     .map_err(|_| {
         warn!("[CHAT_PEER] Outbound blind relay preparation worker failed closed");
-        BlindRelayRequestPreparationFailure::Unavailable
+        BlindRelayRequestPreparationError::Local(BlindRelayRequestPreparationFailure::Unavailable)
     })?
+}
+
+fn encode_prepared_peer_blind_relay_request(
+    request: PeerBlindRelayRequest,
+) -> Result<PreparedPeerBlindRelayHttpRequest, BlindRelayRequestPreparationFailure> {
+    let route_id = request.envelope.route_id;
+    let body =
+        serde_json::to_vec(&request).map_err(|_| BlindRelayRequestPreparationFailure::Encoding)?;
+    if body.len() > PEER_BLIND_RELAY_REQUEST_BODY_MAX_BYTES {
+        return Err(BlindRelayRequestPreparationFailure::BodyTooLarge);
+    }
+    Ok(PreparedPeerBlindRelayHttpRequest {
+        body: Bytes::from(body),
+        route_id,
+    })
 }
 
 fn encode_prepared_peer_chat_relay_request<T: Serialize>(

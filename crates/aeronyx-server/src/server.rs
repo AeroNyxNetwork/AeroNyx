@@ -986,11 +986,12 @@ use crate::api::blind_vault::build_blind_vault_router;
 use crate::api::chat_handlers::build_chat_router;
 use crate::api::chat_peer::{
     build_chat_peer_router, prepare_peer_blind_relay_http_request,
+    prepare_peer_blind_relay_http_request_with,
     prepare_peer_chat_relay_request_v1,
     prepare_peer_chat_relay_request_v2,
     prepare_peer_chat_relay_request_v3, verify_peer_chat_relay_receipt,
-    DirectRelayReceiptVerificationFailure, PeerBlindRelayRequest, PeerBlindRelayResponse,
-    PeerChatRelayResponse, PeerChatRelayResponseV2,
+    BlindRelayRequestPreparationError, DirectRelayReceiptVerificationFailure,
+    PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayResponse, PeerChatRelayResponseV2,
     PreparedAuthenticatedPeerChatRelayHttpRequest, PreparedPeerChatRelayHttpRequest,
 };
 use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica_and_runtime;
@@ -12750,31 +12751,37 @@ impl Server {
                 rand::thread_rng().fill_bytes(&mut route_id);
                 route_id
             };
-            let (request, payload_commitment) = match Self::build_two_hop_onion_request(
-                identity,
-                self_node_id,
-                &middle,
-                &terminal,
-                envelope,
-                route_id,
-                now,
-            ) {
-                Ok(request) => request,
-                Err(error) => {
-                    last_failure_reason = Some(error.reason_bucket().to_string());
-                    continue;
-                }
-            };
-            let request = match prepare_peer_blind_relay_http_request(request).await {
-                Ok(request) => request,
-                Err(error) => {
-                    // [OUTBOUND-BLIND-REQUEST-PREPARATION 2026-08-31 by Codex]
-                    // A locally rejected carrier was never observed by either
-                    // hop, so it remains eligible for another safe route.
-                    last_failure_reason = Some(error.reason_bucket().to_string());
-                    continue;
-                }
-            };
+            let preparation_identity = (*identity).clone();
+            let preparation_self_node_id = *self_node_id;
+            let preparation_middle = middle.clone();
+            let preparation_terminal = terminal.clone();
+            let preparation_envelope = (*envelope).clone();
+            let (request, payload_commitment) =
+                match prepare_peer_blind_relay_http_request_with(move || {
+                    Self::build_two_hop_onion_request(
+                        &preparation_identity,
+                        &preparation_self_node_id,
+                        &preparation_middle,
+                        &preparation_terminal,
+                        &preparation_envelope,
+                        route_id,
+                        now,
+                    )
+                })
+                .await
+                {
+                    Ok(request) => request,
+                    Err(BlindRelayRequestPreparationError::Build(error)) => {
+                        last_failure_reason = Some(error.reason_bucket().to_string());
+                        continue;
+                    }
+                    Err(BlindRelayRequestPreparationError::Local(error)) => {
+                        // [ATOMIC-OUTBOUND-BLIND-PREPARATION 2026-08-31 by Codex]
+                        // No hop observed locally rejected route material.
+                        last_failure_reason = Some(error.reason_bucket().to_string());
+                        continue;
+                    }
+                };
 
             // Once sent, both hops are considered exposed for this envelope
             // even if the ACK is lost. Reusing either node or endpoint network
