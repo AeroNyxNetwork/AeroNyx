@@ -179,8 +179,13 @@
 //!   records whether it entered through strict live transport or an explicit
 //!   operator import, plus that admission's bounded delay. Never infer or
 //!   widen this policy during restart audit.
+//! - [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] SaaS-managed instances may
+//!   carry an optional byte-growth admission policy. Local/global instances
+//!   retain their original behavior; reads, deletion, and recovery never need
+//!   a permit.
 //!
 //! ## Last Modified
+//! v2.8.66-ManagedVolumeGrowth - Added optional managed-volume admission.
 //! v2.8.65-CustodyWitnessReceiptImport - Added schema-v18 typed receipt
 //! admission evidence for restart-safe live and air-gapped workflows.
 //! [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Added follower-only,
@@ -266,6 +271,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use nix::fcntl::Flock;
@@ -312,6 +318,70 @@ pub(super) const SCHEMA_VERSION: u32 = 18;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
+
+// ============================================
+// Managed-volume growth admission
+// ============================================
+
+/// Privacy-safe failure to admit a byte-growing managed-volume mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum StorageGrowthError {
+    #[error("Managed storage has reached its configured byte capacity")]
+    AtCapacity,
+    #[error("Managed storage capacity measurement is temporarily unavailable")]
+    ProbeUnavailable,
+    #[error("Managed storage byte accounting overflow")]
+    AccountingOverflow,
+    #[error("Managed storage volume is unavailable")]
+    VolumeUnavailable,
+}
+
+impl StorageGrowthError {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::AtCapacity => "at_capacity",
+            Self::ProbeUnavailable => "probe_unavailable",
+            Self::AccountingOverflow => "accounting_overflow",
+            Self::VolumeUnavailable => "volume_unavailable",
+        }
+    }
+
+    pub(crate) const fn is_at_capacity(self) -> bool {
+        matches!(self, Self::AtCapacity)
+    }
+}
+
+/// Opaque RAII permit held through one complete logical mutation.
+pub(crate) struct StorageGrowthPermit {
+    _inner: Box<dyn Send + Sync>,
+}
+
+impl StorageGrowthPermit {
+    pub(crate) fn new(inner: impl Send + Sync + 'static) -> Self {
+        Self {
+            _inner: Box::new(inner),
+        }
+    }
+
+    fn unmanaged() -> Self {
+        Self::new(())
+    }
+}
+
+impl std::fmt::Debug for StorageGrowthPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StorageGrowthPermit")
+    }
+}
+
+/// Replaceable policy boundary used only by SaaS managed-volume instances.
+#[async_trait::async_trait]
+pub(crate) trait StorageGrowthAdmission: Send + Sync {
+    async fn acquire(
+        &self,
+        minimum_growth_bytes: u64,
+    ) -> Result<StorageGrowthPermit, StorageGrowthError>;
+}
 
 // ============================================
 // Embedding helpers
@@ -1570,6 +1640,9 @@ pub struct MemoryStorage {
     /// One-way process-local safety latch. It is set while the incident write
     /// still owns the SQLite connection, closing the append race window.
     pub(crate) commitment_production_halted: AtomicBool,
+    /// Optional SaaS managed-volume byte-growth policy. It contains no owner
+    /// key and its implementation must never expose the configured path.
+    growth_admission: Option<Arc<dyn StorageGrowthAdmission>>,
 }
 
 impl MemoryStorage {
@@ -1611,7 +1684,12 @@ impl MemoryStorage {
         } else {
             "plaintext"
         };
-        info!(path = %path.display(), mode = mode, "[STORAGE] ✅ SQLite opened (schema v{})", SCHEMA_VERSION);
+        // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] Managed DB filenames
+        // are derived from owner keys. Log only mode/schema, never the path.
+        info!(
+            mode = mode,
+            "[STORAGE] ✅ SQLite opened (schema v{})", SCHEMA_VERSION
+        );
 
         Ok(Self {
             conn: TokioMutex::new(conn),
@@ -1639,7 +1717,30 @@ impl MemoryStorage {
             ),
             commitment_checkpoint_certificate_anchor_write: TokioMutex::new(()),
             commitment_production_halted: AtomicBool::new(false),
+            growth_admission: None,
         })
+    }
+
+    /// Attach the internal managed-volume growth policy without changing the
+    /// public `open` constructor or Local/global storage semantics.
+    pub(crate) fn with_growth_admission(
+        mut self,
+        admission: Arc<dyn StorageGrowthAdmission>,
+    ) -> Self {
+        self.growth_admission = Some(admission);
+        self
+    }
+
+    /// Acquire a permit for a logical operation that may add managed bytes.
+    /// Reads, deletion, and recovery deliberately do not call this method.
+    pub(crate) async fn acquire_growth_permit(
+        &self,
+        minimum_growth_bytes: u64,
+    ) -> Result<StorageGrowthPermit, StorageGrowthError> {
+        match &self.growth_admission {
+            Some(admission) => admission.acquire(minimum_growth_bytes).await,
+            None => Ok(StorageGrowthPermit::unmanaged()),
+        }
     }
 
     fn create_schema(conn: &Connection) -> Result<(), String> {
@@ -4208,6 +4309,14 @@ impl std::fmt::Debug for MemoryStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unmanaged_local_storage_keeps_backward_compatible_growth_behavior() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let permit = storage.acquire_growth_permit(u64::MAX).await.unwrap();
+        drop(permit);
+        assert_eq!(storage.count().await, 0);
+    }
 
     fn make_rec(ts: u64, layer: MemoryLayer, src: &str) -> MemoryRecord {
         MemoryRecord::new(

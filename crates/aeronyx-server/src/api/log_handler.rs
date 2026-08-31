@@ -57,10 +57,13 @@
 //! - MAX_EXTRACTION_BYTES (4KB): prevents storage amplification
 //! - set_record_session_id returns () — do NOT wrap in if-let-Err
 //! - Privacy stripping runs on turn.content; entropy filter uses original content
+//! - Hold one managed-volume growth permit across the complete multi-turn
+//!   ingestion so partial capacity admission cannot split a request.
 //! - [LOG-TYPED-CONTEXT 2026-08-12 by Codex] Keep `Request<Body>` last and
 //!   preserve remote 403 responses before validating local storage context.
 //!
 //! ## Last Modified
+//! v2.8.58-ManagedVolumeGrowth - Added fail-closed log-ingestion admission.
 //! v2.7.16-TypedContext - Removed panic-on-missing request extensions and kept
 //!                       local-only authorization behavior fail-closed.
 //! v2.7.14-RustdocQuality - Corrected executable-example classification.
@@ -80,7 +83,12 @@ const MAX_EXTRACTION_BYTES: usize = 4 * 1024;
 const MAX_RULE_ENGINE_INPUT: usize = 2_000;
 
 use axum::http::Request;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Extension, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Extension, Json,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -89,6 +97,7 @@ use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
 use crate::api::mpi::{AuthenticatedOwner, MpiState};
 use crate::services::memchain::derive_rawlog_key;
+use crate::services::memchain::storage::StorageGrowthError;
 use crate::services::memchain::MemoryStorage;
 
 // ============================================
@@ -113,6 +122,24 @@ pub struct LogRequest {
     /// None / "all" = default context; any other string = project_id.
     #[serde(default)]
     pub context: Option<String>,
+}
+
+fn growth_failure_response(error: StorageGrowthError) -> Response {
+    // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] Keep the established JSON
+    // object shape while withholding owner keys, paths, and probe details.
+    warn!(
+        kind = error.code(),
+        "[MPI_LOG] Byte-growth admission rejected"
+    );
+    let (status, message) = if error.is_at_capacity() {
+        (StatusCode::INSUFFICIENT_STORAGE, "storage capacity reached")
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage capacity temporarily unavailable",
+        )
+    };
+    (status, Json(serde_json::json!({"error": message}))).into_response()
 }
 
 #[derive(Debug, Serialize)]
@@ -155,7 +182,6 @@ fn strip_privacy_tags(content: &str) -> Cow<'_, str> {
 struct EntropyResult {
     score: f32,
     passes: bool,
-    detected_entities: Vec<String>,
 }
 
 /// Run Stage 1 entropy filter on conversation turns.
@@ -177,7 +203,6 @@ fn run_entropy_filter(
         return EntropyResult {
             score: 0.0,
             passes: false,
-            detected_entities: Vec::new(),
         };
     }
 
@@ -242,11 +267,9 @@ fn run_entropy_filter(
         "[ENTROPY] Filter result"
     );
 
-    EntropyResult {
-        score,
-        passes,
-        detected_entities,
-    }
+    // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] Entity names are needed
+    // only for the aggregate diagnostic above; do not retain them in the result.
+    EntropyResult { score, passes }
 }
 
 // ============================================
@@ -647,10 +670,7 @@ pub async fn mpi_log(
 ) -> impl IntoResponse {
     // Step 0: extract auth and enforce local-only access.
     if auth.is_remote() {
-        warn!(
-            "[MPI_LOG] Rejected remote /log request from {}",
-            &auth.owner_hex()[..8]
-        );
+        warn!("[MPI_LOG] Rejected remote /log request");
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -684,6 +704,7 @@ pub async fn mpi_log(
                 .into_response()
         }
     };
+    let growth_bytes = u64::try_from(body_bytes.len()).unwrap_or(u64::MAX).max(1);
     let log_req: LogRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
         Err(e) => {
@@ -717,6 +738,16 @@ pub async fn mpi_log(
         result.passes
     } else {
         true
+    };
+
+    // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] Empty requests retain the
+    // established no-op response and do not require a byte-growth permit.
+    let _growth_permit = match log_req.turns.is_empty() {
+        true => None,
+        false => match storage.acquire_growth_permit(growth_bytes).await {
+            Ok(permit) => Some(permit),
+            Err(error) => return growth_failure_response(error),
+        },
     };
 
     // Rawlog key derived from identity private key (never changes per server).
@@ -978,6 +1009,7 @@ pub async fn mpi_log(
 mod tests {
     use super::*;
     use crate::api::mpi::SessionEmbeddingCache;
+    use crate::services::memchain::storage::{StorageGrowthAdmission, StorageGrowthPermit};
     use crate::services::memchain::VectorIndex;
     use aeronyx_core::crypto::IdentityKeyPair;
     use axum::body::Body;
@@ -986,6 +1018,18 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use tower::ServiceExt;
+
+    struct ProbeUnavailableAdmission;
+
+    #[async_trait::async_trait]
+    impl StorageGrowthAdmission for ProbeUnavailableAdmission {
+        async fn acquire(
+            &self,
+            _minimum_growth_bytes: u64,
+        ) -> Result<StorageGrowthPermit, StorageGrowthError> {
+            Err(StorageGrowthError::ProbeUnavailable)
+        }
+    }
 
     fn make_test_state() -> (Arc<MpiState>, AuthenticatedOwner) {
         let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
@@ -1017,6 +1061,85 @@ mod tests {
             None,
         );
         (Arc::new(state), AuthenticatedOwner::Local { owner })
+    }
+
+    #[tokio::test]
+    async fn log_probe_failure_is_retryable_and_writes_nothing() {
+        let storage = Arc::new(
+            MemoryStorage::open(":memory:", None)
+                .unwrap()
+                .with_growth_admission(Arc::new(ProbeUnavailableAdmission)),
+        );
+        let vector_index = Arc::new(VectorIndex::new());
+        let identity = IdentityKeyPair::generate();
+        let owner = identity.public_key_bytes();
+        let state = Arc::new(MpiState::local(
+            Arc::clone(&storage),
+            vector_index,
+            identity,
+            RwLock::new(HashMap::new()),
+            AtomicBool::new(true),
+            Arc::new(RwLock::new(HashMap::new())),
+            0.0,
+            false,
+            RwLock::new(SessionEmbeddingCache::default()),
+            RwLock::new(None),
+            owner,
+            None,
+            None,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+        ));
+        let app = axum::Router::new()
+            .route("/log", axum::routing::post(mpi_log))
+            .layer(Extension(AuthenticatedOwner::Local { owner }))
+            .layer(Extension(Arc::clone(&storage)))
+            .with_state(state);
+        let request = Request::builder()
+            .uri("/log")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "session_id": "retryable",
+                    "turns": [{"role": "user", "content": "remember this"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": "storage capacity temporarily unavailable"})
+        );
+        assert!(storage.get_unprocessed_rawlogs(10).await.is_empty());
+
+        let empty_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/log")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"session_id": "noop", "turns": []}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty_response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]

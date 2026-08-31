@@ -65,8 +65,12 @@
 //! - [MPI-TYPED-CONTEXT 2026-08-12 by Codex] Handler authentication context
 //!   must use typed `Extension<AuthenticatedOwner>` extraction so missing
 //!   middleware is contained as an HTTP rejection under release `panic=abort`.
+//! - [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] SaaS authentication logs
+//!   never expose owner-key prefixes. Mutation handlers perform capacity
+//!   admission after validation; reads retain their existing path.
 //!
 //! ## Last Modified
+//! v2.6.2-ManagedVolumeGrowth - Removed owner-key authentication telemetry.
 //! v2.6.1+TypedContext - Removed the unused panic-based owner extraction helper
 //! v2.6.0+BoundedRecallSessions - Owner-isolated bounded session centroid cache
 //! v2.5.2+Provenance  - +2 routes (patch record, provenance); 29→31
@@ -789,7 +793,7 @@ async fn handle_saas_jwt_auth(
     req.extensions_mut().insert(storage);
     req.extensions_mut().insert(vector_index);
 
-    debug!(owner = &claims.sub[..8], "[MPI_AUTH_SAAS] Authenticated");
+    debug!("[MPI_AUTH_SAAS] Authenticated");
 
     next.run(req).await.into_response()
 }

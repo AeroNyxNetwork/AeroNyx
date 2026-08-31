@@ -16,6 +16,7 @@
 //! - Supports hot-reload (SIGHUP) to add/change volumes at runtime
 //! - Auto-generates default volumes.toml on first SaaS startup
 //! - Measures managed DB/sidecar/vector bytes without following symlinks
+//! - Serializes managed byte-growth admission per volume
 //!
 //! ## Dependencies
 //! - Depends on SystemDb (Task 1a) for persistent assignment storage
@@ -52,9 +53,12 @@
 //! - ensure_volumes_config() is called from Server::new() in SaaS mode,
 //!   not from VolumeRouter::new() — keep them separate for testability.
 //! - Volume usage probing is synchronous filesystem work and must stay behind
-//!   the explicit `spawn_blocking` boundary in `volume_stats()`.
+//!   the explicit `spawn_blocking` boundary in `measure_volume_usage()`.
+//! - Growth admission is an application-level fail-closed guard, not an OS
+//!   filesystem quota. SQLite page/WAL amplification can exceed payload size.
 //!
 //! ## Last Modified
+//! v2.8.58-ManagedVolumeGrowth - Gate ongoing managed-volume mutations.
 //! v2.8.57-VolumeByteCapacity - Enforce managed-file bytes during placement.
 //! v2.8.56-VolumeUsageObservability - Report real managed-file volume usage.
 //! v2.8.55-VolumeRouterIntegrity - Made hot reload fail closed and recoverable.
@@ -67,7 +71,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 use tracing::{info, warn};
 
 use super::system_db::{SystemDb, SystemDbError};
@@ -156,7 +160,58 @@ pub enum VolumeUsageProbeError {
 /// Implementations may perform blocking filesystem I/O. Callers from async
 /// code must execute this trait behind a blocking-worker boundary.
 pub trait VolumeUsageProbe: Send + Sync {
+    /// Measure bytes occupied by AeroNyx-managed regular files under one root.
     fn usage_bytes(&self, volume_root: &Path) -> Result<u64, VolumeUsageProbeError>;
+}
+
+/// Privacy-safe classification for a synchronous probe failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolumeGrowthProbeFailureKind {
+    /// Filesystem metadata or directory enumeration failed.
+    Io,
+    /// The configured root is a symlink or is not a directory.
+    UnsafeRoot,
+    /// Managed-file byte summation overflowed.
+    AccountingOverflow,
+    /// The blocking measurement worker could not complete.
+    WorkerFailed,
+}
+
+/// Typed failure returned before a managed-volume byte-growing mutation.
+///
+/// None of these variants retain an owner key or filesystem path. Detailed
+/// probe errors remain confined to the existing operator-only stats path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum VolumeGrowthAdmissionError {
+    /// The projected logical mutation exceeds configured capacity.
+    #[error("Managed volume has reached its configured byte capacity")]
+    AtCapacity,
+
+    /// Usage could not be measured safely, so admission failed closed.
+    #[error("Managed volume usage probe is unavailable ({kind:?})")]
+    ProbeUnavailable {
+        /// Privacy-safe probe failure classification.
+        kind: VolumeGrowthProbeFailureKind,
+    },
+
+    /// Adding the requested logical growth overflowed `u64` accounting.
+    #[error("Managed volume byte accounting overflow")]
+    AccountingOverflow,
+
+    /// The configured volume or its admission gate is unavailable.
+    #[error("Managed volume configuration is unavailable")]
+    VolumeUnavailable,
+}
+
+/// RAII guard keeping one volume's measurement and mutation serialized.
+pub struct VolumeGrowthPermit {
+    _guard: OwnedMutexGuard<()>,
+}
+
+impl std::fmt::Debug for VolumeGrowthPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("VolumeGrowthPermit")
+    }
 }
 
 /// Production probe for the flat per-owner volume layout.
@@ -302,6 +357,9 @@ pub struct VolumeRouter {
 
     /// Synchronous managed-file measurement boundary.
     usage_probe: Arc<dyn VolumeUsageProbe>,
+
+    /// Per-volume gates covering usage measurement through mutation completion.
+    growth_gates: DashMap<String, Arc<TokioMutex<()>>>,
 }
 
 impl VolumeRouter {
@@ -377,6 +435,11 @@ impl VolumeRouter {
             "[VOLUME_ROUTER] ✅ Initialized"
         );
 
+        let growth_gates = DashMap::new();
+        for volume in &volumes {
+            growth_gates.insert(volume.id.clone(), Arc::new(TokioMutex::new(())));
+        }
+
         Ok(Arc::new(Self {
             volumes: RwLock::new(volumes),
             assignment_gate: TokioMutex::new(()),
@@ -384,6 +447,7 @@ impl VolumeRouter {
             system_db,
             config_path,
             usage_probe,
+            growth_gates,
         }))
     }
 
@@ -559,6 +623,36 @@ impl VolumeRouter {
     pub async fn reload_config(&self) -> Result<(), VolumeRouterError> {
         let mut new_volumes = load_volumes_config(&self.config_path)?;
         let _assignment_guard = self.assignment_gate.lock().await;
+
+        // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] Reload takes every
+        // affected volume gate in stable order before replacing capacity
+        // values. A mutation admitted against the old limit therefore finishes
+        // before a lower reloaded limit becomes visible.
+        let mut gate_ids: Vec<String> = self
+            .volumes
+            .read()
+            .iter()
+            .chain(new_volumes.iter())
+            .map(|volume| volume.id.clone())
+            .collect();
+        gate_ids.sort_unstable();
+        gate_ids.dedup();
+        let gate_arcs: Vec<Arc<TokioMutex<()>>> = gate_ids
+            .iter()
+            .map(|volume_id| {
+                Arc::clone(
+                    self.growth_gates
+                        .entry(volume_id.clone())
+                        .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                        .value(),
+                )
+            })
+            .collect();
+        let mut _growth_guards = Vec::with_capacity(gate_arcs.len());
+        for gate in gate_arcs {
+            _growth_guards.push(gate.lock_owned().await);
+        }
+
         let mut vols = self.volumes.write();
 
         let assigned_users_by_volume = self.assignments.iter().fold(
@@ -653,6 +747,53 @@ impl VolumeRouter {
         .map_err(|_| VolumeRouterError::VolumeUsageWorkerFailed)?
     }
 
+    /// Admit one byte-growing logical mutation on an already assigned volume.
+    ///
+    /// The returned permit must live through the complete mutation. Same-volume
+    /// callers serialize from measurement to permit drop; callers on different
+    /// volumes remain independent. `minimum_growth_bytes` is an application
+    /// reservation, not a prediction of SQLite page or WAL amplification.
+    pub async fn acquire_growth_permit(
+        &self,
+        volume_id: &str,
+        minimum_growth_bytes: u64,
+    ) -> Result<VolumeGrowthPermit, VolumeGrowthAdmissionError> {
+        let gate = self
+            .growth_gates
+            .get(volume_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or(VolumeGrowthAdmissionError::VolumeUnavailable)?;
+        let guard = gate.lock_owned().await;
+
+        // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] Clone configuration
+        // only after acquiring the volume gate. Reload holds the same gate,
+        // preventing a capacity change from crossing this admission window.
+        let volume = self
+            .volumes
+            .read()
+            .iter()
+            .find(|volume| volume.id == volume_id)
+            .cloned()
+            .ok_or(VolumeGrowthAdmissionError::VolumeUnavailable)?;
+        let measured = self
+            .measure_volume_usage(std::slice::from_ref(&volume))
+            .await
+            .map_err(map_growth_measurement_error)?;
+        let usage_bytes = measured.first().map(|(_, usage)| *usage).ok_or(
+            VolumeGrowthAdmissionError::ProbeUnavailable {
+                kind: VolumeGrowthProbeFailureKind::WorkerFailed,
+            },
+        )?;
+        let projected = usage_bytes
+            .checked_add(minimum_growth_bytes.max(1))
+            .ok_or(VolumeGrowthAdmissionError::AccountingOverflow)?;
+        if projected > volume.max_bytes {
+            return Err(VolumeGrowthAdmissionError::AtCapacity);
+        }
+
+        Ok(VolumeGrowthPermit { _guard: guard })
+    }
+
     /// Get per-volume statistics for the Admin API.
     pub async fn volume_stats(&self) -> Result<Vec<VolumeStats>, VolumeRouterError> {
         let counts: std::collections::HashMap<String, usize> = self
@@ -698,6 +839,29 @@ impl VolumeRouter {
     pub fn has_writable_volume(&self) -> bool {
         let vols = self.volumes.read();
         vols.iter().any(|v| v.status == VolumeStatus::ReadWrite)
+    }
+}
+
+fn map_growth_measurement_error(error: VolumeRouterError) -> VolumeGrowthAdmissionError {
+    match error {
+        VolumeRouterError::VolumeUsage { source, .. } => {
+            let kind = match source {
+                VolumeUsageProbeError::Io { .. } => VolumeGrowthProbeFailureKind::Io,
+                VolumeUsageProbeError::SymlinkRoot(_) | VolumeUsageProbeError::InvalidRoot(_) => {
+                    VolumeGrowthProbeFailureKind::UnsafeRoot
+                }
+                VolumeUsageProbeError::Overflow { .. } => {
+                    VolumeGrowthProbeFailureKind::AccountingOverflow
+                }
+            };
+            VolumeGrowthAdmissionError::ProbeUnavailable { kind }
+        }
+        VolumeRouterError::VolumeUsageWorkerFailed => {
+            VolumeGrowthAdmissionError::ProbeUnavailable {
+                kind: VolumeGrowthProbeFailureKind::WorkerFailed,
+            }
+        }
+        _ => VolumeGrowthAdmissionError::VolumeUnavailable,
     }
 }
 
@@ -1241,6 +1405,144 @@ mod tests {
 
         assert_eq!(router.assign(&make_owner(0x37)).await.unwrap(), "vol-001");
         assert_ne!(receiver.recv().unwrap(), async_thread);
+    }
+
+    // ── Ongoing byte-growth admission ────────────────────────────────
+
+    #[tokio::test]
+    async fn growth_admission_accepts_exact_remaining_byte_and_rejects_larger_growth() {
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml_with_limits(
+            dir.path(),
+            &[("vol-001", VolumeStatus::ReadWrite, 10, 100)],
+        );
+        let router = VolumeRouter::new_with_usage_probe(
+            &config_path,
+            db,
+            Arc::new(NamedUsageProbe::new(&[("vol-001", 99)])),
+        )
+        .await
+        .unwrap();
+
+        let permit = router.acquire_growth_permit("vol-001", 1).await.unwrap();
+        drop(permit);
+        assert_eq!(
+            router
+                .acquire_growth_permit("vol-001", 2)
+                .await
+                .unwrap_err(),
+            VolumeGrowthAdmissionError::AtCapacity
+        );
+    }
+
+    #[tokio::test]
+    async fn growth_admission_fails_closed_at_capacity_and_on_accounting_overflow() {
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml_with_limits(
+            dir.path(),
+            &[("vol-001", VolumeStatus::ReadOnly, 10, 100)],
+        );
+        let router = VolumeRouter::new_with_usage_probe(
+            &config_path,
+            db,
+            Arc::new(NamedUsageProbe::new(&[("vol-001", u64::MAX)])),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            router
+                .acquire_growth_permit("vol-001", 1)
+                .await
+                .unwrap_err(),
+            VolumeGrowthAdmissionError::AccountingOverflow
+        );
+    }
+
+    #[tokio::test]
+    async fn growth_admission_maps_probe_failure_without_retaining_path() {
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml_with_limits(
+            dir.path(),
+            &[("vol-001", VolumeStatus::ReadWrite, 10, 100)],
+        );
+        let router =
+            VolumeRouter::new_with_usage_probe(&config_path, db, Arc::new(FailingUsageProbe))
+                .await
+                .unwrap();
+
+        let error = router
+            .acquire_growth_permit("vol-001", 1)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            VolumeGrowthAdmissionError::ProbeUnavailable {
+                kind: VolumeGrowthProbeFailureKind::Io
+            }
+        );
+        assert!(!error
+            .to_string()
+            .contains(dir.path().to_string_lossy().as_ref()));
+        assert!(!format!("{error:?}").contains(dir.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn growth_admission_runs_probe_off_the_async_worker() {
+        let async_thread = std::thread::current().id();
+        let (sender, receiver) = mpsc::channel();
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml_with_limits(
+            dir.path(),
+            &[("vol-001", VolumeStatus::ReadWrite, 10, 100)],
+        );
+        let router = VolumeRouter::new_with_usage_probe(
+            &config_path,
+            db,
+            Arc::new(ThreadReportingUsageProbe { sender, usage: 0 }),
+        )
+        .await
+        .unwrap();
+
+        let permit = router.acquire_growth_permit("vol-001", 1).await.unwrap();
+        drop(permit);
+        assert_ne!(receiver.recv().unwrap(), async_thread);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn growth_admission_serializes_same_volume_but_not_different_volumes() {
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml_with_limits(
+            dir.path(),
+            &[
+                ("vol-001", VolumeStatus::ReadWrite, 10, 100),
+                ("vol-002", VolumeStatus::ReadWrite, 10, 100),
+            ],
+        );
+        let router = VolumeRouter::new_with_usage_probe(
+            &config_path,
+            db,
+            Arc::new(NamedUsageProbe::new(&[("vol-001", 0), ("vol-002", 0)])),
+        )
+        .await
+        .unwrap();
+
+        let first = router.acquire_growth_permit("vol-001", 1).await.unwrap();
+        let same_router = Arc::clone(&router);
+        let same_volume =
+            tokio::spawn(async move { same_router.acquire_growth_permit("vol-001", 1).await });
+        tokio::task::yield_now().await;
+        assert!(!same_volume.is_finished());
+
+        let other = router.acquire_growth_permit("vol-002", 1).await.unwrap();
+        drop(other);
+        drop(first);
+        assert!(same_volume.await.unwrap().is_ok());
     }
 
     #[tokio::test]

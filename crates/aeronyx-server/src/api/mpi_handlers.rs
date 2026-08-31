@@ -56,6 +56,8 @@
 //! - RecallRequest.context is passed to recall_handler for project isolation.
 //! - revoke_owned() enforces owner in SQL (fix TOCTOU in mpi_forget).
 //! - PATCH clears embedding on content change; Miner re-embeds (~60s).
+//! - Byte-growing SaaS mutations must hold the storage growth permit through
+//!   all SQLite/FTS side effects. Reads and forget/revoke remain ungated.
 //! - record_commitment_chain is aggregate and privacy-safe. Do not expose
 //!   record IDs, proposer IDs, peer IDs, owners, or payloads in MPI status.
 //! - record_commitment_sync is bounded runtime evidence. Error codes are
@@ -67,6 +69,7 @@
 //!   by Axum and must never panic a request task.
 //!
 //! ## Last Modified
+//! v2.8.58-ManagedVolumeGrowth - Added fail-closed mutation admission.
 //! v2.7.16-TypedExtensions - Core MPI request context now uses typed Axum
 //!                           extractors instead of manual `expect` calls.
 //! v2.7.15-InferenceReadiness -
@@ -85,11 +88,15 @@
 // ============================================
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::Path;
 use axum::http::Request;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Extension, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Extension, Json,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -97,6 +104,7 @@ use aeronyx_core::crypto::IdentityPublicKey;
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 use sha2::{Digest, Sha256};
 
+use crate::services::memchain::storage::StorageGrowthError;
 use crate::services::memchain::LlmRouter;
 use crate::services::memchain::{MemoryStorage, VectorIndex};
 
@@ -107,6 +115,29 @@ use super::mpi::{
 
 /// Max identity/allergy records kept in the hot cache per owner (fix #11).
 const MAX_IDENTITY_CACHE_PER_OWNER: usize = 200;
+
+fn growth_failure_response(error: StorageGrowthError) -> Response {
+    // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] Public failures retain the
+    // existing JSON object shape and expose only a stable classification. The
+    // typed error intentionally contains no owner key or volume path.
+    warn!(
+        kind = error.code(),
+        "[MPI_STORAGE] Byte-growth admission rejected"
+    );
+    let (status, message) = if error.is_at_capacity() {
+        (StatusCode::INSUFFICIENT_STORAGE, "storage capacity reached")
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage capacity temporarily unavailable",
+        )
+    };
+    (status, Json(serde_json::json!({"error": message}))).into_response()
+}
+
+fn minimum_growth_bytes(body_len: usize) -> u64 {
+    u64::try_from(body_len).unwrap_or(u64::MAX).max(1)
+}
 
 // ============================================
 // POST /api/mpi/remember
@@ -154,6 +185,7 @@ pub async fn mpi_remember(
                 .into_response()
         }
     };
+    let growth_bytes = minimum_growth_bytes(body_bytes.len());
     let rb: RememberRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
         Err(e) => {
@@ -214,6 +246,19 @@ pub async fn mpi_remember(
     record.signature = state.identity.sign(&record.record_id);
     let rid_hex = record.id_hex();
 
+    // Exact duplicate handling remains available even when the volume is full.
+    if storage.get(&record.record_id).await.is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"exists","record_id":rid_hex})),
+        )
+            .into_response();
+    }
+    let _growth_permit = match storage.acquire_growth_permit(growth_bytes).await {
+        Ok(permit) => permit,
+        Err(error) => return growth_failure_response(error),
+    };
+
     if !storage.insert(&record, &rb.embedding_model).await {
         return (
             StatusCode::CONFLICT,
@@ -248,7 +293,7 @@ pub async fn mpi_remember(
         }
     }
 
-    info!(id = %rid_hex, layer = %layer, owner = %&owner_hex[..8], "[MPI_REMEMBER] Stored");
+    info!(id = %rid_hex, layer = %layer, "[MPI_REMEMBER] Stored");
     (
         StatusCode::CREATED,
         Json(serde_json::json!(RememberResponse {
@@ -353,7 +398,6 @@ pub async fn mpi_remember_sealed(
     }
 
     let owner = auth.owner_bytes();
-    let owner_hex = auth.owner_hex();
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024).await {
         Ok(b) => b,
@@ -365,6 +409,7 @@ pub async fn mpi_remember_sealed(
                 .into_response()
         }
     };
+    let growth_bytes = minimum_growth_bytes(body_bytes.len());
     let rb: SealedRememberRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
         Err(e) => {
@@ -432,8 +477,7 @@ pub async fn mpi_remember_sealed(
         Err(_) => false,
     };
     if !sig_ok {
-        let short = &owner_hex[..8.min(owner_hex.len())];
-        warn!(owner = %short, "[MPI_SEALED] record signature verification failed");
+        warn!("[MPI_SEALED] record signature verification failed");
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error":"record signature invalid for owner"})),
@@ -442,6 +486,19 @@ pub async fn mpi_remember_sealed(
     }
 
     let rid_hex = record.id_hex();
+    // Content-addressed duplicates are not byte-growing mutations and retain
+    // their established conflict response even at configured capacity.
+    if storage.get(&record.record_id).await.is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"exists","record_id":rid_hex})),
+        )
+            .into_response();
+    }
+    let _growth_permit = match storage.acquire_growth_permit(growth_bytes).await {
+        Ok(permit) => permit,
+        Err(error) => return growth_failure_response(error),
+    };
     if !storage.insert(&record, &rb.embedding_model).await {
         return (
             StatusCode::CONFLICT,
@@ -516,8 +573,7 @@ pub async fn mpi_remember_sealed(
         }
     }
 
-    let short = &owner_hex[..8.min(owner_hex.len())];
-    info!(id = %rid_hex, owner = %short, "[MPI_SEALED] Stored node-blind record");
+    info!(id = %rid_hex, "[MPI_SEALED] Stored node-blind record");
     (
         StatusCode::CREATED,
         Json(serde_json::json!(RememberResponse {
@@ -598,8 +654,7 @@ pub async fn mpi_attest(
     let signature = state.identity.sign(&msg);
     let node_pk = state.identity.public_key_bytes();
 
-    let short = &auth.owner_hex()[..8.min(auth.owner_hex().len())];
-    info!(owner = %short, count, "[MPI_ATTEST] Signed node-blind storage root");
+    info!(count, "[MPI_ATTEST] Signed node-blind storage root");
 
     Json(serde_json::json!({
         "scheme": "aeronyx-mem-attest-v1",
@@ -1382,6 +1437,7 @@ pub async fn mpi_patch_record(
                 .into_response()
         }
     };
+    let growth_bytes = minimum_growth_bytes(body_bytes.len());
     let patch: PatchRecordRequest = match serde_json::from_slice(&body_bytes) {
         Ok(p) => p,
         Err(e) => {
@@ -1411,6 +1467,27 @@ pub async fn mpi_patch_record(
             }))).into_response(),
         },
         None => None,
+    };
+
+    // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] A missing, revoked, or
+    // foreign record is not a byte-growing mutation; preserve the established
+    // privacy-safe 404 response even at capacity.
+    match storage.get(&rid).await {
+        Some(record) if record.owner == owner && record.is_active() => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "record not found, not active, or access denied"
+                })),
+            )
+                .into_response()
+        }
+    }
+
+    let _growth_permit = match storage.acquire_growth_permit(growth_bytes).await {
+        Ok(permit) => permit,
+        Err(error) => return growth_failure_response(error),
     };
 
     match storage
@@ -1536,7 +1613,9 @@ pub async fn mpi_record_provenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::memchain::storage::{StorageGrowthAdmission, StorageGrowthPermit};
     use aeronyx_core::crypto::IdentityKeyPair;
+    use aeronyx_core::ledger::RecordStatus;
     use axum::body::Body;
     use axum::http::Request;
     use parking_lot::RwLock;
@@ -1544,14 +1623,27 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tower::ServiceExt;
 
-    fn make_test_state() -> (Arc<MpiState>, AuthenticatedOwner, Arc<MemoryStorage>) {
-        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+    struct AtCapacityAdmission;
+
+    #[async_trait::async_trait]
+    impl StorageGrowthAdmission for AtCapacityAdmission {
+        async fn acquire(
+            &self,
+            _minimum_growth_bytes: u64,
+        ) -> Result<StorageGrowthPermit, StorageGrowthError> {
+            Err(StorageGrowthError::AtCapacity)
+        }
+    }
+
+    fn make_test_state_with_storage(
+        storage: Arc<MemoryStorage>,
+    ) -> (Arc<MpiState>, AuthenticatedOwner, Arc<VectorIndex>) {
         let vector_index = Arc::new(VectorIndex::new());
         let identity = IdentityKeyPair::generate();
         let owner = identity.public_key_bytes();
         let state = MpiState::local(
             Arc::clone(&storage),
-            vector_index,
+            Arc::clone(&vector_index),
             identity,
             RwLock::new(HashMap::new()),
             AtomicBool::new(true),
@@ -1576,8 +1668,134 @@ mod tests {
         (
             Arc::new(state),
             AuthenticatedOwner::Local { owner },
-            storage,
+            vector_index,
         )
+    }
+
+    fn make_test_state() -> (Arc<MpiState>, AuthenticatedOwner, Arc<MemoryStorage>) {
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let (state, auth, _vector_index) = make_test_state_with_storage(Arc::clone(&storage));
+        (state, auth, storage)
+    }
+
+    #[tokio::test]
+    async fn byte_growing_remember_fails_closed_with_compatible_json_schema() {
+        let storage = Arc::new(
+            MemoryStorage::open(":memory:", None)
+                .unwrap()
+                .with_growth_admission(Arc::new(AtCapacityAdmission)),
+        );
+        let (state, auth, vector_index) = make_test_state_with_storage(Arc::clone(&storage));
+        let app = axum::Router::new()
+            .route("/remember", axum::routing::post(mpi_remember))
+            .layer(Extension(auth))
+            .layer(Extension(storage.clone()))
+            .layer(Extension(vector_index))
+            .with_state(state);
+        let request = Request::builder()
+            .uri("/remember")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"content":"new managed bytes"}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status().as_u16(), 507);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"error": "storage capacity reached"})
+        );
+        assert_eq!(storage.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_remember_remains_available_at_capacity() {
+        let storage = Arc::new(
+            MemoryStorage::open(":memory:", None)
+                .unwrap()
+                .with_growth_admission(Arc::new(AtCapacityAdmission)),
+        );
+        let (state, auth, vector_index) = make_test_state_with_storage(Arc::clone(&storage));
+        let owner = auth.owner_bytes();
+        let embedding = vec![0.1_f32, 0.2, 0.3];
+        vector_index.upsert(
+            [0x44; 32],
+            embedding.clone(),
+            MemoryLayer::Knowledge,
+            now_secs(),
+            &owner,
+            "minilm-l6-v2",
+        );
+        let app = axum::Router::new()
+            .route("/remember", axum::routing::post(mpi_remember))
+            .layer(Extension(auth))
+            .layer(Extension(storage))
+            .layer(Extension(vector_index))
+            .with_state(state);
+        let request = Request::builder()
+            .uri("/remember")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "content": "duplicate",
+                    "layer": "knowledge",
+                    "embedding": embedding,
+                    "embedding_model": "minilm-l6-v2"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn forget_remains_available_at_capacity() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let (state, auth, vector_index) =
+            make_test_state_with_storage(Arc::new(MemoryStorage::open(":memory:", None).unwrap()));
+        let owner = auth.owner_bytes();
+        let mut record = MemoryRecord::new(
+            owner,
+            7,
+            MemoryLayer::Knowledge,
+            vec![],
+            "test".into(),
+            b"delete-me".to_vec(),
+            vec![],
+        );
+        record.signature = state.identity.sign(&record.record_id);
+        assert!(storage.insert(&record, "").await);
+        let record_id = record.id_hex();
+        let storage = Arc::new(storage.with_growth_admission(Arc::new(AtCapacityAdmission)));
+        let app = axum::Router::new()
+            .route("/forget", axum::routing::post(mpi_forget))
+            .layer(Extension(auth))
+            .layer(Extension(storage.clone()))
+            .layer(Extension(vector_index))
+            .with_state(state);
+        let request = Request::builder()
+            .uri("/forget")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"record_id": record_id}).to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(storage.get(&record.record_id).await.is_some());
+        assert_eq!(
+            storage.get(&record.record_id).await.unwrap().status,
+            RecordStatus::Revoked
+        );
     }
 
     #[tokio::test]

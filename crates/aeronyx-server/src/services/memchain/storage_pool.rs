@@ -14,6 +14,7 @@
 //! - Evicts idle connections on a configurable timeout
 //! - Enforces a max_connections cap via LRU-style eviction
 //! - Derives a per-user encryption key from their Ed25519 public key
+//! - Composes managed-volume byte-growth admission into each pooled storage
 //!
 //! ## Key Derivation (TENANT ISOLATION)
 //! ⚠️ SECURITY: derive_record_key_from_pubkey() uses the PUBLIC key.
@@ -51,6 +52,7 @@
 //!   it prevents duplicate SQLite opens and concurrent PRAGMA lock failures.
 //!
 //! ## Last Modified
+//! v1.0.3-ManagedVolumeGrowth - Attached privacy-safe per-volume admission.
 //! v1.0.0-MultiTenant - Initial implementation (Task 1b)
 //! v1.0.1-OwnerOpenSingleFlight - Prevent same-owner concurrent SQLite opens
 //!   and serialize cache-capacity insertion without blocking unrelated I/O.
@@ -69,9 +71,11 @@ use tracing::{info, warn};
 
 use crate::error::RuntimeTaskJoinFailureKind;
 
-use super::storage::MemoryStorage;
+use super::storage::{
+    MemoryStorage, StorageGrowthAdmission, StorageGrowthError, StorageGrowthPermit,
+};
 use super::system_db::SystemDb;
-use super::volume_router::{VolumeRouter, VolumeRouterError};
+use super::volume_router::{VolumeGrowthAdmissionError, VolumeRouter, VolumeRouterError};
 
 // ============================================
 // Public Types
@@ -83,7 +87,10 @@ pub enum StoragePoolError {
     #[error("No writable volume available for new user: {0}")]
     NoVolume(#[from] VolumeRouterError),
 
-    #[error("Failed to open database at {path}: {reason}")]
+    // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] Preserve the public
+    // struct variant for compatibility, but never format its owner-derived
+    // path or backend reason into logs/API errors.
+    #[error("Failed to open managed database")]
     DbOpen { path: String, reason: String },
 
     /// A blocking storage-open task failed to join.
@@ -105,11 +112,7 @@ impl std::fmt::Debug for StoragePoolError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoVolume(error) => formatter.debug_tuple("NoVolume").field(error).finish(),
-            Self::DbOpen { path, reason } => formatter
-                .debug_struct("DbOpen")
-                .field("path", path)
-                .field("reason", reason)
-                .finish(),
+            Self::DbOpen { .. } => formatter.write_str("DbOpen"),
             Self::Join(error) => formatter
                 .debug_tuple("Join")
                 .field(&RuntimeTaskJoinFailureKind::classify(error))
@@ -125,6 +128,38 @@ impl std::fmt::Debug for StoragePoolError {
 struct PoolEntry {
     storage: Arc<MemoryStorage>,
     last_accessed: Instant,
+}
+
+/// Binds one pooled storage to its configured volume without retaining an
+/// owner key or filesystem path.
+struct ManagedVolumeGrowthAdmission {
+    volume_router: Arc<VolumeRouter>,
+    volume_id: String,
+}
+
+#[async_trait::async_trait]
+impl StorageGrowthAdmission for ManagedVolumeGrowthAdmission {
+    async fn acquire(
+        &self,
+        minimum_growth_bytes: u64,
+    ) -> Result<StorageGrowthPermit, StorageGrowthError> {
+        self.volume_router
+            .acquire_growth_permit(&self.volume_id, minimum_growth_bytes)
+            .await
+            .map(StorageGrowthPermit::new)
+            .map_err(|error| match error {
+                VolumeGrowthAdmissionError::AtCapacity => StorageGrowthError::AtCapacity,
+                VolumeGrowthAdmissionError::ProbeUnavailable { .. } => {
+                    StorageGrowthError::ProbeUnavailable
+                }
+                VolumeGrowthAdmissionError::AccountingOverflow => {
+                    StorageGrowthError::AccountingOverflow
+                }
+                VolumeGrowthAdmissionError::VolumeUnavailable => {
+                    StorageGrowthError::VolumeUnavailable
+                }
+            })
+    }
 }
 
 /// Fixed shard count bounds synchronization memory while preserving parallel
@@ -153,9 +188,6 @@ pub struct StoragePool {
     /// Routes owner pubkeys to their volume and DB file path.
     volume_router: Arc<VolumeRouter>,
 
-    /// Global metadata DB — used for volume assignment of new users.
-    system_db: Arc<SystemDb>,
-
     /// Maximum number of simultaneously cached connections.
     max_connections: usize,
 
@@ -177,7 +209,9 @@ impl StoragePool {
     /// a periodic call to `evict_idle()`.
     pub fn new(
         volume_router: Arc<VolumeRouter>,
-        system_db: Arc<SystemDb>,
+        // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] Keep the constructor
+        // argument for source compatibility; the stored field was never read.
+        _system_db: Arc<SystemDb>,
         max_connections: usize,
         idle_timeout: Duration,
     ) -> Arc<Self> {
@@ -186,7 +220,6 @@ impl StoragePool {
             creation_locks: std::array::from_fn(|_| TokioMutex::new(())),
             capacity_lock: TokioMutex::new(()),
             volume_router,
-            system_db,
             max_connections,
             idle_timeout,
         })
@@ -263,7 +296,14 @@ impl StoragePool {
                     reason,
                 })?;
 
-        let storage = Arc::new(storage);
+        // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] Only SaaS pooled
+        // instances receive this policy. `MemoryStorage::open` remains
+        // backward compatible for Local/global/recovery callers.
+        let admission: Arc<dyn StorageGrowthAdmission> = Arc::new(ManagedVolumeGrowthAdmission {
+            volume_router: Arc::clone(&self.volume_router),
+            volume_id,
+        });
+        let storage = Arc::new(storage.with_growth_admission(admission));
 
         // A separate short lock makes the max_connections contract exact even
         // when unrelated owners finish their parallel SQLite opens together.
@@ -349,7 +389,6 @@ impl StoragePool {
         if let Some(key) = oldest_key {
             self.stores.remove(&key);
             warn!(
-                owner = &hex::encode(key)[..8],
                 active = self.stores.len(),
                 "[STORAGE_POOL] Evicted oldest connection to make room"
             );
@@ -425,7 +464,9 @@ pub fn derive_record_key_from_pubkey(pubkey: &[u8; 32]) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::services::memchain::system_db::SystemDb;
-    use crate::services::memchain::volume_router::{VolumeRouter, VolumeStatus};
+    use crate::services::memchain::volume_router::{
+        VolumeRouter, VolumeUsageProbe, VolumeUsageProbeError,
+    };
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -449,6 +490,19 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn database_open_error_preserves_variant_but_redacts_path_and_reason() {
+        let error = StoragePoolError::DbOpen {
+            path: "/private/owner-derived/0123456789abcdef.db".into(),
+            reason: "backend included a sensitive path".into(),
+        };
+
+        assert_eq!(error.to_string(), "Failed to open managed database");
+        assert_eq!(format!("{error:?}"), "DbOpen");
+        assert!(!error.to_string().contains("owner-derived"));
+        assert!(!format!("{error:?}").contains("sensitive"));
+    }
+
     // ── Test Helpers ──────────────────────────────────────────────────
 
     fn make_owner(seed: u8) -> [u8; 32] {
@@ -469,6 +523,36 @@ mod tests {
         )
         .unwrap();
         config_path
+    }
+
+    fn write_volumes_toml_with_max_bytes(
+        dir: &std::path::Path,
+        max_bytes: u64,
+    ) -> std::path::PathBuf {
+        let vol_dir = dir.join("volumes").join("vol-001");
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let config_path = dir.join("volumes.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[volumes]]\nid = \"vol-001\"\npath = \"{}\"\nstatus = \"read-write\"\nmax_bytes = {}\n",
+                vol_dir.to_string_lossy().replace('\\', "/"),
+                max_bytes
+            ),
+        )
+        .unwrap();
+        config_path
+    }
+
+    struct FixedUsageProbe(u64);
+
+    impl VolumeUsageProbe for FixedUsageProbe {
+        fn usage_bytes(
+            &self,
+            _volume_root: &std::path::Path,
+        ) -> Result<u64, VolumeUsageProbeError> {
+            Ok(self.0)
+        }
     }
 
     /// Create a fully initialized test environment.
@@ -519,6 +603,31 @@ mod tests {
         // Both calls should return the same underlying Arc.
         assert!(Arc::ptr_eq(&s1, &s2));
         assert_eq!(pool.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn existing_owner_reopen_and_reads_survive_full_volume_but_growth_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let owner = make_owner(0xBC);
+        db.assign_volume(&owner, "vol-001").await.unwrap();
+        let config_path = write_volumes_toml_with_max_bytes(dir.path(), 100);
+        let router = VolumeRouter::new_with_usage_probe(
+            &config_path,
+            Arc::clone(&db),
+            Arc::new(FixedUsageProbe(100)),
+        )
+        .await
+        .unwrap();
+        let pool = StoragePool::new(router, db, 10, Duration::from_secs(3600));
+
+        // Existing route opens for reads/recovery without a capacity probe.
+        let storage = pool.get_or_create(&owner).await.unwrap();
+        assert_eq!(storage.count().await, 0);
+        assert_eq!(
+            storage.acquire_growth_permit(1).await.unwrap_err(),
+            StorageGrowthError::AtCapacity
+        );
     }
 
     #[tokio::test]

@@ -56,8 +56,12 @@
 //!   users. TODO: pass VectorIndexPool to reuse indexes across ticks.
 //! - `run_one_tick()` must be kept in sync with the timer body in
 //!   `ReflectionMiner::run()`. If new steps are added there, add them here too.
+//! - Managed-volume reads and vector rebuild happen before byte-growth
+//!   admission. The permit then covers the complete mutation-bearing miner
+//!   tick; a failed admission does not consume the owner's hourly quota.
 //!
 //! ## Last Modified
+//! v1.0.2-ManagedVolumeGrowth - Fail closed before per-owner miner mutations.
 //! v1.0.1-MinerStartupError - Made stub AOF/socket initialization fallible and
 //!                            covered inaccessible state paths.
 //! v1.0.0-MultiTenant - Initial implementation (Task 4)
@@ -303,7 +307,6 @@ impl MinerScheduler {
                 }
                 Err(e) => {
                     warn!(
-                        owner = &hex::encode(owner)[..8],
                         error = %e,
                         "[MINER_SCHED] Owner tick failed (non-fatal)"
                     );
@@ -354,6 +357,15 @@ impl MinerScheduler {
                 );
             }
         }
+
+        // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] Reads and recovery
+        // above remain available at capacity. Hold the same-volume permit only
+        // across the mutation-bearing tick; failure is retryable by the next
+        // scheduler round and returns before quota accounting.
+        let _growth_permit = storage
+            .acquire_growth_permit(1)
+            .await
+            .map_err(|error| format!("Storage growth admission failed: {error}"))?;
 
         // Construct a per-tick ReflectionMiner (cheap — only Arc clones).
         let miner = self.build_per_owner_miner(storage, vector_index);
@@ -418,6 +430,7 @@ impl MinerScheduler {
 mod tests {
     use super::*;
     use crate::services::memchain::storage_pool::StoragePool;
+    use crate::services::memchain::volume_router::{VolumeUsageProbe, VolumeUsageProbeError};
     use crate::services::memchain::{SystemDb, VolumeRouter};
     use tempfile::TempDir;
 
@@ -438,6 +451,36 @@ mod tests {
         )
         .unwrap();
         config_path
+    }
+
+    fn write_volumes_toml_with_max_bytes(
+        dir: &std::path::Path,
+        max_bytes: u64,
+    ) -> std::path::PathBuf {
+        let vol_dir = dir.join("volumes").join("vol-001");
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let config_path = dir.join("volumes.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[volumes]]\nid = \"vol-001\"\npath = \"{}\"\nstatus = \"read-write\"\nmax_bytes = {}\n",
+                vol_dir.to_string_lossy().replace('\\', "/"),
+                max_bytes
+            ),
+        )
+        .unwrap();
+        config_path
+    }
+
+    struct FixedUsageProbe(u64);
+
+    impl VolumeUsageProbe for FixedUsageProbe {
+        fn usage_bytes(
+            &self,
+            _volume_root: &std::path::Path,
+        ) -> Result<u64, VolumeUsageProbeError> {
+            Ok(self.0)
+        }
     }
 
     async fn make_scheduler(dir: &std::path::Path) -> Arc<MinerScheduler> {
@@ -504,6 +547,33 @@ mod tests {
         let sched = make_scheduler(dir.path()).await;
         // Should complete without error when SystemDb has no owners.
         sched.tick().await;
+    }
+
+    #[tokio::test]
+    async fn capacity_failure_writes_nothing_and_does_not_consume_quota_round() {
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let owner = make_owner(0xC1);
+        db.assign_volume(&owner, "vol-001").await.unwrap();
+        db.update_last_active(&owner).await.unwrap();
+        let config_path = write_volumes_toml_with_max_bytes(dir.path(), 100);
+        let router = VolumeRouter::new_with_usage_probe(
+            &config_path,
+            Arc::clone(&db),
+            Arc::new(FixedUsageProbe(100)),
+        )
+        .await
+        .unwrap();
+        let pool = StoragePool::new(router, Arc::clone(&db), 10, Duration::from_secs(3600));
+        let identity = aeronyx_core::crypto::IdentityKeyPair::generate();
+        let scheduler = MinerScheduler::new(pool, db, 1, 6, identity, None, None, None)
+            .await
+            .unwrap();
+
+        scheduler.tick().await;
+
+        let quotas = scheduler.quotas.lock().await;
+        assert_eq!(quotas.get(&owner).unwrap().rounds_this_hour, 0);
     }
 
     // ── Quota filtering ───────────────────────────────────────────────
