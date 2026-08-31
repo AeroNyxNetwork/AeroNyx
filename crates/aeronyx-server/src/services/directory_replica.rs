@@ -64,6 +64,10 @@
 //!   without granting those producers checkpoint, witness, or policy authority.
 //! - Gates public carrier recovery reads on that durable mirror registry while
 //!   preserving exact producer signatures, object hashes, and quarantine state.
+//! - [DIRECTORY-MIRROR-PROVENANCE 2026-09-01 by Codex] Distinguishes a
+//!   producer-signed tip from a carrier-reported prefix, so untrusted carrier
+//!   metadata cannot create durable producer incidents while signed block
+//!   conflicts remain fail-closed.
 //! - [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] Rebuilds compact descriptor
 //!   inclusion proofs from one fully audited producer namespace and one exact
 //!   selected producer block without granting the carrier authority.
@@ -231,6 +235,8 @@
 //!   Never create one independent admission gate per listener.
 //!
 //! ## Last Modified
+//! v0.44.0-DirectoryMirrorProvenance - Separated producer-signed tips from
+//! carrier-reported prefixes and retained durable mirror resume cursors.
 //! v0.43.0-DirectoryAuditSnapshot - Made streaming audits snapshot-consistent
 //! and added SQL-side admission for persisted block and descriptor payloads.
 //! v0.42.0-DirectoryStreamingProducerAudit - Bounded producer audit memory by
@@ -403,6 +409,28 @@ enum DirectoryReplicaImportMode {
         descriptor_sequence: u64,
         max_producers: usize,
     },
+}
+
+/// Durable scheduling cursor for one non-authoritative mirror namespace.
+///
+/// Registry membership is local availability state only. It grants no
+/// producer, checkpoint, witness, policy, or carrier authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectoryRetainedMirrorCursor {
+    pub(crate) producer: [u8; 32],
+    pub(crate) descriptor_sequence: u64,
+}
+
+/// Authenticated source of the range response's advertised tip fields.
+///
+/// [DIRECTORY-MIRROR-PROVENANCE 2026-09-01 by Codex] Producer responses may
+/// establish tip-level contradictions. Carrier responses authenticate only
+/// what that carrier reported; the embedded producer-signed blocks remain the
+/// sole producer evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryRangeTipProvenance {
+    ProducerSigned,
+    CarrierReported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4283,28 +4311,53 @@ impl DirectoryReplicaStore {
         Self::load_tip(&connection, producer)
     }
 
-    /// Returns durable non-authoritative mirror producer ids in stable order.
+    /// Returns durable non-authoritative mirror resume cursors in stable order.
     ///
-    /// Identities are for internal scheduling only and must not be exposed by
-    /// public status. Registry membership grants no checkpoint or witness role.
-    pub(crate) fn mirror_producer_ids(&self) -> Result<Vec<[u8; 32]>, DirectoryReplicaStoreError> {
+    /// [DIRECTORY-MIRROR-PROVENANCE 2026-09-01 by Codex] The discovery
+    /// descriptor that originally admitted a mirror may expire while its
+    /// producer-signed prefix remains useful. Preserve the last authenticated
+    /// descriptor sequence so the scheduler can retry direct discovery and
+    /// then current admitted carriers without inventing a new namespace.
+    pub(crate) fn retained_mirror_cursors(
+        &self,
+    ) -> Result<Vec<DirectoryRetainedMirrorCursor>, DirectoryReplicaStoreError> {
         let rows = {
             let connection = self.connection.lock();
             Self::validate_metadata(&connection, &self.local_node_id)?;
             let mut statement = connection.prepare(
-                "SELECT producer FROM directory_replica_mirror_producers
+                "SELECT producer, descriptor_sequence
+                 FROM directory_replica_mirror_producers
                  ORDER BY last_selected_at DESC, producer ASC",
             )?;
             let rows = statement
-                .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
             drop(statement);
             drop(connection);
             rows
         };
         rows.into_iter()
-            .map(|value| bytes32(&value, "directory mirror producer"))
+            .map(|(producer, descriptor_sequence)| {
+                Ok(DirectoryRetainedMirrorCursor {
+                    producer: bytes32(&producer, "directory mirror producer")?,
+                    descriptor_sequence: positive_i64_to_u64(
+                        descriptor_sequence,
+                        "directory mirror descriptor sequence",
+                    )?,
+                })
+            })
             .collect()
+    }
+
+    /// Returns durable non-authoritative mirror producer ids in stable order.
+    ///
+    /// Identities are for internal scheduling only and must not be exposed by
+    /// public status. Registry membership grants no checkpoint or witness role.
+    pub(crate) fn mirror_producer_ids(&self) -> Result<Vec<[u8; 32]>, DirectoryReplicaStoreError> {
+        self.retained_mirror_cursors()
+            .map(|cursors| cursors.into_iter().map(|cursor| cursor.producer).collect())
     }
 
     /// Verifies that the durable mirror registry fits an operator capacity.
@@ -7313,7 +7366,7 @@ impl DirectoryReplicaStore {
                 "read-only carrier verification fields are invalid".to_string(),
             ));
         }
-        let has_more = verify_range_response_evidence(
+        let response_admission = verify_range_response_evidence(
             signed_response_frame,
             &producer,
             blocks,
@@ -7321,9 +7374,14 @@ impl DirectoryReplicaStore {
             &advertised_tip_hash,
             observed_at,
         )?;
+        if response_admission.tip_provenance != DirectoryRangeTipProvenance::CarrierReported {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "read-only carrier verification requires carrier-reported evidence".to_string(),
+            ));
+        }
         validate_page_tip_contract(
             blocks,
-            has_more,
+            response_admission.has_more,
             advertised_tip_height,
             &advertised_tip_hash,
         )?;
@@ -7421,7 +7479,7 @@ impl DirectoryReplicaStore {
                 "signed response evidence is empty or oversized".to_string(),
             ));
         }
-        let has_more = verify_range_response_evidence(
+        let response_admission = verify_range_response_evidence(
             signed_response_frame,
             &producer,
             blocks,
@@ -7431,7 +7489,7 @@ impl DirectoryReplicaStore {
         )?;
         validate_page_tip_contract(
             blocks,
-            has_more,
+            response_admission.has_more,
             advertised_tip_height,
             &advertised_tip_hash,
         )?;
@@ -7450,49 +7508,100 @@ impl DirectoryReplicaStore {
             ));
         }
 
-        if advertised_tip_height < tip.tip_height {
-            let incident = QuarantineIncident {
-                kind: "signed_tip_rollback",
-                height: advertised_tip_height,
-                local_hash: tip.tip_hash,
-                remote_hash: advertised_tip_hash,
-                evidence_frame: signed_response_frame,
-            };
-            Self::persist_quarantine(&transaction, &producer, &incident, observed_at)?;
-            transaction.commit()?;
-            return Err(DirectoryReplicaStoreError::Quarantined(
-                incident.kind.to_string(),
-            ));
-        }
-        if advertised_tip_height == tip.tip_height && advertised_tip_hash != tip.tip_hash {
-            let incident = QuarantineIncident {
-                kind: "signed_tip_fork",
-                height: advertised_tip_height,
-                local_hash: tip.tip_hash,
-                remote_hash: advertised_tip_hash,
-                evidence_frame: signed_response_frame,
-            };
-            Self::persist_quarantine(&transaction, &producer, &incident, observed_at)?;
-            transaction.commit()?;
-            return Err(DirectoryReplicaStoreError::Quarantined(
-                incident.kind.to_string(),
-            ));
+        match response_admission.tip_provenance {
+            DirectoryRangeTipProvenance::ProducerSigned => {
+                if advertised_tip_height < tip.tip_height {
+                    let incident = QuarantineIncident {
+                        kind: "signed_tip_rollback",
+                        height: advertised_tip_height,
+                        local_hash: tip.tip_hash,
+                        remote_hash: advertised_tip_hash,
+                        evidence_frame: signed_response_frame,
+                    };
+                    Self::persist_quarantine(&transaction, &producer, &incident, observed_at)?;
+                    transaction.commit()?;
+                    return Err(DirectoryReplicaStoreError::Quarantined(
+                        incident.kind.to_string(),
+                    ));
+                }
+                if advertised_tip_height == tip.tip_height && advertised_tip_hash != tip.tip_hash {
+                    let incident = QuarantineIncident {
+                        kind: "signed_tip_fork",
+                        height: advertised_tip_height,
+                        local_hash: tip.tip_hash,
+                        remote_hash: advertised_tip_hash,
+                        evidence_frame: signed_response_frame,
+                    };
+                    Self::persist_quarantine(&transaction, &producer, &incident, observed_at)?;
+                    transaction.commit()?;
+                    return Err(DirectoryReplicaStoreError::Quarantined(
+                        incident.kind.to_string(),
+                    ));
+                }
+                if blocks.is_empty() && advertised_tip_height > tip.tip_height {
+                    let incident = QuarantineIncident {
+                        kind: "signed_empty_range_gap",
+                        height: tip.tip_height.saturating_add(1),
+                        local_hash: tip.tip_hash,
+                        remote_hash: advertised_tip_hash,
+                        evidence_frame: signed_response_frame,
+                    };
+                    Self::persist_quarantine(&transaction, &producer, &incident, observed_at)?;
+                    transaction.commit()?;
+                    return Err(DirectoryReplicaStoreError::Quarantined(
+                        incident.kind.to_string(),
+                    ));
+                }
+            }
+            DirectoryRangeTipProvenance::CarrierReported => {
+                // A carrier cannot authenticate producer-tip metadata. Check
+                // any embedded producer-signed fork first so genuine signed
+                // conflicts remain durable, then reject tip-only claims
+                // without committing registry, prefix, incident, or quarantine
+                // changes.
+                for block in blocks {
+                    let existing_hash =
+                        Self::block_hash_at(&transaction, &producer, block.header.height)?;
+                    if let Some(existing_hash) = existing_hash {
+                        if existing_hash != block.hash() {
+                            Self::verify_conflicting_block_at_retained_position(
+                                &transaction,
+                                &producer,
+                                block,
+                                observed_at,
+                            )?;
+                            let incident = QuarantineIncident {
+                                kind: "signed_block_fork",
+                                height: block.header.height,
+                                local_hash: existing_hash,
+                                remote_hash: block.hash(),
+                                evidence_frame: signed_response_frame,
+                            };
+                            Self::persist_quarantine(
+                                &transaction,
+                                &producer,
+                                &incident,
+                                observed_at,
+                            )?;
+                            transaction.commit()?;
+                            return Err(DirectoryReplicaStoreError::Quarantined(
+                                incident.kind.to_string(),
+                            ));
+                        }
+                    }
+                }
+                if advertised_tip_height < tip.tip_height
+                    || (advertised_tip_height == tip.tip_height
+                        && advertised_tip_hash != tip.tip_hash)
+                    || (blocks.is_empty() && advertised_tip_height > tip.tip_height)
+                {
+                    return Err(DirectoryReplicaStoreError::Integrity(
+                        "carrier-reported tip contradicts the retained producer prefix".to_string(),
+                    ));
+                }
+            }
         }
         if blocks.is_empty() {
-            if advertised_tip_height > tip.tip_height {
-                let incident = QuarantineIncident {
-                    kind: "signed_empty_range_gap",
-                    height: tip.tip_height.saturating_add(1),
-                    local_hash: tip.tip_hash,
-                    remote_hash: advertised_tip_hash,
-                    evidence_frame: signed_response_frame,
-                };
-                Self::persist_quarantine(&transaction, &producer, &incident, observed_at)?;
-                transaction.commit()?;
-                return Err(DirectoryReplicaStoreError::Quarantined(
-                    incident.kind.to_string(),
-                ));
-            }
             Self::clear_retry_state(&transaction, &producer)?;
             transaction.commit()?;
             return Ok(DirectoryReplicaImportReport {
@@ -10390,6 +10499,56 @@ impl DirectoryReplicaStore {
             .transpose()
     }
 
+    fn verify_conflicting_block_at_retained_position(
+        connection: &Connection,
+        producer: &[u8; 32],
+        block: &DirectoryCommitmentBlockV1,
+        observed_at: u64,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        // [DIRECTORY-MIRROR-PROVENANCE 2026-09-01 by Codex] A carrier signs
+        // only its response envelope. Before its conflicting payload can open
+        // a durable producer incident, verify the embedded block at the exact
+        // retained predecessor position using the producer's signature.
+        let (previous_hash, previous_timestamp) = if block.header.height == 1 {
+            ([0u8; 32], 0)
+        } else {
+            let previous_height = block.header.height.checked_sub(1).ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "conflicting replica block height is invalid".to_string(),
+                )
+            })?;
+            let previous = connection
+                .query_row(
+                    "SELECT block_hash, produced_at
+                     FROM directory_replica_blocks
+                     WHERE producer = ?1 AND height = ?2",
+                    params![
+                        producer.as_slice(),
+                        u64_to_i64(previous_height, "replica predecessor height")?
+                    ],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let Some((previous_hash, previous_timestamp)) = previous else {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "conflicting replica block predecessor is missing".to_string(),
+                ));
+            };
+            (
+                bytes32(&previous_hash, "replica predecessor hash")?,
+                positive_i64_to_u64(previous_timestamp, "replica predecessor timestamp")?,
+            )
+        };
+        block.verify_at(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            block.header.height,
+            &previous_hash,
+            previous_timestamp,
+            observed_at,
+        )?;
+        Ok(())
+    }
+
     fn insert_block(
         transaction: &Transaction<'_>,
         producer: &[u8; 32],
@@ -11938,6 +12097,7 @@ fn verify_incident_response_evidence(
 }
 
 struct VerifiedRangeResponseEvidence {
+    tip_provenance: DirectoryRangeTipProvenance,
     response_timestamp: u64,
     blocks: Vec<DirectoryCommitmentBlockV1>,
     has_more: bool,
@@ -11993,6 +12153,7 @@ fn verify_signed_range_response_evidence(
                     )
                 })?;
             Ok(VerifiedRangeResponseEvidence {
+                tip_provenance: DirectoryRangeTipProvenance::ProducerSigned,
                 response_timestamp,
                 blocks,
                 has_more,
@@ -12041,6 +12202,7 @@ fn verify_signed_range_response_evidence(
                     )
                 })?;
             Ok(VerifiedRangeResponseEvidence {
+                tip_provenance: DirectoryRangeTipProvenance::CarrierReported,
                 response_timestamp,
                 blocks,
                 has_more,
@@ -12061,7 +12223,7 @@ fn verify_range_response_evidence(
     expected_tip_height: u64,
     expected_tip_hash: &[u8; 32],
     observed_at: u64,
-) -> Result<bool, DirectoryReplicaStoreError> {
+) -> Result<VerifiedRangeResponseAdmission, DirectoryReplicaStoreError> {
     let verified = verify_signed_range_response_evidence(frame, producer)?;
     if verified.blocks != expected_blocks
         || verified.tip_height != expected_tip_height
@@ -12072,7 +12234,16 @@ fn verify_range_response_evidence(
             "signed range evidence does not match the import".to_string(),
         ));
     }
-    Ok(verified.has_more)
+    Ok(VerifiedRangeResponseAdmission {
+        has_more: verified.has_more,
+        tip_provenance: verified.tip_provenance,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifiedRangeResponseAdmission {
+    has_more: bool,
+    tip_provenance: DirectoryRangeTipProvenance,
 }
 
 fn validate_page_tip_contract(
@@ -12912,6 +13083,54 @@ mod tests {
             ),
             Err(DirectoryReplicaStoreError::Request(_))
         ));
+    }
+
+    #[test]
+    fn retained_mirror_cursor_survives_restart_with_latest_descriptor_sequence() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x31; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x32; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x33; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+        let first = block(&producer, 1, [0u8; 32], &object);
+        let frame = response_frame(
+            &producer,
+            vec![first.clone()],
+            false,
+            1,
+            first.hash(),
+            [0x34; 16],
+        );
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        for descriptor_sequence in [7, 11] {
+            store
+                .import_verified_mirror_page(
+                    producer.public_key_bytes(),
+                    descriptor_sequence,
+                    4,
+                    std::slice::from_ref(&first),
+                    std::slice::from_ref(&object),
+                    1,
+                    first.hash(),
+                    &frame,
+                    NOW + 20,
+                )
+                .unwrap();
+        }
+        drop(store);
+
+        let (reopened, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 3_700).unwrap();
+        assert_eq!(audit.mirror_producers, 1);
+        assert_eq!(
+            reopened.retained_mirror_cursors().unwrap(),
+            vec![DirectoryRetainedMirrorCursor {
+                producer: producer.public_key_bytes(),
+                descriptor_sequence: 11,
+            }]
+        );
     }
 
     #[test]
@@ -17066,6 +17285,152 @@ mod tests {
             runtime.snapshot()[0].consecutive_failures,
             DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES
         );
+    }
+
+    #[test]
+    fn carrier_reported_tip_cannot_quarantine_or_mutate_retained_prefix() {
+        // [DIRECTORY-MIRROR-PROVENANCE 2026-09-01 by Codex] A carrier may lie
+        // about terminal metadata, but it cannot turn that report into durable
+        // producer rollback, fork, or empty-gap evidence.
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0x41; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x42; 32]).unwrap();
+        let carrier = IdentityKeyPair::from_bytes(&[0x43; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x44; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+        let first = block(&producer, 1, [0u8; 32], &object);
+        let (store, _) = DirectoryReplicaStore::open(
+            temp.path().join("directory.db"),
+            local.public_key_bytes(),
+            NOW + 20,
+        )
+        .unwrap();
+        import_replica_block(&store, &producer, &object, &first, [0x45; 16]);
+
+        let attacks = [
+            (0, [0u8; 32], [0x46; 16]),
+            (1, [0x47; 32], [0x48; 16]),
+            (2, [0x49; 32], [0x4a; 16]),
+        ];
+        for (tip_height, tip_hash, request_id) in attacks {
+            let frame = carrier_response_frame(
+                &producer,
+                &carrier,
+                Vec::new(),
+                false,
+                tip_height,
+                tip_hash,
+                request_id,
+            );
+            assert!(matches!(
+                store.import_verified_page(
+                    producer.public_key_bytes(),
+                    &[],
+                    &[],
+                    tip_height,
+                    tip_hash,
+                    &frame,
+                    NOW + 20,
+                ),
+                Err(DirectoryReplicaStoreError::Integrity(_))
+            ));
+            let tip = store.producer_tip(&producer.public_key_bytes()).unwrap();
+            assert_eq!(tip.tip_height, 1);
+            assert_eq!(tip.tip_hash, first.hash());
+            assert!(!tip.quarantined);
+        }
+        assert!(store
+            .incident_summaries(None, 1)
+            .unwrap()
+            .incidents
+            .is_empty());
+        let audit = store.audit(NOW + 21).unwrap();
+        assert_eq!(audit.incidents, 0);
+        assert_eq!(audit.quarantined_producers, 0);
+    }
+
+    #[test]
+    fn carrier_block_fork_requires_valid_producer_signature_before_quarantine() {
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0x61; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x62; 32]).unwrap();
+        let carrier = IdentityKeyPair::from_bytes(&[0x63; 32]).unwrap();
+        let subject_a = IdentityKeyPair::from_bytes(&[0x64; 32]).unwrap();
+        let subject_b = IdentityKeyPair::from_bytes(&[0x65; 32]).unwrap();
+        let object_a = descriptor(&subject_a, 1);
+        let object_b = descriptor(&subject_b, 1);
+        let first = block(&producer, 1, [0u8; 32], &object_a);
+        let fork = block(&producer, 1, [0u8; 32], &object_b);
+        let (store, _) = DirectoryReplicaStore::open(
+            temp.path().join("directory.db"),
+            local.public_key_bytes(),
+            NOW + 20,
+        )
+        .unwrap();
+        import_replica_block(&store, &producer, &object_a, &first, [0x66; 16]);
+
+        let mut tampered_fork = fork.clone();
+        tampered_fork.producer_signature[0] ^= 1;
+        let tampered_frame = carrier_response_frame(
+            &producer,
+            &carrier,
+            vec![tampered_fork.clone()],
+            false,
+            1,
+            tampered_fork.hash(),
+            [0x67; 16],
+        );
+        assert!(matches!(
+            store.import_verified_page(
+                producer.public_key_bytes(),
+                std::slice::from_ref(&tampered_fork),
+                std::slice::from_ref(&object_b),
+                1,
+                tampered_fork.hash(),
+                &tampered_frame,
+                NOW + 20,
+            ),
+            Err(DirectoryReplicaStoreError::Block(_))
+        ));
+        assert!(
+            !store
+                .producer_tip(&producer.public_key_bytes())
+                .unwrap()
+                .quarantined
+        );
+        assert!(store
+            .incident_summaries(None, 1)
+            .unwrap()
+            .incidents
+            .is_empty());
+
+        let fork_frame = carrier_response_frame(
+            &producer,
+            &carrier,
+            vec![fork.clone()],
+            false,
+            1,
+            fork.hash(),
+            [0x68; 16],
+        );
+        assert!(matches!(
+            store.import_verified_page(
+                producer.public_key_bytes(),
+                std::slice::from_ref(&fork),
+                std::slice::from_ref(&object_b),
+                1,
+                fork.hash(),
+                &fork_frame,
+                NOW + 20,
+            ),
+            Err(DirectoryReplicaStoreError::Quarantined(_))
+        ));
+        let tip = store.producer_tip(&producer.public_key_bytes()).unwrap();
+        assert!(tip.quarantined);
+        assert_eq!(tip.tip_hash, first.hash());
+        let incidents = store.incident_summaries(None, 1).unwrap().incidents;
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].kind, "signed_block_fork");
     }
 
     #[test]

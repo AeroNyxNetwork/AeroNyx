@@ -48,6 +48,9 @@
 //! - Optionally mirrors bounded multi-page prefixes from a rotating, bounded
 //!   set of valid public discovery peers, using direct-first bounded carrier
 //!   recovery without adding any mirror or carrier to authority checkpoints.
+//! - [DIRECTORY-MIRROR-PROVENANCE 2026-09-01 by Codex] Resumes retained mirror
+//!   prefixes through current admitted carriers after producer discovery
+//!   expiry, while only direct producer responses can declare convergence.
 //! - Prioritizes fresh routeable recovery carriers and uses signed region hints
 //!   only as a best-effort same-tier fault-domain diversity signal.
 //! - Prefers an explicit signed Directory Mirror carrier capability while
@@ -188,6 +191,8 @@
 //!   producer, carrier, endpoint, URL, status code, request, or frame labels.
 //!
 //! ## Last Modified
+//! `v0.32.0-DirectoryMirrorProvenance` - Separated direct producer completion
+//! from carrier-verified prefixes and resumed retained mirrors after expiry.
 //! `v0.31.0-DirectoryTransportTelemetry` - Added task-scoped, mutually
 //! exclusive process transport outcomes without changing stable failure codes.
 //! `v0.30.0-RoleSpecificTransportBudgets` - Restored one canonical 10-second
@@ -301,8 +306,8 @@ use crate::api::{
     privacy_safe_peer_http_client_builder, read_bounded_http_response, BoundedHttpResponseError,
 };
 use crate::services::directory_replica::{
-    DirectoryReplicaTransportOutcome, DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS,
-    DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES,
+    DirectoryReplicaTransportOutcome, DirectoryRetainedMirrorCursor,
+    DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS, DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES,
 };
 use crate::services::{
     DirectoryObservationWitnessOutcome, DirectoryReplicaImportReport, DirectoryReplicaStore,
@@ -899,6 +904,12 @@ enum DirectoryMirrorPullSource {
     PublicCarrier,
 }
 
+impl DirectoryMirrorPullSource {
+    const fn authenticates_producer_tip(self) -> bool {
+        matches!(self, Self::DirectProducer)
+    }
+}
+
 #[derive(Debug)]
 struct DirectoryMirrorPullFailure {
     reason: String,
@@ -1166,20 +1177,58 @@ struct DirectoryMirrorProducerRoundOutcome {
 pub struct DirectorySyncPullOutcome {
     /// Durable replica import result.
     pub import: DirectoryReplicaImportReport,
-    /// Whether the signed remote tip extends beyond this page.
+    /// Whether the authenticated responder reports more pages.
     pub has_more: bool,
-    /// Signed remote tip height observed in this round.
+    /// Transport-authenticated reported tip height observed in this round.
     pub remote_tip_height: u64,
-    /// Signed remote tip hash observed in this round.
+    /// Transport-authenticated reported tip hash observed in this round.
     pub remote_tip_hash: [u8; 32],
     /// HTTP requests consumed by this successful page and object hydration.
     pub requests_made: u32,
 }
 
-fn directory_sync_outcome_is_checkpoint_complete(outcome: &DirectorySyncPullOutcome) -> bool {
-    !outcome.has_more
+fn directory_sync_outcome_is_checkpoint_complete(
+    outcome: &DirectorySyncPullOutcome,
+    source: DirectoryMirrorPullSource,
+) -> bool {
+    // [DIRECTORY-MIRROR-PROVENANCE 2026-09-01 by Codex] A carrier can prove
+    // producer-signed blocks in a verified prefix, but its reported terminal
+    // tip cannot establish that the producer has no later block.
+    source.authenticates_producer_tip()
+        && !outcome.has_more
         && outcome.import.tip_height == outcome.remote_tip_height
         && outcome.import.tip_hash == outcome.remote_tip_hash
+}
+
+fn directory_full_node_mirror_candidates(
+    retained: &[DirectoryRetainedMirrorCursor],
+    mut live_candidates: Vec<([u8; 32], u64)>,
+    max_producers: usize,
+) -> Vec<([u8; 32], u64)> {
+    // [DIRECTORY-MIRROR-PROVENANCE 2026-09-01 by Codex] Retained registry
+    // cursors are eligible availability work even when the producer's public
+    // descriptor has expired. They do not bypass discovery for endpoints: a
+    // direct attempt still requires a current exact descriptor, and carrier
+    // recovery still selects only current admitted carriers.
+    let retained_set = retained
+        .iter()
+        .map(|cursor| cursor.producer)
+        .collect::<HashSet<_>>();
+    let mut candidates = retained
+        .iter()
+        .map(|cursor| (cursor.producer, cursor.descriptor_sequence))
+        .collect::<HashMap<_, _>>();
+    live_candidates.sort_unstable_by_key(|(producer, _)| *producer);
+    for (producer, descriptor_sequence) in live_candidates {
+        if let Some(retained_sequence) = candidates.get_mut(&producer) {
+            *retained_sequence = (*retained_sequence).max(descriptor_sequence);
+        } else if candidates.len() < max_producers {
+            candidates.insert(producer, descriptor_sequence);
+        }
+    }
+    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|(producer, _)| (!retained_set.contains(producer), *producer));
+    candidates
 }
 
 /// Whether another page can be requested without violating the conservative
@@ -1860,8 +1909,8 @@ impl DirectoryReplicaSyncCoordinator {
         let now = unix_now_secs();
         let retained = {
             let store = Arc::clone(&self.store);
-            let Ok(Ok(producers)) =
-                tokio::task::spawn_blocking(move || store.mirror_producer_ids()).await
+            let Ok(Ok(cursors)) =
+                tokio::task::spawn_blocking(move || store.retained_mirror_cursors()).await
             else {
                 self.runtime.record_full_node_mirror_round(0, 0, 0, now);
                 warn!(
@@ -1870,12 +1919,34 @@ impl DirectoryReplicaSyncCoordinator {
                 );
                 return;
             };
-            producers
+            cursors
         };
-        let retained_set = retained.iter().copied().collect::<HashSet<_>>();
         let pinned = self.peers.iter().copied().collect::<HashSet<_>>();
         let local = self.identity.public_key_bytes();
-        let mut candidates = self
+        let retained = retained
+            .into_iter()
+            .filter(|cursor| {
+                if cursor.producer == local || pinned.contains(&cursor.producer) {
+                    return false;
+                }
+                self.peer_store
+                    .get_valid(&cursor.producer, now)
+                    .map(|descriptor| {
+                        descriptor.descriptor.policy.public_discovery
+                            && descriptor
+                                .descriptor
+                                .public_endpoint
+                                .as_deref()
+                                .is_some_and(commitment_peer_endpoint_is_public)
+                    })
+                    // No live descriptor is the retained-expiry recovery case.
+                    // A present live descriptor must still satisfy its current
+                    // signed public-discovery policy.
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+        let retained_count = retained.len();
+        let live_candidates = self
             .peer_store
             .valid_public_descriptors(now, usize::MAX)
             .into_iter()
@@ -1891,23 +1962,12 @@ impl DirectoryReplicaSyncCoordinator {
             })
             .map(|descriptor| (descriptor.node_id(), descriptor.sequence()))
             .collect::<Vec<_>>();
-        candidates.sort_by_key(|(node_id, _)| (!retained_set.contains(node_id), *node_id));
+        let mut candidates = directory_full_node_mirror_candidates(
+            &retained,
+            live_candidates,
+            self.full_node_mirror_max_producers,
+        );
         let candidate_count = candidates.len();
-        let open_slots = self
-            .full_node_mirror_max_producers
-            .saturating_sub(retained_set.len());
-        let mut new_selected = 0usize;
-        candidates.retain(|(node_id, _)| {
-            if retained_set.contains(node_id) {
-                true
-            } else if new_selected < open_slots {
-                new_selected = new_selected.saturating_add(1);
-                true
-            } else {
-                false
-            }
-        });
-        candidates.truncate(self.full_node_mirror_max_producers);
         if candidates.is_empty() {
             self.runtime
                 .record_full_node_mirror_round(candidate_count, 0, 0, now);
@@ -1957,7 +2017,7 @@ impl DirectoryReplicaSyncCoordinator {
             failed,
             pages_succeeded,
             requests_sent,
-            retained = retained_set.len(),
+            retained = retained_count,
             capacity = self.full_node_mirror_max_producers,
             "[DIRECTORY_REPLICA] Full-node Mirror round completed"
         );
@@ -2024,7 +2084,7 @@ impl DirectoryReplicaSyncCoordinator {
                 self.runtime
                     .record_full_node_mirror_recovery(true, unix_now_secs());
             }
-            if directory_sync_outcome_is_checkpoint_complete(&outcome) {
+            if directory_sync_outcome_is_checkpoint_complete(&outcome, source) {
                 round.converged = true;
                 return round;
             }
@@ -2089,7 +2149,7 @@ impl DirectoryReplicaSyncCoordinator {
             )
             .await
             {
-                Ok(outcome) => {
+                Ok((outcome, source)) => {
                     pages_completed = pages_completed.saturating_add(1);
                     requests_used = requests_used.saturating_add(outcome.requests_made);
                     self.runtime.record_success(
@@ -2119,7 +2179,7 @@ impl DirectoryReplicaSyncCoordinator {
                         requests_used,
                         outcome.has_more,
                     ) {
-                        return directory_sync_outcome_is_checkpoint_complete(&outcome);
+                        return directory_sync_outcome_is_checkpoint_complete(&outcome, source);
                     }
                 }
                 Err(reason) => {
@@ -3744,8 +3804,10 @@ pub(crate) async fn run_directory_carrier_cold_bootstrap_smoke(
         report.imported_commitments = imported_commitments;
         report.bootstrapped_tip_height = tip_height;
         report.multi_page_prefix_verified = true;
-        report.reached_observed_remote_tip =
-            directory_sync_outcome_is_checkpoint_complete(&last_outcome);
+        report.reached_observed_remote_tip = directory_sync_outcome_is_checkpoint_complete(
+            &last_outcome,
+            DirectoryMirrorPullSource::PublicCarrier,
+        );
         report.producer_chain_verified = true;
         report.genesis_anchor_verified = true;
         report.isolated_store_audit_verified = true;
@@ -3860,7 +3922,7 @@ async fn pull_directory_chain_page_with_carriers(
     carriers: &[[u8; 32]],
     carrier_capabilities: &DirectoryMirrorCarrierCapabilityCache,
     client: &reqwest::Client,
-) -> Result<DirectorySyncPullOutcome, String> {
+) -> Result<(DirectorySyncPullOutcome, DirectoryMirrorPullSource), String> {
     match pull_directory_chain_page(
         Arc::clone(&replica_store),
         peer_store,
@@ -3870,7 +3932,7 @@ async fn pull_directory_chain_page_with_carriers(
     )
     .await
     {
-        Ok(outcome) => Ok(outcome),
+        Ok(outcome) => Ok((outcome, DirectoryMirrorPullSource::DirectProducer)),
         Err(reason) if directory_sync_failure_allows_carrier_fallback(&reason) => {
             // [CARRIER-COLD-BOOTSTRAP 2026-07-26 by Codex] Bound every
             // availability fallback and account conservatively for the failed
@@ -3902,7 +3964,7 @@ async fn pull_directory_chain_page_with_carriers(
                             requests_made = outcome.requests_made,
                             "[DIRECTORY_REPLICA] Pinned carrier recovered producer evidence"
                         );
-                        return Ok(outcome);
+                        return Ok((outcome, DirectoryMirrorPullSource::PublicCarrier));
                     }
                     Err(carrier_reason)
                         if directory_sync_failure_allows_carrier_fallback(&carrier_reason) =>
@@ -3943,7 +4005,7 @@ async fn pull_directory_chain_page_with_carriers(
                             requests_made = outcome.requests_made,
                             "[DIRECTORY_REPLICA] Explicit public carrier cold-recovered pinned producer evidence"
                         );
-                        return Ok(outcome);
+                        return Ok((outcome, DirectoryMirrorPullSource::PublicCarrier));
                     }
                     Err(carrier_failure)
                         if directory_mirror_failure_allows_recovery(&carrier_failure.reason) =>
@@ -4002,7 +4064,8 @@ fn directory_sync_failure_allows_carrier_fallback(reason: &str) -> bool {
 fn directory_mirror_failure_allows_recovery(reason: &str) -> bool {
     if matches!(
         reason,
-        "directory_range_transport_failed"
+        "directory_mirror_peer_unavailable"
+            | "directory_range_transport_failed"
             | "directory_objects_transport_failed"
             | "directory_replica_range_transport_failed"
             | "directory_replica_objects_transport_failed"
@@ -6828,6 +6891,7 @@ mod tests {
                 < DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS
         );
         for reason in [
+            "directory_mirror_peer_unavailable",
             "directory_range_transport_failed",
             "directory_objects_transport_failed",
             "directory_range_http_status_404",
@@ -7505,19 +7569,59 @@ mod tests {
             remote_tip_hash: [0x41; 32],
             requests_made: 2,
         };
-        assert!(directory_sync_outcome_is_checkpoint_complete(&complete));
+        assert!(directory_sync_outcome_is_checkpoint_complete(
+            &complete,
+            DirectoryMirrorPullSource::DirectProducer
+        ));
+        assert!(!directory_sync_outcome_is_checkpoint_complete(
+            &complete,
+            DirectoryMirrorPullSource::PublicCarrier
+        ));
 
         let mut catching_up = complete;
         catching_up.has_more = true;
-        assert!(!directory_sync_outcome_is_checkpoint_complete(&catching_up));
+        assert!(!directory_sync_outcome_is_checkpoint_complete(
+            &catching_up,
+            DirectoryMirrorPullSource::DirectProducer
+        ));
         let mut stale_height = complete;
         stale_height.remote_tip_height = 10;
         assert!(!directory_sync_outcome_is_checkpoint_complete(
-            &stale_height
+            &stale_height,
+            DirectoryMirrorPullSource::DirectProducer
         ));
         let mut wrong_hash = complete;
         wrong_hash.remote_tip_hash = [0x42; 32];
-        assert!(!directory_sync_outcome_is_checkpoint_complete(&wrong_hash));
+        assert!(!directory_sync_outcome_is_checkpoint_complete(
+            &wrong_hash,
+            DirectoryMirrorPullSource::DirectProducer
+        ));
+    }
+
+    #[test]
+    fn expired_retained_mirror_remains_a_resume_candidate_without_live_descriptor() {
+        // [DIRECTORY-MIRROR-PROVENANCE 2026-09-01 by Codex] An empty live
+        // candidate set models a restarted node after the producer descriptor
+        // expired. The durable cursor remains schedulable so the direct lookup
+        // can fail normally and current admitted carriers can resume tip + 1.
+        let producer = [0x51; 32];
+        let newcomer = [0x52; 32];
+        let retained = [DirectoryRetainedMirrorCursor {
+            producer,
+            descriptor_sequence: 7,
+        }];
+        assert_eq!(
+            directory_full_node_mirror_candidates(&retained, Vec::new(), 1),
+            vec![(producer, 7)]
+        );
+        assert_eq!(
+            directory_full_node_mirror_candidates(&retained, vec![(newcomer, 1)], 1),
+            vec![(producer, 7)]
+        );
+        assert_eq!(
+            directory_full_node_mirror_candidates(&retained, vec![(producer, 9)], 1),
+            vec![(producer, 9)]
+        );
     }
 
     #[test]
