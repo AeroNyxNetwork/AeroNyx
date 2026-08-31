@@ -2902,12 +2902,17 @@ async fn snapshot_handler(
 ) -> Json<NodeBootstrapSnapshot> {
     let now = now_secs();
     let limit = state.policy.snapshot_limit(query.limit);
-    Json(state.peer_store.export_bootstrap_snapshot(
-        now,
-        now,
-        query.public_only.unwrap_or(true),
-        Some(limit),
-    ))
+    let _requested_public_only = query.public_only;
+    // [PUBLIC-DISCOVERY-PROJECTION 2026-09-01 by Codex] Keep accepting the
+    // legacy `public_only` query field, but never let an unauthenticated public
+    // request downgrade the descriptor-visibility boundary. Host-local cache
+    // persistence continues to call `PeerStore` directly when it needs the
+    // complete private descriptor set.
+    Json(
+        state
+            .peer_store
+            .export_bootstrap_snapshot(now, now, true, Some(limit)),
+    )
 }
 
 /// Observes first-matching exclusion reasons without changing the candidate
@@ -4187,6 +4192,125 @@ fn apply_gossip_message(
     }
 }
 
+/// Full-identity membership used to sanitize prefix-only public status rows.
+///
+/// [PUBLIC-DISCOVERY-PROJECTION 2026-09-01 by Codex] A short prefix is never
+/// treated as identity evidence on its own. A prefix is publishable only when
+/// it maps to exactly one currently valid full public node id and exactly one
+/// matching public row in the complete peer summary. Collisions, expired rows,
+/// private rows, and projection-only unknowns therefore fail closed.
+struct PublicStatusProjectionMembership {
+    unambiguous_public_prefixes: HashSet<String>,
+}
+
+impl PublicStatusProjectionMembership {
+    fn from_status(status: &PeerStoreStatus, public_descriptors: &[SignedNodeDescriptor]) -> Self {
+        let public_node_ids: HashSet<[u8; 32]> = public_descriptors
+            .iter()
+            .map(SignedNodeDescriptor::node_id)
+            .collect();
+        let mut public_prefix_counts: HashMap<String, usize> = HashMap::new();
+        for node_id in public_node_ids {
+            *public_prefix_counts
+                .entry(hex::encode(&node_id[..4]))
+                .or_default() += 1;
+        }
+
+        let mut summary_prefix_counts: HashMap<String, (usize, usize)> = HashMap::new();
+        for peer in &status.peer_summary.peers {
+            let counts = summary_prefix_counts
+                .entry(peer.node_id_prefix.clone())
+                .or_default();
+            counts.0 += 1;
+            if peer.public_discovery {
+                counts.1 += 1;
+            }
+        }
+
+        let unambiguous_public_prefixes = public_prefix_counts
+            .into_iter()
+            .filter_map(|(prefix, full_public_id_count)| {
+                let summary_counts = summary_prefix_counts.get(&prefix).copied();
+                (full_public_id_count == 1 && summary_counts == Some((1, 1))).then_some(prefix)
+            })
+            .collect();
+        Self {
+            unambiguous_public_prefixes,
+        }
+    }
+
+    fn permits_prefix(&self, prefix: &str) -> bool {
+        self.unambiguous_public_prefixes.contains(prefix)
+    }
+}
+
+fn public_status_audit_event_is_publishable(
+    detail: &str,
+    membership: &PublicStatusProjectionMembership,
+) -> bool {
+    let mut remaining = detail;
+    while let Some(marker_offset) = remaining.find("node_prefix=") {
+        let value = &remaining[marker_offset + "node_prefix=".len()..];
+        let Some(prefix) = value.get(..8) else {
+            return false;
+        };
+        if !prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || value.as_bytes().get(8).is_some_and(u8::is_ascii_hexdigit)
+            || !membership.permits_prefix(prefix)
+        {
+            return false;
+        }
+        remaining = &value[8..];
+    }
+    true
+}
+
+/// Removes identity-bearing private or ambiguous rows from the public status.
+fn sanitize_public_peer_store_status(
+    mut status: PeerStoreStatus,
+    public_descriptors: &[SignedNodeDescriptor],
+) -> PeerStoreStatus {
+    let membership = PublicStatusProjectionMembership::from_status(&status, public_descriptors);
+
+    status
+        .peer_summary
+        .peers
+        .retain(|peer| peer.public_discovery && membership.permits_prefix(&peer.node_id_prefix));
+    status
+        .peer_health_summary
+        .peers
+        .retain(|peer| membership.permits_prefix(&peer.node_id_prefix));
+    status
+        .recent_peer_events
+        .retain(|event| membership.permits_prefix(&event.node_id_prefix));
+    status
+        .recent_audit_events
+        .retain(|event| public_status_audit_event_is_publishable(&event.detail, &membership));
+
+    for candidates in [
+        &mut status.route_candidates.privacy_relay,
+        &mut status.route_candidates.chat_relay,
+        &mut status.route_candidates.onion_middle,
+    ] {
+        candidates.retain(|candidate| {
+            candidate.public_discovery && membership.permits_prefix(&candidate.node_id_prefix)
+        });
+    }
+
+    for path in [
+        &mut status.route_candidates.planned_paths.chat_single_hop,
+        &mut status
+            .route_candidates
+            .planned_paths
+            .chat_two_hop_onion_ready,
+    ] {
+        path.hops
+            .retain(|hop| membership.permits_prefix(&hop.node_id_prefix));
+    }
+
+    status
+}
+
 async fn status_handler(State(state): State<DiscoveryApiState>) -> Json<DiscoveryStatusResponse> {
     let now = now_secs();
     let peer_store = state.peer_store.status(now);
@@ -4195,6 +4319,8 @@ async fn status_handler(State(state): State<DiscoveryApiState>) -> Json<Discover
     let blind_relay_runtime =
         blind_relay_runtime_status_value(now, &peer_store, &local_capabilities);
     let recovery_anchor = recovery_anchor_status_value(&peer_store);
+    let public_descriptors = state.peer_store.valid_public_descriptors(now, usize::MAX);
+    let peer_store = sanitize_public_peer_store_status(peer_store, &public_descriptors);
     Json(DiscoveryStatusResponse {
         generated_at: now,
         peer_store,
@@ -4791,6 +4917,409 @@ mod tests {
             OnionCandidateExclusionTelemetryStatus::SuppressedSmallSample
         );
         assert_eq!(telemetry.buckets, OnionCandidateExclusionBuckets::default());
+    }
+
+    // [PUBLIC-DISCOVERY-PROJECTION 2026-09-01 by Codex] These fixtures bind
+    // public handler output to full verified descriptor membership and exercise
+    // both the direct snapshot leak and every prefix-only status projection.
+    #[tokio::test]
+    async fn test_public_projection_snapshot_forces_public_only_for_default_and_false_query() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let relay_capabilities = [NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
+
+        let private_keypair = IdentityKeyPair::from_bytes(&[211; 32]).unwrap();
+        let mut private_descriptor = signed_candidate_exclusion_descriptor(
+            211,
+            now,
+            Some("private-snapshot.invalid:443"),
+            &relay_capabilities,
+            true,
+        );
+        private_descriptor.descriptor.policy.public_discovery = false;
+        let private_descriptor =
+            SignedNodeDescriptor::sign(private_descriptor.descriptor, &private_keypair).unwrap();
+        let private_node_id = private_descriptor.node_id();
+
+        let public_descriptor = signed_candidate_exclusion_descriptor(
+            212,
+            now,
+            Some("public-snapshot.invalid:443"),
+            &relay_capabilities,
+            true,
+        );
+        let public_node_id = public_descriptor.node_id();
+        store.upsert_verified(private_descriptor, now).unwrap();
+        store.upsert_verified(public_descriptor, now).unwrap();
+
+        let app = build_discovery_router(store, DiscoveryApiPolicy::default());
+        for uri in [
+            "/api/discovery/snapshot?limit=10",
+            "/api/discovery/snapshot?limit=10&public_only=false",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let snapshot: NodeBootstrapSnapshot = serde_json::from_slice(&body).unwrap();
+            assert_eq!(snapshot.peers.len(), 1);
+            assert_eq!(snapshot.peers[0].node_id(), public_node_id);
+            assert!(snapshot.peers[0].descriptor.policy.public_discovery);
+            assert!(snapshot
+                .peers
+                .iter()
+                .all(|descriptor| descriptor.node_id() != private_node_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_public_projection_status_filters_private_rows_and_preserves_public_order() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let relay_capabilities = [NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
+
+        let private_keypair = IdentityKeyPair::from_bytes(&[213; 32]).unwrap();
+        let mut private_descriptor = signed_candidate_exclusion_descriptor(
+            213,
+            now,
+            Some("private-status.invalid:443"),
+            &relay_capabilities,
+            true,
+        );
+        private_descriptor.descriptor.policy.public_discovery = false;
+        private_descriptor.descriptor.capacity = NodeCapacity {
+            max_sessions: 10_000,
+            max_bps: Some(10_000_000_000),
+            max_pps: Some(1_000_000),
+        };
+        let private_descriptor =
+            SignedNodeDescriptor::sign(private_descriptor.descriptor, &private_keypair).unwrap();
+        let private_node_id = private_descriptor.node_id();
+
+        let public_high_keypair = IdentityKeyPair::from_bytes(&[214; 32]).unwrap();
+        let mut public_high = signed_candidate_exclusion_descriptor(
+            214,
+            now,
+            Some("public-high.invalid:443"),
+            &relay_capabilities,
+            true,
+        );
+        public_high.descriptor.capacity = NodeCapacity {
+            max_sessions: 512,
+            max_bps: Some(1_000_000_000),
+            max_pps: Some(100_000),
+        };
+        let public_high =
+            SignedNodeDescriptor::sign(public_high.descriptor, &public_high_keypair).unwrap();
+        let public_high_node_id = public_high.node_id();
+
+        let public_low = signed_candidate_exclusion_descriptor(
+            215,
+            now,
+            Some("public-low.invalid:443"),
+            &relay_capabilities,
+            true,
+        );
+        let public_low_node_id = public_low.node_id();
+
+        for descriptor in [private_descriptor, public_high, public_low] {
+            let node_id = descriptor.node_id();
+            store
+                .upsert_verified_from_source(descriptor, now, "gossip_announce")
+                .unwrap();
+            store.record_route_forward_success(&node_id, now);
+        }
+
+        let private_prefix = hex::encode(&private_node_id[..4]);
+        let public_high_prefix = hex::encode(&public_high_node_id[..4]);
+        let public_low_prefix = hex::encode(&public_low_node_id[..4]);
+        assert_ne!(private_prefix, public_high_prefix);
+        assert_ne!(private_prefix, public_low_prefix);
+        assert_ne!(public_high_prefix, public_low_prefix);
+
+        let app = build_discovery_router(store, DiscoveryApiPolicy::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let peer_store = &parsed["peer_store"];
+
+        assert_eq!(peer_store["snapshot"]["valid_peers"], 3);
+        assert_eq!(peer_store["snapshot"]["public_peers"], 2);
+        for candidate_group in ["chat_relay", "onion_middle"] {
+            let prefixes = peer_store["route_candidates"][candidate_group]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["node_id_prefix"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                prefixes,
+                vec![public_high_prefix.as_str(), public_low_prefix.as_str()]
+            );
+        }
+
+        for rows in [
+            peer_store["peer_summary"]["peers"].as_array().unwrap(),
+            peer_store["peer_health_summary"]["peers"]
+                .as_array()
+                .unwrap(),
+            peer_store["recent_peer_events"].as_array().unwrap(),
+        ] {
+            assert!(rows.iter().all(|row| {
+                matches!(
+                    row["node_id_prefix"].as_str(),
+                    Some(prefix) if prefix == public_high_prefix || prefix == public_low_prefix
+                )
+            }));
+            assert!(rows.iter().any(|row| {
+                row["node_id_prefix"].as_str() == Some(public_high_prefix.as_str())
+            }));
+            assert!(rows
+                .iter()
+                .any(|row| { row["node_id_prefix"].as_str() == Some(public_low_prefix.as_str()) }));
+        }
+
+        let planned_paths = &peer_store["route_candidates"]["planned_paths"];
+        let path_hops = planned_paths["chat_single_hop"]["hops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(
+                planned_paths["chat_two_hop_onion_ready"]["hops"]
+                    .as_array()
+                    .unwrap(),
+            )
+            .collect::<Vec<_>>();
+        assert!(path_hops.iter().all(|hop| {
+            matches!(
+                hop["node_id_prefix"].as_str(),
+                Some(prefix) if prefix == public_high_prefix || prefix == public_low_prefix
+            )
+        }));
+        assert!(path_hops
+            .iter()
+            .any(|hop| { hop["node_id_prefix"].as_str() == Some(public_high_prefix.as_str()) }));
+
+        let serialized = serde_json::to_string(peer_store).unwrap();
+        assert!(!serialized.contains(&private_prefix));
+        assert!(!serialized.contains("private-status.invalid"));
+    }
+
+    #[test]
+    fn test_public_projection_status_rejects_prefix_collision_and_unknown_rows() {
+        let store = PeerStore::new();
+        let now = now_secs();
+        let relay_capabilities = [NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
+
+        let public_descriptor = signed_candidate_exclusion_descriptor(
+            216,
+            now,
+            Some("public-collision.invalid:443"),
+            &relay_capabilities,
+            true,
+        );
+        let public_node_id = public_descriptor.node_id();
+        let private_keypair = IdentityKeyPair::from_bytes(&[217; 32]).unwrap();
+        let mut private_descriptor = signed_candidate_exclusion_descriptor(
+            217,
+            now,
+            Some("private-collision.invalid:443"),
+            &relay_capabilities,
+            true,
+        );
+        private_descriptor.descriptor.policy.public_discovery = false;
+        let private_descriptor =
+            SignedNodeDescriptor::sign(private_descriptor.descriptor, &private_keypair).unwrap();
+        let private_node_id = private_descriptor.node_id();
+
+        for descriptor in [public_descriptor, private_descriptor] {
+            let node_id = descriptor.node_id();
+            store.upsert_verified(descriptor, now).unwrap();
+            store.record_route_forward_success(&node_id, now);
+        }
+
+        let public_prefix = hex::encode(&public_node_id[..4]);
+        let private_prefix = hex::encode(&private_node_id[..4]);
+        assert_ne!(public_prefix, private_prefix);
+        let unknown_prefix = "ffffffff".to_string();
+        assert_ne!(public_prefix, unknown_prefix);
+
+        let mut status = store.status(now);
+        let public_descriptors = store.valid_public_descriptors(now, usize::MAX);
+        for row in &mut status.peer_summary.peers {
+            if row.node_id_prefix == private_prefix {
+                row.node_id_prefix = public_prefix.clone();
+            }
+        }
+        if let Some(mut unknown) = status.peer_summary.peers.first().cloned() {
+            unknown.node_id_prefix = unknown_prefix.clone();
+            status.peer_summary.peers.push(unknown);
+        }
+        for row in &mut status.peer_health_summary.peers {
+            if row.node_id_prefix == private_prefix {
+                row.node_id_prefix = public_prefix.clone();
+            }
+        }
+        if let Some(mut unknown) = status.peer_health_summary.peers.first().cloned() {
+            unknown.node_id_prefix = unknown_prefix.clone();
+            status.peer_health_summary.peers.push(unknown);
+        }
+        for row in &mut status.recent_peer_events {
+            if row.node_id_prefix == private_prefix {
+                row.node_id_prefix = public_prefix.clone();
+            }
+        }
+        if let Some(mut unknown) = status.recent_peer_events.first().cloned() {
+            unknown.node_id_prefix = unknown_prefix.clone();
+            status.recent_peer_events.push(unknown);
+        }
+        for event in &mut status.recent_audit_events {
+            event.detail = event.detail.replace(&private_prefix, &public_prefix);
+        }
+        if let Some(mut unknown) = status
+            .recent_audit_events
+            .iter()
+            .find(|event| event.detail.contains("node_prefix="))
+            .cloned()
+        {
+            unknown.detail = unknown.detail.replace(&public_prefix, &unknown_prefix);
+            status.recent_audit_events.push(unknown);
+        }
+        for candidates in [
+            &mut status.route_candidates.privacy_relay,
+            &mut status.route_candidates.chat_relay,
+            &mut status.route_candidates.onion_middle,
+        ] {
+            for candidate in candidates.iter_mut() {
+                if candidate.node_id_prefix == private_prefix {
+                    candidate.node_id_prefix = public_prefix.clone();
+                }
+            }
+            if let Some(mut unknown) = candidates.first().cloned() {
+                unknown.node_id_prefix = unknown_prefix.clone();
+                candidates.push(unknown);
+            }
+        }
+        for path in [
+            &mut status.route_candidates.planned_paths.chat_single_hop,
+            &mut status
+                .route_candidates
+                .planned_paths
+                .chat_two_hop_onion_ready,
+        ] {
+            for hop in &mut path.hops {
+                if hop.node_id_prefix == private_prefix {
+                    hop.node_id_prefix = public_prefix.clone();
+                }
+            }
+            if let Some(mut unknown) = path.hops.first().cloned() {
+                unknown.node_id_prefix = unknown_prefix.clone();
+                path.hops.push(unknown);
+            }
+        }
+
+        let chat_single_hop_count = status
+            .route_candidates
+            .planned_paths
+            .chat_single_hop
+            .hop_count;
+        let chat_single_complete = status
+            .route_candidates
+            .planned_paths
+            .chat_single_hop
+            .complete;
+        let chat_two_hop_count = status
+            .route_candidates
+            .planned_paths
+            .chat_two_hop_onion_ready
+            .hop_count;
+        let chat_two_hop_complete = status
+            .route_candidates
+            .planned_paths
+            .chat_two_hop_onion_ready
+            .complete;
+
+        let sanitized = sanitize_public_peer_store_status(status, &public_descriptors);
+        assert_eq!(sanitized.snapshot.valid_peers, 2);
+        assert_eq!(sanitized.snapshot.public_peers, 1);
+        assert!(sanitized.peer_summary.peers.is_empty());
+        assert!(sanitized.peer_health_summary.peers.is_empty());
+        assert!(sanitized.recent_peer_events.is_empty());
+        assert!(sanitized
+            .recent_audit_events
+            .iter()
+            .all(|event| !event.detail.contains("node_prefix=")));
+        assert!(sanitized.route_candidates.privacy_relay.is_empty());
+        assert!(sanitized.route_candidates.chat_relay.is_empty());
+        assert!(sanitized.route_candidates.onion_middle.is_empty());
+        assert!(sanitized
+            .route_candidates
+            .planned_paths
+            .chat_single_hop
+            .hops
+            .is_empty());
+        assert_eq!(
+            sanitized
+                .route_candidates
+                .planned_paths
+                .chat_single_hop
+                .hop_count,
+            chat_single_hop_count
+        );
+        assert_eq!(
+            sanitized
+                .route_candidates
+                .planned_paths
+                .chat_single_hop
+                .complete,
+            chat_single_complete
+        );
+        assert!(sanitized
+            .route_candidates
+            .planned_paths
+            .chat_two_hop_onion_ready
+            .hops
+            .is_empty());
+        assert_eq!(
+            sanitized
+                .route_candidates
+                .planned_paths
+                .chat_two_hop_onion_ready
+                .hop_count,
+            chat_two_hop_count
+        );
+        assert_eq!(
+            sanitized
+                .route_candidates
+                .planned_paths
+                .chat_two_hop_onion_ready
+                .complete,
+            chat_two_hop_complete
+        );
     }
 
     /// Records enough fresh aggregate evidence for the requested synthetic
