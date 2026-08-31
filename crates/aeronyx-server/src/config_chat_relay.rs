@@ -31,6 +31,8 @@
 //! period used only by explicit host-local dry-run/prune commands.
 //! v1.12.0-CrashSafeVerifiedSubmitAdmission — Documented that the node-wide
 //! deduplication capacity also bounds durable verified-submit replay evidence.
+//! v1.13.0-BlindRouteResourceBound — Added backward-compatible logical-byte
+//! and recoverable SQLite WAL-backlog admission for blind-route replay state.
 //!
 //! ## Main Functionality
 //! - `ChatRelayConfig` — all knobs for the zero-knowledge P2P chat relay
@@ -62,6 +64,12 @@
 //!   responses/reservations. When the durable bound is full, new verified
 //!   submits fail before route or custody side effects; retained evidence is
 //!   never evicted early. Keep operational headroom for the configured TTL.
+//! - [CHAT-RELAY-RESOURCE-BOUND 2026-08-31 by Codex] Blind-route replay uses
+//!   `blind_route_replay_max_bytes_total` as a logical opaque-BLOB budget and
+//!   `blind_route_wal_backlog_max_bytes` as a checkpoint-backlog admission
+//!   boundary. Neither is an operating-system filesystem quota. A pinned
+//!   reader may pause new blind-route writes until checkpoint progress resumes;
+//!   TTL cleanup and owner-fenced deletion remain available for recovery.
 //! - `max_message_size`: values > 64 KB emit a warn (UDP fragmentation risk)
 //!   and are hard-rejected above `MAX_MESSAGE_SIZE_HARD_LIMIT` (1 MB).
 //!   `ChatRelayService::store_pending()` enforces the configured ciphertext
@@ -106,6 +114,8 @@
 //!   update `chat_relay.db_path` explicitly in your config file.
 //!
 //! ## Last Modified
+//! v1.13.0-BlindRouteResourceBound — Bounded live opaque replay bytes and WAL
+//! checkpoint backlog without changing legacy configuration files.
 //! v1.12.0-CrashSafeVerifiedSubmitAdmission — Documented the shared volatile
 //! and durable admission capacity boundary for verified submits.
 //! v1.11.0-CustodyBackupPrune — Host-local, confirmation-gated prune policy.
@@ -148,6 +158,15 @@ pub const DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 1_200;
 /// parser-front limit remains mandatory because permissionless node identities
 /// can be rotated and therefore cannot provide Sybil resistance by themselves.
 pub const DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 240;
+
+/// Default logical opaque-BLOB budget for live blind-route replay evidence.
+pub const DEFAULT_BLIND_ROUTE_REPLAY_MAX_BYTES_TOTAL: u64 = 512 * 1024 * 1024;
+
+/// Default uncheckpointed WAL admission boundary for blind-route writes.
+pub const DEFAULT_BLIND_ROUTE_WAL_BACKLOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Conservative configuration floor; the domain applies the exact row bound.
+const MIN_BLIND_ROUTE_RESOURCE_BUDGET_BYTES: u64 = 1024 * 1024;
 
 /// Default planning target for verified relay-custody recovery-image count.
 pub const DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS: usize = 8;
@@ -211,12 +230,15 @@ pub const MIN_CUSTODY_BACKUP_PARTIAL_GRACE_SECS: u64 = 24 * 60 * 60;
 /// expired_notification_ttl_secs = 604800  # 7 days
 /// peer_relay_requests_per_minute = 1200
 /// peer_relay_authenticated_requests_per_minute = 240
+/// blind_route_replay_max_bytes_total = 536870912  # 512 MiB logical BLOBs
+/// blind_route_wal_backlog_max_bytes = 67108864    # 64 MiB checkpoint backlog
 /// custody_backup_retention_target_artifacts = 8
 /// custody_backup_retention_target_bytes = 8589934592  # 8 GiB
 /// custody_backup_partial_grace_secs = 86400             # 24 hours
 /// ```
 ///
 /// ## Last Modified
+/// v1.13.0-BlindRouteResourceBound — Typed blind-route resource budgets.
 /// v1.10.0-CustodyBackupRetention — Bounded private recovery-image retention.
 /// v1.8.0-VerifiedCustodyBackup — Private WAL-aware recovery artifacts.
 /// v1.7.0-StartupCustodyIntegrity — Owner-only files and startup quick-check.
@@ -368,6 +390,23 @@ pub struct ChatRelayConfig {
     #[serde(default = "default_authenticated_peer_relay_requests_per_minute")]
     pub peer_relay_authenticated_requests_per_minute: u32,
 
+    /// Maximum logical opaque BLOB bytes reserved by live blind-route replay.
+    ///
+    /// Every reservation charges the maximum possible protected response so
+    /// completion can replace it atomically without exceeding this budget.
+    /// This does not measure SQLite page, index, journal, or filesystem bytes.
+    /// Default: 536 870 912 (512 MiB).
+    #[serde(default = "default_blind_route_replay_max_bytes_total")]
+    pub blind_route_replay_max_bytes_total: u64,
+
+    /// Maximum admitted uncheckpointed SQLite WAL bytes for blind-route writes.
+    ///
+    /// This is a recoverable write-admission boundary, not a filesystem hard
+    /// quota. Cleanup/checkpoint/delete paths remain available while a pinned
+    /// reader prevents checkpoint progress. Default: 67 108 864 (64 MiB).
+    #[serde(default = "default_blind_route_wal_backlog_max_bytes")]
+    pub blind_route_wal_backlog_max_bytes: u64,
+
     /// Planning target for verified relay-custody recovery-image count.
     ///
     /// The audited retention inspection models an oldest-first policy. The
@@ -448,6 +487,12 @@ fn default_peer_relay_requests_per_minute() -> u32 {
 fn default_authenticated_peer_relay_requests_per_minute() -> u32 {
     DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE
 }
+fn default_blind_route_replay_max_bytes_total() -> u64 {
+    DEFAULT_BLIND_ROUTE_REPLAY_MAX_BYTES_TOTAL
+}
+fn default_blind_route_wal_backlog_max_bytes() -> u64 {
+    DEFAULT_BLIND_ROUTE_WAL_BACKLOG_MAX_BYTES
+}
 fn default_custody_backup_retention_target_artifacts() -> usize {
     DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS
 }
@@ -478,6 +523,8 @@ impl Default for ChatRelayConfig {
             peer_relay_requests_per_minute: default_peer_relay_requests_per_minute(),
             peer_relay_authenticated_requests_per_minute:
                 default_authenticated_peer_relay_requests_per_minute(),
+            blind_route_replay_max_bytes_total: default_blind_route_replay_max_bytes_total(),
+            blind_route_wal_backlog_max_bytes: default_blind_route_wal_backlog_max_bytes(),
             custody_backup_retention_target_artifacts:
                 default_custody_backup_retention_target_artifacts(),
             custody_backup_retention_target_bytes: default_custody_backup_retention_target_bytes(),
@@ -638,6 +685,20 @@ impl ChatRelayConfig {
             ));
         }
 
+        if self.blind_route_replay_max_bytes_total < MIN_BLIND_ROUTE_RESOURCE_BUDGET_BYTES {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.blind_route_replay_max_bytes_total",
+                format!("must be >= {MIN_BLIND_ROUTE_RESOURCE_BUDGET_BYTES}"),
+            ));
+        }
+
+        if self.blind_route_wal_backlog_max_bytes < MIN_BLIND_ROUTE_RESOURCE_BUDGET_BYTES {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.blind_route_wal_backlog_max_bytes",
+                format!("must be >= {MIN_BLIND_ROUTE_RESOURCE_BUDGET_BYTES}"),
+            ));
+        }
+
         if self.custody_backup_retention_target_artifacts == 0
             || self.custody_backup_retention_target_artifacts
                 > MAX_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS
@@ -705,6 +766,14 @@ mod tests {
             DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE
         );
         assert_eq!(
+            cr.blind_route_replay_max_bytes_total,
+            DEFAULT_BLIND_ROUTE_REPLAY_MAX_BYTES_TOTAL
+        );
+        assert_eq!(
+            cr.blind_route_wal_backlog_max_bytes,
+            DEFAULT_BLIND_ROUTE_WAL_BACKLOG_MAX_BYTES
+        );
+        assert_eq!(
             cr.custody_backup_retention_target_artifacts,
             DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS
         );
@@ -738,6 +807,8 @@ mod tests {
             expired_notification_ttl_secs: 0,
             peer_relay_requests_per_minute: 0,
             peer_relay_authenticated_requests_per_minute: 0,
+            blind_route_replay_max_bytes_total: 0,
+            blind_route_wal_backlog_max_bytes: 0,
             custody_backup_retention_target_artifacts: 0,
             custody_backup_retention_target_bytes: 0,
             custody_backup_partial_grace_secs: 0,
@@ -939,6 +1010,22 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_relay_blind_route_resource_budget_floors_rejected() {
+        for (live_bytes, wal_bytes) in [
+            (MIN_BLIND_ROUTE_RESOURCE_BUDGET_BYTES - 1, 64 * 1024 * 1024),
+            (512 * 1024 * 1024, MIN_BLIND_ROUTE_RESOURCE_BUDGET_BYTES - 1),
+        ] {
+            let cr = ChatRelayConfig {
+                enabled: true,
+                blind_route_replay_max_bytes_total: live_bytes,
+                blind_route_wal_backlog_max_bytes: wal_bytes,
+                ..Default::default()
+            };
+            assert!(cr.validate().is_err());
+        }
+    }
+
+    #[test]
     fn test_chat_relay_backup_retention_bounds_rejected() {
         // [CHAT-RELAY-BACKUP-RETENTION 2026-08-16 by Codex] Keep both the
         // planning target sane; the service separately hard-bounds directory
@@ -988,6 +1075,8 @@ dedup_lru_capacity = 5000
 expired_notification_ttl_secs = 172800
 peer_relay_requests_per_minute = 2400
 peer_relay_authenticated_requests_per_minute = 480
+blind_route_replay_max_bytes_total = 268435456
+blind_route_wal_backlog_max_bytes = 33554432
 custody_backup_retention_target_artifacts = 4
 custody_backup_retention_target_bytes = 4294967296
 custody_backup_partial_grace_secs = 172800
@@ -1009,6 +1098,8 @@ custody_backup_partial_grace_secs = 172800
         assert_eq!(cr.expired_notification_ttl_secs, 172_800);
         assert_eq!(cr.peer_relay_requests_per_minute, 2_400);
         assert_eq!(cr.peer_relay_authenticated_requests_per_minute, 480);
+        assert_eq!(cr.blind_route_replay_max_bytes_total, 268_435_456);
+        assert_eq!(cr.blind_route_wal_backlog_max_bytes, 33_554_432);
         assert_eq!(cr.custody_backup_retention_target_artifacts, 4);
         assert_eq!(cr.custody_backup_retention_target_bytes, 4_294_967_296);
         assert_eq!(cr.custody_backup_partial_grace_secs, 172_800);
@@ -1037,6 +1128,14 @@ peer_relay_requests_per_minute = 1200
         assert_eq!(
             cr.peer_relay_authenticated_requests_per_minute,
             DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE
+        );
+        assert_eq!(
+            cr.blind_route_replay_max_bytes_total,
+            DEFAULT_BLIND_ROUTE_REPLAY_MAX_BYTES_TOTAL
+        );
+        assert_eq!(
+            cr.blind_route_wal_backlog_max_bytes,
+            DEFAULT_BLIND_ROUTE_WAL_BACKLOG_MAX_BYTES
         );
         assert_eq!(
             cr.custody_backup_retention_target_artifacts,

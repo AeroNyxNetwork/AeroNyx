@@ -1,9 +1,11 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.82.0-BlindRouteResponseSchemaV4
+// Version: 3.83.0-BlindRouteResourceSchemaV5
 //
 // Modification Reason:
+//   [CHAT-RELAY-RESOURCE-BOUND 2026-08-31 by Codex] Version the crash-safe
+//   logical-byte activation marker while preserving v1-v4 rollback semantics.
 //   [BLIND-ROUTE-RESPONSE-SCHEMA-V4 2026-08-31 by Codex] Version the atomic
 //   SQLite CHECK rebuild that binds durable ciphertext to the crypto ceiling.
 //   [CHAT-PENDING-CURSOR-SEAM-DOMAIN 2026-08-28 by Codex] Moved the test-only
@@ -460,6 +462,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.83.0-BlindRouteResourceSchemaV5 - Versioned live resource activation
 //   v3.82.0-BlindRouteResponseSchemaV4 - Versioned the bounded CHECK rebuild
 //   v3.81.0-PendingCursorTestSeam - Co-located test-only cursor decoding
 //   v3.80.0-BackupSupportBoundary - Extracted private backup support methods
@@ -676,7 +679,10 @@ const VERIFIED_SUBMIT_RESPONSE_TTL_SECS: u64 = TIMESTAMP_WINDOW_SECS * 2 + 1;
 pub(crate) const BLIND_RELAY_ROUTE_REPLAY_CAPACITY: usize = 8192;
 /// Route evidence outlives the signed envelope acceptance window by one second.
 pub(crate) const BLIND_RELAY_ROUTE_REPLAY_TTL_SECS: u64 = 10 * 60;
-const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION: i64 = 4;
+// [CHAT-RELAY-RESOURCE-BOUND 2026-08-31 by Codex] V5 activates the logical
+// opaque-byte budget without changing v4 BLOB encoding or response CHECKs.
+const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION: i64 = 5;
+const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V4_VERSION: i64 = 4;
 const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION: i64 = 3;
 const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION: i64 = 2;
 const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION: i64 = 1;

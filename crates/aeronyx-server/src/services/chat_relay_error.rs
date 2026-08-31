@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_error.rs
 // ============================================
-// Version: 1.0.0-RelayErrorDomain
+// Version: 1.1.0-BlindRouteResourceBound
 //
 // Creation Reason:
 //   [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Extract the stable,
@@ -12,6 +12,7 @@
 //   - Defines every public chat relay failure as a closed enum.
 //   - Preserves stable aggregate-only reason buckets for diagnostics.
 //   - Classifies capacity failures that require cleanup or operator action.
+//   - Classifies recoverable WAL backlog without exposing retained identities.
 //   - Exposes the shared `ChatRelayResult<T>` alias.
 //
 // Dependencies:
@@ -31,6 +32,7 @@
 //   - Keep this module free of storage, network, clock, and process side effects.
 //
 // Last Modified:
+//   v1.1.0-BlindRouteResourceBound - Added recoverable WAL admission failure
 //   v1.0.0-RelayErrorDomain - Initial typed error extraction
 // ============================================
 
@@ -93,6 +95,20 @@ pub enum ChatRelayError {
     /// The node could not protect or recover one private blind-route replay row.
     #[error("Unable to protect blind relay replay response")]
     BlindRelayReplayProtectionFailed,
+
+    /// A pinned reader or stalled checkpoint retained too much blind-route WAL.
+    ///
+    /// [CHAT-RELAY-RESOURCE-BOUND 2026-08-31 by Codex] This is a logical
+    /// checkpoint-backlog admission error, not a filesystem quota assertion.
+    /// It contains aggregate byte counts only and is recoverable after readers
+    /// release and checkpoint progress resumes.
+    #[error("Blind relay WAL backlog: {current_bytes} bytes (limit {limit_bytes})")]
+    BlindRelayWalBacklog {
+        /// Projected aggregate backlog including one write's safe headroom.
+        current_bytes: u64,
+        /// Configured write-admission boundary.
+        limit_bytes: u64,
+    },
 
     /// The durable monotonic queue sequence reached `SQLite INTEGER` capacity.
     #[error("Durable relay queue sequence exhausted")]
@@ -208,6 +224,7 @@ impl ChatRelayError {
             Self::PullCursorEncryptionFailed => "pull_cursor_encryption_failed",
             Self::VerifiedSubmitProtectionFailed => "verified_submit_protection_failed",
             Self::BlindRelayReplayProtectionFailed => "blind_relay_replay_protection_failed",
+            Self::BlindRelayWalBacklog { .. } => "blind_relay_wal_backlog",
             Self::QueueSequenceExhausted => "queue_sequence_exhausted",
             Self::MessageTooLarge { .. } => "message_too_large",
             Self::MailboxFull { .. } => "mailbox_full",
@@ -234,6 +251,12 @@ impl ChatRelayError {
                 | Self::PendingBlobStoreFull { .. }
                 | Self::PendingBlobBytesExceeded { .. }
         )
+    }
+
+    /// Whether an external reader releasing its snapshot can make retry safe.
+    #[must_use]
+    pub const fn is_recoverable_resource_backlog(&self) -> bool {
+        matches!(self, Self::BlindRelayWalBacklog { .. })
     }
 }
 
@@ -304,6 +327,14 @@ mod tests {
             (
                 ChatRelayError::BlindRelayReplayProtectionFailed,
                 "blind_relay_replay_protection_failed",
+                false,
+            ),
+            (
+                ChatRelayError::BlindRelayWalBacklog {
+                    current_bytes: 2,
+                    limit_bytes: 1,
+                },
+                "blind_relay_wal_backlog",
                 false,
             ),
             (
@@ -403,6 +434,10 @@ mod tests {
         for (error, expected_bucket, expected_capacity) in cases {
             assert_eq!(error.reason_bucket(), expected_bucket);
             assert_eq!(error.is_capacity_exhausted(), expected_capacity);
+            assert_eq!(
+                error.is_recoverable_resource_backlog(),
+                matches!(error, ChatRelayError::BlindRelayWalBacklog { .. })
+            );
         }
     }
 }

@@ -1,13 +1,15 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_tests.rs
 // ============================================
-// Version: 1.5.0-BlindRouteResponseSchemaV4
+// Version: 1.6.0-BlindRouteResourceSchemaV5
 //
 // Creation Reason:
 //   [CHAT-RELAY-TEST-MODULE-SPLIT 2026-08-27 by Codex] Move the complete
 //   `chat_relay` in-crate test module out of the production implementation.
 //
 // Modification Reason:
+//   [CHAT-RELAY-RESOURCE-BOUND 2026-08-31 by Codex] Pins logical-byte,
+//   concurrent, restart-safe v5, TTL, and pinned-reader WAL recovery behavior.
 //   [BLIND-ROUTE-RESPONSE-SCHEMA-V4 2026-08-31 by Codex] Pins shared-ceiling
 //   DDL, byte-preserving v3 migration, rollback, retry, and writer locking.
 //   [CHAT-RELAY-TEST-IMPORTS 2026-08-31 by Codex] Imports the cursor value and
@@ -43,6 +45,7 @@
 //   - New relay tests belong here or in a focused extracted domain module.
 //
 // Last Modified:
+//   v1.6.0-BlindRouteResourceSchemaV5 - Covered byte and WAL admission
 //   v1.5.0-BlindRouteResponseSchemaV4 - Covered bounded atomic CHECK migration
 //   v1.4.0-ExplicitExtractedDomainDependencies - Restored test compilation
 //   v1.3.0-ExplicitTransactionDependency - Removed parent-import coupling
@@ -104,11 +107,22 @@ fn make_service_with_config(config: ChatRelayConfig) -> ChatRelayService {
 }
 
 fn test_replay_schema_migrator(blind_route_capacity: usize) -> SqliteChatRelayReplaySchemaMigrator {
+    test_replay_schema_migrator_with_budget(
+        blind_route_capacity,
+        ChatRelayConfig::default().blind_route_replay_max_bytes_total,
+    )
+}
+
+fn test_replay_schema_migrator_with_budget(
+    blind_route_capacity: usize,
+    blind_route_live_opaque_bytes: u64,
+) -> SqliteChatRelayReplaySchemaMigrator {
     SqliteChatRelayReplaySchemaMigrator::new(ReplaySchemaContract::new(
         ReplaySchemaVersion::new(
             VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
             VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION,
             VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION,
+            VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
             VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
             VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
         ),
@@ -117,12 +131,14 @@ fn test_replay_schema_migrator(blind_route_capacity: usize) -> SqliteChatRelayRe
             BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION,
             BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION,
             BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION,
+            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V4_VERSION,
             BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION,
         ),
         VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
         BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
         REPLAY_PROCESS_EPOCH_BYTES,
         blind_route_capacity,
+        blind_route_live_opaque_bytes,
     ))
 }
 
@@ -3036,7 +3052,7 @@ fn blind_route_release_only_removes_owned_unarmed_claim() {
 }
 
 #[test]
-fn blind_route_schema_v4_fresh_check_uses_shared_crypto_ceiling() {
+fn blind_route_schema_v5_fresh_check_uses_shared_crypto_ceiling() {
     // [BLIND-ROUTE-RESPONSE-SCHEMA-V4 2026-08-31 by Codex] Prove the active
     // SQLite CHECK accepts the shared maximum and rejects the next byte and
     // non-BLOB storage without duplicating the ceiling in this fixture.
@@ -3346,16 +3362,17 @@ fn blind_route_schema_v4_unknown_version_and_candidate_fail_closed() {
 }
 
 #[test]
-fn blind_route_schema_v3_binary_contract_rejects_committed_v4() {
-    // [BLIND-ROUTE-RESPONSE-SCHEMA-V4 2026-08-31 by Codex] A downgraded
-    // binary must not reinterpret the widened CHECK as v3.
+fn blind_route_schema_v4_binary_contract_rejects_committed_v5() {
+    // [CHAT-RELAY-RESOURCE-BOUND 2026-08-31 by Codex] A rolled-back v4 binary
+    // fails closed on committed v5 instead of running without byte admission.
     let service = make_service();
     let mut connection = service.conn.lock();
-    let v3_migrator = SqliteChatRelayReplaySchemaMigrator::new(ReplaySchemaContract::new(
+    let v4_migrator = SqliteChatRelayReplaySchemaMigrator::new(ReplaySchemaContract::new(
         ReplaySchemaVersion::new(
             VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
             VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION,
             VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION,
+            VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
             VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
             VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
         ),
@@ -3364,15 +3381,17 @@ fn blind_route_schema_v3_binary_contract_rejects_committed_v4() {
             BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION,
             BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION,
             BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION,
-            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V3_VERSION,
+            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V4_VERSION,
+            BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V4_VERSION,
         ),
         VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
         BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
         REPLAY_PROCESS_EPOCH_BYTES,
         BLIND_RELAY_ROUTE_REPLAY_CAPACITY,
+        ChatRelayConfig::default().blind_route_replay_max_bytes_total,
     ));
     assert!(matches!(
-        v3_migrator.migrate_blind_route(&mut connection, now_secs()),
+        v4_migrator.migrate_blind_route(&mut connection, now_secs()),
         Err(ChatRelayError::CorruptStoredData {
             field: "blind_relay_route_replay_installation_version"
         })
@@ -3436,26 +3455,196 @@ fn blind_route_schema_v3_polluted_row_rolls_back_without_candidate() {
 }
 
 #[test]
-fn blind_route_schema_v4_capacity_is_checked_before_activation() {
+fn blind_route_schema_v5_capacity_is_checked_after_ttl_cleanup() {
     let service = make_service();
     let mut connection = service.conn.lock();
+    let active_at = i64::try_from(now_secs()).expect("test time fits SQLite");
     connection
-        .execute_batch(
+        .execute(
             "INSERT INTO relay_blind_route_responses VALUES (
-                zeroblob(32), zeroblob(32), zeroblob(24), zeroblob(17), 1
-             );
-             INSERT INTO relay_blind_route_responses VALUES (
-                CAST('11111111111111111111111111111111' AS BLOB),
-                zeroblob(32), zeroblob(24), zeroblob(17), 1
-             );",
+                zeroblob(32), zeroblob(32), zeroblob(24), zeroblob(17), ?1
+             )",
+            params![active_at],
         )
-        .expect("seed responses above test capacity");
+        .expect("seed first response above test capacity");
+    connection
+        .execute(
+            "INSERT INTO relay_blind_route_responses VALUES (
+                CAST('11111111111111111111111111111111' AS BLOB),
+                zeroblob(32), zeroblob(24), zeroblob(17), ?1
+             )",
+            params![active_at],
+        )
+        .expect("seed second response above test capacity");
     assert!(matches!(
         test_replay_schema_migrator(1).migrate_blind_route(&mut connection, now_secs()),
         Err(ChatRelayError::CorruptStoredData {
             field: "blind_relay_route_replay_capacity"
         })
     ));
+}
+
+#[test]
+fn blind_route_schema_v4_to_v5_is_byte_preserving_idempotent_and_keeps_lease() {
+    // [CHAT-RELAY-RESOURCE-BOUND 2026-08-31 by Codex] V4 already owns the
+    // shared crypto CHECK, so v5 advances only the marker after resource
+    // validation and must not rewrite BLOBs or lease timestamps.
+    let db_path = unique_test_db_path("blind-route-v4-resource-migration");
+    let mut config = test_config();
+    config.db_path = db_path.to_string_lossy().into_owned();
+    let secret = [0xD4; 32];
+    let response_key = [0x41_u8; 32];
+    let response_fingerprint = [0x42_u8; 32];
+    let response_nonce = vec![0x43_u8; BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES];
+    let response_ciphertext = vec![0x44_u8; 4_096];
+    let reservation_key = [0x45_u8; 32];
+    let reservation_fingerprint = [0x46_u8; 32];
+    let owner_epoch = vec![0x47_u8; REPLAY_PROCESS_EPOCH_BYTES];
+    let reserved_at = i64::try_from(now_secs().saturating_sub(10)).expect("test time fits SQLite");
+    let owner_acquired_at = reserved_at + 1;
+    let effect_started_at = reserved_at + 2;
+    {
+        let service = ChatRelayService::new(config.clone(), secret)
+            .expect("install v5 resource migration fixture");
+        let connection = service.conn.lock();
+        connection
+            .execute(
+                "INSERT INTO relay_blind_route_responses VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    response_key.as_slice(),
+                    response_fingerprint.as_slice(),
+                    response_nonce.as_slice(),
+                    response_ciphertext.as_slice(),
+                    reserved_at,
+                ],
+            )
+            .expect("seed v4 response bytes");
+        connection
+            .execute(
+                "INSERT INTO relay_blind_route_reservations VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    reservation_key.as_slice(),
+                    reservation_fingerprint.as_slice(),
+                    reserved_at,
+                    owner_epoch.as_slice(),
+                    owner_acquired_at,
+                    effect_started_at,
+                ],
+            )
+            .expect("seed v4 owner lease");
+        connection
+            .execute(
+                "UPDATE relay_schema_features SET schema_version = ?1 WHERE feature = ?2",
+                params![
+                    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V4_VERSION,
+                    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
+                ],
+            )
+            .expect("mark fixture as committed v4");
+    }
+
+    for attempt in 0..2 {
+        let service = ChatRelayService::new(config.clone(), secret)
+            .unwrap_or_else(|error| panic!("v5 migration attempt {attempt} failed: {error}"));
+        let (version, stored_nonce, stored_ciphertext, stored_reserved, stored_acquired, stored_effect) =
+            service
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT
+                        (SELECT schema_version FROM relay_schema_features WHERE feature = ?1),
+                        (SELECT response_nonce FROM relay_blind_route_responses WHERE cache_key = ?2),
+                        (SELECT response_ciphertext FROM relay_blind_route_responses WHERE cache_key = ?2),
+                        reserved_at, owner_acquired_at, effect_started_at
+                     FROM relay_blind_route_reservations WHERE cache_key = ?3",
+                    params![
+                        BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
+                        response_key.as_slice(),
+                        reservation_key.as_slice(),
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, Option<i64>>(5)?,
+                        ))
+                    },
+                )
+                .expect("inspect v5 byte-preserving migration");
+        assert_eq!(version, BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION);
+        assert_eq!(stored_nonce, response_nonce);
+        assert_eq!(stored_ciphertext, response_ciphertext);
+        assert_eq!(stored_reserved, reserved_at);
+        assert_eq!(stored_acquired, owner_acquired_at);
+        assert_eq!(stored_effect, Some(effect_started_at));
+        drop(service);
+    }
+    remove_test_database(&db_path);
+}
+
+#[test]
+fn blind_route_schema_v5_rejects_live_bytes_but_prunes_expired_bytes() {
+    let service = make_service();
+    let mut connection = service.conn.lock();
+    let now = now_secs();
+    let active_at = i64::try_from(now).expect("active test time fits SQLite");
+    let expired_at = i64::try_from(now.saturating_sub(BLIND_RELAY_ROUTE_REPLAY_TTL_SECS + 1))
+        .expect("expired test time fits SQLite");
+    let max_bytes = i64::try_from(MAX_PROTECTED_BLIND_ROUTE_RESPONSE_BYTES)
+        .expect("max protected bytes fit SQLite");
+    connection
+        .execute(
+            "INSERT INTO relay_blind_route_responses VALUES (
+                zeroblob(32), zeroblob(32), zeroblob(24), zeroblob(?1), ?2
+             )",
+            params![max_bytes, active_at],
+        )
+        .expect("seed maximum active response");
+    connection
+        .execute(
+            "INSERT INTO relay_blind_route_responses VALUES (
+                CAST('22222222222222222222222222222222' AS BLOB),
+                zeroblob(32), zeroblob(24), zeroblob(17), ?1
+             )",
+            params![active_at],
+        )
+        .expect("seed active byte overflow");
+    let one_max_response = 32_u64
+        + 32
+        + u64::try_from(BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES).expect("nonce size fits")
+        + u64::try_from(MAX_PROTECTED_BLIND_ROUTE_RESPONSE_BYTES).expect("ciphertext size fits");
+    assert!(matches!(
+        test_replay_schema_migrator_with_budget(
+            BLIND_RELAY_ROUTE_REPLAY_CAPACITY,
+            one_max_response
+        )
+        .migrate_blind_route(&mut connection, now),
+        Err(ChatRelayError::CorruptStoredData {
+            field: "blind_relay_route_replay_byte_capacity"
+        })
+    ));
+    connection
+        .execute(
+            "UPDATE relay_blind_route_responses SET completed_at = ?1",
+            params![expired_at],
+        )
+        .expect("expire over-budget responses");
+    test_replay_schema_migrator_with_budget(BLIND_RELAY_ROUTE_REPLAY_CAPACITY, one_max_response)
+        .migrate_blind_route(&mut connection, now)
+        .expect("TTL cleanup restores byte capacity");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_blind_route_responses",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count pruned response bytes"),
+        0
+    );
 }
 
 #[test]

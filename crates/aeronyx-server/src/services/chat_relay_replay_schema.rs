@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_replay_schema.rs
 // ============================================
-// Version: 1.1.0-BlindRouteResponseSchemaV4
+// Version: 1.2.0-BlindRouteResourceSchemaV5
 //
 // Creation Reason:
 //   [CHAT-RELAY-REPLAY-SCHEMA-DOMAIN 2026-08-27 by Codex] Extract the
@@ -16,6 +16,7 @@
 //   - Validates installation markers, required columns, and every stored row.
 //   - Applies bounded startup retention only after migration validation.
 //   - Rebuilds the blind-route response table against the shared crypto bound.
+//   - Activates a logical opaque-byte budget only after bounded TTL cleanup.
 //
 // Dependencies:
 //   - `chat_relay.rs` supplies stable schema versions and retention policy.
@@ -27,7 +28,7 @@
 //   2. Open one immediate transaction and install the current table shape.
 //   3. Validate the durable feature marker before adding legacy columns.
 //   4. Normalize old owner/effect state and validate all retained rows.
-//   5. Advance the feature marker, prune expired evidence, and commit.
+//   5. Prune expired evidence, validate capacity, advance marker, and commit.
 //
 // Important Note for Next Developer:
 //   - An installed marker with missing durable state is corruption, not setup.
@@ -38,6 +39,7 @@
 //   - Never duplicate the protected blind-route ciphertext ceiling in SQL.
 //
 // Last Modified:
+//   v1.2.0-BlindRouteResourceSchemaV5 - Added crash-safe live-byte activation
 //   v1.1.0-BlindRouteResponseSchemaV4 - Atomically rebuilt the response CHECK
 //   v1.0.0-ReplaySchemaMigrationDomain - Initial composed SQLite migrator
 // ============================================
@@ -45,6 +47,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::chat_relay_blind_route::MAX_PROTECTED_BLIND_ROUTE_RESPONSE_BYTES;
+use super::chat_relay_blind_route_store::MAX_DURABLE_RESPONSE_OPAQUE_BYTES;
 use super::chat_relay_error::{ChatRelayError, ChatRelayResult};
 
 const LEGACY_BLIND_ROUTE_RESPONSE_CIPHERTEXT_BYTES: usize = 2064;
@@ -57,6 +60,7 @@ pub(crate) struct ReplaySchemaVersion {
     feature: &'static str,
     legacy: i64,
     intermediate: i64,
+    penultimate: i64,
     previous: i64,
     current: i64,
 }
@@ -66,6 +70,7 @@ impl ReplaySchemaVersion {
         feature: &'static str,
         legacy: i64,
         intermediate: i64,
+        penultimate: i64,
         previous: i64,
         current: i64,
     ) -> Self {
@@ -73,6 +78,7 @@ impl ReplaySchemaVersion {
             feature,
             legacy,
             intermediate,
+            penultimate,
             previous,
             current,
         }
@@ -81,6 +87,7 @@ impl ReplaySchemaVersion {
     fn accepts(self, installed: i64) -> bool {
         installed == self.legacy
             || installed == self.intermediate
+            || installed == self.penultimate
             || installed == self.previous
             || installed == self.current
     }
@@ -90,7 +97,13 @@ impl ReplaySchemaVersion {
     }
 
     fn requires_current_reservation_columns(self, installed: Option<i64>) -> bool {
-        installed.is_some_and(|version| version == self.previous || version == self.current)
+        installed.is_some_and(|version| {
+            version == self.penultimate || version == self.previous || version == self.current
+        })
+    }
+
+    fn uses_current_blind_response_shape(self, installed: Option<i64>) -> bool {
+        installed.is_none_or(|version| version == self.previous || version == self.current)
     }
 }
 
@@ -103,6 +116,7 @@ pub(crate) struct ReplaySchemaContract {
     blind_route_ttl_secs: u64,
     owner_epoch_bytes: usize,
     blind_route_capacity: usize,
+    blind_route_live_opaque_bytes: u64,
 }
 
 impl ReplaySchemaContract {
@@ -113,6 +127,7 @@ impl ReplaySchemaContract {
         blind_route_ttl_secs: u64,
         owner_epoch_bytes: usize,
         blind_route_capacity: usize,
+        blind_route_live_opaque_bytes: u64,
     ) -> Self {
         Self {
             verified_submit,
@@ -121,6 +136,7 @@ impl ReplaySchemaContract {
             blind_route_ttl_secs,
             owner_epoch_bytes,
             blind_route_capacity,
+            blind_route_live_opaque_bytes,
         }
     }
 }
@@ -405,13 +421,12 @@ impl SqliteChatRelayReplaySchemaMigrator {
             )?;
         }
 
-        let accepted_ciphertext_bytes = if installed_version == Some(schema.current)
-            || (!response_table_existed && installed_version.is_none())
-        {
-            MAX_PROTECTED_BLIND_ROUTE_RESPONSE_BYTES
-        } else {
-            LEGACY_BLIND_ROUTE_RESPONSE_CIPHERTEXT_BYTES
-        };
+        let accepted_ciphertext_bytes =
+            if schema.uses_current_blind_response_shape(installed_version) {
+                MAX_PROTECTED_BLIND_ROUTE_RESPONSE_BYTES
+            } else {
+                LEGACY_BLIND_ROUTE_RESPONSE_CIPHERTEXT_BYTES
+            };
         let invalid_responses = tx.query_row(
             "SELECT COUNT(*) FROM relay_blind_route_responses
              WHERE TYPEOF(cache_key) != 'blob'
@@ -452,10 +467,30 @@ impl SqliteChatRelayReplaySchemaMigrator {
                 field: "blind_relay_route_replay_row_shape",
             });
         }
-        let response_count = tx.query_row(
-            "SELECT COUNT(*) FROM relay_blind_route_responses",
+        // [CHAT-RELAY-RESOURCE-BOUND 2026-08-31 by Codex] Remove only rows
+        // already outside the immutable TTL before activating v5 capacity.
+        // Shape/version validation above still fails closed on corrupt rows;
+        // cleanup never extends reservation or owner lease timestamps.
+        let cutoff = sqlite_integer(
+            now.saturating_sub(self.contract.blind_route_ttl_secs),
+            "blind_relay_route_replay_startup_cutoff",
+        )?;
+        tx.execute(
+            "DELETE FROM relay_blind_route_responses WHERE completed_at < ?1",
+            params![cutoff],
+        )?;
+        tx.execute(
+            "DELETE FROM relay_blind_route_reservations WHERE reserved_at < ?1",
+            params![cutoff],
+        )?;
+
+        let (response_count, response_bytes) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(
+                LENGTH(cache_key) + LENGTH(request_fingerprint)
+                + LENGTH(response_nonce) + LENGTH(response_ciphertext)
+             ), 0) FROM relay_blind_route_responses",
             [],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )?;
         let reservation_count = tx.query_row(
             "SELECT COUNT(*) FROM relay_blind_route_reservations",
@@ -468,6 +503,7 @@ impl SqliteChatRelayReplaySchemaMigrator {
             },
         )?;
         if response_count < 0
+            || response_bytes < 0
             || reservation_count < 0
             || retained_count > sqlite_integer_from_usize(self.contract.blind_route_capacity)
         {
@@ -475,8 +511,25 @@ impl SqliteChatRelayReplaySchemaMigrator {
                 field: "blind_relay_route_replay_capacity",
             });
         }
+        let reservation_bytes = u64::try_from(reservation_count)
+            .ok()
+            .and_then(|count| count.checked_mul(MAX_DURABLE_RESPONSE_OPAQUE_BYTES))
+            .ok_or(ChatRelayError::CorruptStoredData {
+                field: "blind_relay_route_replay_reservation_bytes",
+            })?;
+        let retained_opaque_bytes = u64::try_from(response_bytes)
+            .ok()
+            .and_then(|bytes| bytes.checked_add(reservation_bytes))
+            .ok_or(ChatRelayError::CorruptStoredData {
+                field: "blind_relay_route_replay_live_bytes",
+            })?;
+        if retained_opaque_bytes > self.contract.blind_route_live_opaque_bytes {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "blind_relay_route_replay_byte_capacity",
+            });
+        }
 
-        if response_table_existed && installed_version != Some(schema.current) {
+        if response_table_existed && !schema.uses_current_blind_response_shape(installed_version) {
             create_blind_route_response_table(
                 &tx,
                 BlindRouteResponseTable::MigrationCandidate,
@@ -521,18 +574,6 @@ impl SqliteChatRelayReplaySchemaMigrator {
             "blind_relay_route_replay_schema_installed_at",
             "blind_relay_route_replay_installation_marker",
             "blind_relay_route_replay_migration_marker",
-        )?;
-        let cutoff = sqlite_integer(
-            now.saturating_sub(self.contract.blind_route_ttl_secs),
-            "blind_relay_route_replay_startup_cutoff",
-        )?;
-        tx.execute(
-            "DELETE FROM relay_blind_route_responses WHERE completed_at < ?1",
-            params![cutoff],
-        )?;
-        tx.execute(
-            "DELETE FROM relay_blind_route_reservations WHERE reserved_at < ?1",
-            params![cutoff],
         )?;
         tx.commit()?;
         Ok(())

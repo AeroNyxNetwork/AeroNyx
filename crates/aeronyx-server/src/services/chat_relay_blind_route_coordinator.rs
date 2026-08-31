@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_blind_route_coordinator.rs
 // ============================================
-// Version: 1.0.0-BlindRouteCoordinator
+// Version: 1.1.0-ResourceBound
 //
 // Creation Reason:
 //   [BLIND-ROUTE-COORDINATOR-DOMAIN 2026-08-28 by Codex] Compose private
@@ -15,6 +15,7 @@
 //   - Releases only the current process's claim when no effect was armed.
 //   - Protects and atomically persists an exact opaque response for retries.
 //   - Authenticates completed responses recovered after process restart.
+//   - Composes typed live-byte and recoverable WAL-backlog budgets.
 //
 // Dependencies:
 //   - `chat_relay_blind_route.rs` owns private identity and response AEAD.
@@ -37,6 +38,7 @@
 //   - Recovery telemetry remains service-owned and aggregate-only.
 //
 // Last Modified:
+//   v1.1.0-ResourceBound - Composed durable resource admission budgets
 //   v1.0.0-BlindRouteCoordinator - Initial use-case composition
 // ============================================
 
@@ -45,7 +47,8 @@ use rusqlite::Connection;
 
 use super::chat_relay_blind_route::{BlindRelayRouteAdmission, BlindRouteReplay};
 use super::chat_relay_blind_route_store::{
-    BlindRouteDurableRepository, DurableBlindRouteAdmission, SqliteBlindRouteDurableStore,
+    BlindRouteDurableRepository, BlindRouteResourceBudget, DurableBlindRouteAdmission,
+    SqliteBlindRouteDurableStore,
 };
 use super::chat_relay_error::ChatRelayResult;
 
@@ -62,13 +65,21 @@ impl BlindRouteCoordinator {
         replay_ttl_secs: u64,
         capacity: usize,
         owner_takeover_grace_secs: u64,
+        live_opaque_bytes: u64,
+        wal_backlog_bytes: u64,
+        enforce_wal_guard: bool,
     ) -> ChatRelayResult<Self> {
+        // [CHAT-RELAY-RESOURCE-BOUND 2026-08-31 by Codex] Validate the exact
+        // cryptographic row budget once at domain composition.
+        let resource_budget = BlindRouteResourceBudget::new(live_opaque_bytes, wal_backlog_bytes)?;
         Ok(Self {
             replay: BlindRouteReplay::new(node_secret)?,
             store: SqliteBlindRouteDurableStore::new(
                 replay_ttl_secs,
                 capacity,
                 owner_takeover_grace_secs,
+                resource_budget,
+                enforce_wal_guard,
             ),
         })
     }
