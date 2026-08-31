@@ -669,8 +669,16 @@ const MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS: usize = 64;
 /// occupying Tokio workers or creating an unbounded blocking-task backlog.
 const MAX_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT: usize = 8;
 
-/// Process-wide admission for CPU-bound blind-relay cryptography.
+/// Process-wide total admission for CPU-bound blind-relay cryptography.
 static BLIND_RELAY_CRYPTO_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Ingress-only sub-quota within the process-wide blind-relay CPU budget.
+///
+/// [BLIND-RELAY-CPU-RESERVATION 2026-08-31 by Codex] Public ingress must not
+/// consume every total permit on multi-worker hosts. Outbound route creation
+/// and post-effect receipt completion need one reserved progress edge so a
+/// saturated relay can still originate and conclusively finish blind work.
+static BLIND_RELAY_INGRESS_CRYPTO_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Hard ceiling for concurrent direct-relay CPU workers.
 ///
@@ -2634,15 +2642,78 @@ fn signature_verification_capacity(hard_cap: usize) -> usize {
         .min(hard_cap)
 }
 
+fn blind_relay_crypto_capacity() -> usize {
+    signature_verification_capacity(MAX_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT)
+}
+
+const fn blind_relay_ingress_crypto_capacity(total_capacity: usize) -> usize {
+    // A one-worker host cannot reserve a permit without disabling ingress.
+    // Multi-worker hosts retain one total permit outside the ingress quota.
+    total_capacity.saturating_sub(1).max(1)
+}
+
 fn blind_relay_crypto_admission() -> Arc<Semaphore> {
     Arc::clone(BLIND_RELAY_CRYPTO_ADMISSION.get_or_init(|| {
         // [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Reserve roughly
         // half the host for the rest of the node and reject excess work before
         // it enters Tokio's blocking queue.
-        Arc::new(Semaphore::new(signature_verification_capacity(
-            MAX_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT,
+        Arc::new(Semaphore::new(blind_relay_crypto_capacity()))
+    }))
+}
+
+fn blind_relay_ingress_crypto_admission() -> Arc<Semaphore> {
+    Arc::clone(BLIND_RELAY_INGRESS_CRYPTO_ADMISSION.get_or_init(|| {
+        Arc::new(Semaphore::new(blind_relay_ingress_crypto_capacity(
+            blind_relay_crypto_capacity(),
         )))
     }))
+}
+
+/// Owned admission for one blind-relay CPU operation.
+///
+/// Ingress work holds both fields. Reserved outbound/completion work holds
+/// only the total permit. Keeping ownership in the blocking worker prevents a
+/// cancelled async request from releasing either quota while CPU work remains.
+struct BlindRelayCryptoPermits {
+    _total: OwnedSemaphorePermit,
+    _ingress: Option<OwnedSemaphorePermit>,
+}
+
+impl BlindRelayCryptoPermits {
+    fn total_only(total: OwnedSemaphorePermit) -> Self {
+        Self {
+            _total: total,
+            _ingress: None,
+        }
+    }
+}
+
+fn try_acquire_blind_relay_ingress_crypto() -> Result<BlindRelayCryptoPermits, BlindRelayError> {
+    let ingress = blind_relay_ingress_crypto_admission()
+        .try_acquire_owned()
+        .map_err(|_| BlindRelayError::Backpressure)?;
+    let total = blind_relay_crypto_admission()
+        .try_acquire_owned()
+        .map_err(|_| BlindRelayError::Backpressure)?;
+    Ok(BlindRelayCryptoPermits {
+        _total: total,
+        _ingress: Some(ingress),
+    })
+}
+
+async fn acquire_blind_relay_ingress_crypto() -> Result<BlindRelayCryptoPermits, BlindRelayError> {
+    let ingress = blind_relay_ingress_crypto_admission()
+        .acquire_owned()
+        .await
+        .map_err(|_| BlindRelayError::Backpressure)?;
+    let total = blind_relay_crypto_admission()
+        .acquire_owned()
+        .await
+        .map_err(|_| BlindRelayError::Backpressure)?;
+    Ok(BlindRelayCryptoPermits {
+        _total: total,
+        _ingress: Some(ingress),
+    })
 }
 
 /// Executes one bounded blind-relay cryptographic operation off the async I/O
@@ -2652,31 +2723,28 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, BlindRelayError> + Send + 'static,
 {
-    let permit = blind_relay_crypto_admission()
-        .try_acquire_owned()
-        .map_err(|_| BlindRelayError::Backpressure)?;
-    execute_blind_relay_crypto(permit, work).await
+    let permits = try_acquire_blind_relay_ingress_crypto()?;
+    execute_blind_relay_crypto(permits, work).await
 }
 
 /// Completes pure cryptographic work after an external route effect is armed.
 ///
 /// Unlike preflight admission, this waits fairly for bounded CPU capacity so a
 /// successfully returned ACK is not discarded merely because new ingress
-/// verification arrived first. The outer HTTP in-flight gate bounds waiters.
+/// verification arrived first. Completion still consumes the ingress quota,
+/// preserving the outbound progress reservation. The outer HTTP in-flight
+/// gate bounds waiters.
 async fn complete_blind_relay_crypto<T, F>(work: F) -> Result<T, BlindRelayError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, BlindRelayError> + Send + 'static,
 {
-    let permit = blind_relay_crypto_admission()
-        .acquire_owned()
-        .await
-        .map_err(|_| BlindRelayError::Backpressure)?;
-    execute_blind_relay_crypto(permit, work).await
+    let permits = acquire_blind_relay_ingress_crypto().await?;
+    execute_blind_relay_crypto(permits, work).await
 }
 
 async fn execute_blind_relay_crypto<T, F>(
-    permit: OwnedSemaphorePermit,
+    permits: BlindRelayCryptoPermits,
     work: F,
 ) -> Result<T, BlindRelayError>
 where
@@ -2687,7 +2755,7 @@ where
         // [BLIND-RELAY-CRYPTO-DOMAIN 2026-08-30 by Codex] Keep the owned
         // permit in the worker after request cancellation. This helper must
         // never contain I/O or durable effects, so retries remain safe.
-        let _permit = permit;
+        let _permits = permits;
         work()
     })
     .await
@@ -2872,7 +2940,7 @@ where
         // [OUTBOUND-BLIND-REQUEST-PREPARATION 2026-08-31 by Codex] Keep the
         // permit in the worker after caller cancellation. The composed work
         // has no I/O or effects, so abandoning the result is always retry-safe.
-        let _permit = permit;
+        let _permits = BlindRelayCryptoPermits::total_only(permit);
         let (request, context) = build().map_err(BlindRelayRequestPreparationError::Build)?;
         let request = encode_prepared_peer_blind_relay_request(request)
             .map_err(BlindRelayRequestPreparationError::Local)?;
@@ -2922,7 +2990,7 @@ pub(crate) async fn verify_blind_relay_delivery_receipt(
     tokio::task::spawn_blocking(move || {
         // [OUTBOUND-BLIND-RECEIPT-VERIFICATION 2026-08-31 by Codex] Hold the
         // permit until signature verification really stops after cancellation.
-        let _permit = permit;
+        let _permits = BlindRelayCryptoPermits::total_only(permit);
         if blind_relay_delivery_receipt_is_valid(
             &receipt,
             &expected_route_id,
@@ -3033,8 +3101,8 @@ where
 async fn authenticate_peer_blind_relay_request(
     request: PeerBlindRelayRequest,
 ) -> Result<AuthenticatedPeerBlindRelayRequest, BlindRelayError> {
-    authenticate_peer_blind_relay_request_with_admission(blind_relay_crypto_admission(), request)
-        .await
+    let permits = try_acquire_blind_relay_ingress_crypto()?;
+    authenticate_peer_blind_relay_request_with_permits(permits, request).await
 }
 
 async fn authenticate_peer_blind_relay_request_with_admission(
@@ -3048,8 +3116,19 @@ async fn authenticate_peer_blind_relay_request_with_admission(
     let permit = admission
         .try_acquire_owned()
         .map_err(|_| BlindRelayError::Backpressure)?;
+    authenticate_peer_blind_relay_request_with_permits(
+        BlindRelayCryptoPermits::total_only(permit),
+        request,
+    )
+    .await
+}
+
+async fn authenticate_peer_blind_relay_request_with_permits(
+    permits: BlindRelayCryptoPermits,
+    request: PeerBlindRelayRequest,
+) -> Result<AuthenticatedPeerBlindRelayRequest, BlindRelayError> {
     match tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+        let _permits = permits;
         authenticate_blind_relay_envelope(&request.envelope, &request.previous_hop_node_id)?;
         if let Some(onward_envelope) = request.onward_envelope.as_ref() {
             // [SIGNED-ONWARD-ENVELOPE 2026-08-24 by Codex] The forwarding
