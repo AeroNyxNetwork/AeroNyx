@@ -42,7 +42,7 @@
 //!   synchronous and short. Do not hold its guard across an await.
 //! - assignment_gate serializes new-owner placement and config reload. This
 //!   prevents a reload from removing a volume after assign() selected it and
-//!   keeps max_users decisions consistent within this process.
+//!   keeps max_users/max_bytes decisions consistent within this process.
 //! - SystemDb.assign_volume() still uses INSERT OR IGNORE + AlreadyAssigned as
 //!   defense in depth against another process assigning the same owner.
 //! - reload_config(): path changes are intentionally ignored (the old
@@ -55,6 +55,7 @@
 //!   the explicit `spawn_blocking` boundary in `volume_stats()`.
 //!
 //! ## Last Modified
+//! v2.8.57-VolumeByteCapacity - Enforce managed-file bytes during placement.
 //! v2.8.56-VolumeUsageObservability - Report real managed-file volume usage.
 //! v2.8.55-VolumeRouterIntegrity - Made hot reload fail closed and recoverable.
 //! v2.7.14-RustdocQuality - Classified the volume lifecycle diagram as text.
@@ -407,9 +408,11 @@ impl VolumeRouter {
     /// ## Algorithm
     /// 1. Get per-volume user counts from SystemDb
     /// 2. Filter to ReadWrite volumes that haven't reached max_users
-    /// 3. Choose the volume with the fewest current users (load balance)
-    /// 4. Persist to SystemDb (INSERT OR IGNORE + AlreadyAssigned handling)
-    /// 5. Update in-memory cache
+    /// 3. Measure candidate managed-file usage on a blocking worker
+    /// 4. Filter candidates that haven't reached max_bytes
+    /// 5. Choose the remaining volume with the fewest current users
+    /// 6. Persist to SystemDb (INSERT OR IGNORE + AlreadyAssigned handling)
+    /// 7. Update in-memory cache
     ///
     /// ## TOCTOU Mitigation
     /// The count → assign window can have a race: two concurrent requests
@@ -423,10 +426,22 @@ impl VolumeRouter {
     /// This function must only be called after the owner has been
     /// authenticated. Never call with an unverified owner pubkey.
     pub async fn assign(&self, owner: &[u8; 32]) -> Result<String, VolumeRouterError> {
+        // [VOLUME-BYTE-CAPACITY 2026-08-31 by Codex] Existing owners retain
+        // their durable route even when every volume is now full or a capacity
+        // probe is unavailable. Capacity gates only new placement.
+        if let Some(existing) = self.route(owner) {
+            return Ok(existing);
+        }
+
         // [VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex] Hold one async control
         // gate across selection and persistence so reload cannot invalidate the
         // selected volume before the durable assignment commits.
         let _assignment_guard = self.assignment_gate.lock().await;
+        // A concurrent assign for this owner may have completed while this task
+        // waited for the placement gate. Do not probe or place it again.
+        if let Some(existing) = self.route(owner) {
+            return Ok(existing);
+        }
 
         // Get current per-volume user counts.
         let counts: std::collections::HashMap<String, usize> = self
@@ -436,20 +451,37 @@ impl VolumeRouter {
             .into_iter()
             .collect();
 
-        // Select the target volume under a read lock.
-        let target_id = {
+        // Clone only user-eligible candidates under the read lock. Filesystem
+        // probing happens after releasing the parking_lot guard.
+        let candidates: Vec<VolumeConfig> = {
             let vols = self.volumes.read();
-
             vols.iter()
                 .filter(|v| v.status == VolumeStatus::ReadWrite)
                 .filter(|v| {
                     let current = counts.get(&v.id).copied().unwrap_or(0);
                     current < v.max_users
                 })
-                .min_by_key(|v| counts.get(&v.id).copied().unwrap_or(0))
-                .map(|v| v.id.clone())
-                .ok_or(VolumeRouterError::NoWritableVolume)?
+                .cloned()
+                .collect()
         };
+        if candidates.is_empty() {
+            return Err(VolumeRouterError::NoWritableVolume);
+        }
+
+        let measured = self.measure_volume_usage(&candidates).await?;
+        // [VOLUME-BYTE-CAPACITY 2026-08-31 by Codex] Equal-to-limit is full;
+        // over-limit remains readable for existing owners but receives no new
+        // owner. A failed measurement returned above, never as a synthetic 0.
+        let target_id = candidates
+            .iter()
+            .zip(measured.iter())
+            .filter(|(volume, (measured_id, usage_bytes))| {
+                debug_assert_eq!(&volume.id, measured_id);
+                *usage_bytes < volume.max_bytes
+            })
+            .min_by_key(|(volume, _)| counts.get(&volume.id).copied().unwrap_or(0))
+            .map(|(volume, _)| volume.id.clone())
+            .ok_or(VolumeRouterError::NoWritableVolume)?;
 
         // Persist the assignment. Handle the race case gracefully.
         match self.system_db.assign_volume(owner, &target_id).await {
@@ -590,6 +622,37 @@ impl VolumeRouter {
     // Observability
     // ============================================
 
+    /// Measure managed-file usage for an owned volume snapshot.
+    ///
+    /// The returned vector preserves input order. Any single probe failure
+    /// fails the complete operation closed; callers never receive a fabricated
+    /// zero for an unavailable volume.
+    async fn measure_volume_usage(
+        &self,
+        volumes: &[VolumeConfig],
+    ) -> Result<Vec<(String, u64)>, VolumeRouterError> {
+        let probe = Arc::clone(&self.usage_probe);
+        let probe_inputs: Vec<(String, PathBuf)> = volumes
+            .iter()
+            .map(|volume| (volume.id.clone(), volume.path.clone()))
+            .collect();
+
+        // [VOLUME-BYTE-CAPACITY 2026-08-31 by Codex] This is the single async
+        // boundary for production usage probes. Both placement and Admin stats
+        // reuse it, keeping blocking filesystem work off Tokio workers.
+        tokio::task::spawn_blocking(move || {
+            probe_inputs
+                .into_iter()
+                .map(|(volume_id, path)| match probe.usage_bytes(&path) {
+                    Ok(usage) => Ok((volume_id, usage)),
+                    Err(source) => Err(VolumeRouterError::VolumeUsage { volume_id, source }),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        .map_err(|_| VolumeRouterError::VolumeUsageWorkerFailed)?
+    }
+
     /// Get per-volume statistics for the Admin API.
     pub async fn volume_stats(&self) -> Result<Vec<VolumeStats>, VolumeRouterError> {
         let counts: std::collections::HashMap<String, usize> = self
@@ -600,26 +663,7 @@ impl VolumeRouter {
             .collect();
 
         let volumes = self.volumes.read().clone();
-        let probe = Arc::clone(&self.usage_probe);
-        let probe_inputs: Vec<(String, PathBuf)> = volumes
-            .iter()
-            .map(|volume| (volume.id.clone(), volume.path.clone()))
-            .collect();
-
-        // [VOLUME-USAGE-OBSERVABILITY 2026-08-31 by Codex] Directory walking
-        // is blocking filesystem I/O. Move the complete scan off Tokio's async
-        // workers, with owned paths and no parking_lot guard crossing await.
-        let measured = tokio::task::spawn_blocking(move || {
-            probe_inputs
-                .into_iter()
-                .map(|(volume_id, path)| match probe.usage_bytes(&path) {
-                    Ok(usage) => Ok((volume_id, usage)),
-                    Err(source) => Err(VolumeRouterError::VolumeUsage { volume_id, source }),
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .await
-        .map_err(|_| VolumeRouterError::VolumeUsageWorkerFailed)??;
+        let measured = self.measure_volume_usage(&volumes).await?;
 
         let stats = volumes
             .into_iter()
@@ -827,6 +871,7 @@ fn checked_add_usage(
 mod tests {
     use super::*;
     use crate::services::memchain::system_db::SystemDb;
+    use std::collections::HashMap;
     use std::sync::mpsc;
     use tempfile::TempDir;
 
@@ -834,9 +879,20 @@ mod tests {
 
     /// Write a volumes.toml with one or two volumes.
     fn write_volumes_toml(dir: &Path, volumes: &[(&str, VolumeStatus)]) -> PathBuf {
+        let volumes_with_limits: Vec<(&str, VolumeStatus, usize, u64)> = volumes
+            .iter()
+            .map(|(id, status)| (*id, *status, default_max_users(), default_max_bytes()))
+            .collect();
+        write_volumes_toml_with_limits(dir, &volumes_with_limits)
+    }
+
+    fn write_volumes_toml_with_limits(
+        dir: &Path,
+        volumes: &[(&str, VolumeStatus, usize, u64)],
+    ) -> PathBuf {
         let config_path = dir.join("volumes.toml");
         let mut content = String::new();
-        for (id, status) in volumes {
+        for (id, status, max_users, max_bytes) in volumes {
             let vol_dir = dir.join("volumes").join(id);
             std::fs::create_dir_all(&vol_dir).unwrap();
             let status_str = match status {
@@ -845,10 +901,13 @@ mod tests {
                 VolumeStatus::Draining => "draining",
             };
             content.push_str(&format!(
-                "[[volumes]]\nid = \"{}\"\npath = \"{}\"\nstatus = \"{}\"\n\n",
+                "[[volumes]]\nid = \"{}\"\npath = \"{}\"\nstatus = \"{}\"\n\
+                 max_users = {}\nmax_bytes = {}\n\n",
                 id,
                 vol_dir.to_string_lossy().replace('\\', "/"),
-                status_str
+                status_str,
+                max_users,
+                max_bytes,
             ));
         }
         std::fs::write(&config_path, content).unwrap();
@@ -889,6 +948,41 @@ mod tests {
     struct ThreadReportingUsageProbe {
         sender: mpsc::Sender<std::thread::ThreadId>,
         usage: u64,
+    }
+
+    struct NamedUsageProbe {
+        usage_by_volume: HashMap<String, u64>,
+    }
+
+    impl NamedUsageProbe {
+        fn new(usages: &[(&str, u64)]) -> Self {
+            Self {
+                usage_by_volume: usages
+                    .iter()
+                    .map(|(volume_id, usage)| ((*volume_id).to_string(), *usage))
+                    .collect(),
+            }
+        }
+    }
+
+    impl VolumeUsageProbe for NamedUsageProbe {
+        fn usage_bytes(&self, volume_root: &Path) -> Result<u64, VolumeUsageProbeError> {
+            let volume_id = volume_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            self.usage_by_volume
+                .get(volume_id)
+                .copied()
+                .ok_or_else(|| VolumeUsageProbeError::Io {
+                    operation: "read injected volume usage",
+                    path: volume_root.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "missing injected volume usage",
+                    ),
+                })
+        }
     }
 
     impl VolumeUsageProbe for ThreadReportingUsageProbe {
@@ -1017,6 +1111,136 @@ mod tests {
 
         let err = router.assign(&make_owner(0xAA)).await.unwrap_err();
         assert!(matches!(err, VolumeRouterError::NoWritableVolume));
+    }
+
+    #[tokio::test]
+    async fn assign_rejects_volume_at_byte_capacity() {
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml_with_limits(
+            dir.path(),
+            &[("vol-001", VolumeStatus::ReadWrite, 10, 100)],
+        );
+        let router = VolumeRouter::new_with_usage_probe(
+            &config_path,
+            db,
+            Arc::new(NamedUsageProbe::new(&[("vol-001", 100)])),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            router.assign(&make_owner(0x31)).await,
+            Err(VolumeRouterError::NoWritableVolume)
+        ));
+    }
+
+    #[tokio::test]
+    async fn assign_rejects_volume_above_byte_capacity() {
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml_with_limits(
+            dir.path(),
+            &[("vol-001", VolumeStatus::ReadWrite, 10, 100)],
+        );
+        let router = VolumeRouter::new_with_usage_probe(
+            &config_path,
+            db,
+            Arc::new(NamedUsageProbe::new(&[("vol-001", 101)])),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            router.assign(&make_owner(0x32)).await,
+            Err(VolumeRouterError::NoWritableVolume)
+        ));
+    }
+
+    #[tokio::test]
+    async fn assign_accepts_volume_one_byte_below_capacity() {
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml_with_limits(
+            dir.path(),
+            &[("vol-001", VolumeStatus::ReadWrite, 10, 100)],
+        );
+        let router = VolumeRouter::new_with_usage_probe(
+            &config_path,
+            db,
+            Arc::new(NamedUsageProbe::new(&[("vol-001", 99)])),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(router.assign(&make_owner(0x33)).await.unwrap(), "vol-001");
+    }
+
+    #[tokio::test]
+    async fn assign_falls_back_to_volume_below_byte_capacity() {
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml_with_limits(
+            dir.path(),
+            &[
+                ("vol-001", VolumeStatus::ReadWrite, 10, 100),
+                ("vol-002", VolumeStatus::ReadWrite, 10, 100),
+            ],
+        );
+        let router = VolumeRouter::new_with_usage_probe(
+            &config_path,
+            db,
+            Arc::new(NamedUsageProbe::new(&[("vol-001", 100), ("vol-002", 20)])),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(router.assign(&make_owner(0x34)).await.unwrap(), "vol-002");
+    }
+
+    #[tokio::test]
+    async fn assign_probe_failure_is_typed_and_existing_route_is_unaffected() {
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml_with_limits(
+            dir.path(),
+            &[("vol-001", VolumeStatus::ReadWrite, 10, 100)],
+        );
+        let router =
+            VolumeRouter::new_with_usage_probe(&config_path, db, Arc::new(FailingUsageProbe))
+                .await
+                .unwrap();
+
+        assert!(matches!(
+            router.assign(&make_owner(0x35)).await,
+            Err(VolumeRouterError::VolumeUsage { volume_id, .. }) if volume_id == "vol-001"
+        ));
+
+        let existing = make_owner(0x36);
+        router.cache_assignment_for_test(existing, "vol-001");
+        assert_eq!(router.assign(&existing).await.unwrap(), "vol-001");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assign_runs_capacity_probe_on_blocking_worker() {
+        let async_thread = std::thread::current().id();
+        let (sender, receiver) = mpsc::channel();
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml_with_limits(
+            dir.path(),
+            &[("vol-001", VolumeStatus::ReadWrite, 10, 100)],
+        );
+        let router = VolumeRouter::new_with_usage_probe(
+            &config_path,
+            db,
+            Arc::new(ThreadReportingUsageProbe { sender, usage: 99 }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(router.assign(&make_owner(0x37)).await.unwrap(), "vol-001");
+        assert_ne!(receiver.recv().unwrap(), async_thread);
     }
 
     #[tokio::test]
