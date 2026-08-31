@@ -38,7 +38,9 @@
 //! - The process fence prevents concurrent writers, not privileged rollback.
 //! - Never return to path-based state I/O after the directory FD is pinned.
 //!
-//! Last Modified: v1.9.0-ValidatedTempOwnership - Required exact unfinished
+//! Last Modified: v1.10.0-TypedPublicationCleanup - Bound failed-publish
+//! cleanup to the pinned inode and the pre-rename publication phase.
+//! v1.9.0-ValidatedTempOwnership - Required exact unfinished
 //! regular-file ownership proof before cleanup may unlink its directory entry.
 //! v1.8.0-ValidatedFileIdentity - Required regular-file,
 //! effective-owner, and single-link proof before writable mode normalization.
@@ -178,36 +180,60 @@ impl PrivateAtomicRecoveryFile {
         bytes: &[u8],
         maximum_bytes: usize,
     ) -> Result<(), PrivateRecoveryIoError> {
+        let temp_name = self.unique_temp_name();
+        self.replace_with_temp_name_and_durability(
+            bytes,
+            maximum_bytes,
+            &temp_name,
+            &HostPublicationDirectoryDurability,
+        )
+    }
+
+    fn replace_with_temp_name_and_durability(
+        &self,
+        bytes: &[u8],
+        maximum_bytes: usize,
+        temp_name: &str,
+        durability: &impl PublicationDirectoryDurability,
+    ) -> Result<(), PrivateRecoveryIoError> {
         if bytes.is_empty() || bytes.len() > maximum_bytes {
             return Err(PrivateRecoveryIoError::TooLarge);
         }
+        if !is_owned_temp_file_name(temp_name.as_bytes()) {
+            return Err(PrivateRecoveryIoError::UnsafePath);
+        }
         validate_existing_state_at(&self.directory)?;
 
-        let temp_name = self.unique_temp_name();
+        let mut phase = PublicationPhase::TempNotCreated;
         let result = (|| {
-            let mut temporary =
-                open_private_regular_file_at(&self.directory, &temp_name, true, true, true)?;
-            temporary.write_all(bytes)?;
-            temporary.sync_all()?;
-            drop(temporary);
+            let temporary =
+                open_private_regular_file_at(&self.directory, temp_name, true, true, true)?;
+            phase = PublicationPhase::TempOpened(PinnedPublicationTemp::new(temporary)?);
+            {
+                let temporary = phase.opened_mut()?;
+                temporary.file.write_all(bytes)?;
+                temporary.file.sync_all()?;
+            }
             renameat(
                 Some(self.directory.as_raw_fd()),
-                temp_name.as_str(),
+                temp_name,
                 Some(self.directory.as_raw_fd()),
                 STATE_FILE_NAME,
             )
             .map_err(nix_filesystem_error)?;
-            self.directory.sync_all()?;
+            phase = PublicationPhase::Renamed;
+            durability.sync_after_rename(&self.directory)?;
             Ok(())
         })();
-        if result.is_err() {
-            let _ = unlinkat(
-                Some(self.directory.as_raw_fd()),
-                temp_name.as_str(),
-                UnlinkatFlags::NoRemoveDir,
-            );
+        if let Err(publication_error) = result {
+            // [BLIND-VAULT-RECOVERY-PUBLICATION-CLEANUP 2026-08-31 by Codex]
+            // The publication failure is authoritative. Cleanup ambiguity
+            // leaves its exact entry for the fenced restart cleanup rather
+            // than replacing the original error or unlinking unknown state.
+            let _cleanup_result = phase.cleanup_failed_publish(&self.directory, temp_name);
+            return Err(publication_error);
         }
-        result
+        Ok(())
     }
 
     /// Re-confirms the visible generation across an ambiguous prior result.
@@ -228,6 +254,111 @@ impl PrivateAtomicRecoveryFile {
         let mut random = [0u8; TEMP_FILE_RANDOM_BYTES];
         OsRng.fill_bytes(&mut random);
         format!("{TEMP_FILE_PREFIX}{}", hex::encode(random))
+    }
+}
+
+trait PublicationDirectoryDurability {
+    fn sync_after_rename(&self, directory: &File) -> std::io::Result<()>;
+}
+
+struct HostPublicationDirectoryDurability;
+
+impl PublicationDirectoryDurability for HostPublicationDirectoryDurability {
+    fn sync_after_rename(&self, directory: &File) -> std::io::Result<()> {
+        directory.sync_all()
+    }
+}
+
+/// The only three ownership states of one replacement attempt.
+///
+/// [BLIND-VAULT-RECOVERY-PUBLICATION-CLEANUP 2026-08-31 by Codex] A failed
+/// attempt can delete a name only while it retains the descriptor and identity
+/// acquired by its successful exclusive create. After rename, the old name is
+/// unowned even when the parent-directory durability result is ambiguous.
+enum PublicationPhase {
+    TempNotCreated,
+    TempOpened(PinnedPublicationTemp),
+    Renamed,
+}
+
+impl PublicationPhase {
+    fn opened_mut(&mut self) -> Result<&mut PinnedPublicationTemp, PrivateRecoveryIoError> {
+        match self {
+            Self::TempOpened(temporary) => Ok(temporary),
+            Self::TempNotCreated | Self::Renamed => Err(PrivateRecoveryIoError::UnsafePath),
+        }
+    }
+
+    fn cleanup_failed_publish(
+        self,
+        directory: &File,
+        temp_name: &str,
+    ) -> Result<(), PrivateRecoveryIoError> {
+        let Self::TempOpened(temporary) = self else {
+            return Ok(());
+        };
+        temporary.identity.validate_entry_at(directory, temp_name)?;
+        unlinkat(
+            Some(directory.as_raw_fd()),
+            temp_name,
+            UnlinkatFlags::NoRemoveDir,
+        )
+        .map_err(nix_filesystem_error)?;
+        directory.sync_all()?;
+        Ok(())
+    }
+}
+
+struct PinnedPublicationTemp {
+    file: File,
+    identity: PinnedPrivateFileIdentity,
+}
+
+impl PinnedPublicationTemp {
+    fn new(file: File) -> Result<Self, PrivateRecoveryIoError> {
+        let identity = PinnedPrivateFileIdentity::from_file(&file)?;
+        Ok(Self { file, identity })
+    }
+}
+
+struct PinnedPrivateFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl PinnedPrivateFileIdentity {
+    fn from_file(file: &File) -> Result<Self, PrivateRecoveryIoError> {
+        let metadata = file.metadata()?;
+        validate_exact_private_regular_metadata(&metadata)?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn validate_entry_at(
+        &self,
+        directory: &File,
+        name: &str,
+    ) -> Result<(), PrivateRecoveryIoError> {
+        let metadata = fstatat(
+            Some(directory.as_raw_fd()),
+            name,
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(nix_filesystem_error)?;
+        let kind = SFlag::from_bits_truncate(metadata.st_mode);
+        if kind != SFlag::S_IFREG
+            || u64::try_from(metadata.st_dev).ok() != Some(self.device)
+            || u64::try_from(metadata.st_ino).ok() != Some(self.inode)
+            || metadata.st_uid != effective_user_id()
+            || metadata.st_nlink != 1
+            || metadata.st_mode & (0o7777 as nix::libc::mode_t)
+                != PRIVATE_FILE_MODE as nix::libc::mode_t
+        {
+            return Err(PrivateRecoveryIoError::UnsafePath);
+        }
+        Ok(())
     }
 }
 
@@ -438,6 +569,16 @@ fn validate_private_regular_identity(
     Ok(())
 }
 
+fn validate_exact_private_regular_metadata(
+    metadata: &fs::Metadata,
+) -> Result<(), PrivateRecoveryIoError> {
+    validate_private_regular_identity(metadata)?;
+    if metadata.permissions().mode() & 0o7777 != PRIVATE_FILE_MODE {
+        return Err(PrivateRecoveryIoError::UnsafePath);
+    }
+    Ok(())
+}
+
 fn validate_existing_state_at(directory: &File) -> Result<(), PrivateRecoveryIoError> {
     match open_private_regular_file_at(directory, STATE_FILE_NAME, false, false, false) {
         Ok(_) => Ok(()),
@@ -475,10 +616,7 @@ impl ValidatedOwnedTempRegularFile {
     fn open_at(directory: &File, name: &str) -> Result<Self, PrivateRecoveryIoError> {
         let file = open_private_regular_file_at(directory, name, false, false, false)?;
         let metadata = file.metadata()?;
-        validate_private_regular_identity(&metadata)?;
-        if metadata.permissions().mode() & 0o7777 != PRIVATE_FILE_MODE {
-            return Err(PrivateRecoveryIoError::UnsafePath);
-        }
+        validate_exact_private_regular_metadata(&metadata)?;
         Ok(Self { _file: file })
     }
 }
@@ -554,7 +692,7 @@ fn effective_user_id() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::{cell::Cell, path::PathBuf};
 
     use super::*;
 
@@ -590,6 +728,23 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    struct RecreateTempThenFailPublicationDurability {
+        external_alias: PathBuf,
+        recreated_temp: PathBuf,
+        calls: Cell<usize>,
+    }
+
+    impl PublicationDirectoryDurability for RecreateTempThenFailPublicationDurability {
+        fn sync_after_rename(&self, _directory: &File) -> std::io::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            fs::hard_link(&self.external_alias, &self.recreated_temp)?;
+            Err(std::io::Error::new(
+                ErrorKind::Other,
+                "injected publication directory sync failure",
+            ))
         }
     }
 
@@ -733,6 +888,152 @@ mod tests {
                 .expect("external alias metadata after cleanup")
                 .nlink(),
             2
+        );
+    }
+
+    #[test]
+    // [BLIND-VAULT-RECOVERY-PUBLICATION-CLEANUP 2026-08-31 by Codex] An
+    // exclusive-create collision never grants cleanup ownership of its name.
+    fn failed_temp_create_does_not_unlink_preexisting_hardlink() {
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("canonical temporary recovery root");
+        let directory = canonical_root.join("recovery");
+        let store = PrivateAtomicRecoveryFile::open(&directory).expect("open recovery fixture");
+
+        let external_alias = canonical_root.join("opaque-publish-alias.bin");
+        fs::write(&external_alias, [0x87; 16]).expect("write opaque publish alias fixture");
+        fs::set_permissions(
+            &external_alias,
+            fs::Permissions::from_mode(PRIVATE_FILE_MODE),
+        )
+        .expect("set opaque publish alias fixture mode");
+        let temp_name = format!("{TEMP_FILE_PREFIX}{}", "7".repeat(TEMP_FILE_HEX_LENGTH));
+        let recovery_alias = directory.join(&temp_name);
+        fs::hard_link(&external_alias, &recovery_alias)
+            .expect("hard-link deterministic publish collision");
+
+        assert!(matches!(
+            store.replace_with_temp_name_and_durability(
+                &[0xc3; 16],
+                64,
+                &temp_name,
+                &HostPublicationDirectoryDurability,
+            ),
+            Err(PrivateRecoveryIoError::Filesystem(error))
+                if error.kind() == ErrorKind::AlreadyExists
+        ));
+        assert!(entry_exists(&recovery_alias));
+        assert_eq!(
+            fs::metadata(&external_alias)
+                .expect("external publish alias metadata after collision")
+                .nlink(),
+            2
+        );
+        assert!(!entry_exists(&directory.join(STATE_FILE_NAME)));
+    }
+
+    #[test]
+    // [BLIND-VAULT-RECOVERY-PUBLICATION-CLEANUP 2026-08-31 by Codex] Once
+    // rename commits, its former temp name is never cleanup-owned again.
+    fn post_rename_sync_failure_does_not_unlink_recreated_temp_name() {
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("canonical temporary recovery root");
+        let directory = canonical_root.join("recovery");
+        let store = PrivateAtomicRecoveryFile::open(&directory).expect("open recovery fixture");
+
+        let external_alias = canonical_root.join("opaque-recreated-alias.bin");
+        fs::write(&external_alias, [0x96; 16]).expect("write opaque recreated alias fixture");
+        fs::set_permissions(
+            &external_alias,
+            fs::Permissions::from_mode(PRIVATE_FILE_MODE),
+        )
+        .expect("set opaque recreated alias fixture mode");
+        let temp_name = format!("{TEMP_FILE_PREFIX}{}", "8".repeat(TEMP_FILE_HEX_LENGTH));
+        let recreated_temp = directory.join(&temp_name);
+        let durability = RecreateTempThenFailPublicationDurability {
+            external_alias: external_alias.clone(),
+            recreated_temp: recreated_temp.clone(),
+            calls: Cell::new(0),
+        };
+        let sealed_generation = [0xd4; 16];
+
+        assert!(matches!(
+            store.replace_with_temp_name_and_durability(
+                &sealed_generation,
+                64,
+                &temp_name,
+                &durability,
+            ),
+            Err(PrivateRecoveryIoError::Filesystem(error))
+                if error.kind() == ErrorKind::Other
+        ));
+        assert_eq!(durability.calls.get(), 1);
+        assert!(entry_exists(&recreated_temp));
+        assert_eq!(
+            fs::metadata(&external_alias)
+                .expect("external recreated alias metadata after sync failure")
+                .nlink(),
+            2
+        );
+        assert_eq!(
+            store.read(64).expect("read renamed opaque generation"),
+            Some(sealed_generation.to_vec())
+        );
+    }
+
+    #[test]
+    // [BLIND-VAULT-RECOVERY-PUBLICATION-CLEANUP 2026-08-31 by Codex] The
+    // opened phase cleans only its pinned inode and retains unknown mismatches.
+    fn opened_phase_cleanup_requires_matching_pinned_inode() {
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("canonical temporary recovery root");
+        let directory = canonical_root.join("recovery");
+        let store = PrivateAtomicRecoveryFile::open(&directory).expect("open recovery fixture");
+
+        let owned_name = format!("{TEMP_FILE_PREFIX}{}", "9".repeat(TEMP_FILE_HEX_LENGTH));
+        let owned_file =
+            open_private_regular_file_at(&store.directory, &owned_name, true, true, true)
+                .expect("create pinned owned temp fixture");
+        let owned_phase = PublicationPhase::TempOpened(
+            PinnedPublicationTemp::new(owned_file).expect("pin owned temp fixture"),
+        );
+        owned_phase
+            .cleanup_failed_publish(&store.directory, &owned_name)
+            .expect("cleanup matching pinned temp fixture");
+        assert!(!entry_exists(&directory.join(&owned_name)));
+
+        let replaced_name = format!("{TEMP_FILE_PREFIX}{}", "a".repeat(TEMP_FILE_HEX_LENGTH));
+        let replaced_path = directory.join(&replaced_name);
+        let replaced_file =
+            open_private_regular_file_at(&store.directory, &replaced_name, true, true, true)
+                .expect("create pinned replaced temp fixture");
+        let replaced_phase = PublicationPhase::TempOpened(
+            PinnedPublicationTemp::new(replaced_file).expect("pin replaced temp fixture"),
+        );
+        fs::remove_file(&replaced_path).expect("remove pinned temp directory entry");
+
+        let unknown = canonical_root.join("opaque-replacement.bin");
+        fs::write(&unknown, [0xb7; 16]).expect("write opaque replacement fixture");
+        fs::set_permissions(&unknown, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            .expect("set opaque replacement fixture mode");
+        let unknown_inode = fs::metadata(&unknown)
+            .expect("opaque replacement metadata")
+            .ino();
+        fs::rename(&unknown, &replaced_path).expect("replace pinned temp directory entry");
+
+        assert!(matches!(
+            replaced_phase.cleanup_failed_publish(&store.directory, &replaced_name),
+            Err(PrivateRecoveryIoError::UnsafePath)
+        ));
+        assert!(entry_exists(&replaced_path));
+        assert_eq!(
+            fs::metadata(&replaced_path)
+                .expect("retained replacement metadata")
+                .ino(),
+            unknown_inode
         );
     }
 
