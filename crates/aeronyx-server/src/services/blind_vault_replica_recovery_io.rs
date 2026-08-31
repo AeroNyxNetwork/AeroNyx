@@ -38,8 +38,10 @@
 //! - The process fence prevents concurrent writers, not privileged rollback.
 //! - Never return to path-based state I/O after the directory FD is pinned.
 //!
-//! Last Modified: v1.5.0-PortableNixMode - Enabled directory enumeration and
-//! made fixed private modes portable across Unix `mode_t` widths.
+//! Last Modified: v1.6.0-ParentDirectoryDurability - Required every traversed
+//! recovery directory entry to be durable in its pinned parent before use.
+//! v1.5.0-PortableNixMode - Enabled directory enumeration and made fixed
+//! private modes portable across Unix `mode_t` widths.
 //! v1.4.0-DurabilityConfirmation - Added descriptor-pinned file
 //! and directory synchronization for exact idempotent transition retries.
 //! v1.3.0-ComponentWalk - Rejected symlinks in every configured
@@ -261,6 +263,18 @@ fn open_or_create_private_directory(path: &Path) -> Result<File, PrivateRecovery
     Ok(directory)
 }
 
+trait ParentDirectoryDurability {
+    fn sync_parent(&self, parent: &File) -> std::io::Result<()>;
+}
+
+struct HostParentDirectoryDurability;
+
+impl ParentDirectoryDurability for HostParentDirectoryDurability {
+    fn sync_parent(&self, parent: &File) -> std::io::Result<()> {
+        parent.sync_all()
+    }
+}
+
 fn private_directory_components(path: &Path) -> Result<Vec<OsString>, PrivateRecoveryIoError> {
     let mut components = Vec::new();
     for component in path.components() {
@@ -282,7 +296,15 @@ fn open_or_create_directory_at(
     parent: &File,
     name: &OsStr,
 ) -> Result<File, PrivateRecoveryIoError> {
-    match open_directory_at(parent, name) {
+    open_or_create_directory_at_with(parent, name, &HostParentDirectoryDurability)
+}
+
+fn open_or_create_directory_at_with(
+    parent: &File,
+    name: &OsStr,
+    durability: &impl ParentDirectoryDurability,
+) -> Result<File, PrivateRecoveryIoError> {
+    let directory = match open_directory_at(parent, name) {
         Ok(directory) => Ok(directory),
         Err(PrivateRecoveryIoError::Filesystem(error)) if error.kind() == ErrorKind::NotFound => {
             match mkdirat(
@@ -299,7 +321,14 @@ fn open_or_create_directory_at(
             }
         }
         Err(error) => Err(error),
-    }
+    }?;
+
+    // [BLIND-VAULT-RECOVERY-IO 2026-08-31 by Codex] A synced child does not
+    // make its directory entry durable. Synchronize the pinned parent even
+    // for an existing/raced entry so a retry cannot bypass an ambiguous prior
+    // mkdir fsync failure.
+    durability.sync_parent(parent)?;
+    Ok(directory)
 }
 
 fn open_directory_at(parent: &File, name: &OsStr) -> Result<File, PrivateRecoveryIoError> {
@@ -431,4 +460,76 @@ fn nix_filesystem_error(error: nix::errno::Errno) -> std::io::Error {
 fn effective_user_id() -> u32 {
     // SAFETY: `geteuid` has no preconditions and does not dereference memory.
     unsafe { nix::libc::geteuid() }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    struct RecordingParentDirectoryDurability {
+        calls: Cell<usize>,
+        fail: bool,
+    }
+
+    impl RecordingParentDirectoryDurability {
+        fn succeeding() -> Self {
+            Self {
+                calls: Cell::new(0),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                calls: Cell::new(0),
+                fail: true,
+            }
+        }
+    }
+
+    impl ParentDirectoryDurability for RecordingParentDirectoryDurability {
+        fn sync_parent(&self, _parent: &File) -> std::io::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            if self.fail {
+                Err(std::io::Error::new(
+                    ErrorKind::Other,
+                    "injected parent directory sync failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn existing_component_retries_parent_sync_after_ambiguous_creation_failure() {
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("canonical temporary recovery root");
+        let parent = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY)
+            .open(canonical_root)
+            .expect("open canonical temporary root");
+
+        let first_attempt = RecordingParentDirectoryDurability::failing();
+        assert!(matches!(
+            open_or_create_directory_at_with(
+                &parent,
+                OsStr::new("recovery"),
+                &first_attempt,
+            ),
+            Err(PrivateRecoveryIoError::Filesystem(error))
+                if error.kind() == ErrorKind::Other
+        ));
+        assert_eq!(first_attempt.calls.get(), 1);
+
+        let retry = RecordingParentDirectoryDurability::succeeding();
+        let directory = open_or_create_directory_at_with(&parent, OsStr::new("recovery"), &retry)
+            .expect("retry existing recovery directory");
+        assert_eq!(retry.calls.get(), 1);
+        assert!(directory.metadata().expect("recovery metadata").is_dir());
+    }
 }
