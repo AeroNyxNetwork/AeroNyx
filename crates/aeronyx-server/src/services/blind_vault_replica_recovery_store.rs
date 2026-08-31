@@ -36,7 +36,9 @@
 //! - Never permit normal snapshots to cross unresolved attempt phases.
 //! - Never weaken exact work/attempt/sequence/commitment comparisons.
 //!
-//! Last Modified: v1.4.0-CrashRecoveryFormatHardening - Added fail-closed V1
+//! Last Modified: v1.5.0-FrozenV1GoldenVector - Froze the complete V1 encoded
+//! generation and exact decode/re-encode compatibility guard.
+//! v1.4.0-CrashRecoveryFormatHardening - Added fail-closed V1
 //! corruption, restart-phase, rollback, conflict, and exact-retry coverage.
 //! v1.3.0-IdempotentDurabilityConfirmation - Re-synchronized
 //! the current file and directory before exact retry success.
@@ -635,6 +637,24 @@ mod tests {
     const SEALED_SNAPSHOT_C: &[u8] = &[0xc3, 0x20, 0x5d, 0x75, 0x4a];
     const SEALED_JOURNAL: &[u8] = &[0xd4, 0x30, 0x4c, 0x66, 0x5b, 0xe1];
     const STATE_FILE_NAME: &str = "recovery-state-v1.bin";
+    const GOLDEN_V1_ENCODED: &[u8] = &[
+        0x41, 0x58, 0x56, 0x52, 0x00, 0x01, 0x00, 0x00, 0x00, 0xbc, 0x61, 0x61, 0x61, 0x61, 0x61,
+        0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x02, 0x00, 0x00, 0x00,
+        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12,
+        0x11, 0x01, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a,
+        0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a,
+        0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0xe4, 0x5c, 0x60,
+        0x25, 0xc0, 0x9c, 0xc9, 0x38, 0xbc, 0x8b, 0x57, 0x08, 0xc6, 0x59, 0xb5, 0x34, 0x08, 0x31,
+        0xe4, 0xc3, 0x84, 0xfa, 0x4e, 0x18, 0xfb, 0x7d, 0x7c, 0xae, 0x96, 0x66, 0xe5, 0xc0, 0x05,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa1, 0x00, 0x7f, 0x93, 0x28, 0x01, 0x45, 0x23,
+        0x07, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23,
+        0x22, 0x21, 0x0b, 0x32, 0x2e, 0xfc, 0x6f, 0x88, 0x8a, 0xc6, 0x68, 0x6d, 0xd7, 0xf3, 0x3d,
+        0x3f, 0xae, 0x69, 0x62, 0x35, 0xe9, 0x83, 0xfb, 0x7a, 0xae, 0xb8, 0x96, 0xda, 0x8e, 0xd3,
+        0xdc, 0xff, 0xe6, 0xca, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd4, 0x30, 0x4c,
+        0x66, 0x5b, 0xe1, 0x12, 0x89, 0x27, 0x6b, 0x45, 0x83, 0x1a, 0xcf, 0x38, 0x3c, 0x84, 0xbf,
+        0x5c, 0xa5, 0x90, 0xe5, 0xcb, 0xde, 0x0c, 0xaf, 0xc9, 0xea, 0x12, 0x57, 0x3e, 0x45, 0xb8,
+        0xeb, 0xb1, 0x59, 0x95, 0x76,
+    ];
 
     fn resolved_state(
         snapshot_sequence: u64,
@@ -677,6 +697,30 @@ mod tests {
         }
     }
 
+    fn golden_v1_state() -> StoredRecoveryStateV1 {
+        let accepted_journal_sequence = 0x1112_1314_1516_1718;
+        StoredRecoveryStateV1 {
+            workflow_id: WORKFLOW_ID,
+            phase: StoredAttemptPhaseV1::Committed,
+            snapshot_sequence: 0x0102_0304_0506_0708,
+            accepted_journal_sequence,
+            last_resolved_attempt: Some(StoredResolvedAttemptV1 {
+                journal_sequence: 0x0102_0304_0506_0708,
+                journal_commitment: [0x5a; 32],
+            }),
+            snapshot_commitment: sealed_record_commitment(SEALED_SNAPSHOT_A),
+            sealed_snapshot: SEALED_SNAPSHOT_A.to_vec(),
+            attempt: Some(StoredAttemptV1 {
+                work_sequence: 0x2345,
+                attempt: 7,
+                journal_sequence: accepted_journal_sequence,
+                retain_until_ms: 0x2122_2324_2526_2728,
+                journal_commitment: sealed_record_commitment(SEALED_JOURNAL),
+                sealed_journal: SEALED_JOURNAL.to_vec(),
+            }),
+        }
+    }
+
     fn recovery_directory(root: &TempDir) -> PathBuf {
         root.path().join("recovery")
     }
@@ -705,6 +749,42 @@ mod tests {
         let checksum_offset = encoded.len() - RECOVERY_FILE_CHECKSUM_BYTES;
         let checksum = recovery_file_checksum(&encoded[..checksum_offset]);
         encoded[checksum_offset..].copy_from_slice(&checksum);
+    }
+
+    #[test]
+    fn v1_encoding_matches_frozen_golden_vector_and_roundtrips_exactly() {
+        // [BLIND-VAULT-RECOVERY-GOLDEN-V1 2026-08-31 by Codex] V1 serde field
+        // order is a disk ABI. Adding even an optional field or reordering a
+        // field must fail this test; evolve under a new version instead of
+        // refreshing this vector while RECOVERY_FILE_VERSION_V1 remains 1.
+        let encoded = encode_state(&golden_v1_state()).expect("encode frozen V1 fixture");
+        assert_eq!(encoded.as_slice(), GOLDEN_V1_ENCODED);
+        assert_eq!(&GOLDEN_V1_ENCODED[..4], RECOVERY_FILE_MAGIC);
+        assert_eq!(
+            u16::from_be_bytes(GOLDEN_V1_ENCODED[4..6].try_into().unwrap()),
+            RECOVERY_FILE_VERSION_V1
+        );
+
+        let body_length = usize::try_from(u32::from_be_bytes(
+            GOLDEN_V1_ENCODED[6..RECOVERY_FILE_HEADER_BYTES]
+                .try_into()
+                .unwrap(),
+        ))
+        .unwrap();
+        let checksum_offset = RECOVERY_FILE_HEADER_BYTES + body_length;
+        assert_eq!(body_length, 188);
+        assert_eq!(
+            GOLDEN_V1_ENCODED.len(),
+            checksum_offset + RECOVERY_FILE_CHECKSUM_BYTES
+        );
+        assert_eq!(
+            &GOLDEN_V1_ENCODED[checksum_offset..],
+            recovery_file_checksum(&GOLDEN_V1_ENCODED[..checksum_offset])
+        );
+
+        let decoded = decode_state(GOLDEN_V1_ENCODED).expect("decode frozen V1 fixture");
+        let reencoded = encode_state(&decoded).expect("re-encode frozen V1 fixture");
+        assert_eq!(reencoded.as_slice(), GOLDEN_V1_ENCODED);
     }
 
     #[test]
