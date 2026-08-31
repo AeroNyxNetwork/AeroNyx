@@ -38,7 +38,9 @@
 //! - The process fence prevents concurrent writers, not privileged rollback.
 //! - Never return to path-based state I/O after the directory FD is pinned.
 //!
-//! Last Modified: v1.8.0-ValidatedFileIdentity - Required regular-file,
+//! Last Modified: v1.9.0-ValidatedTempOwnership - Required exact unfinished
+//! regular-file ownership proof before cleanup may unlink its directory entry.
+//! v1.8.0-ValidatedFileIdentity - Required regular-file,
 //! effective-owner, and single-link proof before writable mode normalization.
 //! v1.7.0-OwnedTempGrammar - Restricted unfinished cleanup to
 //! the exact generated lowercase-hex filename grammar.
@@ -459,6 +461,28 @@ fn is_owned_temp_file_name(name: &[u8]) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
+/// Proof that one exact-name unfinished regular file is safe to unlink.
+///
+/// [BLIND-VAULT-RECOVERY-TEMP-OWNERSHIP 2026-08-31 by Codex] The open
+/// descriptor pins the inode that passed regular-file, owner, single-link, and
+/// exact private-mode validation. Cleanup keeps this guard alive until after
+/// `unlinkat`, so an unvalidated hardlink can never reach the unlink effect.
+struct ValidatedOwnedTempRegularFile {
+    _file: File,
+}
+
+impl ValidatedOwnedTempRegularFile {
+    fn open_at(directory: &File, name: &str) -> Result<Self, PrivateRecoveryIoError> {
+        let file = open_private_regular_file_at(directory, name, false, false, false)?;
+        let metadata = file.metadata()?;
+        validate_private_regular_identity(&metadata)?;
+        if metadata.permissions().mode() & 0o7777 != PRIVATE_FILE_MODE {
+            return Err(PrivateRecoveryIoError::UnsafePath);
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 fn cleanup_owned_temp_files(directory: &File) -> Result<(), PrivateRecoveryIoError> {
     // [BLIND-VAULT-RECOVERY-TEMP-CLEANUP 2026-08-29 by Codex] Cleanup runs
     // only while holding the exclusive fence and only for our exact grammar.
@@ -470,9 +494,8 @@ fn cleanup_owned_temp_files(directory: &File) -> Result<(), PrivateRecoveryIoErr
         if !is_owned_temp_file_name(entry.file_name().to_bytes()) {
             continue;
         }
-        let removable = match entry.file_type() {
-            Some(DirectoryEntryType::File | DirectoryEntryType::Symlink) => true,
-            Some(_) => false,
+        let entry_type = match entry.file_type() {
+            Some(entry_type) => Some(entry_type),
             None => {
                 let metadata = fstatat(
                     Some(directory.as_raw_fd()),
@@ -481,16 +504,39 @@ fn cleanup_owned_temp_files(directory: &File) -> Result<(), PrivateRecoveryIoErr
                 )
                 .map_err(nix_filesystem_error)?;
                 let kind = SFlag::from_bits_truncate(metadata.st_mode);
-                kind == SFlag::S_IFREG || kind == SFlag::S_IFLNK
+                if kind == SFlag::S_IFREG {
+                    Some(DirectoryEntryType::File)
+                } else if kind == SFlag::S_IFLNK {
+                    Some(DirectoryEntryType::Symlink)
+                } else {
+                    None
+                }
             }
         };
-        if removable {
-            unlinkat(
-                Some(directory.as_raw_fd()),
-                entry.file_name(),
-                UnlinkatFlags::NoRemoveDir,
-            )
-            .map_err(nix_filesystem_error)?;
+        match entry_type {
+            Some(DirectoryEntryType::File) => {
+                let name = std::str::from_utf8(entry.file_name().to_bytes())
+                    .map_err(|_| PrivateRecoveryIoError::UnsafePath)?;
+                let _validated = ValidatedOwnedTempRegularFile::open_at(directory, name)?;
+                unlinkat(
+                    Some(directory.as_raw_fd()),
+                    entry.file_name(),
+                    UnlinkatFlags::NoRemoveDir,
+                )
+                .map_err(nix_filesystem_error)?;
+            }
+            Some(DirectoryEntryType::Symlink) => {
+                unlinkat(
+                    Some(directory.as_raw_fd()),
+                    entry.file_name(),
+                    UnlinkatFlags::NoRemoveDir,
+                )
+                .map_err(nix_filesystem_error)?;
+            }
+            None => {
+                continue;
+            }
+            Some(_) => continue,
         }
     }
     directory.sync_all()?;
@@ -625,6 +671,13 @@ mod tests {
         for name in [&exact_regular, &short, &long, &non_hex, &uppercase] {
             fs::write(directory.join(name), [0xa5; 8]).expect("write opaque recovery fixture");
         }
+        // [BLIND-VAULT-RECOVERY-TEMP-OWNERSHIP 2026-08-31 by Codex] Model the
+        // exact mode produced by the real writable temp-file creation path.
+        fs::set_permissions(
+            directory.join(&exact_regular),
+            fs::Permissions::from_mode(PRIVATE_FILE_MODE),
+        )
+        .expect("set exact recovery fixture mode");
         std::os::unix::fs::symlink("opaque-target", directory.join(&exact_symlink))
             .expect("create recovery fixture symlink");
         fs::create_dir(directory.join(&exact_directory))
@@ -640,6 +693,47 @@ mod tests {
         }
         assert!(entry_exists(&directory.join(exact_directory)));
         assert!(entry_exists(&directory.join(unrelated)));
+    }
+
+    #[test]
+    // [BLIND-VAULT-RECOVERY-TEMP-OWNERSHIP 2026-08-31 by Codex] Invalid
+    // ownership must fail before either directory entry or link count changes.
+    fn cleanup_rejects_hardlinked_exact_temp_without_unlinking_external_alias() {
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("canonical temporary recovery root");
+        let directory = canonical_root.join("recovery");
+        let store = PrivateAtomicRecoveryFile::open(&directory).expect("open recovery fixture");
+
+        let external_alias = canonical_root.join("opaque-alias.bin");
+        fs::write(&external_alias, [0x3c; 8]).expect("write opaque alias fixture");
+        fs::set_permissions(
+            &external_alias,
+            fs::Permissions::from_mode(PRIVATE_FILE_MODE),
+        )
+        .expect("set opaque alias fixture mode");
+        let exact_temp = format!("{TEMP_FILE_PREFIX}{}", "6".repeat(TEMP_FILE_HEX_LENGTH));
+        let recovery_alias = directory.join(exact_temp);
+        fs::hard_link(&external_alias, &recovery_alias)
+            .expect("hard-link exact recovery temp fixture");
+        assert_eq!(
+            fs::metadata(&external_alias)
+                .expect("external alias metadata before cleanup")
+                .nlink(),
+            2
+        );
+
+        assert!(matches!(
+            cleanup_owned_temp_files(&store.directory),
+            Err(PrivateRecoveryIoError::UnsafePath)
+        ));
+        assert!(entry_exists(&recovery_alias));
+        assert_eq!(
+            fs::metadata(&external_alias)
+                .expect("external alias metadata after cleanup")
+                .nlink(),
+            2
+        );
     }
 
     #[test]
