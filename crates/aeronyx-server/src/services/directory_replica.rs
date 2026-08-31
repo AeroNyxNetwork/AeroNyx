@@ -68,6 +68,9 @@
 //!   producer-signed tip from a carrier-reported prefix, so untrusted carrier
 //!   metadata cannot create durable producer incidents while signed block
 //!   conflicts remain fail-closed.
+//! - [DIRECTORY-CONFLICT-VERIFICATION 2026-09-01 by Codex] Requires every
+//!   conflicting block to pass producer signature and retained-predecessor
+//!   verification before it may create durable fork evidence or quarantine.
 //! - [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] Rebuilds compact descriptor
 //!   inclusion proofs from one fully audited producer namespace and one exact
 //!   selected producer block without granting the carrier authority.
@@ -235,6 +238,8 @@
 //!   Never create one independent admission gate per listener.
 //!
 //! ## Last Modified
+//! v0.45.0-DirectoryConflictVerification - Rejected unverified same-page fork
+//! payloads atomically before durable incident or retained-prefix mutation.
 //! v0.44.0-DirectoryMirrorProvenance - Separated producer-signed tips from
 //! carrier-reported prefixes and retained durable mirror resume cursors.
 //! v0.43.0-DirectoryAuditSnapshot - Made streaming audits snapshot-consistent
@@ -431,6 +436,18 @@ pub(crate) struct DirectoryRetainedMirrorCursor {
 enum DirectoryRangeTipProvenance {
     ProducerSigned,
     CarrierReported,
+}
+
+/// Producer-authenticated evidence of two different blocks at one page height.
+///
+/// [DIRECTORY-CONFLICT-VERIFICATION 2026-09-01 by Codex] This typed preflight
+/// result carries hashes only after both page claims verify against the same
+/// durable predecessor. Neither hash becomes an accepted fork choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifiedPageBlockFork {
+    height: u64,
+    first_hash: [u8; 32],
+    conflicting_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7508,7 +7525,7 @@ impl DirectoryReplicaStore {
             ));
         }
 
-        match response_admission.tip_provenance {
+        let verified_page_fork = match response_admission.tip_provenance {
             DirectoryRangeTipProvenance::ProducerSigned => {
                 if advertised_tip_height < tip.tip_height {
                     let incident = QuarantineIncident {
@@ -7552,13 +7569,13 @@ impl DirectoryReplicaStore {
                         incident.kind.to_string(),
                     ));
                 }
+                Self::preflight_page_block_fork(&transaction, &producer, blocks, observed_at)?
             }
             DirectoryRangeTipProvenance::CarrierReported => {
                 // A carrier cannot authenticate producer-tip metadata. Check
-                // any embedded producer-signed fork first so genuine signed
-                // conflicts remain durable, then reject tip-only claims
-                // without committing registry, prefix, incident, or quarantine
-                // changes.
+                // any retained-prefix conflict first, then preflight same-page
+                // conflicts so genuine producer-signed evidence remains
+                // durable before rejecting unauthenticated tip-only claims.
                 for block in blocks {
                     let existing_hash =
                         Self::block_hash_at(&transaction, &producer, block.header.height)?;
@@ -7590,16 +7607,37 @@ impl DirectoryReplicaStore {
                         }
                     }
                 }
-                if advertised_tip_height < tip.tip_height
-                    || (advertised_tip_height == tip.tip_height
-                        && advertised_tip_hash != tip.tip_hash)
-                    || (blocks.is_empty() && advertised_tip_height > tip.tip_height)
+                let verified_page_fork =
+                    Self::preflight_page_block_fork(&transaction, &producer, blocks, observed_at)?;
+                if verified_page_fork.is_none()
+                    && (advertised_tip_height < tip.tip_height
+                        || (advertised_tip_height == tip.tip_height
+                            && advertised_tip_hash != tip.tip_hash)
+                        || (blocks.is_empty() && advertised_tip_height > tip.tip_height))
                 {
                     return Err(DirectoryReplicaStoreError::Integrity(
                         "carrier-reported tip contradicts the retained producer prefix".to_string(),
                     ));
                 }
+                verified_page_fork
             }
+        };
+        if let Some(fork) = verified_page_fork {
+            // No page block, object, or commitment has been inserted yet. Keep
+            // the call-entry prefix unchanged while retaining both verified
+            // producer claims for operator review.
+            let incident = QuarantineIncident {
+                kind: "signed_block_fork",
+                height: fork.height,
+                local_hash: fork.first_hash,
+                remote_hash: fork.conflicting_hash,
+                evidence_frame: signed_response_frame,
+            };
+            Self::persist_quarantine(&transaction, &producer, &incident, observed_at)?;
+            transaction.commit()?;
+            return Err(DirectoryReplicaStoreError::Quarantined(
+                incident.kind.to_string(),
+            ));
         }
         if blocks.is_empty() {
             Self::clear_retry_state(&transaction, &producer)?;
@@ -7627,6 +7665,16 @@ impl DirectoryReplicaStore {
             let existing_hash = Self::block_hash_at(&transaction, &producer, block.header.height)?;
             if let Some(existing_hash) = existing_hash {
                 if existing_hash != block.hash() {
+                    // [DIRECTORY-CONFLICT-VERIFICATION 2026-09-01 by Codex]
+                    // A prior block in this page may now occupy this height.
+                    // Authenticate the conflicting producer claim before any
+                    // page mutation or carrier envelope can become blame.
+                    Self::verify_conflicting_block_at_retained_position(
+                        &transaction,
+                        &producer,
+                        block,
+                        observed_at,
+                    )?;
                     let incident = QuarantineIncident {
                         kind: "signed_block_fork",
                         height: block.header.height,
@@ -10499,16 +10547,69 @@ impl DirectoryReplicaStore {
             .transpose()
     }
 
+    fn preflight_page_block_fork(
+        connection: &Connection,
+        producer: &[u8; 32],
+        blocks: &[DirectoryCommitmentBlockV1],
+        observed_at: u64,
+    ) -> Result<Option<VerifiedPageBlockFork>, DirectoryReplicaStoreError> {
+        // [DIRECTORY-CONFLICT-VERIFICATION 2026-09-01 by Codex] Detect a page
+        // fork before insert_block can make response order an implicit choice.
+        // Both claims must independently authenticate at the same retained
+        // predecessor; an unverifiable claim aborts the untouched transaction.
+        let mut first_by_height: HashMap<u64, &DirectoryCommitmentBlockV1> =
+            HashMap::with_capacity(blocks.len());
+        for block in blocks {
+            if block.header.producer != *producer {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "range contains a block signed for another producer".to_string(),
+                ));
+            }
+            let block_hash = block.hash();
+            if let Some(first) = first_by_height.get(&block.header.height) {
+                let first = *first;
+                let first_hash = first.hash();
+                if first_hash == block_hash {
+                    continue;
+                }
+                Self::verify_conflicting_block_at_retained_position(
+                    connection,
+                    producer,
+                    first,
+                    observed_at,
+                )?;
+                Self::verify_conflicting_block_at_retained_position(
+                    connection,
+                    producer,
+                    block,
+                    observed_at,
+                )?;
+                return Ok(Some(VerifiedPageBlockFork {
+                    height: block.header.height,
+                    first_hash,
+                    conflicting_hash: block_hash,
+                }));
+            }
+            first_by_height.insert(block.header.height, block);
+        }
+        Ok(None)
+    }
+
     fn verify_conflicting_block_at_retained_position(
         connection: &Connection,
         producer: &[u8; 32],
         block: &DirectoryCommitmentBlockV1,
         observed_at: u64,
     ) -> Result<(), DirectoryReplicaStoreError> {
-        // [DIRECTORY-MIRROR-PROVENANCE 2026-09-01 by Codex] A carrier signs
-        // only its response envelope. Before its conflicting payload can open
-        // a durable producer incident, verify the embedded block at the exact
-        // retained predecessor position using the producer's signature.
+        // [DIRECTORY-CONFLICT-VERIFICATION 2026-09-01 by Codex] A response
+        // envelope cannot substitute for the embedded producer signature.
+        // Verify every conflicting block against the exact transaction-visible
+        // predecessor before either import path may persist producer blame.
+        if block.header.producer != *producer {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "conflicting block is signed for another producer".to_string(),
+            ));
+        }
         let (previous_hash, previous_timestamp) = if block.header.height == 1 {
             ([0u8; 32], 0)
         } else {
@@ -17357,6 +17458,7 @@ mod tests {
         let carrier = IdentityKeyPair::from_bytes(&[0x63; 32]).unwrap();
         let subject_a = IdentityKeyPair::from_bytes(&[0x64; 32]).unwrap();
         let subject_b = IdentityKeyPair::from_bytes(&[0x65; 32]).unwrap();
+        let other_producer = IdentityKeyPair::from_bytes(&[0x78; 32]).unwrap();
         let object_a = descriptor(&subject_a, 1);
         let object_b = descriptor(&subject_b, 1);
         let first = block(&producer, 1, [0u8; 32], &object_a);
@@ -17404,6 +17506,40 @@ mod tests {
             .incidents
             .is_empty());
 
+        let wrong_producer_fork = block(&other_producer, 1, [0u8; 32], &object_b);
+        let wrong_producer_frame = carrier_response_frame(
+            &producer,
+            &carrier,
+            vec![wrong_producer_fork.clone()],
+            false,
+            1,
+            wrong_producer_fork.hash(),
+            [0x79; 16],
+        );
+        assert!(matches!(
+            store.import_verified_page(
+                producer.public_key_bytes(),
+                std::slice::from_ref(&wrong_producer_fork),
+                std::slice::from_ref(&object_b),
+                1,
+                wrong_producer_fork.hash(),
+                &wrong_producer_frame,
+                NOW + 20,
+            ),
+            Err(DirectoryReplicaStoreError::Integrity(_))
+        ));
+        assert!(
+            !store
+                .producer_tip(&producer.public_key_bytes())
+                .unwrap()
+                .quarantined
+        );
+        assert!(store
+            .incident_summaries(None, 1)
+            .unwrap()
+            .incidents
+            .is_empty());
+
         let fork_frame = carrier_response_frame(
             &producer,
             &carrier,
@@ -17431,6 +17567,128 @@ mod tests {
         let incidents = store.incident_summaries(None, 1).unwrap().incidents;
         assert_eq!(incidents.len(), 1);
         assert_eq!(incidents[0].kind, "signed_block_fork");
+    }
+
+    #[test]
+    fn carrier_duplicate_height_with_invalid_signature_is_atomic_validation_failure() {
+        // [DIRECTORY-CONFLICT-VERIFICATION 2026-09-01 by Codex] A carrier must
+        // not turn an unverified duplicate-height payload into durable producer
+        // blame after an earlier valid block in the same page was staged.
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0x69; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x6a; 32]).unwrap();
+        let carrier = IdentityKeyPair::from_bytes(&[0x6b; 32]).unwrap();
+        let subject_a = IdentityKeyPair::from_bytes(&[0x6c; 32]).unwrap();
+        let subject_b = IdentityKeyPair::from_bytes(&[0x6d; 32]).unwrap();
+        let subject_c = IdentityKeyPair::from_bytes(&[0x6e; 32]).unwrap();
+        let object_a = descriptor(&subject_a, 1);
+        let object_b = descriptor(&subject_b, 1);
+        let object_c = descriptor(&subject_c, 1);
+        let first = block(&producer, 1, [0u8; 32], &object_a);
+        let second = block(&producer, 2, first.hash(), &object_b);
+        let mut invalid_fork = block(&producer, 2, first.hash(), &object_c);
+        invalid_fork.producer_signature[0] ^= 1;
+        let frame = carrier_response_frame(
+            &producer,
+            &carrier,
+            vec![second.clone(), invalid_fork.clone()],
+            false,
+            2,
+            invalid_fork.hash(),
+            [0x6f; 16],
+        );
+        let path = temp.path().join("directory.db");
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        import_replica_block(&store, &producer, &object_a, &first, [0x70; 16]);
+        let retained_before = store.producer_tip(&producer.public_key_bytes()).unwrap();
+
+        assert!(matches!(
+            store.import_verified_page(
+                producer.public_key_bytes(),
+                &[second, invalid_fork.clone()],
+                &[object_b, object_c],
+                2,
+                invalid_fork.hash(),
+                &frame,
+                NOW + 20,
+            ),
+            Err(DirectoryReplicaStoreError::Block(_))
+        ));
+        assert_eq!(
+            store.producer_tip(&producer.public_key_bytes()).unwrap(),
+            retained_before
+        );
+        assert!(store
+            .incident_summaries(None, 1)
+            .unwrap()
+            .incidents
+            .is_empty());
+        let audit = store.audit(NOW + 21).unwrap();
+        assert_eq!(audit.blocks, 1);
+        assert_eq!(audit.commitments, 1);
+        assert_eq!(audit.incidents, 0);
+        assert_eq!(audit.quarantined_producers, 0);
+    }
+
+    #[test]
+    fn producer_signed_duplicate_height_fork_still_quarantines() {
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x72; 32]).unwrap();
+        let subject_a = IdentityKeyPair::from_bytes(&[0x73; 32]).unwrap();
+        let subject_b = IdentityKeyPair::from_bytes(&[0x74; 32]).unwrap();
+        let subject_c = IdentityKeyPair::from_bytes(&[0x75; 32]).unwrap();
+        let object_a = descriptor(&subject_a, 1);
+        let object_b = descriptor(&subject_b, 1);
+        let object_c = descriptor(&subject_c, 1);
+        let first = block(&producer, 1, [0u8; 32], &object_a);
+        let second = block(&producer, 2, first.hash(), &object_b);
+        let signed_fork = block(&producer, 2, first.hash(), &object_c);
+        let frame = response_frame(
+            &producer,
+            vec![second.clone(), signed_fork.clone()],
+            false,
+            2,
+            signed_fork.hash(),
+            [0x76; 16],
+        );
+        let path = temp.path().join("directory.db");
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        import_replica_block(&store, &producer, &object_a, &first, [0x77; 16]);
+
+        assert!(matches!(
+            store.import_verified_page(
+                producer.public_key_bytes(),
+                &[second, signed_fork.clone()],
+                &[object_b, object_c],
+                2,
+                signed_fork.hash(),
+                &frame,
+                NOW + 20,
+            ),
+            Err(DirectoryReplicaStoreError::Quarantined(ref kind))
+                if kind == "signed_block_fork"
+        ));
+        let tip = store.producer_tip(&producer.public_key_bytes()).unwrap();
+        assert!(tip.quarantined);
+        assert_eq!(tip.quarantine_kind.as_deref(), Some("signed_block_fork"));
+        assert_eq!(tip.tip_height, 1);
+        assert_eq!(tip.tip_hash, first.hash());
+        let incidents = store.incident_summaries(None, 1).unwrap().incidents;
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].kind, "signed_block_fork");
+        let audit = store.audit(NOW + 21).unwrap();
+        assert_eq!(audit.blocks, 1);
+        assert_eq!(audit.incidents, 1);
+        assert_eq!(audit.quarantined_producers, 1);
+        drop(store);
+        let (_, reopened_audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 22).unwrap();
+        assert_eq!(reopened_audit.blocks, 1);
+        assert_eq!(reopened_audit.incidents, 1);
+        assert_eq!(reopened_audit.quarantined_producers, 1);
     }
 
     #[test]
