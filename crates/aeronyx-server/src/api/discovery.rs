@@ -3062,6 +3062,11 @@ async fn onion_candidates_handler(
             state.policy.max_snapshot_limit,
         )
         .into_iter()
+        // [PUBLIC-ONION-CANDIDATE-BOUNDARY 2026-09-01 by Codex] The internal
+        // route selector also serves non-public callers, so enforce descriptor
+        // visibility at this public projection boundary before exposing proof,
+        // endpoint, KEM, or identity fields. Filtering preserves relative rank.
+        .filter(|descriptor| descriptor.descriptor.policy.public_discovery)
         .filter_map(|descriptor| {
             let node_id = descriptor.node_id();
             if state.local_node_id == Some(node_id) {
@@ -4704,6 +4709,88 @@ mod tests {
             .unwrap()
             .get("candidate_exclusion_telemetry")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_onion_candidates_endpoint_excludes_private_descriptor_and_preserves_public_control(
+    ) {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let relay_capabilities = [NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
+
+        // [PUBLIC-ONION-CANDIDATE-BOUNDARY 2026-09-01 by Codex] Give the
+        // private descriptor the stronger route score and request one result,
+        // making the pre-fix public projection deterministically expose it.
+        let private_keypair = IdentityKeyPair::from_bytes(&[201; 32]).unwrap();
+        let mut private_descriptor = signed_candidate_exclusion_descriptor(
+            201,
+            now,
+            Some("private-candidate.invalid:443"),
+            &relay_capabilities,
+            true,
+        );
+        private_descriptor.descriptor.policy.public_discovery = false;
+        private_descriptor.descriptor.capacity = NodeCapacity {
+            max_sessions: 10_000,
+            max_bps: Some(10_000_000_000),
+            max_pps: Some(1_000_000),
+        };
+        let private_descriptor =
+            SignedNodeDescriptor::sign(private_descriptor.descriptor, &private_keypair).unwrap();
+        let private_node_id = private_descriptor.node_id();
+        store.upsert_verified(private_descriptor, now).unwrap();
+        store.record_route_forward_success(&private_node_id, now);
+
+        let public_descriptor = signed_candidate_exclusion_descriptor(
+            202,
+            now,
+            Some("public-candidate.invalid:443"),
+            &relay_capabilities,
+            true,
+        );
+        let public_node_id = public_descriptor.node_id();
+        store.upsert_verified(public_descriptor, now).unwrap();
+        store.record_route_forward_success(&public_node_id, now);
+
+        let app = build_discovery_router(store, DiscoveryApiPolicy::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed.count, 1);
+        assert_eq!(parsed.candidates.len(), 1);
+        assert_eq!(parsed.candidates[0].node_id, hex::encode(public_node_id));
+        assert!(
+            parsed.candidates[0]
+                .signed_descriptor
+                .descriptor
+                .policy
+                .public_discovery
+        );
+        assert!(parsed
+            .candidates
+            .iter()
+            .all(|candidate| candidate.node_id != hex::encode(private_node_id)));
+
+        let telemetry = parsed.candidate_exclusion_telemetry.unwrap();
+        assert_eq!(
+            telemetry.status,
+            OnionCandidateExclusionTelemetryStatus::SuppressedSmallSample
+        );
+        assert_eq!(telemetry.buckets, OnionCandidateExclusionBuckets::default());
     }
 
     /// Records enough fresh aggregate evidence for the requested synthetic
