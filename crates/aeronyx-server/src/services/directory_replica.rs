@@ -30,6 +30,9 @@
 //! - [DIRECTORY-STREAMING-AUDIT 2026-08-31 by Codex] Audits each producer
 //!   block-by-block so restart and evidence export do not materialize the full
 //!   retained block, commitment, and descriptor history in memory at once.
+//! - [DIRECTORY-AUDIT-SNAPSHOT 2026-08-31 by Codex] Holds every full-history
+//!   audit inside one deferred SQLite read transaction and rejects oversized
+//!   persisted block/descriptor blobs before materializing them into Rust.
 //! - Resolves quarantine only through a node-identity-signed, host-local,
 //!   compare-and-swap command while retaining the accepted prefix and every
 //!   incident and resolution as an append-only audit trail.
@@ -228,6 +231,8 @@
 //!   Never create one independent admission gate per listener.
 //!
 //! ## Last Modified
+//! v0.43.0-DirectoryAuditSnapshot - Made streaming audits snapshot-consistent
+//! and added SQL-side admission for persisted block and descriptor payloads.
 //! v0.42.0-DirectoryStreamingProducerAudit - Bounded producer audit memory by
 //! streaming blocks and loading only one protocol-limited commitment set.
 //! v0.41.0-DirectoryAuditOwnership - Moved the full-history audit admission
@@ -404,6 +409,80 @@ enum DirectoryReplicaImportMode {
 enum DirectoryReplicaEvidenceScope {
     AnyAudited,
     RetainedMirror,
+}
+
+/// Persisted protocol payloads that require SQL-side size admission before
+/// SQLite may materialize their bytes into a Rust allocation.
+///
+/// [DIRECTORY-AUDIT-SNAPSHOT 2026-08-31 by Codex] Keeping the byte ceiling and
+/// typed failure text on this domain enum prevents audit, proof, and export
+/// readers from applying different limits to the same durable representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedReplicaBlobKind {
+    Block,
+    Descriptor,
+}
+
+impl PersistedReplicaBlobKind {
+    const fn max_bytes(self) -> u64 {
+        match self {
+            Self::Block => MAX_DIRECTORY_BLOCK_BYTES,
+            Self::Descriptor => MAX_DIRECTORY_DESCRIPTOR_OBJECT_BYTES,
+        }
+    }
+
+    const fn length_field(self) -> &'static str {
+        match self {
+            Self::Block => "persisted replica block byte length",
+            Self::Descriptor => "persisted replica descriptor byte length",
+        }
+    }
+
+    const fn oversized_message(self) -> &'static str {
+        match self {
+            Self::Block => "replica block exceeds its byte limit",
+            Self::Descriptor => "replica descriptor object exceeds its byte limit",
+        }
+    }
+
+    const fn missing_message(self) -> &'static str {
+        match self {
+            Self::Block => "admitted replica block payload is missing",
+            Self::Descriptor => "replica commitment is missing its descriptor payload",
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryReplicaAuditTestEvent {
+    BlockVerified(u64),
+    BlobMaterialized(PersistedReplicaBlobKind),
+}
+
+#[cfg(test)]
+thread_local! {
+    static DIRECTORY_REPLICA_AUDIT_TEST_OBSERVER:
+        std::cell::RefCell<Option<Box<dyn Fn(DirectoryReplicaAuditTestEvent)>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_directory_replica_audit_test_observer(
+    observer: Option<Box<dyn Fn(DirectoryReplicaAuditTestEvent)>>,
+) {
+    DIRECTORY_REPLICA_AUDIT_TEST_OBSERVER.with(|current| {
+        *current.borrow_mut() = observer;
+    });
+}
+
+#[cfg(test)]
+fn notify_directory_replica_audit_test_observer(event: DirectoryReplicaAuditTestEvent) {
+    DIRECTORY_REPLICA_AUDIT_TEST_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow().as_ref() {
+            observer(event);
+        }
+    });
 }
 
 /// Failures returned by the producer-isolated replica store.
@@ -4363,7 +4442,9 @@ impl DirectoryReplicaStore {
             });
         }
         let mut statement = transaction.prepare(
-            "SELECT block_blob FROM directory_replica_blocks
+            "SELECT length(block_blob),
+                    CASE WHEN length(block_blob) <= ?4 THEN block_blob END
+             FROM directory_replica_blocks
              WHERE producer = ?1 AND height >= ?2
              ORDER BY height ASC LIMIT ?3",
         )?;
@@ -4372,15 +4453,28 @@ impl DirectoryReplicaStore {
                 params![
                     producer.as_slice(),
                     u64_to_i64(from_height, "replica evidence from height")?,
-                    i64::from(limit)
+                    i64::from(limit),
+                    u64_to_i64(MAX_DIRECTORY_BLOCK_BYTES, "replica block byte limit")?
                 ],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                    ))
+                },
             )?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         let blocks = blobs
-            .iter()
-            .map(|blob| decode_block(blob))
+            .into_iter()
+            .map(|(length, blob)| {
+                let blob = materialize_admitted_replica_blob(
+                    length,
+                    blob,
+                    PersistedReplicaBlobKind::Block,
+                )?;
+                decode_block(&blob)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         transaction.commit()?;
         Ok(DirectoryReplicaEvidencePage {
@@ -4481,22 +4575,41 @@ impl DirectoryReplicaStore {
             ));
         }
         let mut statement = transaction.prepare(
-            "SELECT descriptor_blob FROM directory_replica_descriptor_objects
+            "SELECT length(descriptor_blob),
+                    CASE WHEN length(descriptor_blob) <= ?3 THEN descriptor_blob END
+             FROM directory_replica_descriptor_objects
              WHERE producer = ?1 AND descriptor_hash = ?2",
         )?;
         let mut objects = Vec::with_capacity(descriptor_hashes.len());
         for descriptor_hash in descriptor_hashes {
             let blob = statement
                 .query_row(
-                    params![producer.as_slice(), descriptor_hash.as_slice()],
-                    |row| row.get::<_, Vec<u8>>(0),
+                    params![
+                        producer.as_slice(),
+                        descriptor_hash.as_slice(),
+                        u64_to_i64(
+                            MAX_DIRECTORY_DESCRIPTOR_OBJECT_BYTES,
+                            "replica descriptor byte limit"
+                        )?
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, Option<Vec<u8>>>(1)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            let Some(blob) = blob else {
+            let Some((length, blob)) = blob else {
                 drop(statement);
                 transaction.commit()?;
                 return Ok(None);
             };
+            let blob = materialize_admitted_replica_blob(
+                length,
+                blob,
+                PersistedReplicaBlobKind::Descriptor,
+            )?;
             let object = decode_descriptor_object(&blob)?;
             let commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&object)
                 .map_err(|error| DirectoryReplicaStoreError::Descriptor(error.to_string()))?;
@@ -4610,7 +4723,9 @@ impl DirectoryReplicaStore {
                 "SELECT commitments.producer,
                         blocks.block_hash,
                         commitments.descriptor_hash,
-                        objects.descriptor_blob
+                        length(objects.descriptor_blob),
+                        CASE WHEN length(objects.descriptor_blob) <= ?4
+                             THEN objects.descriptor_blob END
                  FROM directory_replica_commitments AS commitments
                  INNER JOIN directory_replica_chains AS chains
                     ON chains.producer = commitments.producer
@@ -4641,14 +4756,19 @@ impl DirectoryReplicaStore {
                             DirectoryReplicaStoreError::Integrity(
                                 "gossip proof candidate limit exceeds SQLite range".to_string(),
                             )
-                        })?
+                        })?,
+                        u64_to_i64(
+                            MAX_DIRECTORY_DESCRIPTOR_OBJECT_BYTES,
+                            "replica descriptor byte limit"
+                        )?
                     ],
                     |row| {
                         Ok((
                             row.get::<_, Vec<u8>>(0)?,
                             row.get::<_, Vec<u8>>(1)?,
                             row.get::<_, Vec<u8>>(2)?,
-                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<Vec<u8>>>(4)?,
                         ))
                     },
                 )?
@@ -4657,12 +4777,22 @@ impl DirectoryReplicaStore {
         };
 
         let mut latest_live_candidates = BTreeMap::new();
-        for (producer_bytes, block_hash_bytes, descriptor_hash_bytes, descriptor_blob) in
-            persisted_candidates
+        for (
+            producer_bytes,
+            block_hash_bytes,
+            descriptor_hash_bytes,
+            descriptor_blob_length,
+            descriptor_blob,
+        ) in persisted_candidates
         {
             let producer = bytes32(&producer_bytes, "gossip proof producer")?;
             let block_hash = bytes32(&block_hash_bytes, "gossip proof block hash")?;
             let descriptor_hash = bytes32(&descriptor_hash_bytes, "gossip proof descriptor hash")?;
+            let descriptor_blob = materialize_admitted_replica_blob(
+                descriptor_blob_length,
+                descriptor_blob,
+                PersistedReplicaBlobKind::Descriptor,
+            )?;
             let descriptor = decode_descriptor_object(&descriptor_blob)?;
             descriptor.verify_signature().map_err(|error| {
                 DirectoryReplicaStoreError::Descriptor(format!(
@@ -4822,7 +4952,12 @@ impl DirectoryReplicaStore {
         }
         let persisted = transaction
             .query_row(
-                "SELECT blocks.block_blob, objects.descriptor_blob
+                "SELECT length(blocks.block_blob),
+                        CASE WHEN length(blocks.block_blob) <= ?3
+                             THEN blocks.block_blob END,
+                        length(objects.descriptor_blob),
+                        CASE WHEN length(objects.descriptor_blob) <= ?4
+                             THEN objects.descriptor_blob END
                  FROM directory_replica_commitments AS commitments
                  INNER JOIN directory_replica_blocks AS blocks
                     ON blocks.producer = commitments.producer
@@ -4832,14 +4967,39 @@ impl DirectoryReplicaStore {
                    AND objects.descriptor_hash = commitments.descriptor_hash
                  WHERE commitments.producer = ?1
                    AND commitments.descriptor_hash = ?2",
-                params![producer.as_slice(), descriptor_hash.as_slice()],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                params![
+                    producer.as_slice(),
+                    descriptor_hash.as_slice(),
+                    u64_to_i64(MAX_DIRECTORY_BLOCK_BYTES, "replica block byte limit")?,
+                    u64_to_i64(
+                        MAX_DIRECTORY_DESCRIPTOR_OBJECT_BYTES,
+                        "replica descriptor byte limit"
+                    )?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((block_blob, descriptor_blob)) = persisted else {
+        let Some((block_length, block_blob, descriptor_length, descriptor_blob)) = persisted else {
             transaction.commit()?;
             return Ok(None);
         };
+        let block_blob = materialize_admitted_replica_blob(
+            block_length,
+            block_blob,
+            PersistedReplicaBlobKind::Block,
+        )?;
+        let descriptor_blob = materialize_admitted_replica_blob(
+            descriptor_length,
+            descriptor_blob,
+            PersistedReplicaBlobKind::Descriptor,
+        )?;
         let block = decode_block(&block_blob)?;
         if block.hash() != *expected_block_hash {
             transaction.commit()?;
@@ -7446,8 +7606,28 @@ impl DirectoryReplicaStore {
         &self,
         observed_at: u64,
     ) -> Result<DirectoryReplicaAudit, DirectoryReplicaStoreError> {
-        let connection = self.connection.lock();
-        Self::audit_connection(&connection, &self.local_node_id, observed_at)
+        let mut connection = self.connection.lock();
+        // [DIRECTORY-AUDIT-SNAPSHOT 2026-08-31 by Codex] The streaming block
+        // cursor, its per-block index lookups, final orphan counts, and tip
+        // comparison must describe one SQLite state. A deferred read
+        // transaction keeps WAL writers concurrent while preventing a valid
+        // append or hostile index swap from splicing multiple snapshots into
+        // one audit result.
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(DirectoryReplicaStoreError::Sqlite)?;
+        match Self::audit_connection(&transaction, &self.local_node_id, observed_at) {
+            Ok(report) => {
+                transaction
+                    .commit()
+                    .map_err(DirectoryReplicaStoreError::Sqlite)?;
+                Ok(report)
+            }
+            Err(audit_error) => match transaction.rollback() {
+                Ok(()) => Err(audit_error),
+                Err(rollback_error) => Err(DirectoryReplicaStoreError::Sqlite(rollback_error)),
+            },
+        }
     }
 
     fn decode_observation_witness_policy(
@@ -10401,22 +10581,31 @@ impl DirectoryReplicaStore {
         // complete producer indexes before verification.
         let mut statement = connection.prepare(
             "SELECT height, block_hash, prev_block_hash, produced_at,
-                    commitment_count, block_blob
+                    commitment_count, length(block_blob),
+                    CASE WHEN length(block_blob) <= ?2 THEN block_blob END
              FROM directory_replica_blocks WHERE producer = ?1 ORDER BY height ASC",
         )?;
-        let mut rows = statement.query(params![tip.producer.as_slice()])?;
+        let mut rows = statement.query(params![
+            tip.producer.as_slice(),
+            u64_to_i64(MAX_DIRECTORY_BLOCK_BYTES, "replica block byte limit")?
+        ])?;
         let mut expected_height = 1u64;
         let mut previous_hash = [0u8; 32];
         let mut previous_timestamp = 0u64;
         let mut audited_commitments = 0u64;
         while let Some(row) = rows.next()? {
+            let block_blob = materialize_admitted_replica_blob(
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+                PersistedReplicaBlobKind::Block,
+            )?;
             let row = StoredReplicaBlockRow {
                 height: row.get(0)?,
                 block_hash: row.get(1)?,
                 prev_block_hash: row.get(2)?,
                 produced_at: row.get(3)?,
                 commitment_count: row.get(4)?,
-                block_blob: row.get(5)?,
+                block_blob,
             };
             let block = decode_block(&row.block_blob)?;
             let height = positive_i64_to_u64(row.height, "replica block height")?;
@@ -10461,6 +10650,10 @@ impl DirectoryReplicaStore {
                         "replica producer commitment count exhausted".to_string(),
                     )
                 })?;
+            #[cfg(test)]
+            notify_directory_replica_audit_test_observer(
+                DirectoryReplicaAuditTestEvent::BlockVerified(height),
+            );
             previous_hash = block.hash();
             previous_timestamp = block.header.timestamp;
             expected_height = expected_height.checked_add(1).ok_or_else(|| {
@@ -10508,7 +10701,9 @@ impl DirectoryReplicaStore {
     ) -> Result<Vec<DirectoryDescriptorCommitmentV1>, DirectoryReplicaStoreError> {
         let mut statement = connection.prepare(
             "SELECT c.commitment_hash, c.node_id, c.sequence_le, c.descriptor_hash,
-                    o.node_id, o.sequence_le, o.descriptor_blob
+                    o.node_id, o.sequence_le, length(o.descriptor_blob),
+                    CASE WHEN length(o.descriptor_blob) <= ?3
+                         THEN o.descriptor_blob END
              FROM directory_replica_commitments c
              LEFT JOIN directory_replica_descriptor_objects o
                ON o.producer = c.producer
@@ -10516,17 +10711,28 @@ impl DirectoryReplicaStore {
              WHERE c.producer = ?1 AND c.block_height = ?2
              ORDER BY c.commitment_hash ASC",
         )?;
-        let rows = statement.query_map(params![producer.as_slice(), block_height], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, Option<Vec<u8>>>(4)?,
-                row.get::<_, Option<Vec<u8>>>(5)?,
-                row.get::<_, Option<Vec<u8>>>(6)?,
-            ))
-        })?;
+        let rows = statement.query_map(
+            params![
+                producer.as_slice(),
+                block_height,
+                u64_to_i64(
+                    MAX_DIRECTORY_DESCRIPTOR_OBJECT_BYTES,
+                    "replica descriptor byte limit"
+                )?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
+                ))
+            },
+        )?;
         let mut commitments = Vec::with_capacity(MAX_DIRECTORY_COMMITMENTS_PER_BLOCK);
         for row in rows {
             let (
@@ -10536,6 +10742,7 @@ impl DirectoryReplicaStore {
                 descriptor_hash,
                 object_node_id,
                 object_sequence,
+                object_blob_length,
                 object_blob,
             ) = row?;
             if commitments.len() >= MAX_DIRECTORY_COMMITMENTS_PER_BLOCK {
@@ -10568,11 +10775,11 @@ impl DirectoryReplicaStore {
                     "replica commitment is missing its descriptor sequence".to_string(),
                 )
             })?;
-            let object_blob = object_blob.ok_or_else(|| {
-                DirectoryReplicaStoreError::Integrity(
-                    "replica commitment is missing its descriptor payload".to_string(),
-                )
-            })?;
+            let object_blob = materialize_admitted_replica_blob(
+                object_blob_length,
+                object_blob,
+                PersistedReplicaBlobKind::Descriptor,
+            )?;
             let descriptor = decode_descriptor_object(&object_blob)?;
             let object_commitment =
                 DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
@@ -12035,6 +12242,48 @@ fn decode_descriptor_object(
         .map_err(|error| DirectoryReplicaStoreError::Codec(error.to_string()))
 }
 
+/// Converts a SQL-size-admitted payload without ever accepting a missing,
+/// oversized, or length-inconsistent durable value.
+///
+/// The supplying query must project `length(blob)` and
+/// `CASE WHEN length(blob) <= ? THEN blob END`. SQLite can answer `length()`
+/// for a BLOB without first returning the BLOB bytes; the `CASE` keeps an
+/// oversized payload out of `row.get::<Vec<u8>>()` entirely. The codec limits
+/// above remain an independent second layer after this storage admission.
+fn materialize_admitted_replica_blob(
+    stored_length: Option<i64>,
+    admitted_blob: Option<Vec<u8>>,
+    kind: PersistedReplicaBlobKind,
+) -> Result<Vec<u8>, DirectoryReplicaStoreError> {
+    let stored_length = stored_length
+        .ok_or_else(|| DirectoryReplicaStoreError::Integrity(kind.missing_message().to_string()))?;
+    let stored_length = nonnegative_i64_to_u64(stored_length, kind.length_field())?;
+    if stored_length > kind.max_bytes() {
+        return Err(DirectoryReplicaStoreError::Codec(
+            kind.oversized_message().to_string(),
+        ));
+    }
+    let admitted_blob = admitted_blob
+        .ok_or_else(|| DirectoryReplicaStoreError::Integrity(kind.missing_message().to_string()))?;
+    let materialized_length = u64::try_from(admitted_blob.len()).map_err(|_| {
+        DirectoryReplicaStoreError::Integrity(format!(
+            "{} exceeds platform bounds",
+            kind.length_field()
+        ))
+    })?;
+    if materialized_length != stored_length {
+        return Err(DirectoryReplicaStoreError::Integrity(format!(
+            "{} changed during materialization",
+            kind.length_field()
+        )));
+    }
+    #[cfg(test)]
+    notify_directory_replica_audit_test_observer(DirectoryReplicaAuditTestEvent::BlobMaterialized(
+        kind,
+    ));
+    Ok(admitted_blob)
+}
+
 fn validate_retry_state_fields(
     producer: &[u8; 32],
     local_node_id: &[u8; 32],
@@ -12125,9 +12374,26 @@ mod tests {
     use aeronyx_core::protocol::discovery::{
         directory_block_range_response_signing_bytes, encode_directory_sync_message, NodeDescriptor,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
     const NOW: u64 = 1_700_000_100;
+
+    struct DirectoryReplicaAuditObserverGuard;
+
+    impl Drop for DirectoryReplicaAuditObserverGuard {
+        fn drop(&mut self) {
+            set_directory_replica_audit_test_observer(None);
+        }
+    }
+
+    fn observe_directory_replica_audit(
+        observer: impl Fn(DirectoryReplicaAuditTestEvent) + 'static,
+    ) -> DirectoryReplicaAuditObserverGuard {
+        set_directory_replica_audit_test_observer(Some(Box::new(observer)));
+        DirectoryReplicaAuditObserverGuard
+    }
 
     fn descriptor(identity: &IdentityKeyPair, sequence: u64) -> SignedNodeDescriptor {
         SignedNodeDescriptor::sign(
@@ -13289,6 +13555,290 @@ mod tests {
         assert_eq!(reopened.producers, 1);
         assert_eq!(reopened.blocks, 1);
         assert_eq!(reopened.commitments, 1);
+    }
+
+    #[test]
+    fn concurrent_valid_append_does_not_false_fail_streaming_audit() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x31; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x32; 32]).unwrap();
+        let first_subject = IdentityKeyPair::from_bytes(&[0x33; 32]).unwrap();
+        let second_subject = IdentityKeyPair::from_bytes(&[0x34; 32]).unwrap();
+        let first_object = descriptor(&first_subject, 1);
+        let first = block(&producer, 1, [0u8; 32], &first_object);
+        let second_object = descriptor(&second_subject, 1);
+        let second = block(&producer, 2, first.hash(), &second_object);
+        let (reader, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        import_replica_block(&reader, &producer, &first_object, &first, [0x35; 16]);
+        // A separately opened host-local store has an independent mutex and
+        // models a live sync writer racing a CLI/startup audit of the same WAL.
+        let (writer, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        let audit_reached = Arc::new(Barrier::new(2));
+        let writer_finished = Arc::new(Barrier::new(2));
+        let observer_reached = Arc::clone(&audit_reached);
+        let observer_finished = Arc::clone(&writer_finished);
+        let observer = observe_directory_replica_audit(move |event| {
+            if event == DirectoryReplicaAuditTestEvent::BlockVerified(1) {
+                observer_reached.wait();
+                observer_finished.wait();
+            }
+        });
+
+        let audit = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                audit_reached.wait();
+                import_replica_block(&writer, &producer, &second_object, &second, [0x36; 16]);
+                writer_finished.wait();
+            });
+            let audit = reader.audit(NOW + 21);
+            writer.join().unwrap();
+            audit
+        })
+        .unwrap();
+        drop(observer);
+
+        // [DIRECTORY-AUDIT-SNAPSHOT 2026-08-31 by Codex] The in-flight audit
+        // is a truthful snapshot of the one-block prefix, while a later audit
+        // observes the atomically appended second block without a false
+        // orphan-index failure.
+        assert_eq!(audit.blocks, 1);
+        assert_eq!(audit.commitments, 1);
+        let current = reader.audit(NOW + 21).unwrap();
+        assert_eq!(current.blocks, 2);
+        assert_eq!(current.commitments, 2);
+    }
+
+    #[test]
+    fn cross_snapshot_index_swap_cannot_false_pass_streaming_audit() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x41; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x42; 32]).unwrap();
+        let original_subject = IdentityKeyPair::from_bytes(&[0x43; 32]).unwrap();
+        let extra_subject = IdentityKeyPair::from_bytes(&[0x44; 32]).unwrap();
+        let replacement_subject = IdentityKeyPair::from_bytes(&[0x45; 32]).unwrap();
+        let original_object = descriptor(&original_subject, 1);
+        let extra_object = descriptor(&extra_subject, 1);
+        let replacement_object = descriptor(&replacement_subject, 1);
+        let original_commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&original_object).unwrap();
+        let extra_commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&extra_object).unwrap();
+        let replacement_commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&replacement_object).unwrap();
+        let first = block(&producer, 1, [0u8; 32], &original_object);
+        let producer_id = producer.public_key_bytes();
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        import_replica_block(&store, &producer, &original_object, &first, [0x46; 16]);
+        {
+            let connection = store.connection.lock();
+            connection
+                .execute(
+                    "INSERT INTO directory_replica_descriptor_objects
+                        (producer, descriptor_hash, node_id, sequence_le, descriptor_blob)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        producer_id.as_slice(),
+                        extra_commitment.descriptor_hash.as_slice(),
+                        extra_commitment.node_id.as_slice(),
+                        extra_commitment.sequence.to_le_bytes().as_slice(),
+                        encode_descriptor_object(&extra_object).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+
+        let audit_reached = Arc::new(Barrier::new(2));
+        let writer_finished = Arc::new(Barrier::new(2));
+        let observer_reached = Arc::clone(&audit_reached);
+        let observer_finished = Arc::clone(&writer_finished);
+        let observer = observe_directory_replica_audit(move |event| {
+            if event == DirectoryReplicaAuditTestEvent::BlockVerified(1) {
+                observer_reached.wait();
+                observer_finished.wait();
+            }
+        });
+
+        let audit = std::thread::scope(|scope| {
+            let writer_path = path.clone();
+            let writer = scope.spawn(move || {
+                audit_reached.wait();
+                let mut connection = Connection::open(writer_path).unwrap();
+                connection
+                    .pragma_update(None, "journal_mode", "WAL")
+                    .unwrap();
+                connection
+                    .pragma_update(None, "foreign_keys", true)
+                    .unwrap();
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                transaction
+                    .execute(
+                        "DELETE FROM directory_replica_commitments
+                         WHERE producer = ?1 AND commitment_hash = ?2",
+                        params![
+                            producer_id.as_slice(),
+                            original_commitment.hash().as_slice()
+                        ],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "DELETE FROM directory_replica_descriptor_objects
+                         WHERE producer = ?1 AND descriptor_hash IN (?2, ?3)",
+                        params![
+                            producer_id.as_slice(),
+                            original_commitment.descriptor_hash.as_slice(),
+                            extra_commitment.descriptor_hash.as_slice()
+                        ],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO directory_replica_descriptor_objects
+                            (producer, descriptor_hash, node_id, sequence_le, descriptor_blob)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            producer_id.as_slice(),
+                            replacement_commitment.descriptor_hash.as_slice(),
+                            replacement_commitment.node_id.as_slice(),
+                            replacement_commitment.sequence.to_le_bytes().as_slice(),
+                            encode_descriptor_object(&replacement_object).unwrap()
+                        ],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO directory_replica_commitments
+                            (producer, commitment_hash, node_id, sequence_le,
+                             descriptor_hash, block_height)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                        params![
+                            producer_id.as_slice(),
+                            replacement_commitment.hash().as_slice(),
+                            replacement_commitment.node_id.as_slice(),
+                            replacement_commitment.sequence.to_le_bytes().as_slice(),
+                            replacement_commitment.descriptor_hash.as_slice()
+                        ],
+                    )
+                    .unwrap();
+                transaction.commit().unwrap();
+                writer_finished.wait();
+            });
+            let audit = store.audit(NOW + 21);
+            writer.join().unwrap();
+            audit
+        });
+        drop(observer);
+
+        assert!(matches!(
+            audit,
+            Err(DirectoryReplicaStoreError::Integrity(message))
+                if message == "replica contains orphaned commitment or descriptor indexes"
+        ));
+        assert!(matches!(
+            store.audit(NOW + 21),
+            Err(DirectoryReplicaStoreError::Integrity(message))
+                if message == "replica block 1 commitment index mismatch"
+        ));
+    }
+
+    #[test]
+    fn oversized_persisted_blobs_are_rejected_before_materialization() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x51; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x52; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x53; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+        let commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&object).unwrap();
+        let first = block(&producer, 1, [0u8; 32], &object);
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        import_replica_block(&store, &producer, &object, &first, [0x54; 16]);
+
+        let block_materializations = Arc::new(AtomicUsize::new(0));
+        let descriptor_materializations = Arc::new(AtomicUsize::new(0));
+        let observed_blocks = Arc::clone(&block_materializations);
+        let observed_descriptors = Arc::clone(&descriptor_materializations);
+        let observer = observe_directory_replica_audit(move |event| match event {
+            DirectoryReplicaAuditTestEvent::BlobMaterialized(PersistedReplicaBlobKind::Block) => {
+                observed_blocks.fetch_add(1, Ordering::Relaxed);
+            }
+            DirectoryReplicaAuditTestEvent::BlobMaterialized(
+                PersistedReplicaBlobKind::Descriptor,
+            ) => {
+                observed_descriptors.fetch_add(1, Ordering::Relaxed);
+            }
+            DirectoryReplicaAuditTestEvent::BlockVerified(_) => {}
+        });
+
+        {
+            let connection = store.connection.lock();
+            connection
+                .execute(
+                    "UPDATE directory_replica_blocks
+                     SET block_blob = zeroblob(?3)
+                     WHERE producer = ?1 AND height = ?2",
+                    params![
+                        producer.public_key_bytes().as_slice(),
+                        1i64,
+                        u64_to_i64(MAX_DIRECTORY_BLOCK_BYTES + 1, "test block blob size").unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            store.audit(NOW + 21),
+            Err(DirectoryReplicaStoreError::Codec(message))
+                if message == "replica block exceeds its byte limit"
+        ));
+        assert_eq!(block_materializations.load(Ordering::Relaxed), 0);
+        assert_eq!(descriptor_materializations.load(Ordering::Relaxed), 0);
+
+        {
+            let connection = store.connection.lock();
+            connection
+                .execute(
+                    "UPDATE directory_replica_blocks SET block_blob = ?3
+                     WHERE producer = ?1 AND height = ?2",
+                    params![
+                        producer.public_key_bytes().as_slice(),
+                        1i64,
+                        encode_block(&first).unwrap()
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE directory_replica_descriptor_objects
+                     SET descriptor_blob = zeroblob(?3)
+                     WHERE producer = ?1 AND descriptor_hash = ?2",
+                    params![
+                        producer.public_key_bytes().as_slice(),
+                        commitment.descriptor_hash.as_slice(),
+                        u64_to_i64(
+                            MAX_DIRECTORY_DESCRIPTOR_OBJECT_BYTES + 1,
+                            "test descriptor blob size"
+                        )
+                        .unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            store.audit(NOW + 21),
+            Err(DirectoryReplicaStoreError::Codec(message))
+                if message == "replica descriptor object exceeds its byte limit"
+        ));
+        assert_eq!(block_materializations.load(Ordering::Relaxed), 1);
+        assert_eq!(descriptor_materializations.load(Ordering::Relaxed), 0);
+        drop(observer);
     }
 
     #[test]
