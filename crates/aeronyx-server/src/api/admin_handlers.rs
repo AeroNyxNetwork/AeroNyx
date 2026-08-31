@@ -45,7 +45,8 @@
 //! ⚠️ Important Notes for Next Developer:
 //! - These handlers return 404 in Local mode (SaaS fields are None).
 //!   Routes are only registered in SaaS mode by build_mpi_router().
-//! - disk_usage_bytes is always 0 — background disk scan is a future TODO.
+//! - `disk_usage_bytes` reports only AeroNyx-managed regular files. Probe
+//!   failure uses the existing privacy-safe Admin 500 response.
 //! - owner_hex in usage response is truncated to 8 chars for privacy.
 //! - VolumeStatus serialization: always use serde_json on the enum value.
 //!   Never use Debug formatting — it ignores the #[serde(rename_all)] attr.
@@ -58,6 +59,7 @@
 //!   reintroduce unchecked `serde_json::to_value` request panic paths.
 //!
 //! ## Last Modified
+//! v1.0.3-VolumeUsageObservability - Preserve schema while reporting real bytes.
 //! v1.0.2-TypedJson - Removed redundant fallible response conversions and
 //!                    made all admin handler serialization panic-free.
 //! v1.0.1-Fix - VolumeStatus serialization fix; days_to_ymd overflow guard;
@@ -186,6 +188,9 @@ pub async fn admin_volumes(State(state): State<Arc<MpiState>>) -> impl IntoRespo
     let stats = match router.volume_stats().await {
         Ok(s) => s,
         Err(e) => {
+            // [VOLUME-USAGE-OBSERVABILITY 2026-08-31 by Codex] A failed probe
+            // must not be serialized as a plausible zero-byte measurement.
+            // Keep the established Admin error body and status contract.
             tracing::error!(error = %e, "[ADMIN] volume_stats failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -247,10 +252,10 @@ pub async fn admin_volumes_reload(State(state): State<Arc<MpiState>>) -> impl In
 
     match router.reload_config().await {
         Ok(()) => {
-            let volumes_count = match router.volume_stats().await {
-                Ok(stats) => stats.len(),
-                Err(_) => 0,
-            };
+            // [VOLUME-USAGE-OBSERVABILITY 2026-08-31 by Codex] Reload reports
+            // configuration cardinality and must not trigger or swallow a disk
+            // usage probe. GET /volumes owns the fail-closed measurement path.
+            let volumes_count = router.configured_volume_count();
             info!(volumes_count, "[ADMIN] volumes.toml reloaded");
             Json(ReloadResponse {
                 status: "ok",
@@ -543,6 +548,37 @@ mod tests {
         .unwrap();
         assert_eq!(pool["storage_pool"]["max_connections"], 100);
         assert_eq!(pool["vector_pool"]["active_connections"], 1);
+
+        // [VOLUME-USAGE-OBSERVABILITY 2026-08-31 by Codex] Real usage changes
+        // only the value; field names and the top-level Admin schema stay exact.
+        let volumes = serde_json::to_value(VolumesResponse {
+            volumes: vec![VolumeEntry {
+                id: "vol-001".into(),
+                path: "/srv/aeronyx/vol-001".into(),
+                status: serde_json::json!("read-write"),
+                user_count: 2,
+                max_users: 10_000,
+                max_bytes: 500_000_000_000,
+                disk_usage_bytes: 12_345,
+            }],
+            total_users: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            volumes,
+            serde_json::json!({
+                "volumes": [{
+                    "id": "vol-001",
+                    "path": "/srv/aeronyx/vol-001",
+                    "status": "read-write",
+                    "user_count": 2,
+                    "max_users": 10_000,
+                    "max_bytes": 500_000_000_000_u64,
+                    "disk_usage_bytes": 12_345,
+                }],
+                "total_users": 2,
+            })
+        );
     }
 
     // -- Time range resolution --------------------------------------------

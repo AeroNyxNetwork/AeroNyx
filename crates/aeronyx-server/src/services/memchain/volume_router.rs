@@ -15,6 +15,7 @@
 //! - Generates deterministic DB and vec file paths per owner
 //! - Supports hot-reload (SIGHUP) to add/change volumes at runtime
 //! - Auto-generates default volumes.toml on first SaaS startup
+//! - Measures managed DB/sidecar/vector bytes without following symlinks
 //!
 //! ## Dependencies
 //! - Depends on SystemDb (Task 1a) for persistent assignment storage
@@ -50,8 +51,11 @@
 //!   users first; otherwise route() and db_path() could disagree.
 //! - ensure_volumes_config() is called from Server::new() in SaaS mode,
 //!   not from VolumeRouter::new() — keep them separate for testability.
+//! - Volume usage probing is synchronous filesystem work and must stay behind
+//!   the explicit `spawn_blocking` boundary in `volume_stats()`.
 //!
 //! ## Last Modified
+//! v2.8.56-VolumeUsageObservability - Report real managed-file volume usage.
 //! v2.8.55-VolumeRouterIntegrity - Made hot reload fail closed and recoverable.
 //! v2.7.14-RustdocQuality - Classified the volume lifecycle diagram as text.
 //! v1.0.0-MultiTenant - Initial implementation (Task 1a)
@@ -121,9 +125,97 @@ pub struct VolumeStats {
     pub user_count: usize,
     pub max_users: usize,
     pub max_bytes: u64,
-    /// Actual disk usage in bytes. Returns 0 in this version —
-    /// a background task can populate this in future.
+    /// Actual bytes occupied by AeroNyx-managed regular files in this volume.
     pub disk_usage_bytes: u64,
+}
+
+/// Typed failures produced while measuring one volume's managed files.
+#[derive(Debug, thiserror::Error)]
+pub enum VolumeUsageProbeError {
+    #[error("Failed to {operation} at '{path}': {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Volume root must not be a symbolic link: {0}")]
+    SymlinkRoot(PathBuf),
+
+    #[error("Volume root is not a directory: {0}")]
+    InvalidRoot(PathBuf),
+
+    #[error("Managed-file byte accounting overflow at '{path}'")]
+    Overflow { path: PathBuf },
+}
+
+/// Replaceable boundary for synchronous volume-usage measurement.
+///
+/// Implementations may perform blocking filesystem I/O. Callers from async
+/// code must execute this trait behind a blocking-worker boundary.
+pub trait VolumeUsageProbe: Send + Sync {
+    fn usage_bytes(&self, volume_root: &Path) -> Result<u64, VolumeUsageProbeError>;
+}
+
+/// Production probe for the flat per-owner volume layout.
+#[derive(Debug, Default)]
+pub struct FilesystemVolumeUsageProbe;
+
+impl VolumeUsageProbe for FilesystemVolumeUsageProbe {
+    fn usage_bytes(&self, volume_root: &Path) -> Result<u64, VolumeUsageProbeError> {
+        // [VOLUME-USAGE-OBSERVABILITY 2026-08-31 by Codex] Reject a symlinked
+        // root and inspect only its direct entries. No recursive traversal can
+        // escape the configured volume, and symlink metadata never follows an
+        // entry to an operator-uncontrolled target.
+        let root_metadata =
+            std::fs::symlink_metadata(volume_root).map_err(|source| VolumeUsageProbeError::Io {
+                operation: "inspect volume root",
+                path: volume_root.to_path_buf(),
+                source,
+            })?;
+        if root_metadata.file_type().is_symlink() {
+            return Err(VolumeUsageProbeError::SymlinkRoot(
+                volume_root.to_path_buf(),
+            ));
+        }
+        if !root_metadata.is_dir() {
+            return Err(VolumeUsageProbeError::InvalidRoot(
+                volume_root.to_path_buf(),
+            ));
+        }
+
+        let entries =
+            std::fs::read_dir(volume_root).map_err(|source| VolumeUsageProbeError::Io {
+                operation: "read volume directory",
+                path: volume_root.to_path_buf(),
+                source,
+            })?;
+        let mut total = 0u64;
+        for entry in entries {
+            let entry = entry.map_err(|source| VolumeUsageProbeError::Io {
+                operation: "read volume directory entry",
+                path: volume_root.to_path_buf(),
+                source,
+            })?;
+            if !is_managed_volume_filename(&entry.file_name()) {
+                continue;
+            }
+
+            let path = entry.path();
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(|source| VolumeUsageProbeError::Io {
+                    operation: "inspect managed volume file",
+                    path: path.clone(),
+                    source,
+                })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            total = checked_add_usage(total, metadata.len(), &path)?;
+        }
+        Ok(total)
+    }
 }
 
 /// Errors from VolumeRouter operations.
@@ -158,6 +250,16 @@ pub enum VolumeRouterError {
 
     #[error("SystemDb error: {0}")]
     SystemDb(#[from] SystemDbError),
+
+    #[error("Volume usage probe failed for '{volume_id}': {source}")]
+    VolumeUsage {
+        volume_id: String,
+        #[source]
+        source: VolumeUsageProbeError,
+    },
+
+    #[error("Volume usage blocking worker failed")]
+    VolumeUsageWorkerFailed,
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -196,6 +298,9 @@ pub struct VolumeRouter {
 
     /// Path to volumes.toml for hot-reload support.
     config_path: PathBuf,
+
+    /// Synchronous managed-file measurement boundary.
+    usage_probe: Arc<dyn VolumeUsageProbe>,
 }
 
 impl VolumeRouter {
@@ -214,6 +319,19 @@ impl VolumeRouter {
     pub async fn new(
         config_path: &Path,
         system_db: Arc<SystemDb>,
+    ) -> Result<Arc<Self>, VolumeRouterError> {
+        Self::new_with_usage_probe(config_path, system_db, Arc::new(FilesystemVolumeUsageProbe))
+            .await
+    }
+
+    /// Initialize with an explicit usage probe.
+    ///
+    /// This preserves the production constructor while making filesystem
+    /// measurement replaceable for alternate platforms and deterministic tests.
+    pub async fn new_with_usage_probe(
+        config_path: &Path,
+        system_db: Arc<SystemDb>,
+        usage_probe: Arc<dyn VolumeUsageProbe>,
     ) -> Result<Arc<Self>, VolumeRouterError> {
         let config_path = config_path.to_path_buf();
 
@@ -264,6 +382,7 @@ impl VolumeRouter {
             assignments,
             system_db,
             config_path,
+            usage_probe,
         }))
     }
 
@@ -480,21 +599,55 @@ impl VolumeRouter {
             .into_iter()
             .collect();
 
-        let vols = self.volumes.read();
-        let stats = vols
+        let volumes = self.volumes.read().clone();
+        let probe = Arc::clone(&self.usage_probe);
+        let probe_inputs: Vec<(String, PathBuf)> = volumes
             .iter()
-            .map(|v| VolumeStats {
-                volume_id: v.id.clone(),
-                status: v.status,
-                path: v.path.clone(),
-                user_count: counts.get(&v.id).copied().unwrap_or(0),
-                max_users: v.max_users,
-                max_bytes: v.max_bytes,
-                disk_usage_bytes: 0, // TODO: background disk usage scan
+            .map(|volume| (volume.id.clone(), volume.path.clone()))
+            .collect();
+
+        // [VOLUME-USAGE-OBSERVABILITY 2026-08-31 by Codex] Directory walking
+        // is blocking filesystem I/O. Move the complete scan off Tokio's async
+        // workers, with owned paths and no parking_lot guard crossing await.
+        let measured = tokio::task::spawn_blocking(move || {
+            probe_inputs
+                .into_iter()
+                .map(|(volume_id, path)| match probe.usage_bytes(&path) {
+                    Ok(usage) => Ok((volume_id, usage)),
+                    Err(source) => Err(VolumeRouterError::VolumeUsage { volume_id, source }),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        .map_err(|_| VolumeRouterError::VolumeUsageWorkerFailed)??;
+
+        let stats = volumes
+            .into_iter()
+            .zip(measured)
+            .map(|(v, (measured_id, disk_usage_bytes))| {
+                debug_assert_eq!(v.id, measured_id);
+                VolumeStats {
+                    volume_id: v.id.clone(),
+                    status: v.status,
+                    path: v.path.clone(),
+                    user_count: counts.get(&v.id).copied().unwrap_or(0),
+                    max_users: v.max_users,
+                    max_bytes: v.max_bytes,
+                    disk_usage_bytes,
+                }
             })
             .collect();
 
         Ok(stats)
+    }
+
+    /// Return the number of configured volumes without running a usage probe.
+    ///
+    /// Reload responses need only configuration cardinality. Keeping that path
+    /// separate avoids an unnecessary filesystem scan and prevents a probe
+    /// failure from being misreported as a successful reload with zero volumes.
+    pub fn configured_volume_count(&self) -> usize {
+        self.volumes.read().len()
     }
 
     /// Check whether the router has any writable volume available.
@@ -640,6 +793,32 @@ fn owner_to_filename(owner: &[u8; 32]) -> String {
     hex::encode(owner)[..16].to_string()
 }
 
+/// Recognize the complete flat-file grammar owned by VolumeRouter and SQLite.
+fn is_managed_volume_filename(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let owner = [".db-wal", ".db-shm", ".db", ".vec"]
+        .into_iter()
+        .find_map(|suffix| name.strip_suffix(suffix));
+    let Some(owner) = owner else {
+        return false;
+    };
+    matches!(owner.len(), 16 | 64) && owner.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn checked_add_usage(
+    total: u64,
+    file_bytes: u64,
+    path: &Path,
+) -> Result<u64, VolumeUsageProbeError> {
+    total
+        .checked_add(file_bytes)
+        .ok_or_else(|| VolumeUsageProbeError::Overflow {
+            path: path.to_path_buf(),
+        })
+}
+
 // ============================================
 // Tests
 // ============================================
@@ -648,6 +827,7 @@ fn owner_to_filename(owner: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use crate::services::memchain::system_db::SystemDb;
+    use std::sync::mpsc;
     use tempfile::TempDir;
 
     // ── Test Helpers ──────────────────────────────────────────────────
@@ -689,6 +869,33 @@ mod tests {
 
     fn make_owner(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    struct FailingUsageProbe;
+
+    impl VolumeUsageProbe for FailingUsageProbe {
+        fn usage_bytes(&self, volume_root: &Path) -> Result<u64, VolumeUsageProbeError> {
+            Err(VolumeUsageProbeError::Io {
+                operation: "test volume probe",
+                path: volume_root.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected probe failure",
+                ),
+            })
+        }
+    }
+
+    struct ThreadReportingUsageProbe {
+        sender: mpsc::Sender<std::thread::ThreadId>,
+        usage: u64,
+    }
+
+    impl VolumeUsageProbe for ThreadReportingUsageProbe {
+        fn usage_bytes(&self, _volume_root: &Path) -> Result<u64, VolumeUsageProbeError> {
+            self.sender.send(std::thread::current().id()).unwrap();
+            Ok(self.usage)
+        }
     }
 
     // ── Construction ──────────────────────────────────────────────────
@@ -1044,6 +1251,117 @@ mod tests {
 
     // ── Volume Stats ──────────────────────────────────────────────────
 
+    #[test]
+    fn filesystem_usage_probe_counts_only_managed_regular_files() {
+        // [VOLUME-USAGE-OBSERVABILITY 2026-08-31 by Codex] The allowlist is
+        // intentionally narrower than "all bytes under the volume" so operator
+        // files cannot distort MemChain capacity decisions.
+        let dir = TempDir::new().unwrap();
+        let volume = dir.path().join("volume");
+        std::fs::create_dir(&volume).unwrap();
+        let owner = "0123456789abcdef";
+        std::fs::write(volume.join(format!("{owner}.db")), [0u8; 3]).unwrap();
+        std::fs::write(volume.join(format!("{owner}.db-wal")), [0u8; 5]).unwrap();
+        std::fs::write(volume.join(format!("{owner}.db-shm")), [0u8; 7]).unwrap();
+        std::fs::write(volume.join(format!("{owner}.vec")), [0u8; 11]).unwrap();
+
+        std::fs::write(volume.join("operator-notes.txt"), [0u8; 13]).unwrap();
+        std::fs::write(volume.join("not-an-owner.db"), [0u8; 17]).unwrap();
+        let nested = volume.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join(format!("{owner}.db")), [0u8; 19]).unwrap();
+
+        let usage = FilesystemVolumeUsageProbe.usage_bytes(&volume).unwrap();
+        assert_eq!(usage, 3 + 5 + 7 + 11);
+    }
+
+    #[test]
+    fn filesystem_usage_probe_accepts_full_owner_filename_and_empty_volume() {
+        let dir = TempDir::new().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(FilesystemVolumeUsageProbe.usage_bytes(&empty).unwrap(), 0);
+
+        let owner = "ab".repeat(32);
+        std::fs::write(empty.join(format!("{owner}.db")), [0u8; 23]).unwrap();
+        assert_eq!(FilesystemVolumeUsageProbe.usage_bytes(&empty).unwrap(), 23);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_usage_probe_never_follows_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let volume = dir.path().join("volume");
+        std::fs::create_dir(&volume).unwrap();
+        let outside = dir.path().join("outside.bin");
+        std::fs::write(&outside, [0u8; 31]).unwrap();
+        symlink(&outside, volume.join("0123456789abcdef.db")).unwrap();
+
+        assert_eq!(FilesystemVolumeUsageProbe.usage_bytes(&volume).unwrap(), 0);
+
+        let root_link = dir.path().join("volume-link");
+        symlink(&volume, &root_link).unwrap();
+        assert!(matches!(
+            FilesystemVolumeUsageProbe.usage_bytes(&root_link),
+            Err(VolumeUsageProbeError::SymlinkRoot(path)) if path == root_link
+        ));
+    }
+
+    #[test]
+    fn filesystem_usage_probe_reports_io_failure_and_overflow() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing-volume");
+        assert!(matches!(
+            FilesystemVolumeUsageProbe.usage_bytes(&missing),
+            Err(VolumeUsageProbeError::Io { path, .. }) if path == missing
+        ));
+
+        let overflow_path = dir.path().join("0123456789abcdef.db");
+        assert!(matches!(
+            checked_add_usage(u64::MAX, 1, &overflow_path),
+            Err(VolumeUsageProbeError::Overflow { path }) if path == overflow_path
+        ));
+    }
+
+    #[tokio::test]
+    async fn volume_stats_propagates_typed_probe_failure() {
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml(dir.path(), &[("vol-001", VolumeStatus::ReadWrite)]);
+        let router =
+            VolumeRouter::new_with_usage_probe(&config_path, db, Arc::new(FailingUsageProbe))
+                .await
+                .unwrap();
+
+        assert!(matches!(
+            router.volume_stats().await,
+            Err(VolumeRouterError::VolumeUsage { volume_id, source: VolumeUsageProbeError::Io { .. } })
+                if volume_id == "vol-001"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn volume_stats_runs_probe_on_blocking_worker() {
+        let async_thread = std::thread::current().id();
+        let (sender, receiver) = mpsc::channel();
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        let config_path = write_volumes_toml(dir.path(), &[("vol-001", VolumeStatus::ReadWrite)]);
+        let router = VolumeRouter::new_with_usage_probe(
+            &config_path,
+            db,
+            Arc::new(ThreadReportingUsageProbe { sender, usage: 41 }),
+        )
+        .await
+        .unwrap();
+
+        let stats = router.volume_stats().await.unwrap();
+        assert_eq!(stats[0].disk_usage_bytes, 41);
+        assert_ne!(receiver.recv().unwrap(), async_thread);
+    }
+
     #[tokio::test]
     async fn test_volume_stats() {
         let dir = TempDir::new().unwrap();
@@ -1060,6 +1378,14 @@ mod tests {
         for i in 0u8..3 {
             db.assign_volume(&make_owner(i), "vol-001").await.unwrap();
         }
+        let owner = "0123456789abcdef";
+        std::fs::write(
+            dir.path()
+                .join("volumes/vol-001")
+                .join(format!("{owner}.db")),
+            [0u8; 29],
+        )
+        .unwrap();
 
         let stats = router.volume_stats().await.unwrap();
         assert_eq!(stats.len(), 2);
@@ -1067,9 +1393,12 @@ mod tests {
         let v1 = stats.iter().find(|s| s.volume_id == "vol-001").unwrap();
         assert_eq!(v1.user_count, 3);
         assert_eq!(v1.status, VolumeStatus::ReadWrite);
+        assert_eq!(v1.disk_usage_bytes, 29);
 
         let v2 = stats.iter().find(|s| s.volume_id == "vol-002").unwrap();
         assert_eq!(v2.user_count, 0);
         assert_eq!(v2.status, VolumeStatus::ReadOnly);
+        assert_eq!(v2.disk_usage_bytes, 0);
+        assert_eq!(router.configured_volume_count(), 2);
     }
 }
