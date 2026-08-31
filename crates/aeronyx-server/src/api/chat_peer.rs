@@ -163,7 +163,7 @@
 //!   immutable HTTP bytes without retaining a second large request graph
 //! - [OUTBOUND-BLIND-RECEIPT-VERIFICATION 2026-08-31 by Codex] Verifies
 //!   terminal delivery receipts outside Tokio and distinguishes invalid peer
-//!   evidence from local verifier saturation or worker loss
+//!   evidence from local verifier shutdown or worker loss
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -1298,7 +1298,6 @@ pub(crate) enum BlindRelayRequestPreparationError<E> {
 pub(crate) enum BlindRelayDeliveryReceiptVerificationFailure {
     Missing,
     Invalid,
-    Backpressure,
     Unavailable,
 }
 
@@ -2913,9 +2912,14 @@ pub(crate) async fn verify_blind_relay_delivery_receipt(
     // Missing evidence is a peer/protocol outcome and must not be hidden by
     // unrelated local saturation.
     let receipt = receipt.ok_or(BlindRelayDeliveryReceiptVerificationFailure::Missing)?;
+    // [BLIND-RECEIPT-FAIR-COMPLETION 2026-08-31 by Codex] The route has
+    // already been exposed and cannot safely fall back to a new surface.
+    // Await the fair semaphore instead of dropping authoritative evidence on
+    // transient ingress pressure. Outbound fanout bounds these waiters.
     let permit = blind_relay_crypto_admission()
-        .try_acquire_owned()
-        .map_err(|_| BlindRelayDeliveryReceiptVerificationFailure::Backpressure)?;
+        .acquire_owned()
+        .await
+        .map_err(|_| BlindRelayDeliveryReceiptVerificationFailure::Unavailable)?;
     tokio::task::spawn_blocking(move || {
         // [OUTBOUND-BLIND-RECEIPT-VERIFICATION 2026-08-31 by Codex] Hold the
         // permit until signature verification really stops after cancellation.

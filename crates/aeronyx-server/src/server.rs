@@ -11556,8 +11556,7 @@ impl Server {
                                             continue 'terminal_candidates;
                                         }
                                         Err(
-                                            BlindRelayDeliveryReceiptVerificationFailure::Backpressure
-                                            | BlindRelayDeliveryReceiptVerificationFailure::Unavailable,
+                                            BlindRelayDeliveryReceiptVerificationFailure::Unavailable,
                                         ) => {
                                             peer_store
                                                 .record_blind_relay_two_hop_probe_result_with_context(
@@ -12134,8 +12133,7 @@ impl Server {
                                             );
                                         }
                                         Err(
-                                            BlindRelayDeliveryReceiptVerificationFailure::Backpressure
-                                            | BlindRelayDeliveryReceiptVerificationFailure::Unavailable,
+                                            BlindRelayDeliveryReceiptVerificationFailure::Unavailable,
                                         ) => {
                                             peer_store
                                                 .record_blind_relay_three_hop_probe_result_with_context(
@@ -12956,8 +12954,7 @@ impl Server {
                                     );
                                 }
                                 Err(
-                                    BlindRelayDeliveryReceiptVerificationFailure::Backpressure
-                                    | BlindRelayDeliveryReceiptVerificationFailure::Unavailable,
+                                    BlindRelayDeliveryReceiptVerificationFailure::Unavailable,
                                 ) => {
                                     // The route was exposed, so direct fallback remains
                                     // forbidden, but local verifier loss is not peer fault.
