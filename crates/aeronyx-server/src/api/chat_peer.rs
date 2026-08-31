@@ -170,6 +170,9 @@
 //! - [PREPARED-BLIND-FORWARD-CARRIER 2026-08-31 by Codex] Serializes and
 //!   bounds each hop-to-hop request before arming route effects, then reuses
 //!   the same immutable body across exact transport retries
+//! - [TERMINAL-DECODE-CPU-DOMAIN 2026-08-31 by Codex] Classifies, decodes,
+//!   and validates opaque terminal workloads behind blind CPU admission while
+//!   retaining original owned bytes for clone-free purpose-bound receipts
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -2487,10 +2490,9 @@ async fn process_peer_relay(
 
 /// Verifies one end-to-end sender envelope and records only a coarse rejection.
 ///
-/// [PREPARED-TERMINAL-EFFECT 2026-08-30 by Codex] Onion terminal dispatch uses
-/// this same boundary before arming durable route recovery. That prevents an
-/// invalid sender signature or replay timestamp from pinning an ambiguous
-/// effect claim while keeping direct and onion telemetry semantics aligned.
+/// Direct HTTP relay uses its dedicated CPU partition. Onion terminal dispatch
+/// validates the same envelope contract inside the blind CPU domain so one
+/// public surface cannot consume another surface's reserved capacity.
 async fn validate_peer_envelope_for_relay(
     state: &ChatPeerState,
     envelope: ChatEnvelope,
@@ -3693,8 +3695,12 @@ async fn process_onion_blind_relay(
             // negotiation, and chat sender authentication must finish before
             // mutation recovery is armed. Read-only vault observations stay
             // unarmed, so cancellation can release and safely retry the route.
-            let prepared = prepare_onion_terminal_payload(&state, &peel.inner, now).await?;
-            if prepared.requires_durable_guard() {
+            let prepared = prepare_onion_terminal_payload(&state, peel.inner, now).await?;
+            let PreparedOnionTerminalWork {
+                proof_payload,
+                operation,
+            } = prepared;
+            if operation.requires_durable_guard() {
                 route_lease
                     .arm_effect(now)
                     .map_err(|_| record_blind_relay_replay_protection_failure(&state, now))?;
@@ -3702,7 +3708,7 @@ async fn process_onion_blind_relay(
             let terminal_delivery = match execute_onion_terminal_payload(
                 &state,
                 envelope.route_id,
-                prepared,
+                operation,
                 now,
             )
             .await
@@ -3745,7 +3751,7 @@ async fn process_onion_blind_relay(
                         Arc::clone(&envelope),
                         response,
                         TerminalDeliveryProofInput {
-                            payload: peel.inner,
+                            payload: proof_payload,
                             purpose: terminal_delivery.purpose,
                         },
                         accepted_at,
@@ -3947,6 +3953,30 @@ enum PreparedOnionTerminalPayload {
     },
 }
 
+/// Parsed terminal workload before service admission or durable effects.
+enum DecodedOnionTerminalPayload {
+    BlindVaultReply(PreparedTerminalReply),
+    LegacyBlindVaultPut(BlindVaultPutRequest),
+    Message(ChatEnvelope),
+}
+
+/// Typed failure from pure terminal classification and validation.
+enum OnionTerminalDecodeFailure {
+    Protocol(BlindRelayError),
+    Message(ChatPeerRelayError),
+}
+
+/// Terminal operation plus the exact opaque bytes committed by its receipt.
+///
+/// [TERMINAL-DECODE-CPU-DOMAIN 2026-08-31 by Codex] Ownership keeps the
+/// original payload available for a purpose-bound proof while the decoded
+/// operation moves independently into storage execution. No payload clone is
+/// needed between parsing, durable acceptance, and receipt construction.
+struct PreparedOnionTerminalWork {
+    proof_payload: Vec<u8>,
+    operation: PreparedOnionTerminalPayload,
+}
+
 impl PreparedOnionTerminalPayload {
     const fn requires_durable_guard(&self) -> bool {
         match self {
@@ -3956,60 +3986,105 @@ impl PreparedOnionTerminalPayload {
     }
 }
 
+fn decode_onion_terminal_payload(
+    payload: &[u8],
+    now_secs: u64,
+) -> Result<DecodedOnionTerminalPayload, OnionTerminalDecodeFailure> {
+    if is_onion_reply_request(payload) {
+        return prepare_blind_vault_inline_reply(payload)
+            .map(DecodedOnionTerminalPayload::BlindVaultReply)
+            .map_err(|error| {
+                OnionTerminalDecodeFailure::Protocol(map_terminal_reply_failure(error))
+            });
+    }
+    if is_blind_vault_frame(payload) {
+        let frame = decode_blind_vault_frame(payload).map_err(|_| {
+            OnionTerminalDecodeFailure::Protocol(
+                BlindRelayError::OnionTerminalPayloadRejected,
+            )
+        })?;
+        let BlindVaultFrame::Put(request) = frame else {
+            // Lease admission, pull, delete, issuer, and response frames retain
+            // their dedicated bounded client API. Legacy onion terminal
+            // compatibility remains Put-only.
+            return Err(OnionTerminalDecodeFailure::Protocol(
+                BlindRelayError::OnionTerminalPayloadRejected,
+            ));
+        };
+        return Ok(DecodedOnionTerminalPayload::LegacyBlindVaultPut(
+            request,
+        ));
+    }
+
+    let envelope = decode_envelope(payload).map_err(|_| {
+        OnionTerminalDecodeFailure::Protocol(BlindRelayError::OnionTerminalPayloadRejected)
+    })?;
+    validate_peer_envelope(&envelope, now_secs).map_err(OnionTerminalDecodeFailure::Message)?;
+    Ok(DecodedOnionTerminalPayload::Message(envelope))
+}
+
 /// Performs terminal wire parsing and sender authentication without touching
 /// Blind Vault or pending-message storage.
 async fn prepare_onion_terminal_payload(
     state: &ChatPeerState,
-    payload: &[u8],
+    payload: Vec<u8>,
     now_secs: u64,
-) -> Result<PreparedOnionTerminalPayload, BlindRelayError> {
-    if is_onion_reply_request(payload) {
-        state
-            .blind_vault
-            .as_ref()
-            .ok_or(BlindRelayError::ForwardFailed)?;
-        let reply =
-            prepare_blind_vault_inline_reply(payload).map_err(map_terminal_reply_failure)?;
-        let execution_permit = blind_vault_terminal_admission()
-            .try_acquire_owned()
-            .map_err(|_| BlindRelayError::Backpressure)?;
-        return Ok(PreparedOnionTerminalPayload::BlindVaultReply {
-            reply,
-            execution_permit,
-        });
-    }
+) -> Result<PreparedOnionTerminalWork, BlindRelayError> {
+    let (proof_payload, decoded) = run_blind_relay_crypto(move || {
+        let decoded = decode_onion_terminal_payload(&payload, now_secs);
+        Ok((payload, decoded))
+    })
+    .await?;
 
-    if is_blind_vault_frame(payload) {
-        let frame = decode_blind_vault_frame(payload)
-            .map_err(|_| BlindRelayError::OnionTerminalPayloadRejected)?;
-        let BlindVaultFrame::Put(request) = frame else {
-            // Lease admission, pull, delete, issuer, and response frames retain
-            // their dedicated bounded client API. The legacy path is Put-only.
-            return Err(BlindRelayError::OnionTerminalPayloadRejected);
-        };
-        state
-            .blind_vault
-            .as_ref()
-            .ok_or(BlindRelayError::ForwardFailed)?;
-        let execution_permit = blind_vault_terminal_admission()
-            .try_acquire_owned()
-            .map_err(|_| BlindRelayError::Backpressure)?;
-        return Ok(PreparedOnionTerminalPayload::LegacyBlindVaultPut {
-            request,
-            execution_permit,
-        });
-    }
+    let decoded = match decoded {
+        Ok(decoded) => decoded,
+        Err(OnionTerminalDecodeFailure::Protocol(error)) => return Err(error),
+        Err(OnionTerminalDecodeFailure::Message(error)) => {
+            record_peer_envelope_rejection(state, now_secs, &error);
+            return Err(map_terminal_chat_preparation_error(error));
+        }
+    };
 
-    let envelope =
-        decode_envelope(payload).map_err(|_| BlindRelayError::OnionTerminalPayloadRejected)?;
-    let envelope = validate_peer_envelope_for_relay(state, envelope, now_secs)
-        .await
-        .map_err(map_terminal_chat_preparation_error)?;
-    let storage_permit =
-        acquire_chat_relay_storage(state, now_secs).map_err(map_terminal_chat_preparation_error)?;
-    Ok(PreparedOnionTerminalPayload::Message {
-        envelope,
-        storage_permit,
+    let operation = match decoded {
+        DecodedOnionTerminalPayload::BlindVaultReply(reply) => {
+            state
+                .blind_vault
+                .as_ref()
+                .ok_or(BlindRelayError::ForwardFailed)?;
+            let execution_permit = blind_vault_terminal_admission()
+                .try_acquire_owned()
+                .map_err(|_| BlindRelayError::Backpressure)?;
+            PreparedOnionTerminalPayload::BlindVaultReply {
+                reply,
+                execution_permit,
+            }
+        }
+        DecodedOnionTerminalPayload::LegacyBlindVaultPut(request) => {
+            state
+                .blind_vault
+                .as_ref()
+                .ok_or(BlindRelayError::ForwardFailed)?;
+            let execution_permit = blind_vault_terminal_admission()
+                .try_acquire_owned()
+                .map_err(|_| BlindRelayError::Backpressure)?;
+            PreparedOnionTerminalPayload::LegacyBlindVaultPut {
+                request,
+                execution_permit,
+            }
+        }
+        DecodedOnionTerminalPayload::Message(envelope) => {
+            let storage_permit = acquire_chat_relay_storage(state, now_secs)
+                .map_err(map_terminal_chat_preparation_error)?;
+            PreparedOnionTerminalPayload::Message {
+                envelope,
+                storage_permit,
+            }
+        }
+    };
+
+    Ok(PreparedOnionTerminalWork {
+        proof_payload,
+        operation,
     })
 }
 
@@ -7328,7 +7403,7 @@ mod tests {
         );
 
         assert!(matches!(
-            prepare_onion_terminal_payload(&state, b"ANBV", now).await,
+            prepare_onion_terminal_payload(&state, b"ANBV".to_vec(), now).await,
             Err(BlindRelayError::OnionTerminalPayloadRejected)
         ));
     }
