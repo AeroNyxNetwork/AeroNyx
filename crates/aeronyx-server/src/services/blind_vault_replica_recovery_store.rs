@@ -36,7 +36,9 @@
 //! - Never permit normal snapshots to cross unresolved attempt phases.
 //! - Never weaken exact work/attempt/sequence/commitment comparisons.
 //!
-//! Last Modified: v1.5.0-FrozenV1GoldenVector - Froze the complete V1 encoded
+//! Last Modified: v1.6.0-MacOSTestFixtureCanonicalization - Canonicalized the
+//! temporary test root without weakening production no-follow enforcement.
+//! v1.5.0-FrozenV1GoldenVector - Froze the complete V1 encoded
 //! generation and exact decode/re-encode compatibility guard.
 //! v1.4.0-CrashRecoveryFormatHardening - Added fail-closed V1
 //! corruption, restart-phase, rollback, conflict, and exact-retry coverage.
@@ -722,7 +724,11 @@ mod tests {
     }
 
     fn recovery_directory(root: &TempDir) -> PathBuf {
-        root.path().join("recovery")
+        // [BLIND-VAULT-RECOVERY-MACOS-FIXTURE 2026-08-31 by Codex] Resolve
+        // tempfile's `/var` alias before the production O_NOFOLLOW checks.
+        std::fs::canonicalize(root.path())
+            .expect("canonical temporary recovery root")
+            .join("recovery")
     }
 
     fn publish_then_reopen(
