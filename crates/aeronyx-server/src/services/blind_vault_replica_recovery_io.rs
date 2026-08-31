@@ -38,7 +38,9 @@
 //! - The process fence prevents concurrent writers, not privileged rollback.
 //! - Never return to path-based state I/O after the directory FD is pinned.
 //!
-//! Last Modified: v1.7.0-OwnedTempGrammar - Restricted unfinished cleanup to
+//! Last Modified: v1.8.0-ValidatedFileIdentity - Required regular-file,
+//! effective-owner, and single-link proof before writable mode normalization.
+//! v1.7.0-OwnedTempGrammar - Restricted unfinished cleanup to
 //! the exact generated lowercase-hex filename grammar.
 //! v1.6.0-ParentDirectoryDurability - Required every traversed
 //! recovery directory entry to be durable in its pinned parent before use.
@@ -386,21 +388,49 @@ fn open_private_regular_file_at(
     // SAFETY: `openat` returned a new owned descriptor and this is its sole
     // owner. `File` closes it exactly once when dropped.
     let file = unsafe { File::from_raw_fd(raw_fd) };
+    let identity = ValidatedPrivateFileIdentity::new(&file)?;
     if writable {
-        file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+        identity.normalize_mode()?;
     }
-    validate_private_regular_metadata(&file.metadata()?)?;
+    identity.revalidate()?;
     Ok(file)
 }
 
-fn validate_private_regular_metadata(
+/// Proof that one opened descriptor had private-file identity before mutation.
+///
+/// [BLIND-VAULT-RECOVERY-IO 2026-08-31 by Codex] Writable mode normalization
+/// must be reachable only after regular-file, effective-owner, and single-link
+/// validation. A final metadata read rechecks both identity and private mode.
+struct ValidatedPrivateFileIdentity<'file> {
+    file: &'file File,
+}
+
+impl<'file> ValidatedPrivateFileIdentity<'file> {
+    fn new(file: &'file File) -> Result<Self, PrivateRecoveryIoError> {
+        validate_private_regular_identity(&file.metadata()?)?;
+        Ok(Self { file })
+    }
+
+    fn normalize_mode(&self) -> Result<(), PrivateRecoveryIoError> {
+        self.file
+            .set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+        Ok(())
+    }
+
+    fn revalidate(&self) -> Result<(), PrivateRecoveryIoError> {
+        let metadata = self.file.metadata()?;
+        validate_private_regular_identity(&metadata)?;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(PrivateRecoveryIoError::UnsafePath);
+        }
+        Ok(())
+    }
+}
+
+fn validate_private_regular_identity(
     metadata: &fs::Metadata,
 ) -> Result<(), PrivateRecoveryIoError> {
-    if !metadata.is_file()
-        || metadata.uid() != effective_user_id()
-        || metadata.nlink() != 1
-        || metadata.permissions().mode() & 0o077 != 0
-    {
+    if !metadata.is_file() || metadata.uid() != effective_user_id() || metadata.nlink() != 1 {
         return Err(PrivateRecoveryIoError::UnsafePath);
     }
     Ok(())
@@ -610,5 +640,59 @@ mod tests {
         }
         assert!(entry_exists(&directory.join(exact_directory)));
         assert!(entry_exists(&directory.join(unrelated)));
+    }
+
+    #[test]
+    fn hardlinked_lock_is_rejected_without_changing_external_alias_mode() {
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let canonical_root =
+            fs::canonicalize(root.path()).expect("canonical temporary recovery root");
+        let directory = canonical_root.join("recovery");
+        fs::create_dir(&directory).expect("create recovery fixture directory");
+
+        let external_alias = canonical_root.join("opaque-alias.bin");
+        fs::write(&external_alias, [0x6d; 8]).expect("write opaque alias fixture");
+        fs::set_permissions(&external_alias, fs::Permissions::from_mode(0o644))
+            .expect("set alias fixture mode");
+        fs::hard_link(&external_alias, directory.join(LOCK_FILE_NAME))
+            .expect("hard-link recovery lock fixture");
+
+        assert!(matches!(
+            PrivateAtomicRecoveryFile::open(&directory),
+            Err(PrivateRecoveryIoError::UnsafePath)
+        ));
+        assert_eq!(
+            fs::metadata(&external_alias)
+                .expect("external alias metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn legitimate_single_link_lock_mode_is_normalized() {
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let directory = fs::canonicalize(root.path())
+            .expect("canonical temporary recovery root")
+            .join("recovery");
+        fs::create_dir(&directory).expect("create recovery fixture directory");
+        let lock = directory.join(LOCK_FILE_NAME);
+        fs::write(&lock, [0x7e; 8]).expect("write opaque lock fixture");
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644))
+            .expect("set lock fixture mode");
+
+        let store =
+            PrivateAtomicRecoveryFile::open(&directory).expect("open legitimate recovery fixture");
+        assert_eq!(
+            fs::metadata(&lock)
+                .expect("lock fixture metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            PRIVATE_FILE_MODE
+        );
+        drop(store);
     }
 }
