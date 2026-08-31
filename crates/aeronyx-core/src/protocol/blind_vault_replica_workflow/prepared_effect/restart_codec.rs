@@ -31,7 +31,9 @@
 //! - Purpose codes are stable persistence values, not Rust enum ordinals.
 //! - Do not add routes, endpoints, payloads, account identity, or contacts.
 //!
-//! Last Modified: v1.0.0-PreparedEffectRestartCodec - Initial bounded V1
+//! Last Modified: v1.1.0-WorkflowVisibilityBoundary - Exposed restart binding
+//! helpers only to the enclosing replica workflow for sibling recovery paths.
+//! v1.0.0-PreparedEffectRestartCodec - Initial bounded V1
 //! source-local encoding and fail-closed restoration.
 //! ============================================
 
@@ -54,7 +56,12 @@ const RESTART_BINDING_EFFECT_BYTES: usize = 1 + 4 + 32;
 
 impl BlindVaultReplicaPreparedEffectSet {
     /// Encodes only payload-blind state for an identity-sealed local journal.
-    pub(super) fn encode_restart_binding(&self) -> Vec<u8> {
+    // [CORE-BUILD-BOUNDARY 2026-08-31 by Codex] Recovery orchestration lives
+    // in workflow sibling modules; expose this capability only to that parent
+    // domain, never to the crate or public API.
+    pub(in crate::protocol::blind_vault_replica_workflow) fn encode_restart_binding(
+        &self,
+    ) -> Vec<u8> {
         let mut encoded = Vec::with_capacity(
             RESTART_BINDING_HEADER_BYTES.saturating_add(
                 self.effects
@@ -79,7 +86,7 @@ impl BlindVaultReplicaPreparedEffectSet {
     /// [BLIND-VAULT-PREPARED-EFFECT-RESTORE 2026-08-29 by Codex] Both ordered
     /// contract validation and the complete transcript commitment run before
     /// the caller receives a send-time matching capability.
-    pub(super) fn decode_restart_binding(
+    pub(in crate::protocol::blind_vault_replica_workflow) fn decode_restart_binding(
         work_id: BlindVaultReplicaWorkId,
         attempt: u8,
         planned_dispatch_at_ms: u64,
@@ -156,7 +163,7 @@ impl BlindVaultReplicaPreparedEffectSet {
         })
     }
 
-    pub(super) const fn commitment(&self) -> [u8; 32] {
+    pub(in crate::protocol::blind_vault_replica_workflow) const fn commitment(&self) -> [u8; 32] {
         self.commitment
     }
 }

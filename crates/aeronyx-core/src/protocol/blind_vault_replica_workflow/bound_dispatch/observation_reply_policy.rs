@@ -36,7 +36,9 @@
 //! - This policy is source-private and intentionally not serializable.
 //! - Never expose private expectations or inventory values in telemetry.
 //!
-//! Last Modified: v1.2.0-PrivacySafeClockDiagnostics - Redacted generic clock
+//! Last Modified: v1.3.0-RuntimeAttemptPredicate - Removed an invalid const
+//! promise from the work-id comparison used by runtime recovery.
+//! v1.2.0-PrivacySafeClockDiagnostics - Redacted generic clock
 //! and source-private policy errors from standard diagnostics.
 //! v1.1.0-AttemptBoundCompletion - Bound completion capability
 //! to the exact work id and runtime attempt that produced its evidence.
@@ -97,7 +99,10 @@ impl BlindVaultReplicaCompletedObservation {
         &self.evidence
     }
 
-    pub(in crate::protocol::blind_vault_replica_workflow) const fn matches_attempt(
+    // [CORE-BUILD-BOUNDARY 2026-08-31 by Codex] BlindVaultReplicaWorkId uses
+    // derived PartialEq, which is intentionally a runtime operation on the
+    // supported toolchain; this predicate has no compile-time caller.
+    pub(in crate::protocol::blind_vault_replica_workflow) fn matches_attempt(
         &self,
         work_id: BlindVaultReplicaWorkId,
         attempt: u8,

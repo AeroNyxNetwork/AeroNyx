@@ -36,7 +36,9 @@
 //! - A transport must honor `authorized_terminal_node_id` when it is present.
 //! - Route replacement belongs inside the transport adapter, not this binding.
 //!
-//! Last Modified: v1.4.0-PrivacySafeTransportDiagnostics - Replaced generic
+//! Last Modified: v1.5.0-RecoveryVisibilityBoundary - Exposed the owned
+//! durable constructor only to the enclosing replica workflow.
+//! v1.4.0-PrivacySafeTransportDiagnostics - Replaced generic
 //! transport Debug/Display output with stable redacted classifications.
 //! v1.3.0-RetirementPermitGate - Required an exact workflow
 //! permit and terminal binding before old-lease retirement transport.
@@ -181,7 +183,10 @@ impl<'effects> BlindVaultReplicaTerminalSendSequence<'effects> {
         }
     }
 
-    pub(super) fn from_owned_durable_parts(
+    // [CORE-BUILD-BOUNDARY 2026-08-31 by Codex] Restart recovery is a sibling
+    // of bound dispatch, so scope this constructor to the workflow domain
+    // rather than widening it to the crate.
+    pub(in crate::protocol::blind_vault_replica_workflow) fn from_owned_durable_parts(
         effect_set: BlindVaultReplicaPreparedEffectSet,
         snapshot_sequence: u64,
         journal_sequence: u64,

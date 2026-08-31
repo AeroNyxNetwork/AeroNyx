@@ -36,7 +36,9 @@
 //! - Never permit interleaved replica groups or caller-selected group indexes.
 //! - Never expose private expectations or replica topology in telemetry.
 //!
-//! Last Modified: v1.2.0-PrivacySafeClockDiagnostics - Redacted generic clock
+//! Last Modified: v1.3.0-RuntimeAttemptPredicate - Removed an invalid const
+//! promise from the work-id comparison used by runtime recovery.
+//! v1.2.0-PrivacySafeClockDiagnostics - Redacted generic clock
 //! and source-private policy errors from standard diagnostics.
 //! v1.1.0-AttemptBoundCompletion - Preserved exact aggregate
 //! attempt binding inside the emitted durable completion capability.
@@ -116,7 +118,9 @@ impl BlindVaultReplicaCompletedProvisioning {
         &self.evidence
     }
 
-    pub(in crate::protocol::blind_vault_replica_workflow) const fn matches_attempt(
+    // [CORE-BUILD-BOUNDARY 2026-08-31 by Codex] This comparison is runtime
+    // validation; derived PartialEq is not const on the supported toolchain.
+    pub(in crate::protocol::blind_vault_replica_workflow) fn matches_attempt(
         &self,
         work_id: BlindVaultReplicaWorkId,
         attempt: u8,

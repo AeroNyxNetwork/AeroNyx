@@ -38,7 +38,9 @@
 //! - Never add a transition that accepts retirement before verified inventory.
 //! - Never expose request, receipt, manifest, node, or lease values in Debug.
 //!
-//! Last Modified: v1.7.0-PrivacySafePolicyDiagnostics - Redacted generic clock,
+//! Last Modified: v1.8.0-RuntimeAttemptPredicate - Removed an invalid const
+//! promise from the work-id comparison used by runtime recovery.
+//! v1.7.0-PrivacySafePolicyDiagnostics - Redacted generic clock,
 //! transport, and source-private policy errors from standard diagnostics.
 //! v1.6.0-AttemptBoundCompletion - Preserved exact replacement
 //! attempt binding inside the emitted durable completion capability.
@@ -125,7 +127,9 @@ impl BlindVaultReplicaCompletedReplacement {
         &self.evidence
     }
 
-    pub(in crate::protocol::blind_vault_replica_workflow) const fn matches_attempt(
+    // [CORE-BUILD-BOUNDARY 2026-08-31 by Codex] This comparison is runtime
+    // validation; derived PartialEq is not const on the supported toolchain.
+    pub(in crate::protocol::blind_vault_replica_workflow) fn matches_attempt(
         &self,
         work_id: BlindVaultReplicaWorkId,
         attempt: u8,

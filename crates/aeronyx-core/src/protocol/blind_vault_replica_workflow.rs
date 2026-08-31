@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.71.0-TotalRuntimeStateGate - Removed the terminal runtime
+//! Last Modified: v1.72.0-CoreBuildBoundary - Restored the explicit onion
+//! purpose dependency required by the dispatch contract.
+//! v1.71.0-TotalRuntimeStateGate - Removed the terminal runtime
 //! panic branch in favor of exhaustive typed state handling.
 //! v1.70.0-PrivacySafeFailureDiagnostics - Redacted exact
 //! durable failure and retry timing from standard diagnostics.
@@ -317,7 +319,10 @@ use super::blind_vault::{
     BlindVaultError, BlindVaultReplicaAction, BlindVaultReplicaPlanHealth,
     BlindVaultTerminalFailureCode, MAX_BLIND_VAULT_REPLICA_PLAN_ACTIONS,
 };
-use super::onion::{OnionRouteFailureDisposition, OnionRoutePlanError};
+// [CORE-BUILD-BOUNDARY 2026-08-31 by Codex] The dispatch contract owns
+// purpose-level protocol semantics directly, so keep the enum dependency
+// explicit instead of relying on an unrelated parent re-export.
+use super::onion::{OnionRouteFailureDisposition, OnionRoutePlanError, OnionRoutePurpose};
 
 /// At most two per-member actions plus one aggregate provisioning action can
 /// be emitted by the current deterministic planner.
