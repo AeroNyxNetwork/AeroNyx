@@ -16,7 +16,7 @@
 //! - Reads only bounded regular `0600` files without following symlinks.
 //! - Publishes a temp file through file fsync, rename, and directory fsync.
 //! - Re-confirms current file and directory durability after ambiguous errors.
-//! - Removes only adapter-owned unfinished temp files after acquiring the lock.
+//! - Removes only exact adapter-generated unfinished temp files after locking.
 //!
 //! ## Dependencies
 //! - `nix::fcntl::Flock`: process ownership fence.
@@ -34,11 +34,13 @@
 //! - This adapter is Unix-only because AeroNyx nodes run on Linux hosts.
 //! - Never weaken `O_NOFOLLOW`, regular-file, link-count, or mode checks.
 //! - Never include private paths or file bytes in errors, Debug, or telemetry.
-//! - Do not clean unknown files; only the exact temp prefix belongs to us.
+//! - Do not clean unknown files; only the exact generated temp grammar is ours.
 //! - The process fence prevents concurrent writers, not privileged rollback.
 //! - Never return to path-based state I/O after the directory FD is pinned.
 //!
-//! Last Modified: v1.6.0-ParentDirectoryDurability - Required every traversed
+//! Last Modified: v1.7.0-OwnedTempGrammar - Restricted unfinished cleanup to
+//! the exact generated lowercase-hex filename grammar.
+//! v1.6.0-ParentDirectoryDurability - Required every traversed
 //! recovery directory entry to be durable in its pinned parent before use.
 //! v1.5.0-PortableNixMode - Enabled directory enumeration and made fixed
 //! private modes portable across Unix `mode_t` widths.
@@ -76,6 +78,8 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 const STATE_FILE_NAME: &str = "recovery-state-v1.bin";
 const LOCK_FILE_NAME: &str = ".recovery-state-v1.lock";
 const TEMP_FILE_PREFIX: &str = ".recovery-state-v1.tmp.";
+const TEMP_FILE_RANDOM_BYTES: usize = 16;
+const TEMP_FILE_HEX_LENGTH: usize = TEMP_FILE_RANDOM_BYTES * 2;
 
 /// Host I/O failures without private path disclosure.
 #[derive(Debug, Error)]
@@ -217,7 +221,7 @@ impl PrivateAtomicRecoveryFile {
     }
 
     fn unique_temp_name(&self) -> String {
-        let mut random = [0u8; 16];
+        let mut random = [0u8; TEMP_FILE_RANDOM_BYTES];
         OsRng.fill_bytes(&mut random);
         format!("{TEMP_FILE_PREFIX}{}", hex::encode(random))
     }
@@ -412,18 +416,28 @@ fn validate_existing_state_at(directory: &File) -> Result<(), PrivateRecoveryIoE
     }
 }
 
+// [BLIND-VAULT-RECOVERY-IO 2026-08-31 by Codex] A prefix alone does not prove
+// adapter ownership. Generated names are exactly the ASCII prefix followed by
+// one lowercase hexadecimal encoding of the fixed-size random nonce.
+fn is_owned_temp_file_name(name: &[u8]) -> bool {
+    let Some(suffix) = name.strip_prefix(TEMP_FILE_PREFIX.as_bytes()) else {
+        return false;
+    };
+    suffix.len() == TEMP_FILE_HEX_LENGTH
+        && suffix
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
 fn cleanup_owned_temp_files(directory: &File) -> Result<(), PrivateRecoveryIoError> {
     // [BLIND-VAULT-RECOVERY-TEMP-CLEANUP 2026-08-29 by Codex] Cleanup runs
-    // only while holding the exclusive fence and only for our exact prefix.
+    // only while holding the exclusive fence and only for our exact grammar.
     // Unknown files and directories are never touched.
     let duplicated = dup(directory.as_raw_fd()).map_err(nix_filesystem_error)?;
     let mut entries = Dir::from_fd(duplicated).map_err(nix_filesystem_error)?;
     for entry in entries.iter() {
         let entry = entry.map_err(nix_filesystem_error)?;
-        let Some(name) = entry.file_name().to_str().ok() else {
-            continue;
-        };
-        if !name.starts_with(TEMP_FILE_PREFIX) {
+        if !is_owned_temp_file_name(entry.file_name().to_bytes()) {
             continue;
         }
         let removable = match entry.file_type() {
@@ -503,6 +517,14 @@ mod tests {
         }
     }
 
+    fn entry_exists(path: &Path) -> bool {
+        match fs::symlink_metadata(path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
+            Err(error) => panic!("inspect recovery fixture entry: {error}"),
+        }
+    }
+
     #[test]
     fn existing_component_retries_parent_sync_after_ambiguous_creation_failure() {
         let root = tempfile::tempdir().expect("temporary recovery root");
@@ -531,5 +553,62 @@ mod tests {
             .expect("retry existing recovery directory");
         assert_eq!(retry.calls.get(), 1);
         assert!(directory.metadata().expect("recovery metadata").is_dir());
+    }
+
+    #[test]
+    fn owned_temp_name_requires_exact_lowercase_hex_grammar() {
+        let exact = format!("{TEMP_FILE_PREFIX}{}", "0a".repeat(TEMP_FILE_RANDOM_BYTES));
+        let short = format!("{TEMP_FILE_PREFIX}{}", "1".repeat(TEMP_FILE_HEX_LENGTH - 1));
+        let long = format!("{TEMP_FILE_PREFIX}{}", "2".repeat(TEMP_FILE_HEX_LENGTH + 1));
+        let non_hex = format!(
+            "{TEMP_FILE_PREFIX}{}g",
+            "3".repeat(TEMP_FILE_HEX_LENGTH - 1)
+        );
+        let uppercase = format!("{TEMP_FILE_PREFIX}{}", "A".repeat(TEMP_FILE_HEX_LENGTH));
+
+        assert!(is_owned_temp_file_name(exact.as_bytes()));
+        for unknown in [short, long, non_hex, uppercase] {
+            assert!(!is_owned_temp_file_name(unknown.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn cleanup_removes_only_exact_regular_and_symlink_temp_entries() {
+        let root = tempfile::tempdir().expect("temporary recovery root");
+        let directory = fs::canonicalize(root.path())
+            .expect("canonical temporary recovery root")
+            .join("recovery");
+        let store = PrivateAtomicRecoveryFile::open(&directory).expect("open recovery fixture");
+
+        let exact_regular = format!("{TEMP_FILE_PREFIX}{}", "0".repeat(TEMP_FILE_HEX_LENGTH));
+        let exact_symlink = format!("{TEMP_FILE_PREFIX}{}", "1".repeat(TEMP_FILE_HEX_LENGTH));
+        let exact_directory = format!("{TEMP_FILE_PREFIX}{}", "2".repeat(TEMP_FILE_HEX_LENGTH));
+        let short = format!("{TEMP_FILE_PREFIX}{}", "3".repeat(TEMP_FILE_HEX_LENGTH - 1));
+        let long = format!("{TEMP_FILE_PREFIX}{}", "4".repeat(TEMP_FILE_HEX_LENGTH + 1));
+        let non_hex = format!(
+            "{TEMP_FILE_PREFIX}{}g",
+            "5".repeat(TEMP_FILE_HEX_LENGTH - 1)
+        );
+        let uppercase = format!("{TEMP_FILE_PREFIX}{}", "A".repeat(TEMP_FILE_HEX_LENGTH));
+        let unrelated = ".recovery-state-v1.tmp-unknown";
+
+        for name in [&exact_regular, &short, &long, &non_hex, &uppercase] {
+            fs::write(directory.join(name), [0xa5; 8]).expect("write opaque recovery fixture");
+        }
+        std::os::unix::fs::symlink("opaque-target", directory.join(&exact_symlink))
+            .expect("create recovery fixture symlink");
+        fs::create_dir(directory.join(&exact_directory))
+            .expect("create recovery fixture directory");
+        fs::write(directory.join(unrelated), [0x5a; 8]).expect("write unrelated recovery fixture");
+
+        cleanup_owned_temp_files(&store.directory).expect("cleanup owned recovery fixtures");
+
+        assert!(!entry_exists(&directory.join(exact_regular)));
+        assert!(!entry_exists(&directory.join(exact_symlink)));
+        for name in [short, long, non_hex, uppercase] {
+            assert!(entry_exists(&directory.join(name)));
+        }
+        assert!(entry_exists(&directory.join(exact_directory)));
+        assert!(entry_exists(&directory.join(unrelated)));
     }
 }
