@@ -1,13 +1,15 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_backup_audit_chain.rs
 // ============================================
-// Version: 1.1.0-MaintenanceCoordinatorComposition
+// Version: 1.2.0-PairedLinkRecovery
 //
 // Creation Reason:
 //   [CHAT-RELAY-BACKUP-AUDIT-CHAIN-DOMAIN 2026-08-27 by Codex] Extract the
 //   authenticated multi-segment audit-chain verifier from the relay service.
 //
 // Modification Reason:
+//   [CHAT-RELAY-BACKUP-PAIRED-LINK-RECOVERY 2026-08-31 by Codex] Admit only
+//   an identity-proven active/segment hard-link pair as duplicate publication.
 //   [CHAT-BACKUP-AUDIT-MAINTENANCE-DOMAIN 2026-08-28 by Codex] Documented the
 //   dedicated coordinator that consumes authenticated state and recovery work.
 //
@@ -37,6 +39,7 @@
 //   - Recovery actions may be returned only after full authentication.
 //
 // Last Modified:
+//   v1.2.0-PairedLinkRecovery - Authenticated exact two-link crash recovery
 //   v1.1.0-MaintenanceCoordinatorComposition - Documented use-case ownership
 //   v1.0.0-BackupAuditChainDomain - Initial composed chain verifier extraction
 // ============================================
@@ -339,11 +342,12 @@ where
             .classify_active_tail(active_fingerprint.as_ref(), latest_segment_fingerprint)
         {
             BackupAuditActiveTailDisposition::RetirePublishedDuplicate => {
-                return Ok((
-                    state,
-                    Some(ChatRelayBackupAuditPendingRotation::RemoveDuplicateActive {
-                        active_path: active_path.to_path_buf(),
-                    }),
+                // Byte equality alone cannot prove that both names are the
+                // publication pair. The paired-inode path in `verify_chain`
+                // handles the only legal duplicate-active crash state.
+                return Err(backup_io_error(
+                    rusqlite::ffi::SQLITE_CORRUPT,
+                    "relay backup maintenance audit duplicate is not identity-bound",
                 ));
             }
             BackupAuditActiveTailDisposition::VerifyActiveTail => {}
@@ -379,19 +383,40 @@ where
                 )
             })?);
             let previous_record_count = state.receipt().record_count;
-            let (mut segment, uses_active) =
+            let (mut segment, uses_active, paired_active) =
                 if let Some(segment_file_name) = files.segment_file_name {
                     let segment_path = parent.join(segment_file_name);
-                    let segment = self
-                        .filesystem
-                        .open_existing_control_file(&segment_path)?
-                        .ok_or_else(|| {
-                            backup_io_error(
-                                rusqlite::ffi::SQLITE_CORRUPT,
-                                "relay backup maintenance audit segment is missing",
-                            )
-                        })?;
-                    (segment, false)
+                    if index + 1 == segment_count {
+                        if let Some(pair) = self
+                            .filesystem
+                            .open_existing_control_file_pair(&segment_path, &active_path)?
+                        {
+                            let identity = pair.identity;
+                            (pair.first, false, Some((pair.second, identity)))
+                        } else {
+                            let segment = self
+                                .filesystem
+                                .open_existing_control_file(&segment_path)?
+                                .ok_or_else(|| {
+                                    backup_io_error(
+                                        rusqlite::ffi::SQLITE_CORRUPT,
+                                        "relay backup maintenance audit segment is missing",
+                                    )
+                                })?;
+                            (segment, false, None)
+                        }
+                    } else {
+                        let segment = self
+                            .filesystem
+                            .open_existing_control_file(&segment_path)?
+                            .ok_or_else(|| {
+                                backup_io_error(
+                                    rusqlite::ffi::SQLITE_CORRUPT,
+                                    "relay backup maintenance audit segment is missing",
+                                )
+                            })?;
+                        (segment, false, None)
+                    }
                 } else {
                     if index + 1 != segment_count || pending_rotation.is_some() {
                         return Err(backup_io_error(
@@ -412,7 +437,7 @@ where
                         active_path: active_path.clone(),
                         segment_path: parent.join(self.audit_io.segment_file_name(range)),
                     });
-                    (segment, true)
+                    (segment, true, None)
                 };
             state = self.verify_segment(&mut segment, node_secret, state)?;
             let (segment_bytes, segment_sha256) = self.audit_io.hash_segment(&mut segment)?;
@@ -430,6 +455,17 @@ where
                 bytes: segment_bytes,
                 sha256: segment_sha256,
             });
+            if let Some((_active, expected_identity)) = paired_active {
+                // [CHAT-RELAY-BACKUP-PAIRED-LINK-RECOVERY 2026-08-31 by Codex]
+                // Keep the active descriptor alive through full segment and
+                // checkpoint authentication before emitting deletion work.
+                pending_rotation =
+                    Some(ChatRelayBackupAuditPendingRotation::RemoveDuplicateActive {
+                        active_path: active_path.clone(),
+                        expected_identity,
+                    });
+                break;
+            }
             if uses_active {
                 break;
             }

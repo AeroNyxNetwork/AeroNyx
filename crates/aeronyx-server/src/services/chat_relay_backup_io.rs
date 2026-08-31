@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_backup_io.rs
 // ============================================
-// Version: 1.0.0-BackupFilesystemDomain
+// Version: 1.3.0-PairedLinkRecovery
 //
 // Creation Reason:
 //   [CHAT-RELAY-BACKUP-FILESYSTEM-DOMAIN 2026-08-27 by Codex] Extract the
@@ -13,6 +13,7 @@
 //   - Rejects foreign-owned or multiply-linked private control files.
 //   - Acquires an exclusive, RAII-released cross-process maintenance lock.
 //   - Durably synchronizes backup publication boundaries.
+//   - Proves an exact read-only pair of canonical crash-publication links.
 //
 // Dependencies:
 //   - `chat_relay_error` supplies the stable relay error contract.
@@ -32,8 +33,12 @@
 //   - Validate file owner and link count before returning a writable handle.
 //   - Lock acquisition and publication durability must remain fail-closed.
 //   - Keep backup policy, artifact names, payloads, and service state elsewhere.
+//   - Never relax the single-file `nlink == 1` rule; only the paired read
+//     capability may admit two canonical names for one exact `nlink == 2` inode.
 //
 // Last Modified:
+//   v1.3.0-PairedLinkRecovery - Added identity-bound read-only recovery for
+//     exact two-name hard-link publication states without weakening writers
 //   v1.2.0-DirectoryIdentity - Pinned and validated the effective-user-owned
 //     directory inode before normalizing its private mode
 //   v1.1.0-ControlFileIdentity - Rejected foreign-owned and multiply-linked
@@ -56,6 +61,27 @@ pub(super) enum PrivateBackupControlFileMode {
     ReadWrite,
     /// Open for append-only maintenance audit publication.
     Append,
+}
+
+/// Stable storage identity for one fully validated private control inode.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PrivateBackupControlFileIdentity {
+    device_id: u64,
+    inode: u64,
+}
+
+/// Portable placeholder; paired-link recovery remains Unix-only.
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PrivateBackupControlFileIdentity;
+
+/// Two read-only descriptors proven to be the only names of one private inode.
+#[derive(Debug)]
+pub(super) struct PrivateBackupControlFilePair {
+    pub(super) first: File,
+    pub(super) second: File,
+    pub(super) identity: PrivateBackupControlFileIdentity,
 }
 
 impl PrivateBackupControlFileMode {
@@ -84,6 +110,22 @@ pub(super) trait BackupFilesystem {
 
     /// Opens an existing private regular control file without creating it.
     fn open_existing_control_file(&self, path: &Path) -> ChatRelayResult<Option<File>>;
+
+    /// Opens two canonical read-only names only when they are the exact two
+    /// links to one owner-private regular inode.
+    fn open_existing_control_file_pair(
+        &self,
+        first: &Path,
+        second: &Path,
+    ) -> ChatRelayResult<Option<PrivateBackupControlFilePair>>;
+
+    /// Removes one exact paired link after revalidating its storage identity.
+    fn remove_verified_control_link(
+        &self,
+        parent: &Path,
+        path: &Path,
+        expected: PrivateBackupControlFileIdentity,
+    ) -> ChatRelayResult<()>;
 
     /// Acquires the host-local exclusive backup maintenance lock.
     fn acquire_maintenance_lock(
@@ -225,6 +267,116 @@ fn effective_user_id() -> u32 {
     unsafe { nix::libc::geteuid() }
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrivateControlFileFacts {
+    identity: PrivateBackupControlFileIdentity,
+    owner_id: u32,
+    link_count: u64,
+    mode: u32,
+}
+
+#[cfg(unix)]
+fn private_control_file_facts(file: &File) -> ChatRelayResult<PrivateControlFileFacts> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = file.metadata().map_err(|_| {
+        backup_io_error(
+            rusqlite::ffi::SQLITE_IOERR,
+            "unable to inspect private relay backup control file",
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(backup_io_error(
+            rusqlite::ffi::SQLITE_PERM,
+            "relay backup control boundary is not a private regular file",
+        ));
+    }
+    Ok(PrivateControlFileFacts {
+        identity: PrivateBackupControlFileIdentity {
+            device_id: metadata.dev(),
+            inode: metadata.ino(),
+        },
+        owner_id: metadata.uid(),
+        link_count: metadata.nlink(),
+        mode: metadata.permissions().mode(),
+    })
+}
+
+#[cfg(unix)]
+fn validate_owner_private_facts(facts: PrivateControlFileFacts) -> ChatRelayResult<()> {
+    if facts.owner_id != effective_user_id() || facts.mode & 0o077 != 0 {
+        return Err(backup_io_error(
+            rusqlite::ffi::SQLITE_PERM,
+            "relay backup control file is not owner-private",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn paired_private_control_identity(
+    first: PrivateControlFileFacts,
+    second: PrivateControlFileFacts,
+) -> ChatRelayResult<Option<PrivateBackupControlFileIdentity>> {
+    validate_owner_private_facts(first)?;
+    validate_owner_private_facts(second)?;
+    if first.identity != second.identity {
+        return Ok(None);
+    }
+    // [CHAT-RELAY-BACKUP-PAIRED-LINK-RECOVERY 2026-08-31 by Codex] Both
+    // expected canonical names must account for the inode's entire link count.
+    // A third or external alias is unknown state and remains fail-closed.
+    if first.link_count != 2 || second.link_count != 2 {
+        return Err(backup_io_error(
+            rusqlite::ffi::SQLITE_PERM,
+            "relay backup control link pair is not exclusive",
+        ));
+    }
+    Ok(Some(first.identity))
+}
+
+fn open_existing_control_file_unvalidated(path: &Path) -> ChatRelayResult<Option<File>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    match options.open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(backup_io_error(
+            rusqlite::ffi::SQLITE_CANTOPEN,
+            "unable to open private relay backup control file",
+        )),
+    }
+}
+
+fn canonical_control_path(path: &Path) -> ChatRelayResult<(PathBuf, PathBuf)> {
+    let parent = path.parent().ok_or_else(|| {
+        backup_io_error(
+            rusqlite::ffi::SQLITE_CANTOPEN,
+            "relay backup control file has no private parent",
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        backup_io_error(
+            rusqlite::ffi::SQLITE_CANTOPEN,
+            "relay backup control file has no private name",
+        )
+    })?;
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|_| {
+        backup_io_error(
+            rusqlite::ffi::SQLITE_CANTOPEN,
+            "unable to resolve private relay backup control parent",
+        )
+    })?;
+    let canonical_path = canonical_parent.join(file_name);
+    Ok((canonical_parent, canonical_path))
+}
+
 fn validate_private_control_file(file: &File) -> ChatRelayResult<()> {
     let metadata = file.metadata().map_err(|_| {
         backup_io_error(
@@ -240,15 +392,12 @@ fn validate_private_control_file(file: &File) -> ChatRelayResult<()> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
         // [CHAT-RELAY-BACKUP-FILE-IDENTITY 2026-08-31 by Codex] A private
         // mode does not prove exclusive ownership of an inode. Reject foreign
         // ownership and hard links before a caller receives a writable handle.
-        if metadata.uid() != effective_user_id()
-            || metadata.nlink() != 1
-            || metadata.permissions().mode() & 0o077 != 0
-        {
+        let facts = private_control_file_facts(file)?;
+        validate_owner_private_facts(facts)?;
+        if facts.link_count != 1 {
             return Err(backup_io_error(
                 rusqlite::ffi::SQLITE_PERM,
                 "relay backup control file is not owner-private",
@@ -368,9 +517,6 @@ impl BackupFilesystem for LocalBackupFilesystem {
     }
 
     fn open_existing_control_file(&self, path: &Path) -> ChatRelayResult<Option<File>> {
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-
         #[cfg(not(unix))]
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -389,22 +535,107 @@ impl BackupFilesystem for LocalBackupFilesystem {
             }
         }
 
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
-        let file = match options.open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => {
-                return Err(backup_io_error(
-                    rusqlite::ffi::SQLITE_CANTOPEN,
-                    "unable to open private relay backup control file",
-                ));
-            }
+        let Some(file) = open_existing_control_file_unvalidated(path)? else {
+            return Ok(None);
         };
         validate_private_control_file(&file)?;
         Ok(Some(file))
+    }
+
+    fn open_existing_control_file_pair(
+        &self,
+        first: &Path,
+        second: &Path,
+    ) -> ChatRelayResult<Option<PrivateBackupControlFilePair>> {
+        #[cfg(not(unix))]
+        {
+            let _ = (first, second);
+            return Ok(None);
+        }
+
+        #[cfg(unix)]
+        {
+            let (first_parent, first_path) = canonical_control_path(first)?;
+            let (second_parent, second_path) = canonical_control_path(second)?;
+            if first_parent != second_parent || first_path == second_path {
+                return Err(backup_io_error(
+                    rusqlite::ffi::SQLITE_PERM,
+                    "relay backup control link pair is not canonical",
+                ));
+            }
+            let Some(first_file) = open_existing_control_file_unvalidated(&first_path)? else {
+                return Ok(None);
+            };
+            let Some(second_file) = open_existing_control_file_unvalidated(&second_path)? else {
+                return Ok(None);
+            };
+            let Some(identity) = paired_private_control_identity(
+                private_control_file_facts(&first_file)?,
+                private_control_file_facts(&second_file)?,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(PrivateBackupControlFilePair {
+                first: first_file,
+                second: second_file,
+                identity,
+            }))
+        }
+    }
+
+    fn remove_verified_control_link(
+        &self,
+        parent: &Path,
+        path: &Path,
+        expected: PrivateBackupControlFileIdentity,
+    ) -> ChatRelayResult<()> {
+        #[cfg(not(unix))]
+        {
+            let _ = (parent, path, expected);
+            return Err(backup_io_error(
+                rusqlite::ffi::SQLITE_PERM,
+                "paired relay backup control recovery is unavailable",
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            let canonical_parent = std::fs::canonicalize(parent).map_err(|_| {
+                backup_io_error(
+                    rusqlite::ffi::SQLITE_CANTOPEN,
+                    "unable to resolve relay backup recovery parent",
+                )
+            })?;
+            let (path_parent, canonical_path) = canonical_control_path(path)?;
+            if path_parent != canonical_parent {
+                return Err(backup_io_error(
+                    rusqlite::ffi::SQLITE_PERM,
+                    "relay backup recovery link escaped its private parent",
+                ));
+            }
+            let file =
+                open_existing_control_file_unvalidated(&canonical_path)?.ok_or_else(|| {
+                    backup_io_error(
+                        rusqlite::ffi::SQLITE_CORRUPT,
+                        "relay backup recovery link became unavailable",
+                    )
+                })?;
+            let facts = private_control_file_facts(&file)?;
+            validate_owner_private_facts(facts)?;
+            if facts.identity != expected || facts.link_count != 2 {
+                return Err(backup_io_error(
+                    rusqlite::ffi::SQLITE_PERM,
+                    "relay backup recovery link identity changed",
+                ));
+            }
+            std::fs::remove_file(&canonical_path).map_err(|_| {
+                backup_io_error(
+                    rusqlite::ffi::SQLITE_IOERR_DELETE,
+                    "unable to remove verified relay backup recovery link",
+                )
+            })
+        }
     }
 
     fn acquire_maintenance_lock(
@@ -699,5 +930,179 @@ mod tests {
             std::fs::read(&external).expect("external file remains readable"),
             b"external"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_paired_links_are_identity_bound_and_recoverable() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().expect("temporary paired-link directory");
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonical paired parent");
+        let active = root.path().join("active-control");
+        let segment = canonical_root.join("segment-control");
+        let filesystem = LocalBackupFilesystem;
+        filesystem
+            .reserve_private_file(&active)
+            .expect("reserve private active control");
+        std::fs::hard_link(&active, &segment).expect("publish exact paired link");
+
+        let pair = filesystem
+            .open_existing_control_file_pair(&active, &segment)
+            .expect("inspect exact paired link")
+            .expect("paired link must be recognized");
+        assert_eq!(
+            pair.first.metadata().expect("first metadata").ino(),
+            pair.second.metadata().expect("second metadata").ino()
+        );
+        assert!(filesystem.open_existing_control_file(&active).is_err());
+        let identity = pair.identity;
+        drop(pair);
+
+        filesystem
+            .remove_verified_control_link(root.path(), &active, identity)
+            .expect("remove identity-bound active link");
+        assert!(!active.exists());
+        assert_eq!(
+            std::fs::metadata(&segment)
+                .expect("retained segment metadata")
+                .nlink(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paired_link_facts_reject_uid_mode_third_link_and_distinct_inode() {
+        let identity = PrivateBackupControlFileIdentity {
+            device_id: 7,
+            inode: 11,
+        };
+        let valid = PrivateControlFileFacts {
+            identity,
+            owner_id: effective_user_id(),
+            link_count: 2,
+            mode: 0o100600,
+        };
+        assert_eq!(
+            paired_private_control_identity(valid, valid).expect("valid pair facts"),
+            Some(identity)
+        );
+
+        for invalid in [
+            PrivateControlFileFacts {
+                owner_id: effective_user_id().wrapping_add(1),
+                ..valid
+            },
+            PrivateControlFileFacts {
+                mode: 0o100644,
+                ..valid
+            },
+            PrivateControlFileFacts {
+                link_count: 3,
+                ..valid
+            },
+        ] {
+            assert!(paired_private_control_identity(valid, invalid).is_err());
+        }
+        assert_eq!(
+            paired_private_control_identity(
+                valid,
+                PrivateControlFileFacts {
+                    identity: PrivateBackupControlFileIdentity {
+                        device_id: 7,
+                        inode: 12,
+                    },
+                    ..valid
+                }
+            )
+            .expect("distinct private files are not a pair"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paired_link_identity_or_mode_drift_is_rejected_before_unlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for replace_identity in [false, true] {
+            let root = tempfile::tempdir().expect("temporary paired-link drift directory");
+            let filesystem = LocalBackupFilesystem;
+            let active = root.path().join("active-control");
+            let segment = root.path().join("segment-control");
+            filesystem
+                .reserve_private_file(&active)
+                .expect("reserve drift active control");
+            std::fs::hard_link(&active, &segment).expect("publish drift segment link");
+            let pair = filesystem
+                .open_existing_control_file_pair(&active, &segment)
+                .expect("inspect drift pair")
+                .expect("drift pair starts valid");
+            let identity = pair.identity;
+            drop(pair);
+
+            if replace_identity {
+                std::fs::remove_file(&active).expect("remove original active name");
+                filesystem
+                    .reserve_private_file(&active)
+                    .expect("replace active with distinct inode");
+            } else {
+                std::fs::set_permissions(&active, std::fs::Permissions::from_mode(0o644))
+                    .expect("drift paired inode mode");
+            }
+
+            assert!(filesystem
+                .remove_verified_control_link(root.path(), &active, identity)
+                .is_err());
+            assert!(active.exists() && segment.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_and_external_or_third_links_fail_without_removal() {
+        use nix::sys::stat::Mode;
+
+        let root = tempfile::tempdir().expect("temporary unsafe-link directory");
+        let outside = tempfile::tempdir().expect("external alias directory");
+        let filesystem = LocalBackupFilesystem;
+        let active = root.path().join("active-control");
+        let segment = root.path().join("segment-control");
+        let third = root.path().join("third-control");
+        filesystem
+            .reserve_private_file(&active)
+            .expect("reserve active control");
+        std::fs::hard_link(&active, &segment).expect("publish segment link");
+        std::fs::hard_link(&active, &third).expect("publish forbidden third link");
+        assert!(filesystem
+            .open_existing_control_file_pair(&active, &segment)
+            .is_err());
+        assert!(active.exists() && segment.exists() && third.exists());
+
+        let external_source = root.path().join("external-source");
+        let expected_alias = root.path().join("expected-alias");
+        filesystem
+            .reserve_private_file(&external_source)
+            .expect("reserve externally-linked control");
+        let external_alias = outside.path().join("external-alias");
+        std::fs::hard_link(&external_source, &external_alias)
+            .expect("create external hard-link alias");
+        filesystem
+            .reserve_private_file(&expected_alias)
+            .expect("reserve distinct expected alias");
+        assert!(filesystem
+            .open_existing_control_file_pair(&external_source, &external_alias)
+            .is_err());
+        assert!(filesystem
+            .open_existing_control_file_pair(&external_source, &expected_alias)
+            .expect("distinct in-parent names are inspectable")
+            .is_none());
+        assert!(external_source.exists() && external_alias.exists() && expected_alias.exists());
+
+        let fifo = root.path().join("fifo-control");
+        nix::unistd::mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).expect("create private FIFO");
+        assert!(filesystem.open_existing_control_file(&fifo).is_err());
+        assert!(fifo.exists());
     }
 }

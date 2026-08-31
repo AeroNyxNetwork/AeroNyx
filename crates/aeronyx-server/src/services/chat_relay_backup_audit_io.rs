@@ -1,13 +1,15 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_backup_audit_io.rs
 // ============================================
-// Version: 1.2.0-MaintenanceCoordinatorComposition
+// Version: 1.3.0-PairedLinkRecovery
 //
 // Creation Reason:
 //   [CHAT-RELAY-BACKUP-AUDIT-IO-DOMAIN 2026-08-27 by Codex] Extract bounded
 //   audit artifact reads and crash-safe publication from the relay service.
 //
 // Modification Reason:
+//   [CHAT-RELAY-BACKUP-PAIRED-LINK-RECOVERY 2026-08-31 by Codex] Recover only
+//   exact identity-proven checkpoint/temp and active/segment crash pairs.
 //   [CHAT-BACKUP-AUDIT-MAINTENANCE-DOMAIN 2026-08-28 by Codex] Documented the
 //   coordinator that now composes this I/O capability with chain policies.
 //
@@ -37,6 +39,7 @@
 //   - HMAC policy and chain state transitions belong outside this I/O module.
 //
 // Last Modified:
+//   v1.3.0-PairedLinkRecovery - Identity-bound two-link cleanup and retirement
 //   v1.2.0-MaintenanceCoordinatorComposition - Documented use-case ownership
 //   v1.1.0-CanonicalSegmentNaming - Exposed canonical segment naming to the
 //     composed chain verifier without leaking catalog implementation details
@@ -57,7 +60,8 @@ use crate::services::chat_relay_backup_audit_catalog::{
 use crate::services::chat_relay_backup_audit_checkpoint::ChatRelayBackupAuditCheckpoint;
 use crate::services::chat_relay_backup_audit_rotation::ChatRelayBackupAuditSegmentRange;
 use crate::services::chat_relay_backup_io::{
-    backup_io_error, BackupFilesystem, PrivateBackupControlFileMode,
+    backup_io_error, BackupFilesystem, PrivateBackupControlFileIdentity,
+    PrivateBackupControlFileMode,
 };
 use crate::services::chat_relay_error::{ChatRelayError, ChatRelayResult};
 
@@ -84,7 +88,10 @@ pub(super) enum ChatRelayBackupAuditPendingRotation {
         segment_path: PathBuf,
     },
     /// The named segment exists but the duplicate active link remains.
-    RemoveDuplicateActive { active_path: PathBuf },
+    RemoveDuplicateActive {
+        active_path: PathBuf,
+        expected_identity: PrivateBackupControlFileIdentity,
+    },
 }
 
 /// Bounded host I/O required by backup-audit verification and publication.
@@ -173,6 +180,66 @@ impl<F> LocalBackupAuditIo<F> {
     }
 }
 
+impl<F: BackupFilesystem> LocalBackupAuditIo<F> {
+    fn checkpoint_temporary_paths(&self, parent: &Path) -> ChatRelayResult<Vec<PathBuf>> {
+        let entries = std::fs::read_dir(parent).map_err(|_| {
+            backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "unable to inspect relay backup maintenance audit temporaries",
+            )
+        })?;
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|_| {
+                backup_io_error(
+                    rusqlite::ffi::SQLITE_IOERR,
+                    "unable to inspect relay backup maintenance audit temporary",
+                )
+            })?;
+            let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(nonce) = file_name.strip_prefix(BACKUP_AUDIT_CHECKPOINT_TEMP_PREFIX) else {
+                continue;
+            };
+            if !is_lower_hex(nonce, 16) {
+                return Err(backup_io_error(
+                    rusqlite::ffi::SQLITE_CORRUPT,
+                    "relay backup maintenance audit temporary name is malformed",
+                ));
+            }
+            if paths.len() >= BACKUP_AUDIT_CHECKPOINT_TEMP_MAX_FILES {
+                return Err(backup_io_error(
+                    rusqlite::ffi::SQLITE_FULL,
+                    "relay backup maintenance audit temporary limit reached",
+                ));
+            }
+            paths.push(entry.path());
+        }
+        Ok(paths)
+    }
+
+    fn open_checkpoint_for_read(&self, path: &Path) -> ChatRelayResult<Option<File>> {
+        let parent = path.parent().ok_or_else(|| {
+            backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "relay backup maintenance audit checkpoint has no private parent",
+            )
+        })?;
+        for temporary_path in self.checkpoint_temporary_paths(parent)? {
+            if let Some(pair) = self
+                .filesystem
+                .open_existing_control_file_pair(path, &temporary_path)?
+            {
+                let checkpoint = pair.first;
+                drop(pair.second);
+                return Ok(Some(checkpoint));
+            }
+        }
+        self.filesystem.open_existing_control_file(path)
+    }
+}
+
 impl<F: BackupFilesystem> BackupAuditIo for LocalBackupAuditIo<F> {
     fn segment_file_name(&self, range: ChatRelayBackupAuditSegmentRange) -> String {
         // [CHAT-RELAY-BACKUP-AUDIT-CHAIN-DOMAIN 2026-08-27 by Codex] Keep
@@ -215,45 +282,35 @@ impl<F: BackupFilesystem> BackupAuditIo for LocalBackupAuditIo<F> {
     }
 
     fn cleanup_checkpoint_temporaries(&self, parent: &Path) -> ChatRelayResult<()> {
-        let entries = std::fs::read_dir(parent).map_err(|_| {
-            backup_io_error(
-                rusqlite::ffi::SQLITE_CANTOPEN,
-                "unable to inspect relay backup maintenance audit temporaries",
-            )
-        })?;
-        let mut removed = 0usize;
-        for entry in entries {
-            let entry = entry.map_err(|_| {
-                backup_io_error(
-                    rusqlite::ffi::SQLITE_IOERR,
-                    "unable to inspect relay backup maintenance audit temporary",
-                )
-            })?;
-            let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let Some(nonce) = file_name.strip_prefix(BACKUP_AUDIT_CHECKPOINT_TEMP_PREFIX) else {
-                continue;
-            };
-            if !is_lower_hex(nonce, 16) {
-                return Err(backup_io_error(
-                    rusqlite::ffi::SQLITE_CORRUPT,
-                    "relay backup maintenance audit temporary name is malformed",
-                ));
+        let checkpoint_paths = self
+            .collect_segment_files(parent)?
+            .into_values()
+            .filter_map(|files| files.checkpoint_file_name)
+            .map(|file_name| parent.join(file_name))
+            .collect::<Vec<_>>();
+        let temporary_paths = self.checkpoint_temporary_paths(parent)?;
+        let removed = temporary_paths.len();
+        for path in temporary_paths {
+            let mut published_identity = None;
+            for checkpoint_path in &checkpoint_paths {
+                if let Some(pair) = self
+                    .filesystem
+                    .open_existing_control_file_pair(&path, checkpoint_path)?
+                {
+                    published_identity = Some(pair.identity);
+                    drop(pair);
+                    break;
+                }
             }
-            removed = removed.checked_add(1).ok_or_else(|| {
-                backup_io_error(
-                    rusqlite::ffi::SQLITE_FULL,
-                    "relay backup maintenance audit temporary count overflow",
-                )
-            })?;
-            if removed > BACKUP_AUDIT_CHECKPOINT_TEMP_MAX_FILES {
-                return Err(backup_io_error(
-                    rusqlite::ffi::SQLITE_FULL,
-                    "relay backup maintenance audit temporary limit reached",
-                ));
+            if let Some(identity) = published_identity {
+                // [CHAT-RELAY-BACKUP-PAIRED-LINK-RECOVERY 2026-08-31 by Codex]
+                // The canonical checkpoint is the inode's only other name.
+                // Revalidate the temporary identity immediately before unlink.
+                self.filesystem
+                    .remove_verified_control_link(parent, &path, identity)?;
+                self.filesystem.sync_backup_parent(parent)?;
+                continue;
             }
-            let path = entry.path();
             let Some(file) = self.filesystem.open_existing_control_file(&path)? else {
                 continue;
             };
@@ -272,7 +329,7 @@ impl<F: BackupFilesystem> BackupAuditIo for LocalBackupAuditIo<F> {
     }
 
     fn read_checkpoint(&self, path: &Path) -> ChatRelayResult<ChatRelayBackupAuditCheckpoint> {
-        let Some(mut file) = self.filesystem.open_existing_control_file(path)? else {
+        let Some(mut file) = self.open_checkpoint_for_read(path)? else {
             return Err(backup_io_error(
                 rusqlite::ffi::SQLITE_CORRUPT,
                 "relay backup maintenance audit checkpoint is missing",
@@ -413,13 +470,15 @@ impl<F: BackupFilesystem> BackupAuditIo for LocalBackupAuditIo<F> {
                 })?;
                 self.filesystem.sync_backup_parent(parent)
             }
-            ChatRelayBackupAuditPendingRotation::RemoveDuplicateActive { active_path } => {
-                std::fs::remove_file(&active_path).map_err(|_| {
-                    backup_io_error(
-                        rusqlite::ffi::SQLITE_IOERR_DELETE,
-                        "unable to finalize relay backup maintenance audit segment publication",
-                    )
-                })?;
+            ChatRelayBackupAuditPendingRotation::RemoveDuplicateActive {
+                active_path,
+                expected_identity,
+            } => {
+                self.filesystem.remove_verified_control_link(
+                    parent,
+                    &active_path,
+                    expected_identity,
+                )?;
                 self.filesystem.sync_backup_parent(parent)
             }
         }
@@ -561,6 +620,97 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn published_checkpoint_temporary_pair_is_readable_and_cleanup_is_idempotent() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+
+        let parent = tempfile::tempdir().expect("temporary checkpoint crash parent");
+        let io = audit_io();
+        let filesystem = LocalBackupFilesystem;
+        let range = range(1, 1);
+        let expected = checkpoint(range);
+        let checkpoint_path = parent.path().join(io.checkpoint_file_name(range));
+        let temporary_path = parent.path().join(format!(
+            "{BACKUP_AUDIT_CHECKPOINT_TEMP_PREFIX}0123456789abcdef"
+        ));
+        filesystem
+            .reserve_private_file(&temporary_path)
+            .expect("reserve checkpoint temporary");
+        let mut temporary = filesystem
+            .open_control_file(&temporary_path, PrivateBackupControlFileMode::ReadWrite)
+            .expect("open checkpoint temporary");
+        temporary
+            .write_all(&serde_json::to_vec(&expected).expect("encode checkpoint"))
+            .expect("write checkpoint temporary");
+        temporary.sync_all().expect("sync checkpoint temporary");
+        drop(temporary);
+        std::fs::hard_link(&temporary_path, &checkpoint_path)
+            .expect("publish checkpoint hard link before crash");
+
+        assert_eq!(
+            io.read_checkpoint(&checkpoint_path)
+                .expect("read identity-bound checkpoint pair"),
+            expected
+        );
+        io.cleanup_checkpoint_temporaries(parent.path())
+            .expect("recover checkpoint publication temporary");
+        assert!(!temporary_path.exists());
+        assert_eq!(
+            std::fs::metadata(&checkpoint_path)
+                .expect("retained checkpoint metadata")
+                .nlink(),
+            1
+        );
+        io.cleanup_checkpoint_temporaries(parent.path())
+            .expect("checkpoint cleanup retry is idempotent");
+        assert!(checkpoint_path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn checkpoint_pair_with_third_link_or_mode_drift_has_zero_cleanup_effect() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        for drift_mode in [false, true] {
+            let parent = tempfile::tempdir().expect("temporary invalid checkpoint pair parent");
+            let io = audit_io();
+            let filesystem = LocalBackupFilesystem;
+            let range = range(1, 1);
+            let checkpoint_path = parent.path().join(io.checkpoint_file_name(range));
+            let temporary_path = parent.path().join(format!(
+                "{BACKUP_AUDIT_CHECKPOINT_TEMP_PREFIX}fedcba9876543210"
+            ));
+            filesystem
+                .reserve_private_file(&temporary_path)
+                .expect("reserve invalid checkpoint temporary");
+            std::fs::hard_link(&temporary_path, &checkpoint_path)
+                .expect("publish invalid checkpoint pair");
+            let third_path = parent.path().join("unmanaged-third-link");
+            if drift_mode {
+                std::fs::set_permissions(&checkpoint_path, std::fs::Permissions::from_mode(0o644))
+                    .expect("drift checkpoint pair mode");
+            } else {
+                std::fs::hard_link(&temporary_path, &third_path)
+                    .expect("add forbidden checkpoint third link");
+            }
+
+            assert!(io.cleanup_checkpoint_temporaries(parent.path()).is_err());
+            assert!(temporary_path.exists() && checkpoint_path.exists());
+            if drift_mode {
+                assert_eq!(
+                    std::fs::metadata(&temporary_path)
+                        .expect("drifted temporary metadata")
+                        .nlink(),
+                    2
+                );
+            } else {
+                assert!(third_path.exists());
+            }
+        }
+    }
+
+    #[test]
     fn cleanup_removes_only_canonical_abandoned_temporaries() {
         let parent = tempfile::tempdir().expect("temporary audit parent");
         let io = audit_io();
@@ -658,20 +808,31 @@ mod tests {
     fn duplicate_active_recovery_retires_only_the_active_name() {
         let parent = tempfile::tempdir().expect("temporary audit parent");
         let active_path = parent.path().join(BACKUP_AUDIT_FILE_NAME);
+        let segment_path = parent.path().join("immutable-segment");
         LocalBackupFilesystem
             .reserve_private_file(&active_path)
             .expect("reserve duplicate active segment");
+        std::fs::hard_link(&active_path, &segment_path)
+            .expect("publish duplicate active segment link");
+        let pair = LocalBackupFilesystem
+            .open_existing_control_file_pair(&active_path, &segment_path)
+            .expect("inspect duplicate active pair")
+            .expect("duplicate active pair is exact");
+        let expected_identity = pair.identity;
+        drop(pair);
 
         audit_io()
             .complete_pending_rotation(
                 parent.path(),
                 ChatRelayBackupAuditPendingRotation::RemoveDuplicateActive {
                     active_path: active_path.clone(),
+                    expected_identity,
                 },
             )
             .expect("retire duplicate active segment");
 
         assert!(!active_path.exists());
+        assert!(segment_path.exists());
     }
 
     #[test]
