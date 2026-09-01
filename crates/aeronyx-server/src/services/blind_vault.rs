@@ -82,7 +82,9 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.21.0-ReplicaJobAuthorization - Added a dedicated,
+//! Last Modified: v1.21.1-ReplicaJobNodeIdentityExclusion - Rejected source
+//! lease administration keys that collide with the local node identity.
+//! v1.21.0-ReplicaJobAuthorization - Added a dedicated,
 //! read-only per-source-lease replication authorization capability.
 //! v1.20.0-PrivacySafeServiceDiagnostics - Redacted opaque pull
 //! values and nested host errors, disabled private-row Debug, and removed the
@@ -1628,6 +1630,9 @@ impl BlindVaultService {
     /// The single query reads no ciphertext and this method performs no
     /// transaction, durable mutation, token spend, counter update, telemetry,
     /// recovery staging, or network work on either success or failure.
+    /// This proves only the exact typed claims in `authorization`: a future
+    /// coordinator must stage and dispatch those same source, target, and
+    /// bundle claims, never verify one target/bundle and substitute another.
     pub(crate) fn verify_replica_job_authorization(
         &self,
         authorization: &BlindVaultReplicaJobAuthorizationV1,
@@ -1650,6 +1655,13 @@ impl BlindVaultService {
             || authority.ciphertext_commitment == [0; 32]
         {
             return Err(BlindVaultReplicaJobAuthorizationError::Unavailable);
+        }
+        // [BLIND-VAULT-REPLICA-AUTH 2026-09-01 by Codex] A node may already
+        // administer an otherwise valid lease, but its identity is never
+        // client replication authority. Reject the collision only here so
+        // ordinary lease provisioning and opaque object storage stay intact.
+        if authority.admin_verifying_key == self.node_identity.public_key_bytes() {
+            return Err(BlindVaultReplicaJobAuthorizationError::Rejected);
         }
         if authority.lease_expires_at_ms <= now_ms
             || authority.object_expires_at_ms <= now_ms
@@ -3694,6 +3706,15 @@ mod tests {
 
     impl Fixture {
         fn new(max_objects: u64, max_bytes: u64) -> Self {
+            Self::new_with_admin_and_node_seeds(max_objects, max_bytes, [8; 32], [10; 32])
+        }
+
+        fn new_with_admin_and_node_seeds(
+            max_objects: u64,
+            max_bytes: u64,
+            admin_seed: [u8; 32],
+            node_seed: [u8; 32],
+        ) -> Self {
             let directory = tempfile::tempdir().expect("temp directory");
             let issuer_key = IdentityKeyPair::from_bytes(&[6; 32]).expect("issuer key");
             let config = BlindVaultConfig {
@@ -3706,7 +3727,7 @@ mod tests {
                 ..BlindVaultConfig::default()
             };
             let write_key = IdentityKeyPair::from_bytes(&[7; 32]).expect("write key");
-            let admin_key = IdentityKeyPair::from_bytes(&[8; 32]).expect("admin key");
+            let admin_key = IdentityKeyPair::from_bytes(&admin_seed).expect("admin key");
             let read_capability = [9; 32];
             let mut lease = BlindVaultLeaseCreateRequest::new(
                 [1; 32],
@@ -3725,7 +3746,7 @@ mod tests {
                 14 * 24 * 60 * 60 * 1_000,
             );
             admission.sign(&issuer_key).expect("sign admission");
-            let node_key = IdentityKeyPair::from_bytes(&[10; 32]).expect("node key");
+            let node_key = IdentityKeyPair::from_bytes(&node_seed).expect("node key");
             let service = BlindVaultService::new(config, node_key).expect("service");
             Self {
                 _directory: directory,
@@ -3952,6 +3973,41 @@ mod tests {
             &put.object_id,
         );
         assert!(before == after, "authorization must be read-only");
+    }
+
+    #[test]
+    fn replica_authorization_rejects_node_identity_admin_collision_without_mutation() {
+        let fixture = Fixture::new_with_admin_and_node_seeds(10, 1024 * 1024, [50; 32], [50; 32]);
+        fixture.provision();
+        let put = fixture.store_object(51, 52);
+        let authorization = fixture.replica_authorization(&put);
+        assert_eq!(
+            fixture.admin_key.public_key_bytes(),
+            fixture.service.node_identity.public_key_bytes()
+        );
+        IdentityPublicKey::from_bytes(&fixture.service.node_identity.public_key_bytes())
+            .expect("node verifier")
+            .verify(&authorization.signing_bytes(), &authorization.signature)
+            .expect("proof is valid under colliding node identity");
+        let before = replica_authorization_mutation_snapshot(
+            &fixture.service,
+            &put.lease_id,
+            &put.object_id,
+        );
+
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&authorization, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+
+        let after = replica_authorization_mutation_snapshot(
+            &fixture.service,
+            &put.lease_id,
+            &put.object_id,
+        );
+        assert!(before == after, "collision rejection must be read-only");
     }
 
     #[test]
