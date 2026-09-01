@@ -24,6 +24,7 @@
 //! - Blind-authorized administration-key lease renewal with atomic token spend.
 //! - Administration-authorized coherent live-lease status receipts.
 //! - Streaming private inventory commitments over still-live ciphertext rows.
+//! - Read-only per-lease administration authorization for explicit replica jobs.
 //! - Transactional per-lease count/byte quotas and bounded expiry cleanup.
 //! - Atomic node-wide live-lease and aggregate ciphertext capacity admission.
 //! - Fail-closed physical disk reserve enforcement through a replaceable host
@@ -53,9 +54,11 @@
 //!    then return a terminal-signed private status receipt.
 //! 9. Stream the canonical live object set into a per-replica commitment and
 //!    return only its encrypted terminal-signed aggregate receipt.
-//! 10. Reject new leases or ciphertext before token spend/write when the
+//! 10. Verify explicit source-object replication authority without exposing
+//!    the lease administration verifier or mutating Blind Vault state.
+//! 11. Reject new leases or ciphertext before token spend/write when the
 //!    operator's node-wide capacity commitment has been reached.
-//! 11. Preserve the configured database-filesystem reserve while leaving
+//! 12. Preserve the configured database-filesystem reserve while leaving
 //!    recovery, deletion, retirement, and cleanup available under pressure.
 //!
 //! ## Privacy Invariant
@@ -79,7 +82,9 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.20.0-PrivacySafeServiceDiagnostics - Redacted opaque pull
+//! Last Modified: v1.21.0-ReplicaJobAuthorization - Added a dedicated,
+//! read-only per-source-lease replication authorization capability.
+//! v1.20.0-PrivacySafeServiceDiagnostics - Redacted opaque pull
 //! values and nested host errors, disabled private-row Debug, and removed the
 //! remaining production HMAC panic path.
 //! v1.19.0-BlindVaultAdmissionReadiness - Added one aggregate,
@@ -169,6 +174,12 @@ const READ_AUTH_TAG_DOMAIN: &[u8] = b"AeroNyx-BlindVault-ReadAuth-Tag-v1";
 const PULL_CURSOR_KEY_DOMAIN: &[u8] = b"AeroNyx-BlindVault-PullCursor-Key-v1";
 const PULL_CURSOR_AAD_DOMAIN: &[u8] = b"AeroNyx-BlindVault-PullCursor-AAD-v1";
 const BLIND_ISSUER_SET_DIGEST_DOMAIN: &[u8] = b"AeroNyx-BlindVault-IssuerSet-Digest-v1";
+const REPLICA_JOB_AUTHORIZATION_DOMAIN: &[u8] = b"AeroNyx-BlindVault-ReplicaJobAuthorization-v1";
+const REPLICA_JOB_AUTHORIZATION_VERSION_V1: u16 = 1;
+// [BLIND-VAULT-REPLICA-AUTH 2026-09-01 by Codex] Keep client authority within
+// a fixed ten-minute replay window. Longer lifecycle work must obtain a new
+// per-lease authorization rather than inheriting node authority.
+const MAX_REPLICA_JOB_AUTHORIZATION_TTL_MS: u64 = 10 * 60 * 1_000;
 const PULL_CURSOR_VERSION: u8 = 1;
 const PULL_CURSOR_NONCE_BYTES: usize = 24;
 const PULL_CURSOR_PLAINTEXT_BYTES: usize = 16;
@@ -305,6 +316,134 @@ pub struct BlindVaultStoredObject {
     /// Object retention deadline in Unix milliseconds.
     pub expires_at_ms: u64,
 }
+
+/// Client-signed authority for one explicit source-object replication job.
+///
+/// This is source-local control data, not a Blind Vault frame or node-to-node
+/// protocol value. The target bundle commitment binds independently wrapped
+/// replica requests without making their identifiers comparable to this
+/// source lease or object.
+pub(crate) struct BlindVaultReplicaJobAuthorizationV1 {
+    version: u16,
+    job_id: [u8; 16],
+    source_lease_id: [u8; 32],
+    source_object_id: [u8; 32],
+    source_ciphertext_commitment: [u8; 32],
+    target_node_id: [u8; 32],
+    target_bundle_commitment: [u8; 32],
+    authorized_at_ms: u64,
+    expires_at_ms: u64,
+    signature: [u8; 64],
+}
+
+impl BlindVaultReplicaJobAuthorizationV1 {
+    /// Constructs a proof supplied by a future bounded replica-job API.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn new(
+        job_id: [u8; 16],
+        source_lease_id: [u8; 32],
+        source_object_id: [u8; 32],
+        source_ciphertext_commitment: [u8; 32],
+        target_node_id: [u8; 32],
+        target_bundle_commitment: [u8; 32],
+        authorized_at_ms: u64,
+        expires_at_ms: u64,
+        signature: [u8; 64],
+    ) -> Self {
+        Self {
+            version: REPLICA_JOB_AUTHORIZATION_VERSION_V1,
+            job_id,
+            source_lease_id,
+            source_object_id,
+            source_ciphertext_commitment,
+            target_node_id,
+            target_bundle_commitment,
+            authorized_at_ms,
+            expires_at_ms,
+            signature,
+        }
+    }
+
+    /// Canonical bytes signed only by the existing source lease admin key.
+    #[must_use]
+    pub(crate) fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(REPLICA_JOB_AUTHORIZATION_DOMAIN.len() + 194);
+        bytes.extend_from_slice(REPLICA_JOB_AUTHORIZATION_DOMAIN);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.job_id);
+        bytes.extend_from_slice(&self.source_lease_id);
+        bytes.extend_from_slice(&self.source_object_id);
+        bytes.extend_from_slice(&self.source_ciphertext_commitment);
+        bytes.extend_from_slice(&self.target_node_id);
+        bytes.extend_from_slice(&self.target_bundle_commitment);
+        bytes.extend_from_slice(&self.authorized_at_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.expires_at_ms.to_be_bytes());
+        bytes
+    }
+
+    fn validate_shape(&self, now_ms: u64) -> Result<(), BlindVaultReplicaJobAuthorizationError> {
+        let lifetime = self
+            .expires_at_ms
+            .checked_sub(self.authorized_at_ms)
+            .ok_or(BlindVaultReplicaJobAuthorizationError::Rejected)?;
+        if self.version != REPLICA_JOB_AUTHORIZATION_VERSION_V1
+            || now_ms == 0
+            || self.job_id == [0; 16]
+            || self.source_lease_id == [0; 32]
+            || self.source_object_id == [0; 32]
+            || self.source_ciphertext_commitment == [0; 32]
+            || self.target_node_id == [0; 32]
+            || self.target_bundle_commitment == [0; 32]
+            || self.authorized_at_ms == 0
+            || self.authorized_at_ms > now_ms
+            || self.expires_at_ms <= now_ms
+            || lifetime == 0
+            || lifetime > MAX_REPLICA_JOB_AUTHORIZATION_TTL_MS
+            || IdentityPublicKey::from_bytes(&self.target_node_id).is_err()
+        {
+            return Err(BlindVaultReplicaJobAuthorizationError::Rejected);
+        }
+        Ok(())
+    }
+}
+
+// [BLIND-VAULT-REPLICA-AUTH 2026-09-01 by Codex] Standard diagnostics expose
+// neither source/target correlation identifiers nor opaque commitments.
+impl fmt::Debug for BlindVaultReplicaJobAuthorizationV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlindVaultReplicaJobAuthorizationV1")
+            .field("version", &self.version)
+            .field("private_fields", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Coarse result of source-lease replication authorization verification.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlindVaultReplicaJobAuthorizationError {
+    /// The same proof cannot authorize this source object and target bundle.
+    Rejected,
+    /// The local source authority could not be established safely.
+    Unavailable,
+}
+
+impl fmt::Display for BlindVaultReplicaJobAuthorizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Rejected => "blind vault replica job authorization rejected",
+            Self::Unavailable => "blind vault replica job authorization unavailable",
+        })
+    }
+}
+
+impl fmt::Debug for BlindVaultReplicaJobAuthorizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl std::error::Error for BlindVaultReplicaJobAuthorizationError {}
 
 // [BLIND-VAULT-OPAQUE-OBJECT-DIAGNOSTICS 2026-08-30 by Codex] Public Debug
 // remains available for compatibility, but must never expose ciphertext or
@@ -1482,6 +1621,49 @@ impl BlindVaultService {
     ) -> Result<LeaseRuntimeRow, BlindVaultServiceError> {
         let connection = self.connection.lock();
         load_lease_runtime(&connection, lease_id)?.ok_or(BlindVaultServiceError::LeaseNotFound)
+    }
+
+    /// Verifies explicit replication authority without exposing the verifier.
+    ///
+    /// The single query reads no ciphertext and this method performs no
+    /// transaction, durable mutation, token spend, counter update, telemetry,
+    /// recovery staging, or network work on either success or failure.
+    pub(crate) fn verify_replica_job_authorization(
+        &self,
+        authorization: &BlindVaultReplicaJobAuthorizationV1,
+        now_ms: u64,
+    ) -> Result<(), BlindVaultReplicaJobAuthorizationError> {
+        // [BLIND-VAULT-REPLICA-AUTH 2026-09-01 by Codex] Validate every
+        // caller-controlled field before resolving private lease authority.
+        authorization.validate_shape(now_ms)?;
+        let authority = {
+            let connection = self.connection.lock();
+            load_replica_job_authority(
+                &connection,
+                &authorization.source_lease_id,
+                &authorization.source_object_id,
+            )?
+            .ok_or(BlindVaultReplicaJobAuthorizationError::Rejected)?
+        };
+
+        if authority.object_expires_at_ms > authority.lease_expires_at_ms
+            || authority.ciphertext_commitment == [0; 32]
+        {
+            return Err(BlindVaultReplicaJobAuthorizationError::Unavailable);
+        }
+        if authority.lease_expires_at_ms <= now_ms
+            || authority.object_expires_at_ms <= now_ms
+            || authorization.expires_at_ms > authority.lease_expires_at_ms
+            || authorization.expires_at_ms > authority.object_expires_at_ms
+            || authority.ciphertext_commitment != authorization.source_ciphertext_commitment
+        {
+            return Err(BlindVaultReplicaJobAuthorizationError::Rejected);
+        }
+        let admin_key = IdentityPublicKey::from_bytes(&authority.admin_verifying_key)
+            .map_err(|_| BlindVaultReplicaJobAuthorizationError::Unavailable)?;
+        admin_key
+            .verify(&authorization.signing_bytes(), &authorization.signature)
+            .map_err(|_| BlindVaultReplicaJobAuthorizationError::Rejected)
     }
 
     /// Authenticates one private read-only administration observation before
@@ -2791,6 +2973,13 @@ struct LeaseRuntimeRow {
     byte_count: u64,
 }
 
+struct ReplicaJobAuthorityRow {
+    admin_verifying_key: [u8; 32],
+    lease_expires_at_ms: u64,
+    ciphertext_commitment: [u8; 32],
+    object_expires_at_ms: u64,
+}
+
 /// One coherent live-usage observation returned by a single SQLite statement.
 #[derive(Clone, Copy)]
 struct LeaseStatusObservation {
@@ -3159,6 +3348,45 @@ fn load_lease_runtime(
             expires_at_ms: non_negative_u64(expires)?,
             object_count: non_negative_u64(count)?,
             byte_count: non_negative_u64(bytes)?,
+        })
+    })
+    .transpose()
+}
+
+fn load_replica_job_authority(
+    connection: &Connection,
+    lease_id: &[u8; 32],
+    object_id: &[u8; 32],
+) -> Result<Option<ReplicaJobAuthorityRow>, BlindVaultReplicaJobAuthorizationError> {
+    // [BLIND-VAULT-REPLICA-AUTH 2026-09-01 by Codex] Keep this projection
+    // intentionally narrow: ciphertext bytes, read capabilities, request IDs,
+    // usage counters, and unrelated lease metadata never cross this boundary.
+    let row: Option<(Vec<u8>, i64, Vec<u8>, i64)> = connection
+        .query_row(
+            "SELECT l.admin_verifying_key, l.expires_at_ms,
+                    o.ciphertext_commitment, o.expires_at_ms
+             FROM blind_vault_leases l
+             JOIN blind_vault_objects o ON o.lease_id = l.lease_id
+             WHERE l.lease_id = ?1 AND o.object_id = ?2",
+            params![&lease_id[..], &object_id[..]],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|_| BlindVaultReplicaJobAuthorizationError::Unavailable)?;
+    row.map(|(admin, lease_expires, commitment, object_expires)| {
+        Ok(ReplicaJobAuthorityRow {
+            admin_verifying_key: admin
+                .as_slice()
+                .try_into()
+                .map_err(|_| BlindVaultReplicaJobAuthorizationError::Unavailable)?,
+            lease_expires_at_ms: u64::try_from(lease_expires)
+                .map_err(|_| BlindVaultReplicaJobAuthorizationError::Unavailable)?,
+            ciphertext_commitment: commitment
+                .as_slice()
+                .try_into()
+                .map_err(|_| BlindVaultReplicaJobAuthorizationError::Unavailable)?,
+            object_expires_at_ms: u64::try_from(object_expires)
+                .map_err(|_| BlindVaultReplicaJobAuthorizationError::Unavailable)?,
         })
     })
     .transpose()
@@ -3543,6 +3771,488 @@ mod tests {
             put.sign(&self.write_key);
             put
         }
+
+        fn store_object(&self, object_byte: u8, request_byte: u8) -> BlindVaultPutRequest {
+            let put = self.put(object_byte, request_byte);
+            self.service
+                .put(&put, NOW_MS + 1)
+                .expect("store opaque object");
+            put
+        }
+
+        fn replica_authorization(
+            &self,
+            put: &BlindVaultPutRequest,
+        ) -> BlindVaultReplicaJobAuthorizationV1 {
+            let target = IdentityKeyPair::from_bytes(&[31; 32]).expect("target node key");
+            let mut authorization = BlindVaultReplicaJobAuthorizationV1::new(
+                [40; 16],
+                put.lease_id,
+                put.object_id,
+                put.ciphertext_commitment,
+                target.public_key_bytes(),
+                [41; 32],
+                NOW_MS + 2,
+                NOW_MS + 2 + MAX_REPLICA_JOB_AUTHORIZATION_TTL_MS / 2,
+                [0; 64],
+            );
+            resign_replica_authorization(&mut authorization, &self.admin_key);
+            authorization
+        }
+    }
+
+    fn resign_replica_authorization(
+        authorization: &mut BlindVaultReplicaJobAuthorizationV1,
+        admin_key: &IdentityKeyPair,
+    ) {
+        authorization.signature = admin_key.sign(&authorization.signing_bytes());
+    }
+
+    // [BLIND-VAULT-REPLICA-AUTH 2026-09-01 by Codex] This snapshot proves the
+    // verifier cannot spend admission authority, stage work, or change durable
+    // lease/object/capacity counters. It deliberately never selects ciphertext.
+    #[derive(PartialEq, Eq)]
+    struct ReplicaAuthorizationMutationSnapshot {
+        table_rows: [i64; 9],
+        capacity: (i64, i64),
+        lease_usage: (i64, i64, i64),
+        object_authority: (Vec<u8>, i64),
+        sqlite_total_changes: i64,
+    }
+
+    fn replica_authorization_mutation_snapshot(
+        service: &BlindVaultService,
+        lease_id: &[u8; 32],
+        object_id: &[u8; 32],
+    ) -> ReplicaAuthorizationMutationSnapshot {
+        let connection = service.connection.lock();
+        let count = |table: &str| -> i64 {
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("table row count")
+        };
+        let capacity = connection
+            .query_row(
+                "SELECT committed_lease_count, committed_ciphertext_bytes
+                 FROM blind_vault_capacity_state WHERE state_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("capacity state");
+        let lease_usage = connection
+            .query_row(
+                "SELECT object_count, byte_count, expires_at_ms
+                 FROM blind_vault_leases WHERE lease_id = ?1",
+                params![&lease_id[..]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("lease usage");
+        let object_authority = connection
+            .query_row(
+                "SELECT ciphertext_commitment, expires_at_ms
+                 FROM blind_vault_objects WHERE lease_id = ?1 AND object_id = ?2",
+                params![&lease_id[..], &object_id[..]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("object authority");
+        let sqlite_total_changes = connection
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .expect("SQLite total changes");
+        ReplicaAuthorizationMutationSnapshot {
+            table_rows: [
+                count("blind_vault_leases"),
+                count("blind_vault_objects"),
+                count("blind_vault_capacity_state"),
+                count("blind_vault_tombstones"),
+                count("blind_vault_lease_tombstones"),
+                count("blind_vault_lease_renewals"),
+                count("blind_vault_admission_spends"),
+                count("blind_vault_blind_issuer_state"),
+                count("blind_vault_blind_issuer_epochs"),
+            ],
+            capacity,
+            lease_usage,
+            object_authority,
+            sqlite_total_changes,
+        }
+    }
+
+    fn provisioned_object_fixture() -> (Fixture, BlindVaultPutRequest) {
+        let fixture = Fixture::new(10, 1024 * 1024);
+        fixture.provision();
+        let put = fixture.store_object(42, 43);
+        (fixture, put)
+    }
+
+    #[test]
+    fn replica_authorization_canonical_bytes_are_frozen() {
+        let target = IdentityKeyPair::from_bytes(&[31; 32]).expect("target node key");
+        let authorization = BlindVaultReplicaJobAuthorizationV1::new(
+            [40; 16],
+            [1; 32],
+            [42; 32],
+            [43; 32],
+            target.public_key_bytes(),
+            [44; 32],
+            0x0102_0304_0506_0708,
+            0x1112_1314_1516_1718,
+            [45; 64],
+        );
+        let mut expected = REPLICA_JOB_AUTHORIZATION_DOMAIN.to_vec();
+        expected.extend_from_slice(&REPLICA_JOB_AUTHORIZATION_VERSION_V1.to_be_bytes());
+        expected.extend_from_slice(&[40; 16]);
+        expected.extend_from_slice(&[1; 32]);
+        expected.extend_from_slice(&[42; 32]);
+        expected.extend_from_slice(&[43; 32]);
+        expected.extend_from_slice(&target.public_key_bytes());
+        expected.extend_from_slice(&[44; 32]);
+        expected.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
+        expected.extend_from_slice(&0x1112_1314_1516_1718_u64.to_be_bytes());
+
+        let canonical = authorization.signing_bytes();
+        assert_eq!(
+            canonical.len(),
+            REPLICA_JOB_AUTHORIZATION_DOMAIN.len() + 194
+        );
+        assert!(
+            canonical == expected,
+            "canonical field order must remain stable"
+        );
+    }
+
+    #[test]
+    fn replica_authorization_accepts_valid_per_lease_admin_proof_without_mutation() {
+        let (fixture, put) = provisioned_object_fixture();
+        let authorization = fixture.replica_authorization(&put);
+        let before = replica_authorization_mutation_snapshot(
+            &fixture.service,
+            &put.lease_id,
+            &put.object_id,
+        );
+
+        fixture
+            .service
+            .verify_replica_job_authorization(&authorization, NOW_MS + 2)
+            .expect("valid per-lease admin authorization");
+
+        let mut rejected = fixture.replica_authorization(&put);
+        rejected.source_ciphertext_commitment = [44; 32];
+        resign_replica_authorization(&mut rejected, &fixture.admin_key);
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&rejected, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+        let after = replica_authorization_mutation_snapshot(
+            &fixture.service,
+            &put.lease_id,
+            &put.object_id,
+        );
+        assert!(before == after, "authorization must be read-only");
+    }
+
+    #[test]
+    fn replica_authorization_binds_source_target_and_target_bundle() {
+        let (fixture, put) = provisioned_object_fixture();
+
+        let mut wrong_source = fixture.replica_authorization(&put);
+        wrong_source.source_ciphertext_commitment = [45; 32];
+        resign_replica_authorization(&mut wrong_source, &fixture.admin_key);
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&wrong_source, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+
+        let alternate_target =
+            IdentityKeyPair::from_bytes(&[46; 32]).expect("alternate target node key");
+        let mut wrong_target = fixture.replica_authorization(&put);
+        wrong_target.target_node_id = alternate_target.public_key_bytes();
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&wrong_target, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+
+        let mut wrong_bundle = fixture.replica_authorization(&put);
+        wrong_bundle.target_bundle_commitment = [47; 32];
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&wrong_bundle, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+    }
+
+    #[test]
+    fn replica_authorization_rejects_wrong_authority_domain_and_version() {
+        let (fixture, put) = provisioned_object_fixture();
+
+        let mut node_authorized = fixture.replica_authorization(&put);
+        node_authorized.signature = fixture
+            .service
+            .node_identity
+            .sign(&node_authorized.signing_bytes());
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&node_authorized, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+
+        let mut wrong_domain = fixture.replica_authorization(&put);
+        let canonical = wrong_domain.signing_bytes();
+        let mut wrong_domain_bytes = b"AeroNyx-BlindVault-ReplicaJobAuthorization-v0".to_vec();
+        wrong_domain_bytes.extend_from_slice(&canonical[REPLICA_JOB_AUTHORIZATION_DOMAIN.len()..]);
+        wrong_domain.signature = fixture.admin_key.sign(&wrong_domain_bytes);
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&wrong_domain, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+
+        let mut wrong_version = fixture.replica_authorization(&put);
+        wrong_version.version = REPLICA_JOB_AUTHORIZATION_VERSION_V1 + 1;
+        resign_replica_authorization(&mut wrong_version, &fixture.admin_key);
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&wrong_version, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+    }
+
+    #[test]
+    fn replica_authorization_rejects_invalid_time_bounds_and_shape() {
+        let (fixture, put) = provisioned_object_fixture();
+
+        let mut expired = fixture.replica_authorization(&put);
+        expired.authorized_at_ms = NOW_MS - 2;
+        expired.expires_at_ms = NOW_MS - 1;
+        resign_replica_authorization(&mut expired, &fixture.admin_key);
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&expired, NOW_MS),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+
+        let mut future = fixture.replica_authorization(&put);
+        future.authorized_at_ms = NOW_MS + 3;
+        future.expires_at_ms = NOW_MS + 4;
+        resign_replica_authorization(&mut future, &fixture.admin_key);
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&future, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+
+        let mut overlong = fixture.replica_authorization(&put);
+        overlong.expires_at_ms =
+            overlong.authorized_at_ms + MAX_REPLICA_JOB_AUTHORIZATION_TTL_MS + 1;
+        resign_replica_authorization(&mut overlong, &fixture.admin_key);
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&overlong, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+
+        let mut zero_identifier = fixture.replica_authorization(&put);
+        zero_identifier.job_id = [0; 16];
+        resign_replica_authorization(&mut zero_identifier, &fixture.admin_key);
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&zero_identifier, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+    }
+
+    #[test]
+    fn replica_authorization_rejects_missing_or_expired_source_rows() {
+        let (fixture, put) = provisioned_object_fixture();
+
+        let mut missing_lease = fixture.replica_authorization(&put);
+        missing_lease.source_lease_id = [48; 32];
+        resign_replica_authorization(&mut missing_lease, &fixture.admin_key);
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&missing_lease, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+
+        let mut missing_object = fixture.replica_authorization(&put);
+        missing_object.source_object_id = [49; 32];
+        resign_replica_authorization(&mut missing_object, &fixture.admin_key);
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&missing_object, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+
+        {
+            let connection = fixture.service.connection.lock();
+            connection
+                .execute(
+                    "UPDATE blind_vault_objects SET expires_at_ms = ?1
+                     WHERE lease_id = ?2 AND object_id = ?3",
+                    params![
+                        sqlite_i64(NOW_MS + 2).expect("time"),
+                        &put.lease_id[..],
+                        &put.object_id[..]
+                    ],
+                )
+                .expect("expire object");
+        }
+        let expired_object = fixture.replica_authorization(&put);
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&expired_object, NOW_MS + 3),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+
+        let (expired_lease_fixture, expired_lease_put) = provisioned_object_fixture();
+        {
+            let connection = expired_lease_fixture.service.connection.lock();
+            connection
+                .execute(
+                    "UPDATE blind_vault_objects SET expires_at_ms = ?1
+                     WHERE lease_id = ?2 AND object_id = ?3",
+                    params![
+                        sqlite_i64(NOW_MS + 2).expect("time"),
+                        &expired_lease_put.lease_id[..],
+                        &expired_lease_put.object_id[..]
+                    ],
+                )
+                .expect("bound object retention");
+            connection
+                .execute(
+                    "UPDATE blind_vault_leases SET expires_at_ms = ?1 WHERE lease_id = ?2",
+                    params![
+                        sqlite_i64(NOW_MS + 3).expect("time"),
+                        &expired_lease_put.lease_id[..]
+                    ],
+                )
+                .expect("expire lease");
+        }
+        let expired_lease = expired_lease_fixture.replica_authorization(&expired_lease_put);
+        assert!(matches!(
+            expired_lease_fixture
+                .service
+                .verify_replica_job_authorization(&expired_lease, NOW_MS + 4),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+    }
+
+    #[test]
+    fn replica_authorization_must_fit_source_retention() {
+        let (fixture, put) = provisioned_object_fixture();
+        {
+            let connection = fixture.service.connection.lock();
+            connection
+                .execute(
+                    "UPDATE blind_vault_objects SET expires_at_ms = ?1
+                     WHERE lease_id = ?2 AND object_id = ?3",
+                    params![
+                        sqlite_i64(NOW_MS + 60_000).expect("time"),
+                        &put.lease_id[..],
+                        &put.object_id[..]
+                    ],
+                )
+                .expect("shorten object retention");
+        }
+        let authorization = fixture.replica_authorization(&put);
+        assert!(matches!(
+            fixture
+                .service
+                .verify_replica_job_authorization(&authorization, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+
+        let (lease_fixture, lease_put) = provisioned_object_fixture();
+        {
+            let connection = lease_fixture.service.connection.lock();
+            for table in ["blind_vault_objects", "blind_vault_leases"] {
+                connection
+                    .execute(
+                        &format!("UPDATE {table} SET expires_at_ms = ?1 WHERE lease_id = ?2"),
+                        params![
+                            sqlite_i64(NOW_MS + 2 * 60_000).expect("time"),
+                            &lease_put.lease_id[..]
+                        ],
+                    )
+                    .expect("shorten source retention");
+            }
+        }
+        let authorization = lease_fixture.replica_authorization(&lease_put);
+        assert!(matches!(
+            lease_fixture
+                .service
+                .verify_replica_job_authorization(&authorization, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+        ));
+    }
+
+    #[test]
+    fn replica_authorization_maps_corrupt_or_unavailable_storage_coarsely() {
+        let (fixture, put) = provisioned_object_fixture();
+        let malformed_admin = [0xff_u8; 31];
+        {
+            let connection = fixture.service.connection.lock();
+            connection
+                .pragma_update(None, "ignore_check_constraints", true)
+                .expect("inject corrupt durable row");
+            connection
+                .execute(
+                    "UPDATE blind_vault_leases SET admin_verifying_key = ?1
+                     WHERE lease_id = ?2",
+                    params![&malformed_admin[..], &put.lease_id[..]],
+                )
+                .expect("store malformed admin verifier fixture");
+        }
+        let authorization = fixture.replica_authorization(&put);
+        let error = fixture
+            .service
+            .verify_replica_job_authorization(&authorization, NOW_MS + 2)
+            .expect_err("malformed durable verifier must fail closed");
+        assert!(matches!(
+            error,
+            BlindVaultReplicaJobAuthorizationError::Unavailable
+        ));
+        assert_eq!(
+            format!("{error}"),
+            "blind vault replica job authorization unavailable"
+        );
+        assert_eq!(
+            format!("{error:?}"),
+            "blind vault replica job authorization unavailable"
+        );
+
+        let (unavailable_fixture, unavailable_put) = provisioned_object_fixture();
+        let authorization = unavailable_fixture.replica_authorization(&unavailable_put);
+        unavailable_fixture
+            .service
+            .connection
+            .lock()
+            .execute("DROP TABLE blind_vault_objects", [])
+            .expect("make authority store unavailable");
+        assert!(matches!(
+            unavailable_fixture
+                .service
+                .verify_replica_job_authorization(&authorization, NOW_MS + 2),
+            Err(BlindVaultReplicaJobAuthorizationError::Unavailable)
+        ));
     }
 
     #[test]
