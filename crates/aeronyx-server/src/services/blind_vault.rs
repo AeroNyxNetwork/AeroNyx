@@ -454,6 +454,20 @@ impl BlindVaultReplicaJobAuthorizationV1 {
         self.claims.canonical_bytes()
     }
 
+    /// Exact private bytes used to compare durable authorization retries.
+    ///
+    /// [BLIND-VAULT-REPLICA-COORDINATOR 2026-09-01 by Codex] The source
+    /// coordinator persists this opaque value together with the canonical
+    /// target bundle. It must never rebuild an authorization from parallel
+    /// target or bundle arguments after verification.
+    pub(crate) fn canonical_authorization_bytes(&self) -> Vec<u8> {
+        let signing_bytes = self.signing_bytes();
+        let mut bytes = Vec::with_capacity(signing_bytes.len() + self.signature.len());
+        bytes.extend_from_slice(&signing_bytes);
+        bytes.extend_from_slice(&self.signature);
+        bytes
+    }
+
     fn validate_shape(&self, now_ms: u64) -> Result<(), BlindVaultReplicaJobAuthorizationError> {
         let claims = &self.claims;
         let lifetime = claims

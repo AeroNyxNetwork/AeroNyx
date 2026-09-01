@@ -217,6 +217,10 @@
 //   v1.0.0-BlindVaultService - Added anonymous encrypted-object storage
 
 pub mod blind_vault;
+// [BLIND-VAULT-REPLICA-COORDINATOR 2026-09-01 by Codex] Keep explicit
+// source authorization, canonical target bundles, and exact-idempotent job
+// admission behind one private composition boundary.
+mod blind_vault_replica_coordinator;
 // [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] Keep host filesystem
 // inspection behind a replaceable capability instead of embedding platform
 // calls in the storage transaction service.
