@@ -468,6 +468,53 @@ impl BlindVaultReplicaJobAuthorizationV1 {
         bytes
     }
 
+    /// Restores one exact canonical proof from the private durable job store.
+    ///
+    /// [BLIND-VAULT-REPLICA-JOB-STORE 2026-09-01 by Codex] Parsing is fixed
+    /// width and domain/version checked. Cryptographic authority verification
+    /// remains a separate read-only service capability immediately before use.
+    pub(crate) fn from_canonical_authorization_bytes(
+        bytes: &[u8],
+    ) -> Result<Self, BlindVaultReplicaJobAuthorizationError> {
+        const FIXED_CLAIMS_BYTES: usize = 2 + 16 + 32 * 5 + 8 * 2;
+        const SIGNATURE_BYTES: usize = 64;
+        let expected_len = REPLICA_JOB_AUTHORIZATION_DOMAIN
+            .len()
+            .checked_add(FIXED_CLAIMS_BYTES)
+            .and_then(|length| length.checked_add(SIGNATURE_BYTES))
+            .ok_or(BlindVaultReplicaJobAuthorizationError::Rejected)?;
+        if bytes.len() != expected_len || !bytes.starts_with(REPLICA_JOB_AUTHORIZATION_DOMAIN) {
+            return Err(BlindVaultReplicaJobAuthorizationError::Rejected);
+        }
+
+        let mut cursor = REPLICA_JOB_AUTHORIZATION_DOMAIN.len();
+        let wire_version = u16::from_be_bytes(replica_authorization_take(bytes, &mut cursor)?);
+        let job_id = replica_authorization_take(bytes, &mut cursor)?;
+        let source_lease_id = replica_authorization_take(bytes, &mut cursor)?;
+        let source_object_id = replica_authorization_take(bytes, &mut cursor)?;
+        let source_ciphertext_commitment = replica_authorization_take(bytes, &mut cursor)?;
+        let target_node_id = replica_authorization_take(bytes, &mut cursor)?;
+        let target_bundle_commitment = replica_authorization_take(bytes, &mut cursor)?;
+        let authorized_at_ms = u64::from_be_bytes(replica_authorization_take(bytes, &mut cursor)?);
+        let expires_at_ms = u64::from_be_bytes(replica_authorization_take(bytes, &mut cursor)?);
+        let signature = replica_authorization_take(bytes, &mut cursor)?;
+        if cursor != bytes.len() {
+            return Err(BlindVaultReplicaJobAuthorizationError::Rejected);
+        }
+        Self::from_wire_parts(
+            wire_version,
+            job_id,
+            source_lease_id,
+            source_object_id,
+            source_ciphertext_commitment,
+            target_node_id,
+            target_bundle_commitment,
+            authorized_at_ms,
+            expires_at_ms,
+            signature,
+        )
+    }
+
     fn validate_shape(&self, now_ms: u64) -> Result<(), BlindVaultReplicaJobAuthorizationError> {
         let claims = &self.claims;
         let lifetime = claims
@@ -493,6 +540,22 @@ impl BlindVaultReplicaJobAuthorizationV1 {
         }
         Ok(())
     }
+}
+
+fn replica_authorization_take<const N: usize>(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<[u8; N], BlindVaultReplicaJobAuthorizationError> {
+    let end = cursor
+        .checked_add(N)
+        .ok_or(BlindVaultReplicaJobAuthorizationError::Rejected)?;
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or(BlindVaultReplicaJobAuthorizationError::Rejected)?
+        .try_into()
+        .map_err(|_| BlindVaultReplicaJobAuthorizationError::Rejected)?;
+    *cursor = end;
+    Ok(value)
 }
 
 // [BLIND-VAULT-REPLICA-AUTH 2026-09-01 by Codex] Standard diagnostics expose
@@ -4059,6 +4122,47 @@ mod tests {
         for version in [0, 2, u16::MAX] {
             assert!(matches!(
                 decode(version),
+                Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+            ));
+        }
+    }
+
+    #[test]
+    fn replica_authorization_private_store_round_trip_is_exact() {
+        let authorization = BlindVaultReplicaJobAuthorizationV1::from_wire_parts(
+            REPLICA_JOB_AUTHORIZATION_VERSION_V1,
+            [46; 16],
+            [47; 32],
+            [48; 32],
+            [49; 32],
+            [5; 32],
+            [50; 32],
+            NOW_MS,
+            NOW_MS + 1,
+            [51; 64],
+        )
+        .expect("authorization");
+        let canonical = authorization.canonical_authorization_bytes();
+        let restored =
+            BlindVaultReplicaJobAuthorizationV1::from_canonical_authorization_bytes(&canonical)
+                .expect("restore exact canonical proof");
+        assert_eq!(restored.canonical_authorization_bytes(), canonical);
+
+        let mut wrong_version = canonical.clone();
+        let version_offset = REPLICA_JOB_AUTHORIZATION_DOMAIN.len();
+        wrong_version[version_offset..version_offset + 2].copy_from_slice(&2_u16.to_be_bytes());
+        let mut wrong_domain = canonical.clone();
+        wrong_domain[0] ^= 1;
+        let mut trailing = canonical.clone();
+        trailing.push(0);
+        for invalid in [
+            &canonical[..canonical.len() - 1],
+            wrong_version.as_slice(),
+            wrong_domain.as_slice(),
+            trailing.as_slice(),
+        ] {
+            assert!(matches!(
+                BlindVaultReplicaJobAuthorizationV1::from_canonical_authorization_bytes(invalid),
                 Err(BlindVaultReplicaJobAuthorizationError::Rejected)
             ));
         }

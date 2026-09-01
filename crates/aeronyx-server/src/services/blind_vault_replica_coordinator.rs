@@ -22,6 +22,8 @@
 //!
 //! Last Modified: v1.0.0-ReplicaCoordinatorAdmission - Added the typed,
 //! node-blind M12 admission boundary.
+//! v1.1.0-DurableSingleJobGeneration - Added an atomic, versioned,
+//! exact-idempotent single-active-job store with restart validation.
 
 use super::blind_vault::{
     BlindVaultReplicaJobAuthorizationError, BlindVaultReplicaJobAuthorizationV1, BlindVaultService,
@@ -32,12 +34,40 @@ use aeronyx_core::protocol::blind_vault::{
 };
 use sha2::{Digest, Sha256};
 use std::fmt;
+#[cfg(unix)]
+use std::path::Path;
+use zeroize::{Zeroize, Zeroizing};
+
+#[cfg(unix)]
+use super::blind_vault_replica_recovery_io::{PrivateAtomicRecoveryFile, PrivateRecoveryIoError};
 
 const REPLICA_TARGET_BUNDLE_VERSION_V1: u16 = 1;
 const REPLICA_TARGET_EFFECT_COUNT: usize = 3;
 const REPLICA_TARGET_OBJECT_BYTES: usize = 4_096;
 const REPLICA_TARGET_BUNDLE_DOMAIN: &[u8] = b"AeroNyx-BlindVault-ReplicaTargetBundle-v1";
 const REPLICA_STAGED_JOB_DOMAIN: &[u8] = b"AeroNyx-BlindVault-ReplicaStagedJob-v1";
+#[cfg(unix)]
+const REPLICA_JOB_FILE_MAGIC: [u8; 4] = *b"AXVJ";
+#[cfg(unix)]
+const REPLICA_JOB_FILE_VERSION_V1: u16 = 1;
+#[cfg(unix)]
+const REPLICA_JOB_FILE_CHECKSUM_DOMAIN: &[u8] = b"AeroNyx-BlindVault-ReplicaJobFile-v1";
+#[cfg(unix)]
+const REPLICA_JOB_FILE_HEADER_BYTES: usize = 4 + 2 + 4;
+#[cfg(unix)]
+const REPLICA_JOB_FILE_CHECKSUM_BYTES: usize = 32;
+#[cfg(unix)]
+const MAX_REPLICA_JOB_AUTHORIZATION_BYTES: usize = 512;
+#[cfg(unix)]
+const MAX_REPLICA_TARGET_BUNDLE_BYTES: usize = 32 * 1024;
+#[cfg(unix)]
+const REPLICA_JOB_BODY_FIXED_BYTES: usize = 16 + 32 * 3 + 4 + 4 + 32;
+#[cfg(unix)]
+const MAX_REPLICA_JOB_FILE_BYTES: usize = REPLICA_JOB_FILE_HEADER_BYTES
+    + REPLICA_JOB_BODY_FIXED_BYTES
+    + MAX_REPLICA_JOB_AUTHORIZATION_BYTES
+    + MAX_REPLICA_TARGET_BUNDLE_BYTES
+    + REPLICA_JOB_FILE_CHECKSUM_BYTES;
 
 /// Validation policy supplied by the source runtime for one target bundle.
 #[derive(Clone, Copy)]
@@ -194,6 +224,17 @@ impl BlindVaultReplicaTargetBundleV1 {
     }
 }
 
+impl Drop for BlindVaultReplicaTargetBundleV1 {
+    fn drop(&mut self) {
+        for effect in &mut self.canonical_effects {
+            effect.zeroize();
+        }
+        self.canonical_bytes.zeroize();
+        self.commitment.zeroize();
+        self.target_node_id.zeroize();
+    }
+}
+
 /// The only admissible source-authority and target-bundle pairing.
 pub(crate) struct BlindVaultReplicaJobSubmissionV1 {
     authorization: BlindVaultReplicaJobAuthorizationV1,
@@ -259,24 +300,26 @@ impl BlindVaultReplicaStagedJobV1 {
         self.record_commitment
     }
 
-    pub(crate) const fn claims_commitment(&self) -> [u8; 32] {
-        self.claims_commitment
+    fn exactly_matches(&self, other: &Self) -> bool {
+        self.job_id == other.job_id
+            && self.claims_commitment == other.claims_commitment
+            && self.target_node_id == other.target_node_id
+            && self.target_bundle_commitment == other.target_bundle_commitment
+            && self.canonical_authorization == other.canonical_authorization
+            && self.canonical_target_bundle == other.canonical_target_bundle
+            && self.record_commitment == other.record_commitment
     }
+}
 
-    pub(crate) const fn target_node_id(&self) -> [u8; 32] {
-        self.target_node_id
-    }
-
-    pub(crate) const fn target_bundle_commitment(&self) -> [u8; 32] {
-        self.target_bundle_commitment
-    }
-
-    pub(crate) fn canonical_authorization(&self) -> &[u8] {
-        &self.canonical_authorization
-    }
-
-    pub(crate) fn canonical_target_bundle(&self) -> &[u8] {
-        &self.canonical_target_bundle
+impl Drop for BlindVaultReplicaStagedJobV1 {
+    fn drop(&mut self) {
+        self.job_id.zeroize();
+        self.claims_commitment.zeroize();
+        self.target_node_id.zeroize();
+        self.target_bundle_commitment.zeroize();
+        self.canonical_authorization.zeroize();
+        self.canonical_target_bundle.zeroize();
+        self.record_commitment.zeroize();
     }
 }
 
@@ -317,6 +360,8 @@ impl BlindVaultReplicaAuthorizationVerifier for BlindVaultService {
 /// Durable store contract: same id/same bytes is idempotent, any drift conflicts.
 pub(crate) trait BlindVaultReplicaJobStore: Send + Sync {
     type Error: Send + Sync;
+
+    fn load_active(&self) -> Result<Option<BlindVaultReplicaStagedJobV1>, Self::Error>;
 
     fn stage_exact(
         &self,
@@ -443,6 +488,398 @@ fn staged_job_commitment(authorization: &[u8], target_bundle: &[u8]) -> [u8; 32]
     hasher.update((target_bundle.len() as u32).to_be_bytes());
     hasher.update(target_bundle);
     hasher.finalize().into()
+}
+
+#[cfg(unix)]
+/// Fail-closed local errors for the single-active-job durable store.
+pub(crate) enum BlindVaultReplicaJobFileStoreError {
+    Host(PrivateRecoveryIoError),
+    CorruptState,
+    TooLarge,
+    Unavailable,
+}
+
+#[cfg(unix)]
+impl fmt::Display for BlindVaultReplicaJobFileStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Host(_) | Self::Unavailable => "blind vault replica job store unavailable",
+            Self::CorruptState => "blind vault replica job store is corrupt",
+            Self::TooLarge => "blind vault replica job store exceeds its bound",
+        })
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Debug for BlindVaultReplicaJobFileStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for BlindVaultReplicaJobFileStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Host(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<PrivateRecoveryIoError> for BlindVaultReplicaJobFileStoreError {
+    fn from(error: PrivateRecoveryIoError) -> Self {
+        Self::Host(error)
+    }
+}
+
+/// Single-writer durable store for the intentionally single-active M12 job.
+///
+/// [BLIND-VAULT-REPLICA-JOB-STORE 2026-09-01 by Codex] The adapter reuses the
+/// audited private atomic file host. A different job cannot replace an active
+/// generation; exact same bytes are the only accepted retry.
+#[cfg(unix)]
+pub(crate) struct FileBlindVaultReplicaJobStore {
+    file: std::sync::Mutex<PrivateAtomicRecoveryFile>,
+}
+
+#[cfg(unix)]
+impl FileBlindVaultReplicaJobStore {
+    pub(crate) fn open(directory: &Path) -> Result<Self, BlindVaultReplicaJobFileStoreError> {
+        let file = PrivateAtomicRecoveryFile::open(directory)?;
+        if let Some(bytes) = file.read(MAX_REPLICA_JOB_FILE_BYTES)? {
+            let bytes = Zeroizing::new(bytes);
+            decode_replica_job_file(bytes.as_slice())?;
+        }
+        Ok(Self {
+            file: std::sync::Mutex::new(file),
+        })
+    }
+
+    fn lock_file(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, PrivateAtomicRecoveryFile>,
+        BlindVaultReplicaJobFileStoreError,
+    > {
+        self.file
+            .lock()
+            .map_err(|_| BlindVaultReplicaJobFileStoreError::Unavailable)
+    }
+
+    fn load_from(
+        file: &PrivateAtomicRecoveryFile,
+    ) -> Result<Option<BlindVaultReplicaStagedJobV1>, BlindVaultReplicaJobFileStoreError> {
+        let Some(bytes) = file.read(MAX_REPLICA_JOB_FILE_BYTES)? else {
+            return Ok(None);
+        };
+        let bytes = Zeroizing::new(bytes);
+        decode_replica_job_file(bytes.as_slice()).map(Some)
+    }
+}
+
+#[cfg(unix)]
+impl BlindVaultReplicaJobStore for FileBlindVaultReplicaJobStore {
+    type Error = BlindVaultReplicaJobFileStoreError;
+
+    fn load_active(&self) -> Result<Option<BlindVaultReplicaStagedJobV1>, Self::Error> {
+        let file = self.lock_file()?;
+        Self::load_from(&file)
+    }
+
+    fn stage_exact(
+        &self,
+        record: &BlindVaultReplicaStagedJobV1,
+    ) -> Result<BlindVaultReplicaStageOutcome, Self::Error> {
+        validate_staged_job(record)?;
+        let file = self.lock_file()?;
+        match Self::load_from(&file)? {
+            None => {
+                let encoded = Zeroizing::new(encode_replica_job_file(record)?);
+                file.replace(encoded.as_slice(), MAX_REPLICA_JOB_FILE_BYTES)?;
+                Ok(BlindVaultReplicaStageOutcome::Inserted)
+            }
+            Some(current) if current.exactly_matches(record) => {
+                file.confirm_current_durable()?;
+                Ok(BlindVaultReplicaStageOutcome::Existing)
+            }
+            Some(_) => Ok(BlindVaultReplicaStageOutcome::Conflict),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn validate_staged_job(
+    record: &BlindVaultReplicaStagedJobV1,
+) -> Result<(), BlindVaultReplicaJobFileStoreError> {
+    if record.job_id == [0; 16]
+        || record.claims_commitment == [0; 32]
+        || record.target_node_id == [0; 32]
+        || record.target_bundle_commitment == [0; 32]
+        || record.record_commitment == [0; 32]
+        || record.canonical_authorization.is_empty()
+        || record.canonical_authorization.len() > MAX_REPLICA_JOB_AUTHORIZATION_BYTES
+        || record.canonical_target_bundle.is_empty()
+        || record.canonical_target_bundle.len() > MAX_REPLICA_TARGET_BUNDLE_BYTES
+        || IdentityPublicKey::from_bytes(&record.target_node_id).is_err()
+    {
+        return Err(BlindVaultReplicaJobFileStoreError::CorruptState);
+    }
+
+    let authorization = BlindVaultReplicaJobAuthorizationV1::from_canonical_authorization_bytes(
+        &record.canonical_authorization,
+    )
+    .map_err(|_| BlindVaultReplicaJobFileStoreError::CorruptState)?;
+    let claims = authorization.claims();
+    if authorization.canonical_authorization_bytes() != record.canonical_authorization
+        || claims.job_id() != record.job_id
+        || claims.commitment() != record.claims_commitment
+        || claims.target_node_id() != record.target_node_id
+        || claims.target_bundle_commitment() != record.target_bundle_commitment
+    {
+        return Err(BlindVaultReplicaJobFileStoreError::CorruptState);
+    }
+
+    validate_canonical_target_bundle(&record.canonical_target_bundle, record.target_node_id)?;
+    if <[u8; 32]>::from(Sha256::digest(&record.canonical_target_bundle))
+        != record.target_bundle_commitment
+        || staged_job_commitment(
+            &record.canonical_authorization,
+            &record.canonical_target_bundle,
+        ) != record.record_commitment
+    {
+        return Err(BlindVaultReplicaJobFileStoreError::CorruptState);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_canonical_target_bundle(
+    bytes: &[u8],
+    expected_target_node_id: [u8; 32],
+) -> Result<(), BlindVaultReplicaJobFileStoreError> {
+    if bytes.len() > MAX_REPLICA_TARGET_BUNDLE_BYTES
+        || !bytes.starts_with(REPLICA_TARGET_BUNDLE_DOMAIN)
+    {
+        return Err(BlindVaultReplicaJobFileStoreError::CorruptState);
+    }
+    let mut cursor = REPLICA_TARGET_BUNDLE_DOMAIN.len();
+    let version = u16::from_be_bytes(replica_job_take(bytes, &mut cursor)?);
+    let target_node_id = replica_job_take(bytes, &mut cursor)?;
+    let effect_count = *bytes
+        .get(cursor)
+        .ok_or(BlindVaultReplicaJobFileStoreError::CorruptState)?;
+    cursor += 1;
+    if version != REPLICA_TARGET_BUNDLE_VERSION_V1
+        || target_node_id != expected_target_node_id
+        || usize::from(effect_count) != REPLICA_TARGET_EFFECT_COUNT
+    {
+        return Err(BlindVaultReplicaJobFileStoreError::CorruptState);
+    }
+
+    let expected = [
+        (BlindVaultReplicaTargetEffectPurpose::LeaseAdmission, 0_u8),
+        (BlindVaultReplicaTargetEffectPurpose::Put, 1_u8),
+        (BlindVaultReplicaTargetEffectPurpose::LeaseInventory, 2_u8),
+    ];
+    for (purpose, ordinal) in expected {
+        let stored_ordinal = *bytes
+            .get(cursor)
+            .ok_or(BlindVaultReplicaJobFileStoreError::CorruptState)?;
+        cursor += 1;
+        let stored_purpose = *bytes
+            .get(cursor)
+            .ok_or(BlindVaultReplicaJobFileStoreError::CorruptState)?;
+        cursor += 1;
+        let effect_len = usize::try_from(u32::from_be_bytes(replica_job_take(bytes, &mut cursor)?))
+            .map_err(|_| BlindVaultReplicaJobFileStoreError::TooLarge)?;
+        let end = cursor
+            .checked_add(effect_len)
+            .ok_or(BlindVaultReplicaJobFileStoreError::TooLarge)?;
+        let effect = bytes
+            .get(cursor..end)
+            .ok_or(BlindVaultReplicaJobFileStoreError::CorruptState)?;
+        cursor = end;
+        if stored_ordinal != ordinal || stored_purpose != purpose as u8 || effect.is_empty() {
+            return Err(BlindVaultReplicaJobFileStoreError::CorruptState);
+        }
+        let frame = decode_blind_vault_frame(effect)
+            .map_err(|_| BlindVaultReplicaJobFileStoreError::CorruptState)?;
+        let expected_kind = matches!(
+            (purpose, &frame),
+            (
+                BlindVaultReplicaTargetEffectPurpose::LeaseAdmission,
+                BlindVaultFrame::BlindLeaseAdmission(_)
+            ) | (
+                BlindVaultReplicaTargetEffectPurpose::Put,
+                BlindVaultFrame::Put(_)
+            ) | (
+                BlindVaultReplicaTargetEffectPurpose::LeaseInventory,
+                BlindVaultFrame::LeaseInventory(_)
+            )
+        );
+        let canonical = encode_blind_vault_frame(&frame)
+            .map_err(|_| BlindVaultReplicaJobFileStoreError::CorruptState)?;
+        if !expected_kind || canonical != effect {
+            return Err(BlindVaultReplicaJobFileStoreError::CorruptState);
+        }
+    }
+    if cursor != bytes.len() {
+        return Err(BlindVaultReplicaJobFileStoreError::CorruptState);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn encode_replica_job_file(
+    record: &BlindVaultReplicaStagedJobV1,
+) -> Result<Vec<u8>, BlindVaultReplicaJobFileStoreError> {
+    validate_staged_job(record)?;
+    let authorization_len = u32::try_from(record.canonical_authorization.len())
+        .map_err(|_| BlindVaultReplicaJobFileStoreError::TooLarge)?;
+    let bundle_len = u32::try_from(record.canonical_target_bundle.len())
+        .map_err(|_| BlindVaultReplicaJobFileStoreError::TooLarge)?;
+    let body_len = REPLICA_JOB_BODY_FIXED_BYTES
+        .checked_add(record.canonical_authorization.len())
+        .and_then(|length| length.checked_add(record.canonical_target_bundle.len()))
+        .ok_or(BlindVaultReplicaJobFileStoreError::TooLarge)?;
+    let body_len_u32 =
+        u32::try_from(body_len).map_err(|_| BlindVaultReplicaJobFileStoreError::TooLarge)?;
+    let total_len = REPLICA_JOB_FILE_HEADER_BYTES
+        .checked_add(body_len)
+        .and_then(|length| length.checked_add(REPLICA_JOB_FILE_CHECKSUM_BYTES))
+        .ok_or(BlindVaultReplicaJobFileStoreError::TooLarge)?;
+    if total_len > MAX_REPLICA_JOB_FILE_BYTES {
+        return Err(BlindVaultReplicaJobFileStoreError::TooLarge);
+    }
+
+    let mut encoded = Vec::with_capacity(total_len);
+    encoded.extend_from_slice(&REPLICA_JOB_FILE_MAGIC);
+    encoded.extend_from_slice(&REPLICA_JOB_FILE_VERSION_V1.to_be_bytes());
+    encoded.extend_from_slice(&body_len_u32.to_be_bytes());
+    encoded.extend_from_slice(&record.job_id);
+    encoded.extend_from_slice(&record.claims_commitment);
+    encoded.extend_from_slice(&record.target_node_id);
+    encoded.extend_from_slice(&record.target_bundle_commitment);
+    encoded.extend_from_slice(&authorization_len.to_be_bytes());
+    encoded.extend_from_slice(&bundle_len.to_be_bytes());
+    encoded.extend_from_slice(&record.canonical_authorization);
+    encoded.extend_from_slice(&record.canonical_target_bundle);
+    encoded.extend_from_slice(&record.record_commitment);
+    let mut checksum = Sha256::new();
+    checksum.update(REPLICA_JOB_FILE_CHECKSUM_DOMAIN);
+    checksum.update(&encoded);
+    encoded.extend_from_slice(&checksum.finalize());
+    Ok(encoded)
+}
+
+#[cfg(unix)]
+fn decode_replica_job_file(
+    bytes: &[u8],
+) -> Result<BlindVaultReplicaStagedJobV1, BlindVaultReplicaJobFileStoreError> {
+    if bytes.len() > MAX_REPLICA_JOB_FILE_BYTES
+        || bytes.len()
+            < REPLICA_JOB_FILE_HEADER_BYTES
+                + REPLICA_JOB_BODY_FIXED_BYTES
+                + REPLICA_JOB_FILE_CHECKSUM_BYTES
+    {
+        return Err(BlindVaultReplicaJobFileStoreError::CorruptState);
+    }
+    let mut cursor = 0;
+    let magic = replica_job_take(bytes, &mut cursor)?;
+    let version = u16::from_be_bytes(replica_job_take(bytes, &mut cursor)?);
+    let body_len = usize::try_from(u32::from_be_bytes(replica_job_take(bytes, &mut cursor)?))
+        .map_err(|_| BlindVaultReplicaJobFileStoreError::TooLarge)?;
+    let expected_total = REPLICA_JOB_FILE_HEADER_BYTES
+        .checked_add(body_len)
+        .and_then(|length| length.checked_add(REPLICA_JOB_FILE_CHECKSUM_BYTES))
+        .ok_or(BlindVaultReplicaJobFileStoreError::TooLarge)?;
+    if magic != REPLICA_JOB_FILE_MAGIC
+        || version != REPLICA_JOB_FILE_VERSION_V1
+        || expected_total != bytes.len()
+    {
+        return Err(BlindVaultReplicaJobFileStoreError::CorruptState);
+    }
+
+    let checksum_offset = bytes
+        .len()
+        .checked_sub(REPLICA_JOB_FILE_CHECKSUM_BYTES)
+        .ok_or(BlindVaultReplicaJobFileStoreError::CorruptState)?;
+    let stored_checksum: [u8; 32] = bytes[checksum_offset..]
+        .try_into()
+        .map_err(|_| BlindVaultReplicaJobFileStoreError::CorruptState)?;
+    let mut checksum = Sha256::new();
+    checksum.update(REPLICA_JOB_FILE_CHECKSUM_DOMAIN);
+    checksum.update(&bytes[..checksum_offset]);
+    if <[u8; 32]>::from(checksum.finalize()) != stored_checksum {
+        return Err(BlindVaultReplicaJobFileStoreError::CorruptState);
+    }
+
+    let job_id = replica_job_take(bytes, &mut cursor)?;
+    let claims_commitment = replica_job_take(bytes, &mut cursor)?;
+    let target_node_id = replica_job_take(bytes, &mut cursor)?;
+    let target_bundle_commitment = replica_job_take(bytes, &mut cursor)?;
+    let authorization_len =
+        usize::try_from(u32::from_be_bytes(replica_job_take(bytes, &mut cursor)?))
+            .map_err(|_| BlindVaultReplicaJobFileStoreError::TooLarge)?;
+    let bundle_len = usize::try_from(u32::from_be_bytes(replica_job_take(bytes, &mut cursor)?))
+        .map_err(|_| BlindVaultReplicaJobFileStoreError::TooLarge)?;
+    if authorization_len == 0
+        || authorization_len > MAX_REPLICA_JOB_AUTHORIZATION_BYTES
+        || bundle_len == 0
+        || bundle_len > MAX_REPLICA_TARGET_BUNDLE_BYTES
+    {
+        return Err(BlindVaultReplicaJobFileStoreError::TooLarge);
+    }
+    let authorization_end = cursor
+        .checked_add(authorization_len)
+        .ok_or(BlindVaultReplicaJobFileStoreError::TooLarge)?;
+    let canonical_authorization = bytes
+        .get(cursor..authorization_end)
+        .ok_or(BlindVaultReplicaJobFileStoreError::CorruptState)?
+        .to_vec();
+    cursor = authorization_end;
+    let bundle_end = cursor
+        .checked_add(bundle_len)
+        .ok_or(BlindVaultReplicaJobFileStoreError::TooLarge)?;
+    let canonical_target_bundle = bytes
+        .get(cursor..bundle_end)
+        .ok_or(BlindVaultReplicaJobFileStoreError::CorruptState)?
+        .to_vec();
+    cursor = bundle_end;
+    let record_commitment = replica_job_take(bytes, &mut cursor)?;
+    if cursor != checksum_offset {
+        return Err(BlindVaultReplicaJobFileStoreError::CorruptState);
+    }
+    let record = BlindVaultReplicaStagedJobV1 {
+        job_id,
+        claims_commitment,
+        target_node_id,
+        target_bundle_commitment,
+        canonical_authorization,
+        canonical_target_bundle,
+        record_commitment,
+    };
+    validate_staged_job(&record)?;
+    Ok(record)
+}
+
+#[cfg(unix)]
+fn replica_job_take<const N: usize>(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<[u8; N], BlindVaultReplicaJobFileStoreError> {
+    let end = cursor
+        .checked_add(N)
+        .ok_or(BlindVaultReplicaJobFileStoreError::TooLarge)?;
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or(BlindVaultReplicaJobFileStoreError::CorruptState)?
+        .try_into()
+        .map_err(|_| BlindVaultReplicaJobFileStoreError::CorruptState)?;
+    *cursor = end;
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -608,6 +1045,10 @@ mod tests {
 
     impl BlindVaultReplicaJobStore for ExactMemoryStore {
         type Error = ();
+
+        fn load_active(&self) -> Result<Option<BlindVaultReplicaStagedJobV1>, Self::Error> {
+            Ok(None)
+        }
 
         fn stage_exact(
             &self,
@@ -806,5 +1247,100 @@ mod tests {
             format!("{:?}", BlindVaultReplicaCoordinatorError::Unavailable),
             "blind vault replica job unavailable"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_reopens_exact_job_and_rejects_parallel_job() {
+        let root = tempfile::tempdir().expect("temp root");
+        let directory = root
+            .path()
+            .canonicalize()
+            .expect("canonical root")
+            .join("jobs");
+        let first_fixture = Fixture::new();
+        let first_authorization =
+            first_fixture.authorization([81; 16], first_fixture.bundle.commitment());
+        let first_submission =
+            BlindVaultReplicaJobSubmissionV1::new(first_authorization, first_fixture.bundle)
+                .expect("first submission");
+        let first_record = BlindVaultReplicaStagedJobV1::from_submission(&first_submission);
+
+        {
+            let store = FileBlindVaultReplicaJobStore::open(&directory).expect("open store");
+            assert_eq!(
+                store.stage_exact(&first_record).expect("insert"),
+                BlindVaultReplicaStageOutcome::Inserted
+            );
+            assert_eq!(
+                store.stage_exact(&first_record).expect("exact retry"),
+                BlindVaultReplicaStageOutcome::Existing
+            );
+            let loaded = store.load_active().expect("load").expect("active job");
+            assert!(loaded.exactly_matches(&first_record));
+        }
+
+        let store = FileBlindVaultReplicaJobStore::open(&directory).expect("reopen store");
+        let loaded = store.load_active().expect("reload").expect("active job");
+        assert!(loaded.exactly_matches(&first_record));
+
+        let second_fixture = Fixture::new();
+        let second_authorization =
+            second_fixture.authorization([82; 16], second_fixture.bundle.commitment());
+        let second_submission =
+            BlindVaultReplicaJobSubmissionV1::new(second_authorization, second_fixture.bundle)
+                .expect("second submission");
+        let second_record = BlindVaultReplicaStagedJobV1::from_submission(&second_submission);
+        assert_eq!(
+            store.stage_exact(&second_record).expect("active conflict"),
+            BlindVaultReplicaStageOutcome::Conflict
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_rejects_corrupt_generation_on_reopen() {
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let root = tempfile::tempdir().expect("temp root");
+        let directory = root
+            .path()
+            .canonicalize()
+            .expect("canonical root")
+            .join("jobs");
+        let fixture = Fixture::new();
+        let authorization = fixture.authorization([83; 16], fixture.bundle.commitment());
+        let submission = BlindVaultReplicaJobSubmissionV1::new(authorization, fixture.bundle)
+            .expect("submission");
+        let record = BlindVaultReplicaStagedJobV1::from_submission(&submission);
+        {
+            let store = FileBlindVaultReplicaJobStore::open(&directory).expect("open store");
+            assert_eq!(
+                store.stage_exact(&record).expect("insert"),
+                BlindVaultReplicaStageOutcome::Inserted
+            );
+        }
+
+        let state_path = directory.join("recovery-state-v1.bin");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state_path)
+            .expect("open state");
+        let mut first_body_byte = [0_u8; 1];
+        file.seek(SeekFrom::Start(REPLICA_JOB_FILE_HEADER_BYTES as u64))
+            .expect("seek body");
+        file.read_exact(&mut first_body_byte).expect("read body");
+        first_body_byte[0] ^= 1;
+        file.seek(SeekFrom::Start(REPLICA_JOB_FILE_HEADER_BYTES as u64))
+            .expect("seek body again");
+        file.write_all(&first_body_byte).expect("corrupt body");
+        file.sync_all().expect("sync corruption");
+
+        assert!(matches!(
+            FileBlindVaultReplicaJobStore::open(&directory),
+            Err(BlindVaultReplicaJobFileStoreError::CorruptState)
+        ));
     }
 }
