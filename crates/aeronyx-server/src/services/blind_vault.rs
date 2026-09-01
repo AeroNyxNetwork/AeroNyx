@@ -82,7 +82,9 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.21.1-ReplicaJobNodeIdentityExclusion - Rejected source
+//! Last Modified: v1.22.0-ReplicaJobClaims - Made the exact signed replica-job
+//! claims one private typed value with an explicit V1 construction boundary.
+//! v1.21.1-ReplicaJobNodeIdentityExclusion - Rejected source
 //! lease administration keys that collide with the local node identity.
 //! v1.21.0-ReplicaJobAuthorization - Added a dedicated,
 //! read-only per-source-lease replication authorization capability.
@@ -177,6 +179,8 @@ const PULL_CURSOR_KEY_DOMAIN: &[u8] = b"AeroNyx-BlindVault-PullCursor-Key-v1";
 const PULL_CURSOR_AAD_DOMAIN: &[u8] = b"AeroNyx-BlindVault-PullCursor-AAD-v1";
 const BLIND_ISSUER_SET_DIGEST_DOMAIN: &[u8] = b"AeroNyx-BlindVault-IssuerSet-Digest-v1";
 const REPLICA_JOB_AUTHORIZATION_DOMAIN: &[u8] = b"AeroNyx-BlindVault-ReplicaJobAuthorization-v1";
+const REPLICA_JOB_CLAIMS_COMMITMENT_DOMAIN: &[u8] =
+    b"AeroNyx-BlindVault-ReplicaJobClaimsCommitment-v1";
 const REPLICA_JOB_AUTHORIZATION_VERSION_V1: u16 = 1;
 // [BLIND-VAULT-REPLICA-AUTH 2026-09-01 by Codex] Keep client authority within
 // a fixed ten-minute replay window. Longer lifecycle work must obtain a new
@@ -319,13 +323,16 @@ pub struct BlindVaultStoredObject {
     pub expires_at_ms: u64,
 }
 
-/// Client-signed authority for one explicit source-object replication job.
+/// The one canonical set of client-authorized replica-job claims.
 ///
-/// This is source-local control data, not a Blind Vault frame or node-to-node
-/// protocol value. The target bundle commitment binds independently wrapped
-/// replica requests without making their identifiers comparable to this
-/// source lease or object.
-pub(crate) struct BlindVaultReplicaJobAuthorizationV1 {
+/// Fields stay private so a future coordinator must carry this typed value (or
+/// its canonical commitment) instead of rebuilding parallel source, target,
+/// and bundle arguments after verification.
+///
+/// [BLIND-VAULT-REPLICA-CLAIMS 2026-09-01 by Codex] This value is deliberately
+/// neither cloneable nor independently constructible outside its versioned
+/// authorization boundary.
+pub(crate) struct BlindVaultReplicaJobClaimsV1 {
     version: u16,
     job_id: [u8; 16],
     source_lease_id: [u8; 32],
@@ -335,40 +342,11 @@ pub(crate) struct BlindVaultReplicaJobAuthorizationV1 {
     target_bundle_commitment: [u8; 32],
     authorized_at_ms: u64,
     expires_at_ms: u64,
-    signature: [u8; 64],
 }
 
-impl BlindVaultReplicaJobAuthorizationV1 {
-    /// Constructs a proof supplied by a future bounded replica-job API.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) const fn new(
-        job_id: [u8; 16],
-        source_lease_id: [u8; 32],
-        source_object_id: [u8; 32],
-        source_ciphertext_commitment: [u8; 32],
-        target_node_id: [u8; 32],
-        target_bundle_commitment: [u8; 32],
-        authorized_at_ms: u64,
-        expires_at_ms: u64,
-        signature: [u8; 64],
-    ) -> Self {
-        Self {
-            version: REPLICA_JOB_AUTHORIZATION_VERSION_V1,
-            job_id,
-            source_lease_id,
-            source_object_id,
-            source_ciphertext_commitment,
-            target_node_id,
-            target_bundle_commitment,
-            authorized_at_ms,
-            expires_at_ms,
-            signature,
-        }
-    }
-
-    /// Canonical bytes signed only by the existing source lease admin key.
-    #[must_use]
-    pub(crate) fn signing_bytes(&self) -> Vec<u8> {
+impl BlindVaultReplicaJobClaimsV1 {
+    /// Exact bytes signed by the existing source lease administration key.
+    fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(REPLICA_JOB_AUTHORIZATION_DOMAIN.len() + 194);
         bytes.extend_from_slice(REPLICA_JOB_AUTHORIZATION_DOMAIN);
         bytes.extend_from_slice(&self.version.to_be_bytes());
@@ -383,25 +361,119 @@ impl BlindVaultReplicaJobAuthorizationV1 {
         bytes
     }
 
+    /// Domain-separated identity for exact durable job-id retry comparison.
+    #[allow(dead_code)]
+    pub(crate) fn commitment(&self) -> [u8; 32] {
+        let canonical = self.canonical_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(REPLICA_JOB_CLAIMS_COMMITMENT_DOMAIN);
+        hasher.update((canonical.len() as u32).to_be_bytes());
+        hasher.update(canonical);
+        hasher.finalize().into()
+    }
+
+    /// Random client job identifier for future exact-retry staging.
+    #[allow(dead_code)]
+    pub(crate) const fn job_id(&self) -> [u8; 16] {
+        self.job_id
+    }
+
+    /// Exact target whose canonical bundle was authorized.
+    #[allow(dead_code)]
+    pub(crate) const fn target_node_id(&self) -> [u8; 32] {
+        self.target_node_id
+    }
+
+    /// Commitment to the only target bundle a coordinator may stage.
+    #[allow(dead_code)]
+    pub(crate) const fn target_bundle_commitment(&self) -> [u8; 32] {
+        self.target_bundle_commitment
+    }
+}
+
+/// Client-signed authority for one explicit source-object replication job.
+///
+/// This is source-local control data, not a Blind Vault frame or node-to-node
+/// protocol value. The target bundle commitment binds independently wrapped
+/// replica requests without making their identifiers comparable to this
+/// source lease or object.
+pub(crate) struct BlindVaultReplicaJobAuthorizationV1 {
+    // [BLIND-VAULT-REPLICA-CLAIMS 2026-09-01 by Codex] Authorization owns the
+    // sole typed claims value. Verification and future staging must borrow this
+    // same value rather than accepting a second raw target/bundle context.
+    claims: BlindVaultReplicaJobClaimsV1,
+    signature: [u8; 64],
+}
+
+impl BlindVaultReplicaJobAuthorizationV1 {
+    /// Decodes the fixed-width wire fields into one explicit V1 proof.
+    ///
+    /// Unknown versions fail before a typed claims value exists. A future API
+    /// must pass the received version here rather than defaulting it to V1.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_wire_parts(
+        wire_version: u16,
+        job_id: [u8; 16],
+        source_lease_id: [u8; 32],
+        source_object_id: [u8; 32],
+        source_ciphertext_commitment: [u8; 32],
+        target_node_id: [u8; 32],
+        target_bundle_commitment: [u8; 32],
+        authorized_at_ms: u64,
+        expires_at_ms: u64,
+        signature: [u8; 64],
+    ) -> Result<Self, BlindVaultReplicaJobAuthorizationError> {
+        if wire_version != REPLICA_JOB_AUTHORIZATION_VERSION_V1 {
+            return Err(BlindVaultReplicaJobAuthorizationError::Rejected);
+        }
+        Ok(Self {
+            claims: BlindVaultReplicaJobClaimsV1 {
+                version: wire_version,
+                job_id,
+                source_lease_id,
+                source_object_id,
+                source_ciphertext_commitment,
+                target_node_id,
+                target_bundle_commitment,
+                authorized_at_ms,
+                expires_at_ms,
+            },
+            signature,
+        })
+    }
+
+    /// The exact claims future staging and dispatch must continue to use.
+    #[allow(dead_code)]
+    pub(crate) const fn claims(&self) -> &BlindVaultReplicaJobClaimsV1 {
+        &self.claims
+    }
+
+    /// Canonical bytes signed only by the existing source lease admin key.
+    #[must_use]
+    pub(crate) fn signing_bytes(&self) -> Vec<u8> {
+        self.claims.canonical_bytes()
+    }
+
     fn validate_shape(&self, now_ms: u64) -> Result<(), BlindVaultReplicaJobAuthorizationError> {
-        let lifetime = self
+        let claims = &self.claims;
+        let lifetime = claims
             .expires_at_ms
-            .checked_sub(self.authorized_at_ms)
+            .checked_sub(claims.authorized_at_ms)
             .ok_or(BlindVaultReplicaJobAuthorizationError::Rejected)?;
-        if self.version != REPLICA_JOB_AUTHORIZATION_VERSION_V1
+        if claims.version != REPLICA_JOB_AUTHORIZATION_VERSION_V1
             || now_ms == 0
-            || self.job_id == [0; 16]
-            || self.source_lease_id == [0; 32]
-            || self.source_object_id == [0; 32]
-            || self.source_ciphertext_commitment == [0; 32]
-            || self.target_node_id == [0; 32]
-            || self.target_bundle_commitment == [0; 32]
-            || self.authorized_at_ms == 0
-            || self.authorized_at_ms > now_ms
-            || self.expires_at_ms <= now_ms
+            || claims.job_id == [0; 16]
+            || claims.source_lease_id == [0; 32]
+            || claims.source_object_id == [0; 32]
+            || claims.source_ciphertext_commitment == [0; 32]
+            || claims.target_node_id == [0; 32]
+            || claims.target_bundle_commitment == [0; 32]
+            || claims.authorized_at_ms == 0
+            || claims.authorized_at_ms > now_ms
+            || claims.expires_at_ms <= now_ms
             || lifetime == 0
             || lifetime > MAX_REPLICA_JOB_AUTHORIZATION_TTL_MS
-            || IdentityPublicKey::from_bytes(&self.target_node_id).is_err()
+            || IdentityPublicKey::from_bytes(&claims.target_node_id).is_err()
         {
             return Err(BlindVaultReplicaJobAuthorizationError::Rejected);
         }
@@ -415,7 +487,7 @@ impl fmt::Debug for BlindVaultReplicaJobAuthorizationV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("BlindVaultReplicaJobAuthorizationV1")
-            .field("version", &self.version)
+            .field("version", &self.claims.version)
             .field("private_fields", &"<redacted>")
             .finish_non_exhaustive()
     }
@@ -1641,12 +1713,13 @@ impl BlindVaultService {
         // [BLIND-VAULT-REPLICA-AUTH 2026-09-01 by Codex] Validate every
         // caller-controlled field before resolving private lease authority.
         authorization.validate_shape(now_ms)?;
+        let claims = authorization.claims();
         let authority = {
             let connection = self.connection.lock();
             load_replica_job_authority(
                 &connection,
-                &authorization.source_lease_id,
-                &authorization.source_object_id,
+                &claims.source_lease_id,
+                &claims.source_object_id,
             )?
             .ok_or(BlindVaultReplicaJobAuthorizationError::Rejected)?
         };
@@ -1665,9 +1738,9 @@ impl BlindVaultService {
         }
         if authority.lease_expires_at_ms <= now_ms
             || authority.object_expires_at_ms <= now_ms
-            || authorization.expires_at_ms > authority.lease_expires_at_ms
-            || authorization.expires_at_ms > authority.object_expires_at_ms
-            || authority.ciphertext_commitment != authorization.source_ciphertext_commitment
+            || claims.expires_at_ms > authority.lease_expires_at_ms
+            || claims.expires_at_ms > authority.object_expires_at_ms
+            || authority.ciphertext_commitment != claims.source_ciphertext_commitment
         {
             return Err(BlindVaultReplicaJobAuthorizationError::Rejected);
         }
@@ -3806,7 +3879,8 @@ mod tests {
             put: &BlindVaultPutRequest,
         ) -> BlindVaultReplicaJobAuthorizationV1 {
             let target = IdentityKeyPair::from_bytes(&[31; 32]).expect("target node key");
-            let mut authorization = BlindVaultReplicaJobAuthorizationV1::new(
+            let mut authorization = BlindVaultReplicaJobAuthorizationV1::from_wire_parts(
+                REPLICA_JOB_AUTHORIZATION_VERSION_V1,
                 [40; 16],
                 put.lease_id,
                 put.object_id,
@@ -3816,7 +3890,8 @@ mod tests {
                 NOW_MS + 2,
                 NOW_MS + 2 + MAX_REPLICA_JOB_AUTHORIZATION_TTL_MS / 2,
                 [0; 64],
-            );
+            )
+            .expect("V1 replica authorization fixture");
             resign_replica_authorization(&mut authorization, &self.admin_key);
             authorization
         }
@@ -3909,38 +3984,70 @@ mod tests {
 
     #[test]
     fn replica_authorization_canonical_bytes_are_frozen() {
-        let target = IdentityKeyPair::from_bytes(&[31; 32]).expect("target node key");
-        let authorization = BlindVaultReplicaJobAuthorizationV1::new(
+        let authorization = BlindVaultReplicaJobAuthorizationV1::from_wire_parts(
+            REPLICA_JOB_AUTHORIZATION_VERSION_V1,
             [40; 16],
             [1; 32],
             [42; 32],
             [43; 32],
-            target.public_key_bytes(),
+            [5; 32],
             [44; 32],
             0x0102_0304_0506_0708,
             0x1112_1314_1516_1718,
             [45; 64],
-        );
-        let mut expected = REPLICA_JOB_AUTHORIZATION_DOMAIN.to_vec();
-        expected.extend_from_slice(&REPLICA_JOB_AUTHORIZATION_VERSION_V1.to_be_bytes());
-        expected.extend_from_slice(&[40; 16]);
-        expected.extend_from_slice(&[1; 32]);
-        expected.extend_from_slice(&[42; 32]);
-        expected.extend_from_slice(&[43; 32]);
-        expected.extend_from_slice(&target.public_key_bytes());
-        expected.extend_from_slice(&[44; 32]);
-        expected.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
-        expected.extend_from_slice(&0x1112_1314_1516_1718_u64.to_be_bytes());
+        )
+        .expect("V1 golden authorization");
+        // [BLIND-VAULT-REPLICA-CLAIMS 2026-09-01 by Codex] This complete,
+        // independent byte vector freezes the M12A signing domain, version,
+        // field order, widths, and integer endianness. Future optional claims
+        // require a new version; they must not silently alter this transcript.
+        let expected = hex::decode(concat!(
+            "4165726f4e79782d426c696e645661756c742d5265706c6963614a6f62417574686f72697a6174696f6e2d7631",
+            "0001",
+            "28282828282828282828282828282828",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+            "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+            "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+            "0505050505050505050505050505050505050505050505050505050505050505",
+            "2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c",
+            "0102030405060708",
+            "1112131415161718",
+        ))
+        .expect("literal V1 golden bytes");
 
         let canonical = authorization.signing_bytes();
-        assert_eq!(
-            canonical.len(),
-            REPLICA_JOB_AUTHORIZATION_DOMAIN.len() + 194
-        );
-        assert!(
-            canonical == expected,
-            "canonical field order must remain stable"
-        );
+        assert_eq!(canonical.len(), 239);
+        assert_eq!(canonical, expected, "V1 signing bytes must remain stable");
+        assert_eq!(authorization.claims().job_id(), [40; 16]);
+        assert_eq!(authorization.claims().target_node_id(), [5; 32]);
+        assert_eq!(authorization.claims().target_bundle_commitment(), [44; 32]);
+        assert_ne!(authorization.claims().commitment(), [0; 32]);
+    }
+
+    #[test]
+    fn replica_authorization_wire_boundary_rejects_unknown_versions() {
+        let decode = |version| {
+            BlindVaultReplicaJobAuthorizationV1::from_wire_parts(
+                version,
+                [40; 16],
+                [1; 32],
+                [42; 32],
+                [43; 32],
+                [5; 32],
+                [44; 32],
+                NOW_MS,
+                NOW_MS + 1,
+                [45; 64],
+            )
+        };
+
+        assert!(decode(REPLICA_JOB_AUTHORIZATION_VERSION_V1).is_ok());
+        for version in [0, 2, u16::MAX] {
+            assert!(matches!(
+                decode(version),
+                Err(BlindVaultReplicaJobAuthorizationError::Rejected)
+            ));
+        }
     }
 
     #[test]
@@ -3959,7 +4066,7 @@ mod tests {
             .expect("valid per-lease admin authorization");
 
         let mut rejected = fixture.replica_authorization(&put);
-        rejected.source_ciphertext_commitment = [44; 32];
+        rejected.claims.source_ciphertext_commitment = [44; 32];
         resign_replica_authorization(&mut rejected, &fixture.admin_key);
         assert!(matches!(
             fixture
@@ -4015,8 +4122,13 @@ mod tests {
         let (fixture, put) = provisioned_object_fixture();
 
         let mut wrong_source = fixture.replica_authorization(&put);
-        wrong_source.source_ciphertext_commitment = [45; 32];
+        let authorized_claims_commitment = wrong_source.claims().commitment();
+        wrong_source.claims.source_ciphertext_commitment = [45; 32];
         resign_replica_authorization(&mut wrong_source, &fixture.admin_key);
+        assert_ne!(
+            authorized_claims_commitment,
+            wrong_source.claims().commitment()
+        );
         assert!(matches!(
             fixture
                 .service
@@ -4027,7 +4139,7 @@ mod tests {
         let alternate_target =
             IdentityKeyPair::from_bytes(&[46; 32]).expect("alternate target node key");
         let mut wrong_target = fixture.replica_authorization(&put);
-        wrong_target.target_node_id = alternate_target.public_key_bytes();
+        wrong_target.claims.target_node_id = alternate_target.public_key_bytes();
         assert!(matches!(
             fixture
                 .service
@@ -4036,7 +4148,7 @@ mod tests {
         ));
 
         let mut wrong_bundle = fixture.replica_authorization(&put);
-        wrong_bundle.target_bundle_commitment = [47; 32];
+        wrong_bundle.claims.target_bundle_commitment = [47; 32];
         assert!(matches!(
             fixture
                 .service
@@ -4074,7 +4186,7 @@ mod tests {
         ));
 
         let mut wrong_version = fixture.replica_authorization(&put);
-        wrong_version.version = REPLICA_JOB_AUTHORIZATION_VERSION_V1 + 1;
+        wrong_version.claims.version = REPLICA_JOB_AUTHORIZATION_VERSION_V1 + 1;
         resign_replica_authorization(&mut wrong_version, &fixture.admin_key);
         assert!(matches!(
             fixture
@@ -4089,8 +4201,8 @@ mod tests {
         let (fixture, put) = provisioned_object_fixture();
 
         let mut expired = fixture.replica_authorization(&put);
-        expired.authorized_at_ms = NOW_MS - 2;
-        expired.expires_at_ms = NOW_MS - 1;
+        expired.claims.authorized_at_ms = NOW_MS - 2;
+        expired.claims.expires_at_ms = NOW_MS - 1;
         resign_replica_authorization(&mut expired, &fixture.admin_key);
         assert!(matches!(
             fixture
@@ -4100,8 +4212,8 @@ mod tests {
         ));
 
         let mut future = fixture.replica_authorization(&put);
-        future.authorized_at_ms = NOW_MS + 3;
-        future.expires_at_ms = NOW_MS + 4;
+        future.claims.authorized_at_ms = NOW_MS + 3;
+        future.claims.expires_at_ms = NOW_MS + 4;
         resign_replica_authorization(&mut future, &fixture.admin_key);
         assert!(matches!(
             fixture
@@ -4111,8 +4223,8 @@ mod tests {
         ));
 
         let mut overlong = fixture.replica_authorization(&put);
-        overlong.expires_at_ms =
-            overlong.authorized_at_ms + MAX_REPLICA_JOB_AUTHORIZATION_TTL_MS + 1;
+        overlong.claims.expires_at_ms =
+            overlong.claims.authorized_at_ms + MAX_REPLICA_JOB_AUTHORIZATION_TTL_MS + 1;
         resign_replica_authorization(&mut overlong, &fixture.admin_key);
         assert!(matches!(
             fixture
@@ -4122,7 +4234,7 @@ mod tests {
         ));
 
         let mut zero_identifier = fixture.replica_authorization(&put);
-        zero_identifier.job_id = [0; 16];
+        zero_identifier.claims.job_id = [0; 16];
         resign_replica_authorization(&mut zero_identifier, &fixture.admin_key);
         assert!(matches!(
             fixture
@@ -4137,7 +4249,7 @@ mod tests {
         let (fixture, put) = provisioned_object_fixture();
 
         let mut missing_lease = fixture.replica_authorization(&put);
-        missing_lease.source_lease_id = [48; 32];
+        missing_lease.claims.source_lease_id = [48; 32];
         resign_replica_authorization(&mut missing_lease, &fixture.admin_key);
         assert!(matches!(
             fixture
@@ -4147,7 +4259,7 @@ mod tests {
         ));
 
         let mut missing_object = fixture.replica_authorization(&put);
-        missing_object.source_object_id = [49; 32];
+        missing_object.claims.source_object_id = [49; 32];
         resign_replica_authorization(&mut missing_object, &fixture.admin_key);
         assert!(matches!(
             fixture
