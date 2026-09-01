@@ -1,13 +1,15 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_backup_audit_io.rs
 // ============================================
-// Version: 1.3.0-PairedLinkRecovery
+// Version: 1.4.0-ExactLinkPairCapability
 //
 // Creation Reason:
 //   [CHAT-RELAY-BACKUP-AUDIT-IO-DOMAIN 2026-08-27 by Codex] Extract bounded
 //   audit artifact reads and crash-safe publication from the relay service.
 //
 // Modification Reason:
+//   [CHAT-RELAY-BACKUP-LINK-PAIR 2026-09-01 by Codex] Consume a directory-
+//   pinned, exact-name pair capability before retiring a crash duplicate.
 //   [CHAT-RELAY-BACKUP-PAIRED-LINK-RECOVERY 2026-08-31 by Codex] Recover only
 //   exact identity-proven checkpoint/temp and active/segment crash pairs.
 //   [CHAT-BACKUP-AUDIT-MAINTENANCE-DOMAIN 2026-08-28 by Codex] Documented the
@@ -37,8 +39,12 @@
 //   - Never follow symbolic links or accept changing files during verification.
 //   - Publication order and both parent-directory fsync calls are required.
 //   - HMAC policy and chain state transitions belong outside this I/O module.
+//   - Exact-pair recovery detects namespace drift before unlink, but portable
+//     Unix cannot eliminate a hostile same-euid fstat-to-unlink rename race.
 //
 // Last Modified:
+//   v1.4.0-ExactLinkPairCapability - Revalidates both canonical pair names
+//     relative to their pinned parent before consuming unlink authority
 //   v1.3.0-PairedLinkRecovery - Identity-bound two-link cleanup and retirement
 //   v1.2.0-MaintenanceCoordinatorComposition - Documented use-case ownership
 //   v1.1.0-CanonicalSegmentNaming - Exposed canonical segment naming to the
@@ -60,8 +66,8 @@ use crate::services::chat_relay_backup_audit_catalog::{
 use crate::services::chat_relay_backup_audit_checkpoint::ChatRelayBackupAuditCheckpoint;
 use crate::services::chat_relay_backup_audit_rotation::ChatRelayBackupAuditSegmentRange;
 use crate::services::chat_relay_backup_io::{
-    backup_io_error, BackupFilesystem, PrivateBackupControlFileIdentity,
-    PrivateBackupControlFileMode,
+    backup_io_error, BackupFilesystem, PrivateBackupControlFileMode,
+    PrivateBackupControlLinkPairCapability,
 };
 use crate::services::chat_relay_error::{ChatRelayError, ChatRelayResult};
 
@@ -90,7 +96,7 @@ pub(super) enum ChatRelayBackupAuditPendingRotation {
     /// The named segment exists but the duplicate active link remains.
     RemoveDuplicateActive {
         active_path: PathBuf,
-        expected_identity: PrivateBackupControlFileIdentity,
+        expected_identity: PrivateBackupControlLinkPairCapability,
     },
 }
 
@@ -291,23 +297,24 @@ impl<F: BackupFilesystem> BackupAuditIo for LocalBackupAuditIo<F> {
         let temporary_paths = self.checkpoint_temporary_paths(parent)?;
         let removed = temporary_paths.len();
         for path in temporary_paths {
-            let mut published_identity = None;
+            let mut published_pair_capability = None;
             for checkpoint_path in &checkpoint_paths {
                 if let Some(pair) = self
                     .filesystem
-                    .open_existing_control_file_pair(&path, checkpoint_path)?
+                    .open_existing_control_file_pair(checkpoint_path, &path)?
                 {
-                    published_identity = Some(pair.identity);
-                    drop(pair);
+                    published_pair_capability = Some(pair.identity);
+                    drop(pair.first);
+                    drop(pair.second);
                     break;
                 }
             }
-            if let Some(identity) = published_identity {
-                // [CHAT-RELAY-BACKUP-PAIRED-LINK-RECOVERY 2026-08-31 by Codex]
-                // The canonical checkpoint is the inode's only other name.
-                // Revalidate the temporary identity immediately before unlink.
-                self.filesystem
-                    .remove_verified_control_link(parent, &path, identity)?;
+            if let Some(capability) = published_pair_capability {
+                // [CHAT-RELAY-BACKUP-LINK-PAIR 2026-09-01 by Codex] Consume
+                // authority that binds the retained checkpoint, removed
+                // temporary, pinned parent, and exact inode. No raw path can
+                // independently authorize this crash cleanup.
+                self.filesystem.remove_verified_control_link(capability)?;
                 self.filesystem.sync_backup_parent(parent)?;
                 continue;
             }
@@ -471,14 +478,15 @@ impl<F: BackupFilesystem> BackupAuditIo for LocalBackupAuditIo<F> {
                 self.filesystem.sync_backup_parent(parent)
             }
             ChatRelayBackupAuditPendingRotation::RemoveDuplicateActive {
-                active_path,
+                active_path: _active_path,
                 expected_identity,
             } => {
-                self.filesystem.remove_verified_control_link(
-                    parent,
-                    &active_path,
-                    expected_identity,
-                )?;
+                // [CHAT-RELAY-BACKUP-LINK-PAIR 2026-09-01 by Codex] The path
+                // remains in this internal action for its frozen producer; it
+                // is deliberately inert. Only the capability can authorize
+                // which pinned-parent name is removed.
+                self.filesystem
+                    .remove_verified_control_link(expected_identity)?;
                 self.filesystem.sync_backup_parent(parent)
             }
         }
@@ -815,11 +823,12 @@ mod tests {
         std::fs::hard_link(&active_path, &segment_path)
             .expect("publish duplicate active segment link");
         let pair = LocalBackupFilesystem
-            .open_existing_control_file_pair(&active_path, &segment_path)
+            .open_existing_control_file_pair(&segment_path, &active_path)
             .expect("inspect duplicate active pair")
             .expect("duplicate active pair is exact");
         let expected_identity = pair.identity;
-        drop(pair);
+        drop(pair.first);
+        drop(pair.second);
 
         audit_io()
             .complete_pending_rotation(
@@ -833,6 +842,43 @@ mod tests {
 
         assert!(!active_path.exists());
         assert!(segment_path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn duplicate_active_recovery_rejects_retained_name_drift_without_unlink() {
+        let parent = tempfile::tempdir().expect("temporary audit pair drift parent");
+        let active_path = parent.path().join(BACKUP_AUDIT_FILE_NAME);
+        let segment_path = parent.path().join("immutable-segment");
+        let external_alias = parent.path().join("unmanaged-external-alias");
+        LocalBackupFilesystem
+            .reserve_private_file(&active_path)
+            .expect("reserve drift duplicate active segment");
+        std::fs::hard_link(&active_path, &segment_path)
+            .expect("publish drift duplicate active segment link");
+        let pair = LocalBackupFilesystem
+            .open_existing_control_file_pair(&segment_path, &active_path)
+            .expect("inspect duplicate pair before namespace drift")
+            .expect("duplicate pair starts exact");
+        let expected_identity = pair.identity;
+        drop(pair.first);
+        drop(pair.second);
+
+        std::fs::rename(&segment_path, &external_alias)
+            .expect("move retained segment to unmanaged sibling");
+
+        assert!(audit_io()
+            .complete_pending_rotation(
+                parent.path(),
+                ChatRelayBackupAuditPendingRotation::RemoveDuplicateActive {
+                    active_path: active_path.clone(),
+                    expected_identity,
+                },
+            )
+            .is_err());
+        assert!(active_path.exists());
+        assert!(external_alias.exists());
+        assert!(!segment_path.exists());
     }
 
     #[test]
