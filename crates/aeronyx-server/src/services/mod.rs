@@ -221,6 +221,10 @@ pub mod blind_vault;
 // source authorization, canonical target bundles, and exact-idempotent job
 // admission behind one private composition boundary.
 mod blind_vault_replica_coordinator;
+// [BLIND-VAULT-REPLICA-TRANSPORT 2026-09-01 by Codex] Preserve the exact
+// committed onion carrier and bind source, entry, and terminal identities
+// before asynchronous I/O can observe any request bytes.
+mod blind_vault_replica_transport;
 // [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] Keep host filesystem
 // inspection behind a replaceable capability instead of embedding platform
 // calls in the storage transaction service.
