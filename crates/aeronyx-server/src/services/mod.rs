@@ -220,7 +220,7 @@ pub mod blind_vault;
 // [BLIND-VAULT-REPLICA-COORDINATOR 2026-09-01 by Codex] Keep explicit
 // source authorization, canonical target bundles, and exact-idempotent job
 // admission behind one private composition boundary.
-mod blind_vault_replica_coordinator;
+pub(crate) mod blind_vault_replica_coordinator;
 // [BLIND-VAULT-REPLICA-TRANSPORT 2026-09-01 by Codex] Preserve the exact
 // committed onion carrier and bind source, entry, and terminal identities
 // before asynchronous I/O can observe any request bytes.

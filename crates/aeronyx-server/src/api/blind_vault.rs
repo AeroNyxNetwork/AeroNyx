@@ -78,7 +78,13 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 use crate::api::InFlightRequestGuard;
-use crate::services::{BlindVaultLeaseProvisionOutcome, BlindVaultService, BlindVaultServiceError};
+use crate::services::blind_vault::{BlindVaultReplicaJobAuthorizationV1, BlindVaultService};
+use crate::services::blind_vault_replica_coordinator::{
+    BlindVaultReplicaAdmissionOutcome, BlindVaultReplicaCoordinatorError,
+    BlindVaultReplicaJobAdmission, BlindVaultReplicaJobSubmissionV1,
+    BlindVaultReplicaTargetBundlePolicyV1, BlindVaultReplicaTargetBundleV1,
+};
+use crate::services::{BlindVaultLeaseProvisionOutcome, BlindVaultServiceError};
 
 const SMALL_REQUEST_BODY_MAX_BYTES: usize = 16 * 1024;
 const MUTATION_REQUEST_BODY_MAX_BYTES: usize = MAX_BLIND_VAULT_MUTATION_FRAME_BYTES as usize;
@@ -88,12 +94,60 @@ const MAX_MUTATIONS_PER_SECOND: u64 = 256;
 const MAX_PULLS_PER_SECOND: u64 = 64;
 const BINARY_CONTENT_TYPE: &str = "application/vnd.aeronyx.blind-vault-v1";
 const ISSUER_DIRECTORY_CACHE_CONTROL: &str = "public, max-age=60, must-revalidate";
+const REPLICA_JOB_REQUEST_MAGIC: [u8; 4] = *b"AXRJ";
+const REPLICA_JOB_REQUEST_VERSION_V1: u16 = 1;
+const REPLICA_JOB_REQUEST_HEADER_BYTES: usize = 4 + 2 + 4 * 4;
+const MAX_REPLICA_JOB_AUTHORIZATION_BYTES: usize = 512;
+const MAX_REPLICA_JOB_REQUEST_BODY_BYTES: usize = 48 * 1024;
 
 #[derive(Clone)]
 struct BlindVaultApiState {
     service: Arc<BlindVaultService>,
     node_identity: Arc<IdentityKeyPair>,
     admission: Arc<BlindVaultApiAdmissionRuntime>,
+    replica: Option<BlindVaultReplicaApiState>,
+}
+
+#[derive(Clone)]
+struct BlindVaultReplicaApiState {
+    admission: Arc<dyn BlindVaultReplicaJobAdmission>,
+    policy: BlindVaultReplicaApiPolicyV1,
+}
+
+/// Runtime bounds used to validate a client-authorized target bundle.
+#[derive(Clone, Copy)]
+pub(crate) struct BlindVaultReplicaApiPolicyV1 {
+    maximum_lease_ttl_ms: u64,
+    maximum_object_ttl_ms: u64,
+    maximum_inventory_clock_skew_ms: u64,
+}
+
+impl BlindVaultReplicaApiPolicyV1 {
+    pub(crate) fn new(
+        maximum_lease_ttl_ms: u64,
+        maximum_object_ttl_ms: u64,
+        maximum_inventory_clock_skew_ms: u64,
+    ) -> Option<Self> {
+        (maximum_lease_ttl_ms > 0
+            && maximum_object_ttl_ms > 0
+            && maximum_object_ttl_ms <= maximum_lease_ttl_ms
+            && maximum_inventory_clock_skew_ms > 0)
+            .then_some(Self {
+                maximum_lease_ttl_ms,
+                maximum_object_ttl_ms,
+                maximum_inventory_clock_skew_ms,
+            })
+    }
+
+    fn at(self, now_ms: u64) -> Result<BlindVaultReplicaTargetBundlePolicyV1, ApiFailure> {
+        BlindVaultReplicaTargetBundlePolicyV1::new(
+            now_ms,
+            self.maximum_lease_ttl_ms,
+            self.maximum_object_ttl_ms,
+            self.maximum_inventory_clock_skew_ms,
+        )
+        .map_err(|_| ApiFailure::invalid_frame())
+    }
 }
 
 /// Process-scoped, identity-free admission budget for all Blind Vault routes.
@@ -138,6 +192,12 @@ struct ApiErrorBody {
 
 #[derive(Debug, Serialize)]
 struct LeaseAdmissionBody {
+    success: bool,
+    existing: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicaJobAdmissionBody {
     success: bool,
     existing: bool,
 }
@@ -193,10 +253,44 @@ pub(crate) fn build_blind_vault_router_with_admission_runtime(
     node_identity: Arc<IdentityKeyPair>,
     admission: Arc<BlindVaultApiAdmissionRuntime>,
 ) -> Router {
+    build_blind_vault_router_with_optional_replica_admission(
+        service,
+        node_identity,
+        admission,
+        None,
+    )
+}
+
+/// Builds the client routes with an explicit, default-off replica admission.
+pub(crate) fn build_blind_vault_router_with_replica_admission(
+    service: Arc<BlindVaultService>,
+    node_identity: Arc<IdentityKeyPair>,
+    admission: Arc<BlindVaultApiAdmissionRuntime>,
+    replica_admission: Arc<dyn BlindVaultReplicaJobAdmission>,
+    replica_policy: BlindVaultReplicaApiPolicyV1,
+) -> Router {
+    build_blind_vault_router_with_optional_replica_admission(
+        service,
+        node_identity,
+        admission,
+        Some(BlindVaultReplicaApiState {
+            admission: replica_admission,
+            policy: replica_policy,
+        }),
+    )
+}
+
+fn build_blind_vault_router_with_optional_replica_admission(
+    service: Arc<BlindVaultService>,
+    node_identity: Arc<IdentityKeyPair>,
+    admission: Arc<BlindVaultApiAdmissionRuntime>,
+    replica: Option<BlindVaultReplicaApiState>,
+) -> Router {
     let state = BlindVaultApiState {
         service,
         node_identity,
         admission,
+        replica,
     };
 
     let lease_router = Router::new()
@@ -235,12 +329,28 @@ pub(crate) fn build_blind_vault_router_with_admission_runtime(
         ))
         .layer(DefaultBodyLimit::max(0));
 
-    lease_router
+    // [BLIND-VAULT-REPLICA-API 2026-09-01 by Codex] Ordinary storage routes
+    // are identical when source replication is absent. The replica endpoint
+    // exists only when server startup supplies an explicit coordinator.
+    let replica_router = state.replica.as_ref().map(|_| {
+        Router::new()
+            .route("/api/vault/v1/replica-jobs", post(replica_job_handler))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                mutation_request_gate,
+            ))
+            .layer(DefaultBodyLimit::max(MAX_REPLICA_JOB_REQUEST_BODY_BYTES))
+    });
+
+    let router = lease_router
         .merge(put_router)
         .merge(delete_router)
         .merge(pull_router)
-        .merge(issuer_router)
-        .with_state(state)
+        .merge(issuer_router);
+    match replica_router {
+        Some(replica_router) => router.merge(replica_router).with_state(state),
+        None => router.with_state(state),
+    }
 }
 
 async fn mutation_request_gate(
@@ -367,6 +477,31 @@ async fn put_handler(
     binary_response(StatusCode::CREATED, BlindVaultFrame::StoredReceipt(receipt))
 }
 
+async fn replica_job_handler(
+    State(state): State<BlindVaultApiState>,
+    body: Bytes,
+) -> Result<Response, ApiFailure> {
+    let replica = state
+        .replica
+        .as_ref()
+        .ok_or_else(|| ApiFailure::new(StatusCode::NOT_FOUND, "not_found"))?;
+    let now_ms = now_millis();
+    let submission = decode_replica_job_submission(&body, replica.policy.at(now_ms)?)?;
+    let admission = Arc::clone(&replica.admission);
+    let outcome = tokio::task::spawn_blocking(move || admission.admit_v1(submission, now_ms))
+        .await
+        .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
+        .map_err(map_replica_coordinator_error)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ReplicaJobAdmissionBody {
+            success: true,
+            existing: outcome == BlindVaultReplicaAdmissionOutcome::Existing,
+        }),
+    )
+        .into_response())
+}
+
 async fn pull_handler(
     State(state): State<BlindVaultApiState>,
     body: Bytes,
@@ -438,6 +573,91 @@ fn decode_frame(body: &[u8]) -> Result<BlindVaultFrame, ApiFailure> {
     decode_blind_vault_frame(body).map_err(|_| ApiFailure::invalid_frame())
 }
 
+fn decode_replica_job_submission(
+    body: &[u8],
+    policy: BlindVaultReplicaTargetBundlePolicyV1,
+) -> Result<BlindVaultReplicaJobSubmissionV1, ApiFailure> {
+    if body.len() < REPLICA_JOB_REQUEST_HEADER_BYTES
+        || body.len() > MAX_REPLICA_JOB_REQUEST_BODY_BYTES
+    {
+        return Err(ApiFailure::invalid_frame());
+    }
+    let mut cursor = 0;
+    let magic = replica_job_take::<4>(body, &mut cursor)?;
+    let version = u16::from_be_bytes(replica_job_take(body, &mut cursor)?);
+    let authorization_len = replica_job_length(body, &mut cursor)?;
+    let admission_len = replica_job_length(body, &mut cursor)?;
+    let put_len = replica_job_length(body, &mut cursor)?;
+    let inventory_len = replica_job_length(body, &mut cursor)?;
+    if magic != REPLICA_JOB_REQUEST_MAGIC
+        || version != REPLICA_JOB_REQUEST_VERSION_V1
+        || authorization_len == 0
+        || authorization_len > MAX_REPLICA_JOB_AUTHORIZATION_BYTES
+        || admission_len == 0
+        || admission_len > MUTATION_REQUEST_BODY_MAX_BYTES
+        || put_len == 0
+        || put_len > MUTATION_REQUEST_BODY_MAX_BYTES
+        || inventory_len == 0
+        || inventory_len > MUTATION_REQUEST_BODY_MAX_BYTES
+    {
+        return Err(ApiFailure::invalid_frame());
+    }
+
+    let authorization_bytes = replica_job_slice(body, &mut cursor, authorization_len)?;
+    let admission_frame = replica_job_slice(body, &mut cursor, admission_len)?;
+    let put_frame = replica_job_slice(body, &mut cursor, put_len)?;
+    let inventory_frame = replica_job_slice(body, &mut cursor, inventory_len)?;
+    if cursor != body.len() {
+        return Err(ApiFailure::invalid_frame());
+    }
+
+    let authorization = BlindVaultReplicaJobAuthorizationV1::from_canonical_authorization_bytes(
+        authorization_bytes,
+    )
+    .map_err(|_| ApiFailure::invalid_frame())?;
+    let target_node_id = authorization.claims().target_node_id();
+    let target_bundle = BlindVaultReplicaTargetBundleV1::from_wire_parts(
+        version,
+        target_node_id,
+        admission_frame,
+        put_frame,
+        inventory_frame,
+        policy,
+    )
+    .map_err(|_| ApiFailure::invalid_frame())?;
+    BlindVaultReplicaJobSubmissionV1::new(authorization, target_bundle)
+        .map_err(|_| ApiFailure::invalid_frame())
+}
+
+fn replica_job_length(body: &[u8], cursor: &mut usize) -> Result<usize, ApiFailure> {
+    usize::try_from(u32::from_be_bytes(replica_job_take(body, cursor)?))
+        .map_err(|_| ApiFailure::invalid_frame())
+}
+
+fn replica_job_slice<'a>(
+    body: &'a [u8],
+    cursor: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], ApiFailure> {
+    let end = cursor
+        .checked_add(length)
+        .ok_or_else(ApiFailure::invalid_frame)?;
+    let value = body
+        .get(*cursor..end)
+        .ok_or_else(ApiFailure::invalid_frame)?;
+    *cursor = end;
+    Ok(value)
+}
+
+fn replica_job_take<const N: usize>(
+    body: &[u8],
+    cursor: &mut usize,
+) -> Result<[u8; N], ApiFailure> {
+    replica_job_slice(body, cursor, N)?
+        .try_into()
+        .map_err(|_| ApiFailure::invalid_frame())
+}
+
 fn binary_response(status: StatusCode, frame: BlindVaultFrame) -> Result<Response, ApiFailure> {
     let encoded = encode_blind_vault_frame(&frame)
         .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
@@ -504,6 +724,17 @@ fn map_service_error(error: BlindVaultServiceError) -> ApiFailure {
     }
 }
 
+fn map_replica_coordinator_error(error: BlindVaultReplicaCoordinatorError) -> ApiFailure {
+    match error {
+        BlindVaultReplicaCoordinatorError::Rejected => {
+            ApiFailure::new(StatusCode::FORBIDDEN, "replica_job_rejected")
+        }
+        BlindVaultReplicaCoordinatorError::Unavailable => {
+            ApiFailure::new(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
+        }
+    }
+}
+
 fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -526,8 +757,8 @@ mod tests {
     use aeronyx_core::protocol::blind_vault::{
         BlindVaultAdmissionTicket, BlindVaultBlindAdmissionToken,
         BlindVaultBlindLeaseAdmissionRequest, BlindVaultLeaseAdmissionRequest,
-        BlindVaultLeaseCreateRequest, BlindVaultPullRequest, BlindVaultPutRequest,
-        BLIND_VAULT_PROTOCOL_VERSION,
+        BlindVaultLeaseCreateRequest, BlindVaultLeaseInventoryRequest, BlindVaultPullRequest,
+        BlindVaultPutRequest, BLIND_VAULT_PROTOCOL_VERSION,
     };
     use axum::{
         body::{to_bytes, Body},
@@ -536,6 +767,7 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use blind_rsa_signatures::{DefaultRng, KeyPairSha384PSSRandomized};
     use sha2::{Digest, Sha256};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -558,6 +790,22 @@ mod tests {
         }
 
         fn with_admission_runtime(admission: Arc<BlindVaultApiAdmissionRuntime>) -> Self {
+            Self::with_components(admission, None)
+        }
+
+        fn with_replica_admission(
+            replica_admission: Arc<dyn BlindVaultReplicaJobAdmission>,
+        ) -> Self {
+            Self::with_components(
+                Arc::new(BlindVaultApiAdmissionRuntime::default()),
+                Some(replica_admission),
+            )
+        }
+
+        fn with_components(
+            admission: Arc<BlindVaultApiAdmissionRuntime>,
+            replica_admission: Option<Arc<dyn BlindVaultReplicaJobAdmission>>,
+        ) -> Self {
             let directory = tempfile::tempdir().expect("temp directory");
             let issuer_key = IdentityKeyPair::from_bytes(&[31; 32]).expect("issuer key");
             let node_key = IdentityKeyPair::from_bytes(&[32; 32]).expect("node key");
@@ -573,13 +821,24 @@ mod tests {
             let service = Arc::new(
                 BlindVaultService::new(config, node_key.clone()).expect("blind vault service"),
             );
-            Self {
-                _directory: directory,
-                router: build_blind_vault_router_with_admission_runtime(
+            let router = match replica_admission {
+                Some(replica_admission) => build_blind_vault_router_with_replica_admission(
+                    Arc::clone(&service),
+                    Arc::new(node_key.clone()),
+                    admission,
+                    replica_admission,
+                    BlindVaultReplicaApiPolicyV1::new(120_000, 120_000, 1_000)
+                        .expect("replica policy"),
+                ),
+                None => build_blind_vault_router_with_admission_runtime(
                     service,
                     Arc::new(node_key.clone()),
                     admission,
                 ),
+            };
+            Self {
+                _directory: directory,
+                router,
                 issuer_key,
                 node_key,
                 write_key,
@@ -631,6 +890,124 @@ mod tests {
         }
     }
 
+    struct RecordingReplicaAdmission {
+        calls: AtomicUsize,
+    }
+
+    impl RecordingReplicaAdmission {
+        const fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl BlindVaultReplicaJobAdmission for RecordingReplicaAdmission {
+        fn admit_v1(
+            &self,
+            _submission: BlindVaultReplicaJobSubmissionV1,
+            _now_ms: u64,
+        ) -> Result<BlindVaultReplicaAdmissionOutcome, BlindVaultReplicaCoordinatorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(BlindVaultReplicaAdmissionOutcome::Inserted)
+        }
+    }
+
+    fn replica_job_body(now_ms: u64) -> Vec<u8> {
+        let target_write = IdentityKeyPair::from_bytes(&[41; 32]).expect("target write");
+        let target_admin = IdentityKeyPair::from_bytes(&[42; 32]).expect("target admin");
+        let target_node = IdentityKeyPair::from_bytes(&[43; 32]).expect("target node");
+        let source_admin = IdentityKeyPair::from_bytes(&[44; 32]).expect("source admin");
+        let lease_id = [45; 32];
+        let lease_expiry = now_ms + 60_000;
+        let mut lease = BlindVaultLeaseCreateRequest::new(
+            lease_id,
+            [46; 16],
+            target_write.public_key_bytes(),
+            target_admin.public_key_bytes(),
+            [47; 32],
+            lease_expiry,
+        );
+        lease.sign(&target_admin).expect("sign target lease");
+        let admission_frame = encode_blind_vault_frame(&BlindVaultFrame::BlindLeaseAdmission(
+            BlindVaultBlindLeaseAdmissionRequest {
+                admission: BlindVaultBlindAdmissionToken::new(
+                    [48; 32],
+                    [49; 32],
+                    [50; 32],
+                    vec![51; 256],
+                ),
+                lease,
+            },
+        ))
+        .expect("encode target admission");
+        let mut put =
+            BlindVaultPutRequest::new(lease_id, [52; 32], [53; 16], vec![54; 4_096], lease_expiry);
+        put.sign(&target_write);
+        let put_frame =
+            encode_blind_vault_frame(&BlindVaultFrame::Put(put)).expect("encode target put");
+        let mut inventory = BlindVaultLeaseInventoryRequest::new(lease_id, [55; 16], now_ms);
+        inventory.sign(&target_admin);
+        let inventory_frame = encode_blind_vault_frame(&BlindVaultFrame::LeaseInventory(inventory))
+            .expect("encode target inventory");
+        let bundle = BlindVaultReplicaTargetBundleV1::from_wire_parts(
+            REPLICA_JOB_REQUEST_VERSION_V1,
+            target_node.public_key_bytes(),
+            &admission_frame,
+            &put_frame,
+            &inventory_frame,
+            BlindVaultReplicaTargetBundlePolicyV1::new(now_ms, 120_000, 120_000, 1_000)
+                .expect("target policy"),
+        )
+        .expect("target bundle");
+        let unsigned = BlindVaultReplicaJobAuthorizationV1::from_wire_parts(
+            REPLICA_JOB_REQUEST_VERSION_V1,
+            [56; 16],
+            [57; 32],
+            [58; 32],
+            [59; 32],
+            target_node.public_key_bytes(),
+            bundle.commitment(),
+            now_ms - 1,
+            now_ms + 30_000,
+            [0; 64],
+        )
+        .expect("unsigned authorization");
+        let signature = source_admin.sign(&unsigned.signing_bytes());
+        let authorization = BlindVaultReplicaJobAuthorizationV1::from_wire_parts(
+            REPLICA_JOB_REQUEST_VERSION_V1,
+            [56; 16],
+            [57; 32],
+            [58; 32],
+            [59; 32],
+            target_node.public_key_bytes(),
+            bundle.commitment(),
+            now_ms - 1,
+            now_ms + 30_000,
+            signature,
+        )
+        .expect("authorization")
+        .canonical_authorization_bytes();
+
+        let lengths = [
+            authorization.len(),
+            admission_frame.len(),
+            put_frame.len(),
+            inventory_frame.len(),
+        ];
+        let mut body = Vec::new();
+        body.extend_from_slice(&REPLICA_JOB_REQUEST_MAGIC);
+        body.extend_from_slice(&REPLICA_JOB_REQUEST_VERSION_V1.to_be_bytes());
+        for length in lengths {
+            body.extend_from_slice(&u32::try_from(length).expect("bounded length").to_be_bytes());
+        }
+        body.extend_from_slice(&authorization);
+        body.extend_from_slice(&admission_frame);
+        body.extend_from_slice(&put_frame);
+        body.extend_from_slice(&inventory_frame);
+        body
+    }
+
     #[test]
     fn identity_free_rate_window_resets_and_bounds() {
         let mut window = RateWindow::default();
@@ -663,6 +1040,84 @@ mod tests {
         drop(permits);
         let response = second.post_body("/api/vault/v1/put", Vec::new()).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn replica_job_route_is_default_off() {
+        let fixture = ApiFixture::new();
+        let response = fixture
+            .post_body("/api/vault/v1/replica-jobs", replica_job_body(now_millis()))
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn replica_job_route_accepts_one_explicit_v1_submission() {
+        let admission = Arc::new(RecordingReplicaAdmission::new());
+        let admission_trait: Arc<dyn BlindVaultReplicaJobAdmission> = admission.clone();
+        let fixture = ApiFixture::with_replica_admission(admission_trait);
+        let response = fixture
+            .post_body("/api/vault/v1/replica-jobs", replica_job_body(now_millis()))
+            .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 1);
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("response body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("response json"),
+            serde_json::json!({"success": true, "existing": false})
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_put_never_invokes_replica_admission() {
+        let admission = Arc::new(RecordingReplicaAdmission::new());
+        let admission_trait: Arc<dyn BlindVaultReplicaJobAdmission> = admission.clone();
+        let fixture = ApiFixture::with_replica_admission(admission_trait);
+        let now_ms = now_millis();
+        let lease = fixture
+            .post_frame(
+                "/api/vault/v1/lease",
+                BlindVaultFrame::LeaseAdmission(fixture.admission(now_ms)),
+            )
+            .await;
+        assert_eq!(lease.status(), StatusCode::OK);
+
+        let mut put = BlindVaultPutRequest::new(
+            fixture.lease_id,
+            [60; 32],
+            [61; 16],
+            vec![62; 4_096],
+            now_ms + 30_000,
+        );
+        put.sign(&fixture.write_key);
+        let response = fixture
+            .post_frame("/api/vault/v1/put", BlindVaultFrame::Put(put))
+            .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_replica_job_never_reaches_admission() {
+        let admission = Arc::new(RecordingReplicaAdmission::new());
+        let admission_trait: Arc<dyn BlindVaultReplicaJobAdmission> = admission.clone();
+        let fixture = ApiFixture::with_replica_admission(admission_trait);
+        let mut wrong_version = replica_job_body(now_millis());
+        wrong_version[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        let response = fixture
+            .post_body("/api/vault/v1/replica-jobs", wrong_version)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let mut trailing = replica_job_body(now_millis());
+        trailing.push(0);
+        let response = fixture
+            .post_body("/api/vault/v1/replica-jobs", trailing)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

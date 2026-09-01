@@ -36,6 +36,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 #[cfg(unix)]
 use std::path::Path;
+use std::sync::Arc;
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(unix)]
@@ -58,7 +59,6 @@ const REPLICA_JOB_FILE_HEADER_BYTES: usize = 4 + 2 + 4;
 const REPLICA_JOB_FILE_CHECKSUM_BYTES: usize = 32;
 #[cfg(unix)]
 const MAX_REPLICA_JOB_AUTHORIZATION_BYTES: usize = 512;
-#[cfg(unix)]
 const MAX_REPLICA_TARGET_BUNDLE_BYTES: usize = 32 * 1024;
 #[cfg(unix)]
 const REPLICA_JOB_BODY_FIXED_BYTES: usize = 16 + 32 * 3 + 4 + 4 + 32;
@@ -198,6 +198,9 @@ impl BlindVaultReplicaTargetBundleV1 {
                 .map_err(|_| BlindVaultReplicaCoordinatorError::Rejected)?,
         ];
         let canonical_bytes = canonical_bundle_bytes(target_node_id, &canonical_effects)?;
+        if canonical_bytes.len() > MAX_REPLICA_TARGET_BUNDLE_BYTES {
+            return Err(BlindVaultReplicaCoordinatorError::Rejected);
+        }
         let commitment = Sha256::digest(&canonical_bytes).into();
         Ok(Self {
             target_node_id,
@@ -357,6 +360,17 @@ impl BlindVaultReplicaAuthorizationVerifier for BlindVaultService {
     }
 }
 
+impl BlindVaultReplicaAuthorizationVerifier for Arc<BlindVaultService> {
+    fn verify(
+        &self,
+        authorization: &BlindVaultReplicaJobAuthorizationV1,
+        now_ms: u64,
+    ) -> Result<(), BlindVaultReplicaJobAuthorizationError> {
+        self.as_ref()
+            .verify_replica_job_authorization(authorization, now_ms)
+    }
+}
+
 /// Durable store contract: same id/same bytes is idempotent, any drift conflicts.
 pub(crate) trait BlindVaultReplicaJobStore: Send + Sync {
     type Error: Send + Sync;
@@ -373,6 +387,15 @@ pub(crate) trait BlindVaultReplicaJobStore: Send + Sync {
 pub(crate) struct BlindVaultReplicaCoordinator<V, S> {
     verifier: V,
     store: S,
+}
+
+/// Object-safe admission boundary consumed by the optional client API.
+pub(crate) trait BlindVaultReplicaJobAdmission: Send + Sync {
+    fn admit_v1(
+        &self,
+        submission: BlindVaultReplicaJobSubmissionV1,
+        now_ms: u64,
+    ) -> Result<BlindVaultReplicaAdmissionOutcome, BlindVaultReplicaCoordinatorError>;
 }
 
 impl<V, S> BlindVaultReplicaCoordinator<V, S>
@@ -415,6 +438,20 @@ where
                 Err(BlindVaultReplicaCoordinatorError::Rejected)
             }
         }
+    }
+}
+
+impl<V, S> BlindVaultReplicaJobAdmission for BlindVaultReplicaCoordinator<V, S>
+where
+    V: BlindVaultReplicaAuthorizationVerifier,
+    S: BlindVaultReplicaJobStore,
+{
+    fn admit_v1(
+        &self,
+        submission: BlindVaultReplicaJobSubmissionV1,
+        now_ms: u64,
+    ) -> Result<BlindVaultReplicaAdmissionOutcome, BlindVaultReplicaCoordinatorError> {
+        BlindVaultReplicaCoordinator::admit_v1(self, submission, now_ms)
     }
 }
 
