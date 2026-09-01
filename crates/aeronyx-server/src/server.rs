@@ -983,7 +983,9 @@ use rand::RngCore;
 use rusqlite::OptionalExtension;
 
 use crate::api::auth::ensure_jwt_secret;
-use crate::api::blind_vault::build_blind_vault_router;
+use crate::api::blind_vault::{
+    build_blind_vault_router_with_admission_runtime, BlindVaultApiAdmissionRuntime,
+};
 use crate::api::chat_handlers::build_chat_router;
 #[cfg(test)]
 use crate::api::chat_peer::blind_relay_delivery_receipt_is_valid;
@@ -6415,6 +6417,10 @@ impl Server {
         let blind_vault_public_api_enabled = self.config.blind_vault.public_api_enabled;
         let public_blind_vault = blind_vault.clone();
         let local_blind_vault = blind_vault.clone();
+        // [BLIND-VAULT-SHARED-ADMISSION 2026-09-01 by Codex] Both listeners
+        // expose the same process capability. They must consume one pressure
+        // budget rather than multiplying limits by the number of routers.
+        let blind_vault_admission = Arc::new(BlindVaultApiAdmissionRuntime::default());
 
         Ok(tokio::spawn(async move {
             // [RUNTIME-SUPERVISION 2026-07-29 by Codex] Required listeners
@@ -6444,6 +6450,7 @@ impl Server {
                     public_commitment_sync_tip_notifier,
                     public_blind_vault,
                     blind_vault_public_api_enabled,
+                    Arc::clone(&blind_vault_admission),
                 );
                 listener_tasks.spawn(async move {
                     Self::serve_public_discovery_api(
@@ -6464,7 +6471,11 @@ impl Server {
                 .map(|relay| build_chat_router(Arc::clone(relay)))
                 .unwrap_or_else(axum::Router::new);
             let blind_vault_router = match (blind_vault_public_api_enabled, local_blind_vault) {
-                (true, Some(vault)) => build_blind_vault_router(vault, Arc::clone(&node_identity)),
+                (true, Some(vault)) => build_blind_vault_router_with_admission_runtime(
+                    vault,
+                    Arc::clone(&node_identity),
+                    Arc::clone(&blind_vault_admission),
+                ),
                 _ => axum::Router::new(),
             };
             // [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] The status route
@@ -6925,6 +6936,7 @@ impl Server {
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
         blind_vault: Option<Arc<BlindVaultService>>,
         blind_vault_public_api_enabled: bool,
+        blind_vault_admission: Arc<BlindVaultApiAdmissionRuntime>,
     ) -> axum::Router {
         let block_peer_store = Arc::clone(&peer_store);
         let block_identity = Arc::clone(&node_identity);
@@ -6982,7 +6994,11 @@ impl Server {
             app
         };
         let app = match (blind_vault_public_api_enabled, blind_vault) {
-            (true, Some(vault)) => app.merge(build_blind_vault_router(vault, node_identity)),
+            (true, Some(vault)) => app.merge(build_blind_vault_router_with_admission_runtime(
+                vault,
+                node_identity,
+                blind_vault_admission,
+            )),
             _ => app,
         };
         if let Some(storage) = commitment_storage {

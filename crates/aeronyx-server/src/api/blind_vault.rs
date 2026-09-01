@@ -39,7 +39,9 @@
 //!   handler; that would apply backpressure after attacker-controlled buffering.
 //! - V1 admission is a signed one-time bearer credential, not blind issuance.
 //!
-//! Last Modified: v1.6.0-BlindVaultDiskReserve - Keeps a failed local physical
+//! Last Modified: v1.7.0-BlindVaultSharedAdmission - Allows every mounted
+//! client router to share one process-wide concurrency and rate budget.
+//! v1.6.0-BlindVaultDiskReserve - Keeps a failed local physical
 //! capacity probe inside the stable service-unavailable response.
 //! v1.5.0-BlindVaultNodeCapacity - Maps node-wide and per-lease
 //! capacity failures to the same stable public response.
@@ -91,6 +93,17 @@ const ISSUER_DIRECTORY_CACHE_CONTROL: &str = "public, max-age=60, must-revalidat
 struct BlindVaultApiState {
     service: Arc<BlindVaultService>,
     node_identity: Arc<IdentityKeyPair>,
+    admission: Arc<BlindVaultApiAdmissionRuntime>,
+}
+
+/// Process-scoped, identity-free admission budget for all Blind Vault routes.
+///
+/// [BLIND-VAULT-SHARED-ADMISSION 2026-09-01 by Codex] A node can mount the
+/// same client API on public and local/VPN listeners. Keeping these counters in
+/// one explicit capability prevents each router from multiplying the declared
+/// global pressure bounds while preserving the legacy standalone builder.
+#[derive(Debug, Default)]
+pub(crate) struct BlindVaultApiAdmissionRuntime {
     mutation_in_flight: Arc<AtomicUsize>,
     pull_in_flight: Arc<AtomicUsize>,
     mutation_rate: Arc<Mutex<RateWindow>>,
@@ -167,13 +180,23 @@ pub fn build_blind_vault_router(
     service: Arc<BlindVaultService>,
     node_identity: Arc<IdentityKeyPair>,
 ) -> Router {
+    build_blind_vault_router_with_admission_runtime(
+        service,
+        node_identity,
+        Arc::new(BlindVaultApiAdmissionRuntime::default()),
+    )
+}
+
+/// Builds all bounded Blind Vault client routes against one shared runtime.
+pub(crate) fn build_blind_vault_router_with_admission_runtime(
+    service: Arc<BlindVaultService>,
+    node_identity: Arc<IdentityKeyPair>,
+    admission: Arc<BlindVaultApiAdmissionRuntime>,
+) -> Router {
     let state = BlindVaultApiState {
         service,
         node_identity,
-        mutation_in_flight: Arc::new(AtomicUsize::new(0)),
-        pull_in_flight: Arc::new(AtomicUsize::new(0)),
-        mutation_rate: Arc::new(Mutex::new(RateWindow::default())),
-        pull_rate: Arc::new(Mutex::new(RateWindow::default())),
+        admission,
     };
 
     let lease_router = Router::new()
@@ -225,12 +248,14 @@ async fn mutation_request_gate(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(_in_flight) =
-        InFlightRequestGuard::try_acquire(&state.mutation_in_flight, MAX_IN_FLIGHT_MUTATIONS)
-    else {
+    let Some(_in_flight) = InFlightRequestGuard::try_acquire(
+        &state.admission.mutation_in_flight,
+        MAX_IN_FLIGHT_MUTATIONS,
+    ) else {
         return ApiFailure::backpressure().into_response();
     };
     if !state
+        .admission
         .mutation_rate
         .lock()
         .try_take(now_seconds(), MAX_MUTATIONS_PER_SECOND)
@@ -246,11 +271,12 @@ async fn pull_request_gate(
     next: Next,
 ) -> Response {
     let Some(_in_flight) =
-        InFlightRequestGuard::try_acquire(&state.pull_in_flight, MAX_IN_FLIGHT_PULLS)
+        InFlightRequestGuard::try_acquire(&state.admission.pull_in_flight, MAX_IN_FLIGHT_PULLS)
     else {
         return ApiFailure::backpressure().into_response();
     };
     if !state
+        .admission
         .pull_rate
         .lock()
         .try_take(now_seconds(), MAX_PULLS_PER_SECOND)
@@ -528,6 +554,10 @@ mod tests {
 
     impl ApiFixture {
         fn new() -> Self {
+            Self::with_admission_runtime(Arc::new(BlindVaultApiAdmissionRuntime::default()))
+        }
+
+        fn with_admission_runtime(admission: Arc<BlindVaultApiAdmissionRuntime>) -> Self {
             let directory = tempfile::tempdir().expect("temp directory");
             let issuer_key = IdentityKeyPair::from_bytes(&[31; 32]).expect("issuer key");
             let node_key = IdentityKeyPair::from_bytes(&[32; 32]).expect("node key");
@@ -545,7 +575,11 @@ mod tests {
             );
             Self {
                 _directory: directory,
-                router: build_blind_vault_router(service, Arc::new(node_key.clone())),
+                router: build_blind_vault_router_with_admission_runtime(
+                    service,
+                    Arc::new(node_key.clone()),
+                    admission,
+                ),
                 issuer_key,
                 node_key,
                 write_key,
@@ -604,6 +638,31 @@ mod tests {
         assert!(window.try_take(10, 2));
         assert!(!window.try_take(10, 2));
         assert!(window.try_take(11, 2));
+    }
+
+    #[tokio::test]
+    async fn shared_admission_runtime_bounds_every_mounted_router() {
+        let admission = Arc::new(BlindVaultApiAdmissionRuntime::default());
+        let first = ApiFixture::with_admission_runtime(Arc::clone(&admission));
+        let second = ApiFixture::with_admission_runtime(Arc::clone(&admission));
+        let permits = (0..MAX_IN_FLIGHT_MUTATIONS)
+            .map(|_| {
+                InFlightRequestGuard::try_acquire(
+                    &admission.mutation_in_flight,
+                    MAX_IN_FLIGHT_MUTATIONS,
+                )
+                .expect("shared mutation permit")
+            })
+            .collect::<Vec<_>>();
+
+        for fixture in [&first, &second] {
+            let response = fixture.post_body("/api/vault/v1/put", Vec::new()).await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        drop(permits);
+        let response = second.post_body("/api/vault/v1/put", Vec::new()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
