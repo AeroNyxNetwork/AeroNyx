@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_backup_io.rs
 // ============================================
-// Version: 1.3.0-PairedLinkRecovery
+// Version: 1.4.0-DirectorySyncIdentity
 //
 // Creation Reason:
 //   [CHAT-RELAY-BACKUP-FILESYSTEM-DOMAIN 2026-08-27 by Codex] Extract the
@@ -37,6 +37,8 @@
 //     capability may admit two canonical names for one exact `nlink == 2` inode.
 //
 // Last Modified:
+//   v1.4.0-DirectorySyncIdentity - Opens directory fsync targets without
+//     following final symlinks or waiting on special-file peers
 //   v1.3.0-PairedLinkRecovery - Added identity-bound read-only recovery for
 //     exact two-name hard-link publication states without weakening writers
 //   v1.2.0-DirectoryIdentity - Pinned and validated the effective-user-owned
@@ -377,6 +379,47 @@ fn canonical_control_path(path: &Path) -> ChatRelayResult<(PathBuf, PathBuf)> {
     Ok((canonical_parent, canonical_path))
 }
 
+#[cfg(unix)]
+fn open_directory_for_sync(
+    path: &Path,
+    sqlite_code: i32,
+    message: &'static str,
+) -> ChatRelayResult<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // [CHAT-RELAY-BACKUP-DIRECTORY-SYNC 2026-09-01 by Codex] Durability must
+    // apply to the directory inode the caller named, not a final symlink or a
+    // special file that can wait for an external peer before type rejection.
+    // O_DIRECTORY performs the type check during open; O_NONBLOCK keeps the
+    // failure bounded if a raced replacement is a FIFO or device boundary.
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            nix::libc::O_CLOEXEC
+                | nix::libc::O_NOFOLLOW
+                | nix::libc::O_DIRECTORY
+                | nix::libc::O_NONBLOCK,
+        )
+        .open(path)
+        .map_err(|_| backup_io_error(sqlite_code, message))
+}
+
+#[cfg(not(unix))]
+fn open_directory_for_sync(
+    path: &Path,
+    sqlite_code: i32,
+    message: &'static str,
+) -> ChatRelayResult<File> {
+    let file = File::open(path).map_err(|_| backup_io_error(sqlite_code, message))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| backup_io_error(sqlite_code, message))?;
+    if !metadata.is_dir() {
+        return Err(backup_io_error(sqlite_code, message));
+    }
+    Ok(file)
+}
+
 fn validate_private_control_file(file: &File) -> ChatRelayResult<()> {
     let metadata = file.metadata().map_err(|_| {
         backup_io_error(
@@ -696,26 +739,20 @@ impl BackupFilesystem for LocalBackupFilesystem {
     }
 
     fn sync_backup_directory(&self, backup_directory: &Path) -> ChatRelayResult<()> {
-        File::open(backup_directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| {
-                backup_io_error(
-                    rusqlite::ffi::SQLITE_IOERR_FSYNC,
-                    "unable to durably sync relay backup directory",
-                )
-            })
+        let code = rusqlite::ffi::SQLITE_IOERR_FSYNC;
+        let message = "unable to durably sync relay backup directory";
+        open_directory_for_sync(backup_directory, code, message)?
+            .sync_all()
+            .map_err(|_| backup_io_error(code, message))
     }
 
     #[cfg(unix)]
     fn sync_backup_parent(&self, parent: &Path) -> ChatRelayResult<()> {
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| {
-                backup_io_error(
-                    rusqlite::ffi::SQLITE_IOERR,
-                    "unable to synchronize relay backup directory",
-                )
-            })
+        let code = rusqlite::ffi::SQLITE_IOERR;
+        let message = "unable to synchronize relay backup directory";
+        open_directory_for_sync(parent, code, message)?
+            .sync_all()
+            .map_err(|_| backup_io_error(code, message))
     }
 
     #[cfg(not(unix))]
@@ -1103,6 +1140,37 @@ mod tests {
         let fifo = root.path().join("fifo-control");
         nix::unistd::mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).expect("create private FIFO");
         assert!(filesystem.open_existing_control_file(&fifo).is_err());
+        assert!(fifo.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_rejects_symlink_and_fifo_boundaries() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary sync directory");
+        let filesystem = LocalBackupFilesystem;
+        let actual = root.path().join("actual-directory");
+        let symbolic = root.path().join("symbolic-directory");
+        let fifo = root.path().join("directory-fifo");
+        std::fs::create_dir(&actual).expect("actual sync directory");
+        symlink(&actual, &symbolic).expect("directory sync symlink");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("directory sync FIFO");
+
+        filesystem
+            .sync_backup_parent(&actual)
+            .expect("real directory remains synchronizable");
+        for unsafe_path in [&symbolic, &fifo] {
+            let error = filesystem
+                .sync_backup_parent(unsafe_path)
+                .expect_err("unsafe directory sync target must fail closed");
+            assert_eq!(sqlite_extended_code(error), rusqlite::ffi::SQLITE_IOERR);
+        }
+        assert!(symbolic.is_symlink());
         assert!(fifo.exists());
     }
 }
