@@ -143,9 +143,8 @@
 //!   even during the short interval between local persistence and witnessing.
 //!
 //! ## Last Modified
-//! v0.62.0-PublicDiscoveryRuntimePrivacy - Restricted latest relay runtime
-//! events to closed aggregate kinds and suppressed per-node or unknown audit
-//! details from every public/helper projection
+//! v0.62.0-PublicRuntimeEventProjection - Projected public blind-relay runtime
+//! events through a closed aggregate allowlist without exporting audit detail
 //! v0.61.0-OnionCandidateExclusionTelemetry - Add k-anonymous aggregate
 //! candidate-exclusion buckets without changing route admission or ordering
 //! v0.60.0-CoreVerifiedRouteContract - Shared the core route hop ceiling and
@@ -2221,46 +2220,67 @@ fn latest_blind_relay_event_value(
     generated_at: u64,
     successful: bool,
 ) -> serde_json::Value {
-    let event = status.recent_audit_events.iter().rev().find(|event| {
-        public_blind_relay_runtime_event_kind(&event.action)
-            && !event.detail.contains("node_prefix=")
-            && if successful {
-                event.outcome == "accepted"
-            } else {
-                event.outcome == "rejected" || event.outcome == "limited"
-            }
+    // [PUBLIC-DISCOVERY-RUNTIME-PRIVACY 2026-09-01 by Codex] Runtime status is
+    // assembled before the operator-oriented PeerStore payload is projected.
+    // Never copy its free-form audit detail into a public response. A closed
+    // action/outcome projection preserves aggregate evidence while making
+    // route-health prefixes, peer quarantine details, and future unknown
+    // audit actions unrepresentable on this surface.
+    let event = status.recent_audit_events.iter().rev().find_map(|event| {
+        let reason_bucket =
+            public_blind_relay_event_reason_bucket(event.action.as_str(), event.outcome.as_str())?;
+        let outcome_matches = if successful {
+            event.outcome == "accepted"
+        } else {
+            event.outcome == "rejected" || event.outcome == "limited"
+        };
+        outcome_matches.then_some((event, reason_bucket))
     });
 
     match event {
-        Some(event) => serde_json::json!({
+        Some((event, reason_bucket)) => serde_json::json!({
             "at": event.at,
             "age_seconds": generated_at.saturating_sub(event.at),
             "action": &event.action,
             "outcome": &event.outcome,
-            "reason_bucket": &event.detail,
+            "reason_bucket": reason_bucket,
         }),
         None => serde_json::Value::Null,
     }
 }
 
-// [PUBLIC-DISCOVERY-RUNTIME-PRIVACY 2026-09-01 by Codex] Public runtime
-// projections may select only aggregate recorder families whose production
-// contracts exclude peer identities and route membership. Per-node health,
-// protection, capability, and quarantine actions are intentionally absent.
-// Unknown future actions fail closed until their detail contract is reviewed.
-fn public_blind_relay_runtime_event_kind(action: &str) -> bool {
-    matches!(
-        action,
-        "blind_relay_terminal"
-            | "blind_relay_forward"
-            | "blind_relay_retry"
-            | "blind_relay_probe"
-            | "blind_relay_two_hop_probe"
-            | "blind_relay_three_hop_probe"
-            | "blind_relay_control_path_proof_evidence"
-            | "blind_relay_path_proof_evidence"
-            | "blind_relay_client_delivery_receipt"
-    )
+fn public_blind_relay_event_reason_bucket(action: &str, outcome: &str) -> Option<&'static str> {
+    match (action, outcome) {
+        ("blind_relay_terminal", "accepted") => Some("opaque_terminal_delivery_accepted"),
+        ("blind_relay_forward", "accepted") => Some("opaque_forward_accepted"),
+        ("blind_relay_forward", "rejected") => Some("opaque_forward_rejected"),
+        ("blind_relay_retry", "accepted") => Some("relay_retry_succeeded"),
+        ("blind_relay_retry", "rejected") => Some("relay_retry_exhausted"),
+        ("blind_relay_probe", "accepted") => Some("synthetic_probe_accepted"),
+        ("blind_relay_probe", "rejected") => Some("synthetic_probe_rejected"),
+        ("blind_relay_two_hop_probe", "accepted") => Some("two_hop_probe_accepted"),
+        ("blind_relay_two_hop_probe", "rejected") => Some("two_hop_probe_rejected"),
+        ("blind_relay_three_hop_probe", "accepted") => Some("three_hop_probe_accepted"),
+        ("blind_relay_three_hop_probe", "rejected") => Some("three_hop_probe_rejected"),
+        ("blind_relay_quarantine", "limited") => Some("relay_quarantine_started"),
+        ("blind_relay_purpose_bound_receipt_capability", "accepted") => {
+            Some("purpose_bound_receipt_capability_accepted")
+        }
+        ("blind_relay_purpose_bound_receipt_capability", "rejected") => {
+            Some("purpose_bound_receipt_capability_rejected")
+        }
+        ("blind_relay_control_path_proof_evidence", "rejected") => {
+            Some("control_path_proof_rejected")
+        }
+        ("blind_relay_path_proof_evidence", "rejected") => Some("path_proof_rejected"),
+        ("blind_relay_client_delivery_receipt", "accepted") => {
+            Some("client_delivery_receipt_accepted")
+        }
+        ("blind_relay_client_delivery_receipt", "rejected") => {
+            Some("client_delivery_receipt_rejected")
+        }
+        _ => None,
+    }
 }
 
 /// Builds the compact public-safe discovery summary response.
@@ -4946,6 +4966,124 @@ mod tests {
     // [PUBLIC-DISCOVERY-PROJECTION 2026-09-01 by Codex] These fixtures bind
     // public handler output to full verified descriptor membership and exercise
     // both the direct snapshot leak and every prefix-only status projection.
+    #[test]
+    fn test_public_runtime_event_projection_skips_private_and_unknown_audit_actions() {
+        let store = PeerStore::new();
+        let generated_at = 1_700_000_100;
+        let private_prefix = "node_prefix=deadbeef result=success";
+
+        store.record_blind_relay_forwarded(generated_at - 4, 1);
+        store.record_audit_event(
+            generated_at - 3,
+            "blind_relay_route_health",
+            "accepted",
+            private_prefix,
+        );
+        store.record_audit_event(
+            generated_at - 2,
+            "blind_relay_future_internal_action",
+            "accepted",
+            "node_prefix=cafebabe internal=unknown",
+        );
+        store.record_blind_relay_quarantine_started(generated_at - 4, "failure_threshold");
+        store.record_audit_event(
+            generated_at - 3,
+            "blind_relay_peer_quarantine",
+            "limited",
+            "node_prefix=deadbeef reason=failure_threshold",
+        );
+        store.record_audit_event(
+            generated_at - 2,
+            "blind_relay_future_internal_action",
+            "rejected",
+            "node_prefix=cafebabe internal=unknown",
+        );
+
+        let status = store.status(generated_at);
+        let successful = latest_blind_relay_event_value(&status, generated_at, true);
+        let failed = latest_blind_relay_event_value(&status, generated_at, false);
+
+        assert_eq!(successful["action"], "blind_relay_forward");
+        assert_eq!(successful["reason_bucket"], "opaque_forward_accepted");
+        assert_eq!(failed["action"], "blind_relay_quarantine");
+        assert_eq!(failed["reason_bucket"], "relay_quarantine_started");
+        let serialized = serde_json::to_string(&(successful, failed)).unwrap();
+        assert!(!serialized.contains("deadbeef"));
+        assert!(!serialized.contains("cafebabe"));
+        assert!(!serialized.contains("future_internal_action"));
+
+        let unknown_only = PeerStore::new();
+        unknown_only.record_audit_event(
+            generated_at,
+            "blind_relay_future_internal_action",
+            "accepted",
+            "node_prefix=deadbeef",
+        );
+        assert!(latest_blind_relay_event_value(
+            &unknown_only.status(generated_at),
+            generated_at,
+            true,
+        )
+        .is_null());
+    }
+
+    #[tokio::test]
+    async fn test_public_status_and_summary_never_export_private_runtime_audit_detail() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let private_prefix = "deadbeef";
+
+        store.record_blind_relay_forwarded(now.saturating_sub(4), 1);
+        store.record_audit_event(
+            now.saturating_sub(3),
+            "blind_relay_route_health",
+            "accepted",
+            format!("node_prefix={private_prefix} result=success"),
+        );
+        store.record_blind_relay_quarantine_started(now.saturating_sub(4), "failure_threshold");
+        store.record_audit_event(
+            now.saturating_sub(3),
+            "blind_relay_route_health",
+            "rejected",
+            format!("node_prefix={private_prefix} result=failure"),
+        );
+
+        let app = build_discovery_router(Arc::clone(&store), DiscoveryApiPolicy::default());
+        for uri in ["/api/discovery/status", "/api/discovery/summary"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let serialized = String::from_utf8(body.to_vec()).unwrap();
+            assert!(!serialized.contains(private_prefix));
+            assert!(!serialized.contains("blind_relay_route_health"));
+
+            if uri.ends_with("/status") {
+                let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+                assert_eq!(
+                    parsed["blind_relay_runtime"]["last_successful_blind_relay"]["action"],
+                    "blind_relay_forward"
+                );
+                assert_eq!(
+                    parsed["blind_relay_runtime"]["last_failed_blind_relay"]["action"],
+                    "blind_relay_quarantine"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_public_projection_snapshot_forces_public_only_for_default_and_false_query() {
         let store = Arc::new(PeerStore::new());
@@ -5213,15 +5351,15 @@ mod tests {
         );
         assert_eq!(
             runtime["last_successful_blind_relay"]["reason_bucket"].as_str(),
-            Some("ttl_remaining=1 encrypted_blob_size_bucket=opaque")
+            Some("opaque_forward_accepted")
         );
         assert_eq!(
             runtime["last_failed_blind_relay"]["action"].as_str(),
-            Some("blind_relay_forward")
+            Some("blind_relay_probe")
         );
         assert_eq!(
             runtime["last_failed_blind_relay"]["reason_bucket"].as_str(),
-            Some("rate_limited")
+            Some("synthetic_probe_rejected")
         );
         let serialized_runtime = serde_json::to_string(&runtime).unwrap();
         assert!(!serialized_runtime.contains(&private_prefix));
@@ -5259,7 +5397,7 @@ mod tests {
                 assert_eq!(
                     parsed["blind_relay_runtime"]["last_failed_blind_relay"]["reason_bucket"]
                         .as_str(),
-                    Some("rate_limited")
+                    Some("synthetic_probe_rejected")
                 );
             }
         }
