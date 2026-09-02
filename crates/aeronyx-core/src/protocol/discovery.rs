@@ -504,11 +504,17 @@ pub enum NodeProtocolFeature {
     /// separate from generic `OnionReplyV1` so upgraded sources never assume
     /// typed encrypted failures from a mixed-version terminal.
     OnionBlindVaultEncryptedFailureV1,
+    /// The node accepts the core v1 anonymous mailbox terminal codec through
+    /// a purpose-bound, source-sealed onion route.
+    ///
+    /// [ANONYMOUS-MAILBOX-V1 2026-09-02 by Codex] This advertises only protocol
+    /// support. It is not a mailbox locator and discloses no tenant activity.
+    AnonymousMailboxV1,
 }
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::BlindRelayFailureReceiptV1,
         Self::BlindRelaySuccessReceiptV1,
         Self::PurposeBoundDeliveryReceiptV2,
@@ -525,6 +531,7 @@ impl NodeProtocolFeature {
         Self::OnionBlindVaultLeaseStatusV1,
         Self::OnionBlindVaultLeaseInventoryV1,
         Self::OnionBlindVaultEncryptedFailureV1,
+        Self::AnonymousMailboxV1,
     ];
 
     /// Exact SemVer build-metadata identifier used on the signed wire.
@@ -547,6 +554,7 @@ impl NodeProtocolFeature {
             Self::OnionBlindVaultLeaseStatusV1 => "anpf1-obls1",
             Self::OnionBlindVaultLeaseInventoryV1 => "anpf1-obli1",
             Self::OnionBlindVaultEncryptedFailureV1 => "anpf1-obef1",
+            Self::AnonymousMailboxV1 => "anpf1-amb1",
         }
     }
 }
@@ -4183,6 +4191,22 @@ mod tests {
         let mut stripped = signed;
         stripped.descriptor.software_version = "test".to_string();
         assert!(stripped.verify_at(1_700_000_100).is_err());
+    }
+
+    #[test]
+    fn anonymous_mailbox_feature_is_signed_and_append_only() {
+        // [ANONYMOUS-MAILBOX-V1 2026-09-02 by Codex] The feature is one
+        // fleet-wide capability claim, never a mailbox or receiver locator.
+        let feature = NodeProtocolFeature::AnonymousMailboxV1;
+        assert_eq!(feature.semver_build_token(), "anpf1-amb1");
+        assert_eq!(NodeProtocolFeature::ALL.len(), 17);
+        assert_eq!(NodeProtocolFeature::ALL[16], feature);
+
+        let identity = IdentityKeyPair::from_bytes(&[0x9a; 32]).expect("identity");
+        let descriptor = descriptor_for(&identity).with_protocol_features([feature]);
+        assert!(descriptor.advertises_protocol_feature(feature));
+        let signed = SignedNodeDescriptor::sign(descriptor, &identity).expect("sign descriptor");
+        assert!(signed.verify_at(1_700_000_100).is_ok());
     }
 
     #[test]

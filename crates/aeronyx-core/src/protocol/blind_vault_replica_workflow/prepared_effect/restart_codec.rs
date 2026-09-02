@@ -180,6 +180,9 @@ fn purpose_code(purpose: OnionRoutePurpose) -> u8 {
         OnionRoutePurpose::BlindVaultLeaseRenewal => 8,
         OnionRoutePurpose::BlindVaultLeaseStatus => 9,
         OnionRoutePurpose::BlindVaultLeaseInventory => 10,
+        // [ANONYMOUS-MAILBOX 2026-09-02 by Codex] Append only: persisted
+        // Blind Vault effect purpose codes 1..10 remain byte-for-byte frozen.
+        OnionRoutePurpose::AnonymousMailboxV1 => 11,
     }
 }
 
@@ -195,6 +198,37 @@ fn purpose_from_code(code: u8) -> Option<OnionRoutePurpose> {
         8 => Some(OnionRoutePurpose::BlindVaultLeaseRenewal),
         9 => Some(OnionRoutePurpose::BlindVaultLeaseStatus),
         10 => Some(OnionRoutePurpose::BlindVaultLeaseInventory),
+        11 => Some(OnionRoutePurpose::AnonymousMailboxV1),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod anonymous_mailbox_tests {
+    use super::*;
+
+    #[test]
+    fn restart_purpose_codes_are_append_only_and_unknown_is_rejected() {
+        let frozen = [
+            OnionRoutePurpose::MessageRelay,
+            OnionRoutePurpose::BlindVaultPut,
+            OnionRoutePurpose::BlindVaultPull,
+            OnionRoutePurpose::BlindVaultDelete,
+            OnionRoutePurpose::BlindVaultLeaseAdmission,
+            OnionRoutePurpose::BlindVaultPutReceipt,
+            OnionRoutePurpose::BlindVaultLeaseRetire,
+            OnionRoutePurpose::BlindVaultLeaseRenewal,
+            OnionRoutePurpose::BlindVaultLeaseStatus,
+            OnionRoutePurpose::BlindVaultLeaseInventory,
+            OnionRoutePurpose::AnonymousMailboxV1,
+        ];
+        for (index, purpose) in frozen.into_iter().enumerate() {
+            let code = u8::try_from(index + 1).expect("frozen code");
+            assert_eq!(purpose_code(purpose), code);
+            assert_eq!(purpose_from_code(code), Some(purpose));
+        }
+        assert_eq!(purpose_from_code(0), None);
+        assert_eq!(purpose_from_code(12), None);
+        assert_eq!(purpose_from_code(u8::MAX), None);
     }
 }

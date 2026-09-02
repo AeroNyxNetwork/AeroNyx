@@ -134,7 +134,7 @@ pub const KEM_ALG_XWING: u8 = 2;
 /// The order is stable for deterministic capability responses. Compatibility
 /// aliases accepted by [`OnionRoutePurpose::from_wire_value`] are deliberately
 /// absent so new integrations emit only canonical values.
-pub const ONION_ROUTE_PURPOSE_VALUES: [&str; 10] = [
+pub const ONION_ROUTE_PURPOSE_VALUES: [&str; 11] = [
     "message_relay",
     "blind_vault_put",
     "blind_vault_pull",
@@ -145,6 +145,17 @@ pub const ONION_ROUTE_PURPOSE_VALUES: [&str; 10] = [
     "blind_vault_lease_renewal",
     "blind_vault_lease_status",
     "blind_vault_lease_inventory",
+    "anonymous_mailbox_v1",
+];
+
+/// [ANONYMOUS-MAILBOX-V1 2026-09-02 by Codex] Terminal contract for the
+/// source-sealed request/response mailbox codec. Every path hop separately
+/// carries the source-sealed reply contract below.
+const ANONYMOUS_MAILBOX_FEATURES: [NodeProtocolFeature; 4] = [
+    NodeProtocolFeature::AnonymousMailboxV1,
+    NodeProtocolFeature::OnionReplyV1,
+    NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+    NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
 ];
 
 /// Path-wide proof contract for topology-hiding terminal replies.
@@ -286,6 +297,8 @@ pub enum OnionRoutePurpose {
     BlindVaultLeaseStatus,
     /// Administration-authorized commitment to one live replica inventory.
     BlindVaultLeaseInventory,
+    /// Anonymous capability-key mailbox operations with sealed chat envelopes.
+    AnonymousMailboxV1,
 }
 
 impl OnionRoutePurpose {
@@ -320,6 +333,9 @@ impl OnionRoutePurpose {
             "blind_vault_lease_inventory" | "blind-vault-lease-inventory" => {
                 Some(Self::BlindVaultLeaseInventory)
             }
+            "anonymous_mailbox" | "anonymous-mailbox" | "anonymous_mailbox_v1" => {
+                Some(Self::AnonymousMailboxV1)
+            }
             _ => None,
         }
     }
@@ -338,6 +354,7 @@ impl OnionRoutePurpose {
             Self::BlindVaultLeaseRenewal => ONION_ROUTE_PURPOSE_VALUES[7],
             Self::BlindVaultLeaseStatus => ONION_ROUTE_PURPOSE_VALUES[8],
             Self::BlindVaultLeaseInventory => ONION_ROUTE_PURPOSE_VALUES[9],
+            Self::AnonymousMailboxV1 => ONION_ROUTE_PURPOSE_VALUES[10],
         }
     }
 
@@ -350,6 +367,7 @@ impl OnionRoutePurpose {
     pub const fn specialized_terminal_capability(self) -> Option<NodeCapability> {
         match self {
             Self::MessageRelay => None,
+            Self::AnonymousMailboxV1 => Some(NodeCapability::ChatRelay),
             Self::BlindVaultPut
             | Self::BlindVaultPull
             | Self::BlindVaultDelete
@@ -382,6 +400,7 @@ impl OnionRoutePurpose {
             Self::BlindVaultLeaseRenewal => &BLIND_VAULT_LEASE_RENEWAL_FEATURES,
             Self::BlindVaultLeaseStatus => &BLIND_VAULT_LEASE_STATUS_FEATURES,
             Self::BlindVaultLeaseInventory => &BLIND_VAULT_LEASE_INVENTORY_FEATURES,
+            Self::AnonymousMailboxV1 => &ANONYMOUS_MAILBOX_FEATURES,
         }
     }
 
@@ -404,6 +423,7 @@ impl OnionRoutePurpose {
             | Self::BlindVaultLeaseRenewal
             | Self::BlindVaultLeaseStatus
             | Self::BlindVaultLeaseInventory => &SOURCE_SEALED_REPLY_PATH_FEATURES,
+            Self::AnonymousMailboxV1 => &SOURCE_SEALED_REPLY_PATH_FEATURES,
         }
     }
 }
@@ -1018,6 +1038,13 @@ fn decode_payload(bytes: &[u8]) -> Result<OnionHopPayload, CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::anonymous_mailbox::{
+        AnonymousMailboxRouteRequestV1, MAX_ANONYMOUS_MAILBOX_SEALED_TERMINAL_BYTES,
+    };
+    use crate::protocol::chat::{
+        encode_blind_relay_envelope, validate_blind_relay_envelope_size, BlindRelayDeliveryReceipt,
+    };
+    use crate::protocol::memchain::{encode_memchain, MemChainMessage};
 
     #[test]
     fn route_purpose_normalizes_canonical_values_and_legacy_aliases() {
@@ -1076,6 +1103,14 @@ mod tests {
             OnionRoutePurpose::from_wire_value("blind-vault-lease-inventory"),
             Some(OnionRoutePurpose::BlindVaultLeaseInventory)
         );
+        assert_eq!(
+            OnionRoutePurpose::from_wire_value("anonymous-mailbox"),
+            Some(OnionRoutePurpose::AnonymousMailboxV1)
+        );
+        assert_eq!(
+            OnionRoutePurpose::AnonymousMailboxV1.as_str(),
+            "anonymous_mailbox_v1"
+        );
     }
 
     #[test]
@@ -1123,6 +1158,24 @@ mod tests {
             Some(NodeCapability::BlindVaultReplica)
         );
         assert_eq!(
+            OnionRoutePurpose::AnonymousMailboxV1.specialized_terminal_capability(),
+            Some(NodeCapability::ChatRelay)
+        );
+        assert!(OnionRoutePurpose::AnonymousMailboxV1
+            .required_terminal_protocol_features()
+            .contains(&NodeProtocolFeature::AnonymousMailboxV1));
+        assert_ne!(
+            BlindRelayDeliveryReceipt::payload_commitment_for_purpose(
+                b"sealed",
+                OnionRoutePurpose::AnonymousMailboxV1
+            ),
+            BlindRelayDeliveryReceipt::payload_commitment_for_purpose(
+                b"sealed",
+                OnionRoutePurpose::MessageRelay
+            ),
+            "wrong purpose must not verify as an anonymous mailbox route"
+        );
+        assert_eq!(
             ONION_ROUTE_PURPOSE_VALUES,
             [
                 "message_relay",
@@ -1134,7 +1187,8 @@ mod tests {
                 "blind_vault_lease_retire",
                 "blind_vault_lease_renewal",
                 "blind_vault_lease_status",
-                "blind_vault_lease_inventory"
+                "blind_vault_lease_inventory",
+                "anonymous_mailbox_v1"
             ]
         );
     }
@@ -1208,6 +1262,41 @@ mod tests {
         let p3 = open_onion_layer(&p2.inner, &x25519_secret(&c_id)).unwrap();
         assert_eq!(p3.next_hop, None);
         assert_eq!(p3.inner, payload);
+    }
+
+    #[test]
+    fn maximum_mailbox_route_fits_three_onion_layers_and_legacy_relay_caps() {
+        let source = IdentityKeyPair::from_bytes(&[0x91; 32]).expect("source");
+        let (_, entry) = hop_keypair();
+        let (_, middle) = hop_keypair();
+        let (_, terminal) = hop_keypair();
+        let request = AnonymousMailboxRouteRequestV1::signed(
+            [0x92; 16],
+            terminal.node_id,
+            vec![0xa5; MAX_ANONYMOUS_MAILBOX_SEALED_TERMINAL_BYTES],
+            1_800_000_000,
+            &source,
+        )
+        .expect("maximum route");
+        let payload = encode_memchain(&MemChainMessage::AnonymousMailboxRouteV1(request))
+            .expect("MemChain route");
+        assert!(payload.len() < MAX_ONION_PAYLOAD_BYTES);
+
+        let envelope = build_onion_envelope(
+            &[entry, middle, terminal],
+            &payload,
+            [0x93; 16],
+            3,
+            1_800_000_000,
+            &source,
+        )
+        .expect("maximum three-hop route");
+        validate_blind_relay_envelope_size(&envelope).expect("legacy relay blob cap");
+        let encoded = encode_blind_relay_envelope(&envelope).expect("legacy relay frame cap");
+        assert!(encoded.len() < 256 * 1024);
+        assert_eq!(payload.len(), 195_718);
+        assert_eq!(envelope.encrypted_blob.len(), 196_019);
+        assert_eq!(encoded.len(), 196_148);
     }
 
     #[test]

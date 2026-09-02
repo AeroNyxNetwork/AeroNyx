@@ -236,6 +236,9 @@
 //! v1.1.0-OnionRoutePurpose - Added stable onion route-purpose negotiation
 //! v1.2.0-SignedProtocolFeatures - Re-exported descriptor-bound feature tokens
 
+// [ANONYMOUS-MAILBOX-V1 2026-09-02 by Codex] Core-only node-blind mailbox
+// domain; runtime storage and routing composition remain separate milestones.
+pub mod anonymous_mailbox;
 pub mod auth;
 pub mod blind_vault;
 pub mod blind_vault_replica_workflow;
@@ -247,6 +250,15 @@ pub mod messages;
 pub mod onion;
 pub mod onion_reply;
 pub mod version;
+
+pub use anonymous_mailbox::{
+    decode_anonymous_mailbox_terminal_frame, encode_anonymous_mailbox_terminal_frame,
+    AnonymousMailboxAckV1, AnonymousMailboxAdmissionTicketV1, AnonymousMailboxLeaseCreateV1,
+    AnonymousMailboxOperationV1, AnonymousMailboxOutcomeV1, AnonymousMailboxProtocolError,
+    AnonymousMailboxPullOneV1, AnonymousMailboxPutV1, AnonymousMailboxRouteRequestV1,
+    AnonymousMailboxRouteResponseV1, AnonymousMailboxTerminalFrameV1,
+    AnonymousMailboxTerminalResponseV1,
+};
 
 // Re-export primary types
 // [SESSION-TERMINATION 2026-08-15 by Codex] Keep the close domain on the same

@@ -145,6 +145,9 @@ use crate::ledger::{
     BlockHeader, MemoryRecord, RecordCommitmentBlockV1, RecordCommitmentHeaderV1,
     RecordCoordinatorHandoverV1,
 };
+use crate::protocol::anonymous_mailbox::{
+    AnonymousMailboxRouteRequestV1, AnonymousMailboxRouteResponseV1,
+};
 use crate::protocol::auth::{
     signed_message_digest, verify_signed_message, AuthError, DOMAIN_CHAT_VERIFIED_SUBMIT_V1,
 };
@@ -653,6 +656,8 @@ pub struct RecordCheckpointCertificateMemberV1 {
 /// | 37    | CustodyAuditAnchorWitnessResponseV1| v2.8.16-CustodyWitnessNetwork |
 /// | 38    | ChatRelayVerifiedSubmitV1 | v2.8.17-VerifiedChatSubmit |
 /// | 39    | ChatRelayVerifiedSubmitResponseV1 | v2.8.17-VerifiedChatSubmit |
+/// | 40    | AnonymousMailboxRouteV1 | v2.8.18-AnonymousMailboxV1 |
+/// | 41    | AnonymousMailboxRouteResponseV1 | v2.8.18-AnonymousMailboxV1 |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(deprecated)]
 pub enum MemChainMessage {
@@ -1285,6 +1290,14 @@ pub enum MemChainMessage {
 
     /// [index 39] Returns entry custody and exact terminal receipt evidence.
     ChatRelayVerifiedSubmitResponseV1(ChatRelayVerifiedSubmitResponseV1),
+
+    // [ANONYMOUS-MAILBOX-V1 2026-09-02 by Codex] Additive one-target route
+    // carriers. The opaque terminal bytes contain no relay-visible chat peers.
+    /// [index 40] Carries one source-signed sealed anonymous mailbox request.
+    AnonymousMailboxRouteV1(AnonymousMailboxRouteRequestV1),
+
+    /// [index 41] Carries one target-signed sealed anonymous mailbox response.
+    AnonymousMailboxRouteResponseV1(AnonymousMailboxRouteResponseV1),
 }
 
 fn deserialize_chat_pull_cursor_v2<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -2371,6 +2384,36 @@ mod tests {
             39,
             "ChatRelayVerifiedSubmitResponseV1 must be discriminant 39"
         );
+
+        // [ANONYMOUS-MAILBOX-V1 2026-09-02 by Codex] Append-only wire ids;
+        // no legacy enum position or ChatEnvelope byte layout changes.
+        let b = bincode::serialize(&MemChainMessage::AnonymousMailboxRouteV1(
+            AnonymousMailboxRouteRequestV1 {
+                version: 1,
+                request_id: [0xe1; 16],
+                target_node_id: [0xe2; 32],
+                sealed_terminal_frame: vec![0xe3; 32],
+                requested_at: 1_800_000_000,
+                signature: [0xe4; 64],
+            },
+        ))
+        .unwrap();
+        assert_eq!(disc(&b), 40, "AnonymousMailboxRouteV1 must be 40");
+
+        let b = bincode::serialize(&MemChainMessage::AnonymousMailboxRouteResponseV1(
+            AnonymousMailboxRouteResponseV1 {
+                version: 1,
+                request_id: [0xe1; 16],
+                request_commitment: [0xe5; 32],
+                outcome: crate::protocol::anonymous_mailbox::AnonymousMailboxOutcomeV1::Accepted,
+                sealed_terminal_response: vec![0xe6; 32],
+                responded_at: 1_800_000_001,
+                responder_node_id: [0xe2; 32],
+                signature: [0xe7; 64],
+            },
+        ))
+        .unwrap();
+        assert_eq!(disc(&b), 41, "AnonymousMailboxRouteResponseV1 must be 41");
     }
 
     #[test]

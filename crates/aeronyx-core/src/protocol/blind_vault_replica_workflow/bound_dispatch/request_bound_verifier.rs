@@ -430,7 +430,10 @@ fn expected_terminal_operation(purpose: OnionRoutePurpose) -> Option<BlindVaultT
         OnionRoutePurpose::MessageRelay
         | OnionRoutePurpose::BlindVaultPut
         | OnionRoutePurpose::BlindVaultPull
-        | OnionRoutePurpose::BlindVaultLeaseStatus => None,
+        | OnionRoutePurpose::BlindVaultLeaseStatus
+        // [ANONYMOUS-MAILBOX 2026-09-02 by Codex] Mailbox traffic is a
+        // distinct terminal domain and must never enter Blind Vault pairing.
+        | OnionRoutePurpose::AnonymousMailboxV1 => None,
     }
 }
 
@@ -526,5 +529,18 @@ impl<PolicyError> BlindVaultReplicaTerminalVerificationFailure
 {
     fn dispatch_failure(&self) -> BlindVaultReplicaDispatchFailure {
         BlindVaultReplicaRequestBoundReplyError::dispatch_failure(self)
+    }
+}
+
+#[cfg(test)]
+mod anonymous_mailbox_tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_mailbox_purpose_is_not_a_blind_vault_terminal_operation() {
+        assert_eq!(
+            expected_terminal_operation(OnionRoutePurpose::AnonymousMailboxV1),
+            None
+        );
     }
 }
