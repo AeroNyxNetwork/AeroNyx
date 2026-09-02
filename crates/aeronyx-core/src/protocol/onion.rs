@@ -1042,7 +1042,10 @@ mod tests {
 
     use super::*;
     use crate::protocol::anonymous_mailbox::{
-        AnonymousMailboxRouteRequestV1, MAX_ANONYMOUS_MAILBOX_SEALED_TERMINAL_BYTES,
+        encode_anonymous_mailbox_terminal_frame, AnonymousMailboxPutV1,
+        AnonymousMailboxRouteRequestV1, AnonymousMailboxSourceTerminalCarrierV1,
+        AnonymousMailboxTerminalFrameV1, MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES,
+        MAX_ANONYMOUS_MAILBOX_SEALED_TERMINAL_BYTES,
     };
     use crate::protocol::chat::{
         encode_blind_relay_envelope, validate_blind_relay_envelope_size, BlindRelayDeliveryReceipt,
@@ -1270,17 +1273,39 @@ mod tests {
     #[test]
     fn maximum_mailbox_route_fits_three_onion_layers_and_legacy_relay_caps() {
         let source = IdentityKeyPair::from_bytes(&[0x91; 32]).expect("source");
+        let depositor = IdentityKeyPair::from_bytes(&[0x94; 32]).expect("depositor");
         let (_, entry) = hop_keypair();
         let (_, middle) = hop_keypair();
         let (_, terminal) = hop_keypair();
+        let maximum_put = AnonymousMailboxPutV1::new(
+            [0x95; 32],
+            [0x96; 16],
+            vec![0xa5; MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES],
+            1_800_000_000,
+            1_800_000_100,
+            &depositor,
+        )
+        .expect("maximum Put");
+        let terminal_frame = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::Put(maximum_put),
+        )
+        .expect("maximum terminal frame");
+        let (carrier, _source_session) = AnonymousMailboxSourceTerminalCarrierV1::prepare(
+            [0x92; 16],
+            terminal.node_id,
+            terminal_frame,
+        )
+        .expect("maximum source terminal carrier");
+        let sealed_terminal_frame = carrier.encode().expect("maximum carrier bytes");
+        assert!(sealed_terminal_frame.len() < MAX_ANONYMOUS_MAILBOX_SEALED_TERMINAL_BYTES);
         let request = AnonymousMailboxRouteRequestV1::signed(
             [0x92; 16],
             terminal.node_id,
-            vec![0xa5; MAX_ANONYMOUS_MAILBOX_SEALED_TERMINAL_BYTES],
+            sealed_terminal_frame,
             1_800_000_000,
             &source,
         )
-        .expect("maximum route");
+        .expect("maximum canonical route");
         let payload = encode_memchain(&MemChainMessage::AnonymousMailboxRouteV1(request))
             .expect("MemChain route");
         assert!(payload.len() < MAX_ONION_PAYLOAD_BYTES);
@@ -1297,14 +1322,25 @@ mod tests {
         validate_blind_relay_envelope_size(&envelope).expect("legacy relay blob cap");
         let encoded = encode_blind_relay_envelope(&envelope).expect("legacy relay frame cap");
         assert!(encoded.len() < 256 * 1024);
-        // [ANONYMOUS-MAILBOX-SIZE-GUARD 2026-09-02 by Codex] Request-side
-        // base64 remains frozen so the PullResult reduction never widens the
-        // deployed three-hop relay envelopes while terminal responses move to
-        // their dedicated compact source-sealed carrier.
-        assert_eq!(payload.len(), 195_718);
-        assert_eq!(envelope.encrypted_blob.len(), 196_019);
-        assert_eq!(encoded.len(), 196_148);
-        assert_eq!(STANDARD.encode(encoded).len(), 261_532);
+        // [ANONYMOUS-MAILBOX-SOURCE-CARRIER 2026-09-02 by Codex] This is the
+        // real largest admitted Put wrapped by the canonical request carrier,
+        // then the frozen MemChain, three-hop onion, blind-relay, and base64
+        // codecs. It must remain below their unchanged production caps.
+        assert_eq!(payload.len(), 163_168);
+        assert_eq!(envelope.encrypted_blob.len(), 163_469);
+        assert_eq!(encoded.len(), 163_598);
+        assert_eq!(STANDARD.encode(encoded).len(), 218_132);
+        assert!(matches!(
+            AnonymousMailboxPutV1::new(
+                [0x95; 32],
+                [0x96; 16],
+                vec![0xa5; MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES + 1],
+                1_800_000_000,
+                1_800_000_100,
+                &depositor,
+            ),
+            Err(crate::protocol::anonymous_mailbox::AnonymousMailboxProtocolError::TooLarge)
+        ));
     }
 
     #[test]
