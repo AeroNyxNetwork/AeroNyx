@@ -33,6 +33,8 @@
 //! deduplication capacity also bounds durable verified-submit replay evidence.
 //! v1.13.0-BlindRouteResourceBound — Added backward-compatible logical-byte
 //! and recoverable SQLite WAL-backlog admission for blind-route replay state.
+//! v1.14.0-AnonymousMailboxStore — Added a default-off, node-local custody
+//! repository configuration for opaque anonymous-mailbox capabilities.
 //!
 //! ## Main Functionality
 //! - `ChatRelayConfig` — all knobs for the zero-knowledge P2P chat relay
@@ -134,6 +136,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use aeronyx_core::protocol::anonymous_mailbox::{
+    MAX_ANONYMOUS_MAILBOX_BYTES_PER_LEASE, MAX_ANONYMOUS_MAILBOX_ITEMS_PER_LEASE,
+};
+
 use crate::error::{Result, ServerError};
 
 /// Hard upper bound for `max_message_size`.
@@ -182,6 +188,111 @@ pub const DEFAULT_CUSTODY_BACKUP_PARTIAL_GRACE_SECS: u64 = 24 * 60 * 60;
 
 /// Hard minimum grace period for interrupted private backup files.
 pub const MIN_CUSTODY_BACKUP_PARTIAL_GRACE_SECS: u64 = 24 * 60 * 60;
+
+/// Default node-wide anonymous-mailbox lease ceiling.
+pub const DEFAULT_ANONYMOUS_MAILBOX_MAX_LEASES_TOTAL: usize = 10_000;
+/// Default live sealed-item row ceiling across all anonymous mailboxes.
+pub const DEFAULT_ANONYMOUS_MAILBOX_MAX_ITEMS_TOTAL: usize = 100_000;
+/// Default logical opaque ciphertext budget for local mailbox custody.
+pub const DEFAULT_ANONYMOUS_MAILBOX_MAX_BYTES_TOTAL: u64 = 512 * 1024 * 1024;
+/// Default process-local concurrent repository-operation ceiling.
+pub const DEFAULT_ANONYMOUS_MAILBOX_MAX_IN_FLIGHT: usize = 32;
+/// Default transactional cleanup row budget.
+pub const DEFAULT_ANONYMOUS_MAILBOX_CLEANUP_BATCH_SIZE: usize = 256;
+
+/// Default-off local custody settings for anonymous mailboxes.
+///
+/// [ANONYMOUS-MAILBOX-STORE 2026-09-02 by Codex] These limits bound only the
+/// node-local repository. They do not advertise custody, enable a route, or
+/// create a filesystem hard quota.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnonymousMailboxStoreConfig {
+    /// Enables explicit construction of the local repository. No startup
+    /// wiring consumes this field in the M13B protocol slice.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Independent SQLite path; never reused for identity-bearing chat rows.
+    #[serde(default = "default_anonymous_mailbox_db_path")]
+    pub db_path: String,
+    /// Maximum live leases retained by this node.
+    #[serde(default = "default_anonymous_mailbox_max_leases_total")]
+    pub max_leases_total: usize,
+    /// Maximum live sealed-item rows retained by this node.
+    #[serde(default = "default_anonymous_mailbox_max_items_total")]
+    pub max_items_total: usize,
+    /// Maximum live logical sealed-envelope bytes retained by this node.
+    #[serde(default = "default_anonymous_mailbox_max_bytes_total")]
+    pub max_bytes_total: u64,
+    /// Maximum concurrent repository calls in this process.
+    #[serde(default = "default_anonymous_mailbox_max_in_flight")]
+    pub max_in_flight: usize,
+    /// Maximum rows removed by one cleanup transaction.
+    #[serde(default = "default_anonymous_mailbox_cleanup_batch_size")]
+    pub cleanup_batch_size: usize,
+}
+
+impl Default for AnonymousMailboxStoreConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            db_path: default_anonymous_mailbox_db_path(),
+            max_leases_total: default_anonymous_mailbox_max_leases_total(),
+            max_items_total: default_anonymous_mailbox_max_items_total(),
+            max_bytes_total: default_anonymous_mailbox_max_bytes_total(),
+            max_in_flight: default_anonymous_mailbox_max_in_flight(),
+            cleanup_batch_size: default_anonymous_mailbox_cleanup_batch_size(),
+        }
+    }
+}
+
+impl AnonymousMailboxStoreConfig {
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.db_path.is_empty() {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox.db_path",
+                "cannot be empty when anonymous_mailbox.enabled = true",
+            ));
+        }
+        if self.max_leases_total == 0 || self.max_leases_total > i64::MAX as usize {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox.max_leases_total",
+                "must fit SQLite's positive signed 64-bit counter domain",
+            ));
+        }
+        if self.max_items_total < usize::from(MAX_ANONYMOUS_MAILBOX_ITEMS_PER_LEASE)
+            || self.max_items_total > i64::MAX as usize
+        {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox.max_items_total",
+                "must fit SQLite and admit one maximum-item lease",
+            ));
+        }
+        if self.max_bytes_total < MAX_ANONYMOUS_MAILBOX_BYTES_PER_LEASE
+            || self.max_bytes_total > i64::MAX as u64
+        {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox.max_bytes_total",
+                "must fit SQLite and admit one maximum-size lease",
+            ));
+        }
+        if self.max_in_flight == 0 {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox.max_in_flight",
+                "must be > 0",
+            ));
+        }
+        if self.cleanup_batch_size == 0 || self.cleanup_batch_size > 4_096 {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox.cleanup_batch_size",
+                "must be between 1 and 4096",
+            ));
+        }
+        Ok(())
+    }
+}
 
 // ============================================
 // ChatRelayConfig
@@ -252,6 +363,13 @@ pub struct ChatRelayConfig {
     /// `ChatExpired` MemChain messages are silently ignored by the node.
     #[serde(default)]
     pub enabled: bool,
+
+    /// Default-off node-local anonymous-mailbox custody repository.
+    ///
+    /// [ANONYMOUS-MAILBOX-STORE 2026-09-02 by Codex] This additive config
+    /// block is not consumed by server startup until a later wiring milestone.
+    #[serde(default)]
+    pub anonymous_mailbox: AnonymousMailboxStoreConfig,
 
     /// Offline message TTL in seconds (default: 259 200 = 72 hours).
     ///
@@ -448,6 +566,24 @@ fn default_chat_ttl() -> u64 {
 fn default_max_pending_per_wallet() -> usize {
     500
 }
+fn default_anonymous_mailbox_db_path() -> String {
+    "data/chat_relay_mailbox.db".into()
+}
+fn default_anonymous_mailbox_max_leases_total() -> usize {
+    DEFAULT_ANONYMOUS_MAILBOX_MAX_LEASES_TOTAL
+}
+fn default_anonymous_mailbox_max_items_total() -> usize {
+    DEFAULT_ANONYMOUS_MAILBOX_MAX_ITEMS_TOTAL
+}
+fn default_anonymous_mailbox_max_bytes_total() -> u64 {
+    DEFAULT_ANONYMOUS_MAILBOX_MAX_BYTES_TOTAL
+}
+fn default_anonymous_mailbox_max_in_flight() -> usize {
+    DEFAULT_ANONYMOUS_MAILBOX_MAX_IN_FLIGHT
+}
+fn default_anonymous_mailbox_cleanup_batch_size() -> usize {
+    DEFAULT_ANONYMOUS_MAILBOX_CLEANUP_BATCH_SIZE
+}
 fn default_max_pending_messages_total() -> usize {
     100_000
 }
@@ -507,6 +643,7 @@ impl Default for ChatRelayConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            anonymous_mailbox: AnonymousMailboxStoreConfig::default(),
             offline_ttl_secs: default_chat_ttl(),
             max_pending_per_wallet: default_max_pending_per_wallet(),
             max_pending_messages_total: default_max_pending_messages_total(),
@@ -544,8 +681,16 @@ impl ChatRelayConfig {
     /// Returns `ServerError::ConfigInvalid` if any enabled constraint is violated.
     pub fn validate(&self) -> Result<()> {
         if !self.enabled {
+            if self.anonymous_mailbox.enabled {
+                return Err(ServerError::config_invalid(
+                    "memchain.chat_relay.anonymous_mailbox.enabled",
+                    "requires chat_relay.enabled = true",
+                ));
+            }
             return Ok(());
         }
+
+        self.anonymous_mailbox.validate()?;
 
         if self.offline_ttl_secs == 0 {
             return Err(ServerError::config_invalid(
@@ -739,6 +884,7 @@ mod tests {
     fn test_chat_relay_disabled_by_default() {
         let cr = ChatRelayConfig::default();
         assert!(!cr.enabled);
+        assert!(!cr.anonymous_mailbox.enabled);
     }
 
     #[test]
@@ -792,6 +938,7 @@ mod tests {
         // All invalid values — must pass because enabled = false
         let cr = ChatRelayConfig {
             enabled: false,
+            anonymous_mailbox: AnonymousMailboxStoreConfig::default(),
             offline_ttl_secs: 0,
             max_pending_per_wallet: 0,
             max_pending_messages_total: 0,
@@ -1111,7 +1258,38 @@ custody_backup_partial_grace_secs = 172800
         // Missing fields → all defaults applied
         let cr: ChatRelayConfig = toml::from_str("").unwrap();
         assert!(!cr.enabled);
+        assert_eq!(cr.anonymous_mailbox, AnonymousMailboxStoreConfig::default());
         assert!(cr.validate().is_ok());
+    }
+
+    #[test]
+    fn anonymous_mailbox_config_is_additive_default_off() {
+        // [ANONYMOUS-MAILBOX-STORE 2026-09-02 by Codex] A pre-M13B config
+        // receives a disabled nested block and therefore creates no store.
+        let cr: ChatRelayConfig = toml::from_str("enabled = true").unwrap();
+        assert!(!cr.anonymous_mailbox.enabled);
+        assert_eq!(cr.anonymous_mailbox.db_path, "data/chat_relay_mailbox.db");
+        assert!(cr.validate().is_ok());
+    }
+
+    #[test]
+    fn anonymous_mailbox_enablement_is_explicit_and_bounded() {
+        let mut cr = ChatRelayConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        cr.anonymous_mailbox.enabled = true;
+        assert!(cr.validate().is_ok());
+        cr.anonymous_mailbox.max_items_total =
+            usize::from(MAX_ANONYMOUS_MAILBOX_ITEMS_PER_LEASE) - 1;
+        assert!(cr.validate().is_err());
+        cr.anonymous_mailbox.max_items_total = DEFAULT_ANONYMOUS_MAILBOX_MAX_ITEMS_TOTAL;
+        cr.anonymous_mailbox.max_in_flight = 0;
+        assert!(cr.validate().is_err());
+
+        let mut disabled_parent = ChatRelayConfig::default();
+        disabled_parent.anonymous_mailbox.enabled = true;
+        assert!(disabled_parent.validate().is_err());
     }
 
     #[test]

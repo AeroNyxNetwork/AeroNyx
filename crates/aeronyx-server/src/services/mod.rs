@@ -234,6 +234,8 @@ mod blind_vault_replica_recovery_io;
 #[cfg(unix)]
 mod blind_vault_replica_recovery_store;
 pub mod chat_relay;
+// [ANONYMOUS-MAILBOX-STORE 2026-09-02 by Codex] Export the default-off local
+// repository domain without wiring it into any API, task, route, or discovery.
 mod chat_relay_backup_artifact;
 mod chat_relay_backup_audit;
 mod chat_relay_backup_audit_anchor;
@@ -265,6 +267,7 @@ mod chat_relay_direct_peer_circuit;
 mod chat_relay_error;
 mod chat_relay_expired_contract;
 mod chat_relay_expired_delivery;
+pub mod chat_relay_mailbox;
 mod chat_relay_maintenance_telemetry;
 mod chat_relay_message_dedup;
 mod chat_relay_node_secret;
