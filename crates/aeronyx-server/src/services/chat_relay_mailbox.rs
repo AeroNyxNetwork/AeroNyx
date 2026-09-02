@@ -1227,27 +1227,28 @@ impl AnonymousMailboxCustodyRepository for SqliteAnonymousMailboxStore {
 fn initialize_or_verify_schema(
     connection: &mut Connection,
 ) -> Result<(), AnonymousMailboxStoreError> {
-    let user_version: i64 = connection
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+    let user_version: i64 = transaction
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
-    if user_version != 0 && user_version != SCHEMA_VERSION {
-        return Err(AnonymousMailboxStoreError::UnsupportedSchema);
-    }
     if user_version == 0 {
-        let managed_tables: i64 = connection
+        // [ANONYMOUS-MAILBOX-SCHEMA-OWNERSHIP 2026-09-02 by Codex]
+        // Claim only an otherwise-empty reserved database so unrelated
+        // permanent schema objects never cohabit this node-blind store.
+        let foreign_schema_objects: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name LIKE 'anonymous_mailbox_%'",
+                 WHERE type IN ('table', 'index', 'view', 'trigger')
+                   AND name NOT LIKE 'sqlite_%'",
                 [],
                 |row| row.get(0),
             )
             .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
-        if managed_tables != 0 {
+        if foreign_schema_objects != 0 {
             return Err(AnonymousMailboxStoreError::UnsupportedSchema);
         }
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
         transaction
             .execute_batch(
                 "CREATE TABLE anonymous_mailbox_meta (
@@ -1315,11 +1316,10 @@ fn initialize_or_verify_schema(
                  PRAGMA user_version = 1;",
             )
             .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
-        transaction
-            .commit()
-            .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+    } else if user_version != SCHEMA_VERSION {
+        return Err(AnonymousMailboxStoreError::UnsupportedSchema);
     }
-    let version: i64 = connection
+    let version: i64 = transaction
         .query_row(
             "SELECT schema_version FROM anonymous_mailbox_meta WHERE singleton = 1",
             [],
@@ -1329,6 +1329,9 @@ fn initialize_or_verify_schema(
     if version != SCHEMA_VERSION {
         return Err(AnonymousMailboxStoreError::UnsupportedSchema);
     }
+    transaction
+        .commit()
+        .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Deferred)
         .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
@@ -2152,6 +2155,23 @@ mod tests {
         }
     }
 
+    fn schema_user_version(connection: &Connection) -> i64 {
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn anonymous_mailbox_object_count(connection: &Connection) -> i64 {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name LIKE 'anonymous_mailbox_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn disabled_open_has_no_filesystem_side_effect() {
         let directory = tempfile::tempdir().unwrap();
@@ -2864,6 +2884,103 @@ mod tests {
             ),
             Err(AnonymousMailboxStoreError::UnsupportedSchema)
         ));
+    }
+
+    #[test]
+    fn foreign_table_on_user_version_zero_fails_without_mailbox_mutation() {
+        let context = TestContext::new();
+        let connection = Connection::open(&context.config.db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE pending_messages (
+                    id INTEGER PRIMARY KEY,
+                    body TEXT NOT NULL
+                 );
+                 INSERT INTO pending_messages (body) VALUES ('still-here');",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            SqliteAnonymousMailboxStore::open(
+                context.config.clone(),
+                context.target.public_key_bytes(),
+                CURSOR_SECRET,
+            ),
+            Err(AnonymousMailboxStoreError::UnsupportedSchema)
+        ));
+
+        let connection = Connection::open(&context.config.db_path).unwrap();
+        assert_eq!(schema_user_version(&connection), 0);
+        assert_eq!(anonymous_mailbox_object_count(&connection), 0);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT body FROM pending_messages WHERE id = 1",
+                    [],
+                    |row| { row.get::<_, String>(0) }
+                )
+                .unwrap(),
+            "still-here"
+        );
+    }
+
+    #[test]
+    fn foreign_view_and_trigger_on_user_version_zero_fail_without_mailbox_mutation() {
+        let context = TestContext::new();
+        let connection = Connection::open(&context.config.db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE VIEW pending_view AS SELECT name FROM sqlite_master;
+                 CREATE TRIGGER pending_view_block
+                 INSTEAD OF INSERT ON pending_view
+                 BEGIN
+                    SELECT RAISE(ABORT, 'blocked');
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            SqliteAnonymousMailboxStore::open(
+                context.config.clone(),
+                context.target.public_key_bytes(),
+                CURSOR_SECRET,
+            ),
+            Err(AnonymousMailboxStoreError::UnsupportedSchema)
+        ));
+
+        let connection = Connection::open(&context.config.db_path).unwrap();
+        assert_eq!(schema_user_version(&connection), 0);
+        assert_eq!(anonymous_mailbox_object_count(&connection), 0);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE name IN ('pending_view', 'pending_view_block')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn empty_reserved_database_initializes_and_reopens() {
+        let context = TestContext::new();
+        std::fs::write(&context.config.db_path, []).unwrap();
+
+        let store = context.open();
+        drop(store);
+
+        let connection = Connection::open(&context.config.db_path).unwrap();
+        assert_eq!(schema_user_version(&connection), SCHEMA_VERSION);
+        assert!(anonymous_mailbox_object_count(&connection) > 0);
+        drop(connection);
+
+        let reopened = context.open();
+        drop(reopened);
     }
 
     #[cfg(unix)]
