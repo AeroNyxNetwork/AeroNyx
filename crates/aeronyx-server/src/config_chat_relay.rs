@@ -199,6 +199,14 @@ pub const DEFAULT_ANONYMOUS_MAILBOX_MAX_BYTES_TOTAL: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_ANONYMOUS_MAILBOX_MAX_IN_FLIGHT: usize = 32;
 /// Default transactional cleanup row budget.
 pub const DEFAULT_ANONYMOUS_MAILBOX_CLEANUP_BATCH_SIZE: usize = 256;
+/// Default maximum live, unconsumed target-issued admission tickets.
+pub const DEFAULT_ANONYMOUS_MAILBOX_MAX_OUTSTANDING_TICKETS: usize = 1_024;
+/// Default fixed-window issuance budget without identity or network buckets.
+pub const DEFAULT_ANONYMOUS_MAILBOX_MAX_TICKET_ISSUES_PER_WINDOW: usize = 64;
+/// Default anonymous ticket-issuance rate window.
+pub const DEFAULT_ANONYMOUS_MAILBOX_TICKET_ISSUANCE_WINDOW_SECS: u64 = 60;
+/// Default target-bound Hashcash difficulty for production mailbox ticket issue.
+pub const DEFAULT_ANONYMOUS_MAILBOX_TICKET_ISSUE_WORK_BITS: u8 = 12;
 
 /// Default-off local custody settings for anonymous mailboxes.
 ///
@@ -229,6 +237,21 @@ pub struct AnonymousMailboxStoreConfig {
     /// Maximum rows removed by one cleanup transaction.
     #[serde(default = "default_anonymous_mailbox_cleanup_batch_size")]
     pub cleanup_batch_size: usize,
+    // [ANONYMOUS-MAILBOX-TICKET-ISSUER 2026-09-03 by Codex] The issuer is
+    // default-off with the whole custody feature. When enabled, global caps
+    // and non-zero target-bound work avoid identity/IP keyed admission.
+    /// Maximum issued tickets that have not yet been consumed or cleaned up.
+    #[serde(default = "default_anonymous_mailbox_max_outstanding_tickets")]
+    pub max_outstanding_tickets: usize,
+    /// Maximum new ticket issues in one fixed anonymous admission window.
+    #[serde(default = "default_anonymous_mailbox_max_ticket_issues_per_window")]
+    pub max_ticket_issues_per_window: usize,
+    /// Fixed window used by the anonymous ticket issuer.
+    #[serde(default = "default_anonymous_mailbox_ticket_issuance_window_secs")]
+    pub ticket_issuance_window_secs: u64,
+    /// Required leading-zero proof-of-work bits for new ticket requests.
+    #[serde(default = "default_anonymous_mailbox_ticket_issue_work_bits")]
+    pub ticket_issue_work_bits: u8,
 }
 
 impl Default for AnonymousMailboxStoreConfig {
@@ -241,6 +264,10 @@ impl Default for AnonymousMailboxStoreConfig {
             max_bytes_total: default_anonymous_mailbox_max_bytes_total(),
             max_in_flight: default_anonymous_mailbox_max_in_flight(),
             cleanup_batch_size: default_anonymous_mailbox_cleanup_batch_size(),
+            max_outstanding_tickets: default_anonymous_mailbox_max_outstanding_tickets(),
+            max_ticket_issues_per_window: default_anonymous_mailbox_max_ticket_issues_per_window(),
+            ticket_issuance_window_secs: default_anonymous_mailbox_ticket_issuance_window_secs(),
+            ticket_issue_work_bits: default_anonymous_mailbox_ticket_issue_work_bits(),
         }
     }
 }
@@ -288,6 +315,37 @@ impl AnonymousMailboxStoreConfig {
             return Err(ServerError::config_invalid(
                 "memchain.chat_relay.anonymous_mailbox.cleanup_batch_size",
                 "must be between 1 and 4096",
+            ));
+        }
+        if self.max_outstanding_tickets == 0 || self.max_outstanding_tickets > i64::MAX as usize {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox.max_outstanding_tickets",
+                "must fit SQLite's positive signed 64-bit counter domain",
+            ));
+        }
+        if self.max_ticket_issues_per_window == 0
+            || self.max_ticket_issues_per_window > i64::MAX as usize
+        {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox.max_ticket_issues_per_window",
+                "must fit SQLite's positive signed 64-bit counter domain",
+            ));
+        }
+        if self.ticket_issuance_window_secs == 0
+            || self.ticket_issuance_window_secs > MAX_SQLITE_TTL_SECS
+        {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox.ticket_issuance_window_secs",
+                "must be a non-zero SQLite-safe duration",
+            ));
+        }
+        if self.ticket_issue_work_bits == 0
+            || self.ticket_issue_work_bits
+                > aeronyx_core::protocol::anonymous_mailbox::MAX_ANONYMOUS_MAILBOX_TICKET_ISSUE_WORK_BITS
+        {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox.ticket_issue_work_bits",
+                "must be non-zero and within the anonymous mailbox protocol bound",
             ));
         }
         Ok(())
@@ -583,6 +641,18 @@ fn default_anonymous_mailbox_max_in_flight() -> usize {
 }
 fn default_anonymous_mailbox_cleanup_batch_size() -> usize {
     DEFAULT_ANONYMOUS_MAILBOX_CLEANUP_BATCH_SIZE
+}
+fn default_anonymous_mailbox_max_outstanding_tickets() -> usize {
+    DEFAULT_ANONYMOUS_MAILBOX_MAX_OUTSTANDING_TICKETS
+}
+fn default_anonymous_mailbox_max_ticket_issues_per_window() -> usize {
+    DEFAULT_ANONYMOUS_MAILBOX_MAX_TICKET_ISSUES_PER_WINDOW
+}
+fn default_anonymous_mailbox_ticket_issuance_window_secs() -> u64 {
+    DEFAULT_ANONYMOUS_MAILBOX_TICKET_ISSUANCE_WINDOW_SECS
+}
+fn default_anonymous_mailbox_ticket_issue_work_bits() -> u8 {
+    DEFAULT_ANONYMOUS_MAILBOX_TICKET_ISSUE_WORK_BITS
 }
 fn default_max_pending_messages_total() -> usize {
     100_000

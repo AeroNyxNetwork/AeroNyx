@@ -16,6 +16,8 @@
 //! the future composition root.
 //!
 //! ## Last modified
+//! v1.1.0-AnonymousMailboxTicketIssuer — Added durable, target-identity
+//! signed, rate-bounded anonymous admission-ticket issuance.
 //! v1.0.0-AnonymousMailboxStore — Initial node-local custody repository.
 
 use std::collections::HashMap;
@@ -30,10 +32,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::anonymous_mailbox::{
-    AnonymousMailboxAckV1, AnonymousMailboxLeaseCreateV1, AnonymousMailboxPullOneV1,
-    AnonymousMailboxPutV1, MAX_ANONYMOUS_MAILBOX_ITEMS_PER_LEASE,
-    MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES,
+    AnonymousMailboxAckV1, AnonymousMailboxAdmissionTicketV1, AnonymousMailboxLeaseCreateV1,
+    AnonymousMailboxPullOneV1, AnonymousMailboxPutV1, AnonymousMailboxTicketIssueV1,
+    MAX_ANONYMOUS_MAILBOX_ITEMS_PER_LEASE, MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES,
 };
 use hmac::{Hmac, Mac};
 #[cfg(unix)]
@@ -53,7 +56,7 @@ use super::chat_relay_backup_sqlite::{
     configure_full_durability, restrict_private_sqlite_permissions,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MINIMUM_SYNCHRONOUS_LEVEL: i64 = 2;
 const CURSOR_VERSION: u8 = 1;
 const CURSOR_BODY_BYTES: usize = 1 + 8 + 8 + 8;
@@ -241,6 +244,36 @@ pub enum AnonymousMailboxAckOutcome {
     NotFound,
 }
 
+/// Coarse durable result of one target-issued admission-ticket request.
+#[derive(Clone, PartialEq, Eq)]
+pub enum AnonymousMailboxTicketIssueOutcome {
+    /// A newly signed ticket was durably issued.
+    Issued(AnonymousMailboxAdmissionTicketV1),
+    /// The exact request was replayed and returned its original ticket.
+    Existing(AnonymousMailboxAdmissionTicketV1),
+    /// The request or ticket id was reused for a different canonical request.
+    Conflict,
+    /// The global ticket count or fixed issue window is full.
+    AtCapacity,
+}
+
+impl fmt::Debug for AnonymousMailboxTicketIssueOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Issued(_) => {
+                formatter.write_str("AnonymousMailboxTicketIssueOutcome::Issued(<redacted>)")
+            }
+            Self::Existing(_) => {
+                formatter.write_str("AnonymousMailboxTicketIssueOutcome::Existing(<redacted>)")
+            }
+            Self::Conflict => formatter.write_str("AnonymousMailboxTicketIssueOutcome::Conflict"),
+            Self::AtCapacity => {
+                formatter.write_str("AnonymousMailboxTicketIssueOutcome::AtCapacity")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AnonymousMailboxCleanupReport {
     pub leases_removed: u64,
@@ -248,11 +281,19 @@ pub struct AnonymousMailboxCleanupReport {
     pub bytes_removed: u64,
     pub acknowledgements_removed: u64,
     pub tickets_removed: u64,
+    pub issued_tickets_removed: u64,
 }
 
 /// Synchronous local capability boundary. Future async callers must place it
 /// behind an explicit blocking boundary.
 pub trait AnonymousMailboxCustodyRepository: Send + Sync {
+    /// Issues one target-signed ticket through the node-local policy boundary.
+    fn issue_ticket(
+        &self,
+        request: &AnonymousMailboxTicketIssueV1,
+        now: u64,
+    ) -> Result<AnonymousMailboxTicketIssueOutcome, AnonymousMailboxStoreError>;
+
     fn create(
         &self,
         request: &AnonymousMailboxLeaseCreateV1,
@@ -287,6 +328,7 @@ pub trait AnonymousMailboxCustodyRepository: Send + Sync {
 pub struct SqliteAnonymousMailboxStore {
     config: AnonymousMailboxStoreConfig,
     target_node_id: [u8; 32],
+    ticket_issuer: Option<IdentityKeyPair>,
     cursor_secret: [u8; 32],
     connection: Mutex<Connection>,
     in_flight: AtomicUsize,
@@ -318,6 +360,39 @@ struct StoreTotals {
     bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TicketIssueMeta {
+    outstanding: u64,
+    window_started_at: u64,
+    issues_in_window: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ExpiredIssuedTicketPurge {
+    removed: u64,
+    unconsumed: u64,
+}
+
+#[derive(Clone)]
+struct IssuedTicketRecord {
+    request_id: [u8; 16],
+    request_commitment: [u8; 32],
+    request: AnonymousMailboxTicketIssueV1,
+    ticket: AnonymousMailboxAdmissionTicketV1,
+    ticket_commitment: [u8; 32],
+    consumed_at: Option<u64>,
+}
+
+impl fmt::Debug for IssuedTicketRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IssuedTicketRecord")
+            .field("capabilities", &"<redacted>")
+            .field("consumed", &self.consumed_at.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LeaseCounterAudit {
     stored_items: u64,
@@ -336,6 +411,28 @@ impl SqliteAnonymousMailboxStore {
         target_node_id: [u8; 32],
         cursor_secret: [u8; 32],
     ) -> Result<Self, AnonymousMailboxStoreError> {
+        Self::open_inner(config, target_node_id, cursor_secret, None)
+    }
+
+    /// Opens a custody store that can issue tickets using the local target identity.
+    ///
+    /// The older [`Self::open`] remains compatible for read/create/put/pull/ack
+    /// callers but deliberately cannot mint new target authority.
+    pub fn open_with_ticket_issuer(
+        config: AnonymousMailboxStoreConfig,
+        ticket_issuer: IdentityKeyPair,
+        cursor_secret: [u8; 32],
+    ) -> Result<Self, AnonymousMailboxStoreError> {
+        let target_node_id = ticket_issuer.public_key_bytes();
+        Self::open_inner(config, target_node_id, cursor_secret, Some(ticket_issuer))
+    }
+
+    fn open_inner(
+        config: AnonymousMailboxStoreConfig,
+        target_node_id: [u8; 32],
+        cursor_secret: [u8; 32],
+        ticket_issuer: Option<IdentityKeyPair>,
+    ) -> Result<Self, AnonymousMailboxStoreError> {
         if !config.enabled {
             return Err(AnonymousMailboxStoreError::Disabled);
         }
@@ -349,6 +446,14 @@ impl SqliteAnonymousMailboxStore {
             || config.max_bytes_total > i64::MAX as u64
             || config.max_in_flight == 0
             || config.cleanup_batch_size == 0
+            || config.max_outstanding_tickets == 0
+            || i64::try_from(config.max_outstanding_tickets).is_err()
+            || config.max_ticket_issues_per_window == 0
+            || i64::try_from(config.max_ticket_issues_per_window).is_err()
+            || config.ticket_issuance_window_secs == 0
+            || config.ticket_issue_work_bits == 0
+            || config.ticket_issue_work_bits
+                > aeronyx_core::protocol::anonymous_mailbox::MAX_ANONYMOUS_MAILBOX_TICKET_ISSUE_WORK_BITS
             || cursor_secret == [0; 32]
         {
             return Err(AnonymousMailboxStoreError::Rejected);
@@ -380,7 +485,7 @@ impl SqliteAnonymousMailboxStore {
         connection
             .execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;")
             .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
-        initialize_or_verify_schema(&mut connection)?;
+        initialize_or_verify_schema(&mut connection, &target_node_id, &config)?;
         let startup_limits = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
@@ -392,6 +497,7 @@ impl SqliteAnonymousMailboxStore {
         Ok(Self {
             config,
             target_node_id,
+            ticket_issuer,
             cursor_secret,
             connection: Mutex::new(connection),
             in_flight: AtomicUsize::new(0),
@@ -475,6 +581,156 @@ impl SqliteAnonymousMailboxStore {
 }
 
 impl AnonymousMailboxCustodyRepository for SqliteAnonymousMailboxStore {
+    fn issue_ticket(
+        &self,
+        request: &AnonymousMailboxTicketIssueV1,
+        now: u64,
+    ) -> Result<AnonymousMailboxTicketIssueOutcome, AnonymousMailboxStoreError> {
+        let _permit = self.acquire()?;
+        let request_commitment = request
+            .request_commitment()
+            .map_err(|_| AnonymousMailboxStoreError::Rejected)?;
+        let mut connection = self.connection.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+
+        // [ANONYMOUS-MAILBOX-TICKET-ISSUER 2026-09-03 by Codex] Exact
+        // durable replay precedes proof-of-work and every capacity check, but
+        // an expired authority is never served again.
+        if let Some(existing) = load_issued_ticket_by_request(&transaction, &request.request_id)? {
+            if existing.request_commitment != request_commitment {
+                transaction
+                    .commit()
+                    .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+                return Ok(AnonymousMailboxTicketIssueOutcome::Conflict);
+            }
+            if existing.ticket.expires_at < now {
+                transaction
+                    .commit()
+                    .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+                return Err(AnonymousMailboxStoreError::Rejected);
+            }
+            validate_issued_ticket(&existing, request, &self.target_node_id)?;
+            transaction
+                .commit()
+                .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+            return Ok(AnonymousMailboxTicketIssueOutcome::Existing(
+                existing.ticket,
+            ));
+        }
+        if load_issued_ticket_by_ticket(&transaction, &request.ticket_id)?.is_some() {
+            transaction
+                .commit()
+                .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+            return Ok(AnonymousMailboxTicketIssueOutcome::Conflict);
+        }
+
+        request
+            .verify_for_target(
+                &self.target_node_id,
+                now,
+                self.config.ticket_issue_work_bits,
+            )
+            .map_err(|_| AnonymousMailboxStoreError::Rejected)?;
+        let issuer = self
+            .ticket_issuer
+            .as_ref()
+            .ok_or(AnonymousMailboxStoreError::Unavailable)?;
+
+        let before = load_ticket_issue_meta(&transaction)?;
+        let removed = purge_expired_issued_tickets(
+            &transaction,
+            now,
+            u64::try_from(self.config.cleanup_batch_size)
+                .map_err(|_| AnonymousMailboxStoreError::Corrupt)?,
+        )?;
+        let after_purge = TicketIssueMeta {
+            outstanding: before
+                .outstanding
+                .checked_sub(removed.unconsumed)
+                .ok_or(AnonymousMailboxStoreError::Corrupt)?,
+            ..before
+        };
+        if after_purge != before {
+            update_ticket_issue_meta_exact(&transaction, before, after_purge)?;
+        }
+        let mut admission = after_purge;
+        if now.saturating_sub(admission.window_started_at)
+            >= self.config.ticket_issuance_window_secs
+        {
+            admission.window_started_at = now;
+            admission.issues_in_window = 0;
+        }
+        let maximum_outstanding = u64::try_from(self.config.max_outstanding_tickets)
+            .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+        let maximum_window = u64::try_from(self.config.max_ticket_issues_per_window)
+            .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+        if admission.outstanding >= maximum_outstanding
+            || admission.issues_in_window >= maximum_window
+        {
+            if admission != after_purge {
+                update_ticket_issue_meta_exact(&transaction, after_purge, admission)?;
+            }
+            transaction
+                .commit()
+                .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+            return Ok(AnonymousMailboxTicketIssueOutcome::AtCapacity);
+        }
+        let ticket = AnonymousMailboxAdmissionTicketV1::issue(
+            request.ticket_id,
+            request.lease_claims_commitment,
+            request.issued_at,
+            request.expires_at,
+            issuer,
+        )
+        .map_err(|_| AnonymousMailboxStoreError::Rejected)?;
+        let ticket_commitment = ticket
+            .request_commitment()
+            .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+        execute_exactly_one(
+            &transaction,
+            transaction
+                .execute(
+                    "INSERT INTO anonymous_mailbox_issued_tickets
+                     (request_id, ticket_id, request_commitment, target_node_id,
+                      claims_commitment, requested_at, expires_at, proof_nonce,
+                      ticket_commitment, ticket_signature, consumed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
+                    params![
+                        &request.request_id[..],
+                        &request.ticket_id[..],
+                        &request_commitment[..],
+                        &request.target_node_id[..],
+                        &request.lease_claims_commitment[..],
+                        as_i64(request.issued_at)?,
+                        as_i64(request.expires_at)?,
+                        &request.proof_nonce.to_le_bytes()[..],
+                        &ticket_commitment[..],
+                        &ticket.signature[..],
+                    ],
+                )
+                .map_err(|_| AnonymousMailboxStoreError::Unavailable)?,
+        )?;
+        let issued = TicketIssueMeta {
+            outstanding: admission
+                .outstanding
+                .checked_add(1)
+                .ok_or(AnonymousMailboxStoreError::Corrupt)?,
+            issues_in_window: admission
+                .issues_in_window
+                .checked_add(1)
+                .ok_or(AnonymousMailboxStoreError::Corrupt)?,
+            ..admission
+        };
+        update_ticket_issue_meta_exact(&transaction, after_purge, issued)?;
+        verify_ticket_issue_meta(&transaction, issued)?;
+        transaction
+            .commit()
+            .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+        Ok(AnonymousMailboxTicketIssueOutcome::Issued(ticket))
+    }
+
     fn create(
         &self,
         request: &AnonymousMailboxLeaseCreateV1,
@@ -557,6 +813,17 @@ impl AnonymousMailboxCustodyRepository for SqliteAnonymousMailboxStore {
                 .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
             return Ok(AnonymousMailboxCreateOutcome::Conflict);
         }
+        let issued_ticket =
+            load_issued_ticket_by_ticket(&transaction, &request.admission.ticket_id)?;
+        if let Some(record) = &issued_ticket {
+            if record.ticket != request.admission
+                || record.consumed_at.is_some()
+                || record.ticket.expires_at < now
+            {
+                return Err(AnonymousMailboxStoreError::Corrupt);
+            }
+            validate_issued_ticket(&record, &record.request, &self.target_node_id)?;
+        }
 
         execute_exactly_one(
             &transaction,
@@ -601,6 +868,28 @@ impl AnonymousMailboxCustodyRepository for SqliteAnonymousMailboxStore {
                 )
                 .map_err(|_| AnonymousMailboxStoreError::Unavailable)?,
         )?;
+        if let Some(record) = issued_ticket {
+            let before = load_ticket_issue_meta(&transaction)?;
+            let after = TicketIssueMeta {
+                outstanding: before
+                    .outstanding
+                    .checked_sub(1)
+                    .ok_or(AnonymousMailboxStoreError::Corrupt)?,
+                ..before
+            };
+            execute_exactly_one(
+                &transaction,
+                transaction
+                    .execute(
+                        "UPDATE anonymous_mailbox_issued_tickets SET consumed_at = ?1
+                         WHERE ticket_id = ?2 AND consumed_at IS NULL",
+                        params![as_i64(now)?, &record.ticket.ticket_id[..]],
+                    )
+                    .map_err(|_| AnonymousMailboxStoreError::Unavailable)?,
+            )?;
+            update_ticket_issue_meta_exact(&transaction, before, after)?;
+            verify_ticket_issue_meta(&transaction, after)?;
+        }
         let new_totals = StoreTotals {
             leases: totals
                 .leases
@@ -1195,6 +1484,25 @@ impl AnonymousMailboxCustodyRepository for SqliteAnonymousMailboxStore {
                 .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
             report.tickets_removed =
                 u64::try_from(removed).map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+            remaining = remaining
+                .checked_sub(report.tickets_removed)
+                .ok_or(AnonymousMailboxStoreError::Corrupt)?;
+        }
+        if remaining > 0 {
+            let before = load_ticket_issue_meta(&transaction)?;
+            let purge = purge_expired_issued_tickets(&transaction, now, remaining)?;
+            let after = TicketIssueMeta {
+                outstanding: before
+                    .outstanding
+                    .checked_sub(purge.unconsumed)
+                    .ok_or(AnonymousMailboxStoreError::Corrupt)?,
+                ..before
+            };
+            if after != before {
+                update_ticket_issue_meta_exact(&transaction, before, after)?;
+                verify_ticket_issue_meta(&transaction, after)?;
+            }
+            report.issued_tickets_removed = purge.removed;
         }
 
         let leases = totals
@@ -1226,6 +1534,8 @@ impl AnonymousMailboxCustodyRepository for SqliteAnonymousMailboxStore {
 
 fn initialize_or_verify_schema(
     connection: &mut Connection,
+    target_node_id: &[u8; 32],
+    config: &AnonymousMailboxStoreConfig,
 ) -> Result<(), AnonymousMailboxStoreError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1256,9 +1566,12 @@ fn initialize_or_verify_schema(
                     schema_version INTEGER NOT NULL,
                     total_leases INTEGER NOT NULL CHECK (total_leases >= 0),
                     total_items INTEGER NOT NULL CHECK (total_items >= 0),
-                    total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0)
+                    total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0),
+                    outstanding_tickets INTEGER NOT NULL CHECK (outstanding_tickets >= 0),
+                    issuance_window_started_at INTEGER NOT NULL CHECK (issuance_window_started_at >= 0),
+                    issues_in_window INTEGER NOT NULL CHECK (issues_in_window >= 0)
                  );
-                 INSERT INTO anonymous_mailbox_meta VALUES (1, 1, 0, 0, 0);
+                 INSERT INTO anonymous_mailbox_meta VALUES (1, 2, 0, 0, 0, 0, 0, 0);
                  CREATE TABLE anonymous_mailbox_tickets (
                     ticket_id BLOB PRIMARY KEY CHECK (length(ticket_id) = 16),
                     ticket_commitment BLOB NOT NULL CHECK (length(ticket_commitment) = 32),
@@ -1305,6 +1618,19 @@ fn initialize_or_verify_schema(
                     PRIMARY KEY (mailbox_id, item_id),
                     FOREIGN KEY (mailbox_id) REFERENCES anonymous_mailbox_leases(mailbox_id) ON DELETE CASCADE
                  );
+                 CREATE TABLE anonymous_mailbox_issued_tickets (
+                    request_id BLOB PRIMARY KEY CHECK (length(request_id) = 16),
+                    ticket_id BLOB NOT NULL UNIQUE CHECK (length(ticket_id) = 16),
+                    request_commitment BLOB NOT NULL CHECK (length(request_commitment) = 32),
+                    target_node_id BLOB NOT NULL CHECK (length(target_node_id) = 32),
+                    claims_commitment BLOB NOT NULL CHECK (length(claims_commitment) = 32),
+                    requested_at INTEGER NOT NULL CHECK (requested_at >= 0),
+                    expires_at INTEGER NOT NULL CHECK (expires_at >= requested_at),
+                    proof_nonce BLOB NOT NULL CHECK (length(proof_nonce) = 8),
+                    ticket_commitment BLOB NOT NULL CHECK (length(ticket_commitment) = 32),
+                    ticket_signature BLOB NOT NULL CHECK (length(ticket_signature) = 64),
+                    consumed_at INTEGER CHECK (consumed_at >= requested_at)
+                 );
                  CREATE INDEX anonymous_mailbox_lease_expiry
                     ON anonymous_mailbox_leases(expires_at, mailbox_id);
                  CREATE INDEX anonymous_mailbox_item_pull
@@ -1313,7 +1639,41 @@ fn initialize_or_verify_schema(
                     ON anonymous_mailbox_items(expires_at, mailbox_id, item_id);
                  CREATE INDEX anonymous_mailbox_ack_expiry
                     ON anonymous_mailbox_acks(retain_until, mailbox_id, item_id);
-                 PRAGMA user_version = 1;",
+                 CREATE INDEX anonymous_mailbox_issued_ticket_expiry
+                    ON anonymous_mailbox_issued_tickets(expires_at, request_id);
+                 PRAGMA user_version = 2;",
+            )
+            .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+    } else if user_version == 1 {
+        // [ANONYMOUS-MAILBOX-TICKET-ISSUER 2026-09-03 by Codex] The v2
+        // journal is additive: existing consumed tickets and leases retain
+        // their frozen rows while only future target-issued authorities gain
+        // exact replay evidence.
+        transaction
+            .execute_batch(
+                "ALTER TABLE anonymous_mailbox_meta
+                    ADD COLUMN outstanding_tickets INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE anonymous_mailbox_meta
+                    ADD COLUMN issuance_window_started_at INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE anonymous_mailbox_meta
+                    ADD COLUMN issues_in_window INTEGER NOT NULL DEFAULT 0;
+                 CREATE TABLE anonymous_mailbox_issued_tickets (
+                    request_id BLOB PRIMARY KEY CHECK (length(request_id) = 16),
+                    ticket_id BLOB NOT NULL UNIQUE CHECK (length(ticket_id) = 16),
+                    request_commitment BLOB NOT NULL CHECK (length(request_commitment) = 32),
+                    target_node_id BLOB NOT NULL CHECK (length(target_node_id) = 32),
+                    claims_commitment BLOB NOT NULL CHECK (length(claims_commitment) = 32),
+                    requested_at INTEGER NOT NULL CHECK (requested_at >= 0),
+                    expires_at INTEGER NOT NULL CHECK (expires_at >= requested_at),
+                    proof_nonce BLOB NOT NULL CHECK (length(proof_nonce) = 8),
+                    ticket_commitment BLOB NOT NULL CHECK (length(ticket_commitment) = 32),
+                    ticket_signature BLOB NOT NULL CHECK (length(ticket_signature) = 64),
+                    consumed_at INTEGER CHECK (consumed_at >= requested_at)
+                 );
+                 CREATE INDEX anonymous_mailbox_issued_ticket_expiry
+                    ON anonymous_mailbox_issued_tickets(expires_at, request_id);
+                 UPDATE anonymous_mailbox_meta SET schema_version = 2 WHERE singleton = 1;
+                 PRAGMA user_version = 2;",
             )
             .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
     } else if user_version != SCHEMA_VERSION {
@@ -1335,7 +1695,7 @@ fn initialize_or_verify_schema(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Deferred)
         .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
-    audit_counters(&transaction)?;
+    audit_counters(&transaction, target_node_id, config)?;
     transaction
         .commit()
         .map_err(|_| AnonymousMailboxStoreError::Unavailable)
@@ -1355,6 +1715,205 @@ fn load_totals(transaction: &Transaction<'_>) -> Result<StoreTotals, AnonymousMa
         items: as_u64(items)?,
         bytes: as_u64(bytes)?,
     })
+}
+
+fn load_ticket_issue_meta(
+    transaction: &Transaction<'_>,
+) -> Result<TicketIssueMeta, AnonymousMailboxStoreError> {
+    let (outstanding, window_started_at, issues_in_window): (i64, i64, i64) = transaction
+        .query_row(
+            "SELECT outstanding_tickets, issuance_window_started_at, issues_in_window
+             FROM anonymous_mailbox_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+    Ok(TicketIssueMeta {
+        outstanding: as_u64(outstanding)?,
+        window_started_at: as_u64(window_started_at)?,
+        issues_in_window: as_u64(issues_in_window)?,
+    })
+}
+
+fn update_ticket_issue_meta_exact(
+    transaction: &Transaction<'_>,
+    old: TicketIssueMeta,
+    new: TicketIssueMeta,
+) -> Result<(), AnonymousMailboxStoreError> {
+    let affected = transaction
+        .execute(
+            "UPDATE anonymous_mailbox_meta
+             SET outstanding_tickets = ?1, issuance_window_started_at = ?2, issues_in_window = ?3
+             WHERE singleton = 1 AND outstanding_tickets = ?4
+               AND issuance_window_started_at = ?5 AND issues_in_window = ?6",
+            params![
+                as_i64(new.outstanding)?,
+                as_i64(new.window_started_at)?,
+                as_i64(new.issues_in_window)?,
+                as_i64(old.outstanding)?,
+                as_i64(old.window_started_at)?,
+                as_i64(old.issues_in_window)?,
+            ],
+        )
+        .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+    execute_exactly_one(transaction, affected)
+}
+
+fn verify_ticket_issue_meta(
+    transaction: &Transaction<'_>,
+    expected: TicketIssueMeta,
+) -> Result<(), AnonymousMailboxStoreError> {
+    if load_ticket_issue_meta(transaction)? != expected {
+        return Err(AnonymousMailboxStoreError::Corrupt);
+    }
+    Ok(())
+}
+
+fn load_issued_ticket_by_request(
+    transaction: &Transaction<'_>,
+    request_id: &[u8; 16],
+) -> Result<Option<IssuedTicketRecord>, AnonymousMailboxStoreError> {
+    load_issued_ticket(transaction, "request_id = ?1", params![&request_id[..]])
+}
+
+fn load_issued_ticket_by_ticket(
+    transaction: &Transaction<'_>,
+    ticket_id: &[u8; 16],
+) -> Result<Option<IssuedTicketRecord>, AnonymousMailboxStoreError> {
+    load_issued_ticket(transaction, "ticket_id = ?1", params![&ticket_id[..]])
+}
+
+fn load_issued_ticket<P>(
+    transaction: &Transaction<'_>,
+    predicate: &str,
+    params: P,
+) -> Result<Option<IssuedTicketRecord>, AnonymousMailboxStoreError>
+where
+    P: rusqlite::Params,
+{
+    let sql = format!(
+        "SELECT request_id, ticket_id, request_commitment, target_node_id,
+                claims_commitment, requested_at, expires_at, proof_nonce,
+                ticket_commitment, ticket_signature, consumed_at
+         FROM anonymous_mailbox_issued_tickets WHERE {predicate}"
+    );
+    let row = transaction
+        .query_row(&sql, params, |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
+                row.get::<_, Vec<u8>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+            ))
+        })
+        .optional()
+        .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let request = AnonymousMailboxTicketIssueV1 {
+        version: aeronyx_core::protocol::anonymous_mailbox::ANONYMOUS_MAILBOX_VERSION_V1,
+        request_id: fixed::<16>(&row.0)?,
+        ticket_id: fixed::<16>(&row.1)?,
+        target_node_id: fixed::<32>(&row.3)?,
+        lease_claims_commitment: fixed::<32>(&row.4)?,
+        issued_at: as_u64(row.5)?,
+        expires_at: as_u64(row.6)?,
+        proof_nonce: u64::from_le_bytes(fixed::<8>(&row.7)?),
+    };
+    let ticket = AnonymousMailboxAdmissionTicketV1 {
+        version: aeronyx_core::protocol::anonymous_mailbox::ANONYMOUS_MAILBOX_VERSION_V1,
+        ticket_id: request.ticket_id,
+        target_node_id: request.target_node_id,
+        lease_claims_commitment: request.lease_claims_commitment,
+        issued_at: request.issued_at,
+        expires_at: request.expires_at,
+        signature: fixed::<64>(&row.9)?,
+    };
+    Ok(Some(IssuedTicketRecord {
+        request_id: request.request_id,
+        request_commitment: fixed::<32>(&row.2)?,
+        request,
+        ticket,
+        ticket_commitment: fixed::<32>(&row.8)?,
+        consumed_at: row.10.map(as_u64).transpose()?,
+    }))
+}
+
+fn validate_issued_ticket(
+    record: &IssuedTicketRecord,
+    request: &AnonymousMailboxTicketIssueV1,
+    target_node_id: &[u8; 32],
+) -> Result<(), AnonymousMailboxStoreError> {
+    if record.request_id != request.request_id
+        || record.request != *request
+        || record.ticket.target_node_id != *target_node_id
+        || record
+            .ticket
+            .request_commitment()
+            .map_err(|_| AnonymousMailboxStoreError::Corrupt)?
+            != record.ticket_commitment
+    {
+        return Err(AnonymousMailboxStoreError::Corrupt);
+    }
+    record
+        .ticket
+        .verify_at(
+            target_node_id,
+            &request.lease_claims_commitment,
+            request.issued_at,
+        )
+        .map_err(|_| AnonymousMailboxStoreError::Corrupt)
+}
+
+fn purge_expired_issued_tickets(
+    transaction: &Transaction<'_>,
+    now: u64,
+    limit: u64,
+) -> Result<ExpiredIssuedTicketPurge, AnonymousMailboxStoreError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT request_id, consumed_at FROM anonymous_mailbox_issued_tickets
+             WHERE expires_at < ?1 ORDER BY expires_at, request_id LIMIT ?2",
+        )
+        .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+    let rows = statement
+        .query_map(params![as_i64(now)?, as_i64(limit)?], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<i64>>(1)?))
+        })
+        .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+    let mut result = ExpiredIssuedTicketPurge::default();
+    for row in rows {
+        let (request_id, consumed_at) = row.map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+        let request_id = fixed::<16>(&request_id)?;
+        execute_exactly_one(
+            transaction,
+            transaction
+                .execute(
+                    "DELETE FROM anonymous_mailbox_issued_tickets WHERE request_id = ?1",
+                    params![&request_id[..]],
+                )
+                .map_err(|_| AnonymousMailboxStoreError::Unavailable)?,
+        )?;
+        result.removed = result
+            .removed
+            .checked_add(1)
+            .ok_or(AnonymousMailboxStoreError::Corrupt)?;
+        if consumed_at.is_none() {
+            result.unconsumed = result
+                .unconsumed
+                .checked_add(1)
+                .ok_or(AnonymousMailboxStoreError::Corrupt)?;
+        }
+    }
+    Ok(result)
 }
 
 fn validate_totals_limits(
@@ -1421,7 +1980,11 @@ fn execute_exactly_one(
     Ok(())
 }
 
-fn audit_counters(transaction: &Transaction<'_>) -> Result<(), AnonymousMailboxStoreError> {
+fn audit_counters(
+    transaction: &Transaction<'_>,
+    target_node_id: &[u8; 32],
+    config: &AnonymousMailboxStoreConfig,
+) -> Result<(), AnonymousMailboxStoreError> {
     #[cfg(test)]
     FULL_AUDIT_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     let totals = load_totals(transaction)?;
@@ -1553,6 +2116,59 @@ fn audit_counters(transaction: &Transaction<'_>) -> Result<(), AnonymousMailboxS
     for (mailbox_id, item_id) in item_keys {
         load_item(transaction, &mailbox_id, &item_id)?
             .ok_or(AnonymousMailboxStoreError::Corrupt)?;
+    }
+    audit_issued_tickets(transaction, target_node_id, config)?;
+    Ok(())
+}
+
+fn audit_issued_tickets(
+    transaction: &Transaction<'_>,
+    target_node_id: &[u8; 32],
+    config: &AnonymousMailboxStoreConfig,
+) -> Result<(), AnonymousMailboxStoreError> {
+    let meta = load_ticket_issue_meta(transaction)?;
+    if meta.outstanding
+        > u64::try_from(config.max_outstanding_tickets)
+            .map_err(|_| AnonymousMailboxStoreError::Corrupt)?
+        || meta.issues_in_window
+            > u64::try_from(config.max_ticket_issues_per_window)
+                .map_err(|_| AnonymousMailboxStoreError::Corrupt)?
+    {
+        return Err(AnonymousMailboxStoreError::Corrupt);
+    }
+    let mut statement = transaction
+        .prepare("SELECT request_id FROM anonymous_mailbox_issued_tickets")
+        .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+    let request_ids = rows
+        .map(|row| {
+            let bytes = row.map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+            fixed::<16>(&bytes)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut outstanding = 0_u64;
+    for request_id in request_ids {
+        let record = load_issued_ticket_by_request(transaction, &request_id)?
+            .ok_or(AnonymousMailboxStoreError::Corrupt)?;
+        // The configured difficulty may increase after issuance. Requiring
+        // one bit here proves a target-bound non-zero work image while durable
+        // issuance admission, not startup policy drift, remains authoritative.
+        record
+            .request
+            .verify_for_target(target_node_id, record.request.issued_at, 1)
+            .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+        validate_issued_ticket(&record, &record.request, target_node_id)?;
+        if record.consumed_at.is_none() {
+            outstanding = outstanding
+                .checked_add(1)
+                .ok_or(AnonymousMailboxStoreError::Corrupt)?;
+        }
+    }
+    if outstanding != meta.outstanding {
+        return Err(AnonymousMailboxStoreError::Corrupt);
     }
     Ok(())
 }
@@ -2038,6 +2654,7 @@ mod tests {
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::anonymous_mailbox::{
         AnonymousMailboxAdmissionTicketV1, AnonymousMailboxLeaseCreateV1,
+        AnonymousMailboxTicketIssueV1,
     };
     use tempfile::TempDir;
 
@@ -2069,6 +2686,10 @@ mod tests {
                 max_bytes_total: 1024 * 1024,
                 max_in_flight: 4,
                 cleanup_batch_size: 8,
+                max_outstanding_tickets: 8,
+                max_ticket_issues_per_window: 4,
+                ticket_issuance_window_secs: 60,
+                ticket_issue_work_bits: 1,
             };
             Self {
                 _directory: directory,
@@ -2083,6 +2704,15 @@ mod tests {
             SqliteAnonymousMailboxStore::open(
                 self.config.clone(),
                 self.target.public_key_bytes(),
+                CURSOR_SECRET,
+            )
+            .unwrap()
+        }
+
+        fn open_with_ticket_issuer(&self) -> SqliteAnonymousMailboxStore {
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                self.config.clone(),
+                self.target.clone(),
                 CURSOR_SECRET,
             )
             .unwrap()
@@ -2120,6 +2750,60 @@ mod tests {
                 max_bytes,
                 NOW,
                 expires_at,
+                ticket,
+                &self.reader,
+            )
+            .unwrap()
+        }
+
+        fn ticket_issue(
+            &self,
+            request_id: [u8; 16],
+            ticket_id: [u8; 16],
+            mailbox_id: [u8; 32],
+            lease_expires_at: u64,
+            ticket_expires_at: u64,
+        ) -> AnonymousMailboxTicketIssueV1 {
+            let claims = AnonymousMailboxLeaseCreateV1::lease_claims_commitment(
+                &mailbox_id,
+                &self.depositor.public_key_bytes(),
+                &self.reader.public_key_bytes(),
+                2,
+                32,
+                NOW,
+                lease_expires_at,
+            );
+            for nonce in 0..u64::MAX {
+                let request = AnonymousMailboxTicketIssueV1::new(
+                    request_id,
+                    ticket_id,
+                    self.target.public_key_bytes(),
+                    claims,
+                    NOW,
+                    ticket_expires_at,
+                    nonce,
+                )
+                .unwrap();
+                if request.proof_digest().unwrap()[0] & 0x80 == 0 {
+                    return request;
+                }
+            }
+            unreachable!("one-bit proof is reachable")
+        }
+
+        fn lease_for_issued_ticket(
+            &self,
+            mailbox_id: [u8; 32],
+            lease_expires_at: u64,
+            ticket: AnonymousMailboxAdmissionTicketV1,
+        ) -> AnonymousMailboxLeaseCreateV1 {
+            AnonymousMailboxLeaseCreateV1::new(
+                mailbox_id,
+                self.depositor.public_key_bytes(),
+                2,
+                32,
+                NOW,
+                lease_expires_at,
                 ticket,
                 &self.reader,
             )
@@ -2246,6 +2930,180 @@ mod tests {
         assert_eq!(
             reopened.create(&conflicting, NOW + 2).unwrap(),
             AnonymousMailboxCreateOutcome::Conflict
+        );
+    }
+
+    #[test]
+    fn ticket_issue_replays_exactly_conflicts_and_survives_restart() {
+        let context = TestContext::new();
+        let request =
+            context.ticket_issue([0x81; 16], [0x82; 16], [0x83; 32], NOW + 1_000, NOW + 300);
+        let store = context.open_with_ticket_issuer();
+        let issued = match store.issue_ticket(&request, NOW).unwrap() {
+            AnonymousMailboxTicketIssueOutcome::Issued(ticket) => ticket,
+            other => panic!("unexpected issue result: {other:?}"),
+        };
+        assert!(matches!(
+            store.issue_ticket(&request, NOW + 1).unwrap(),
+            AnonymousMailboxTicketIssueOutcome::Existing(ticket) if ticket == issued
+        ));
+        let conflict = context.ticket_issue(
+            request.request_id,
+            [0x84; 16],
+            [0x83; 32],
+            NOW + 1_000,
+            NOW + 300,
+        );
+        assert_eq!(
+            store.issue_ticket(&conflict, NOW + 1).unwrap(),
+            AnonymousMailboxTicketIssueOutcome::Conflict
+        );
+        drop(store);
+        let reopened = context.open_with_ticket_issuer();
+        assert!(matches!(
+            reopened.issue_ticket(&request, NOW + 2).unwrap(),
+            AnonymousMailboxTicketIssueOutcome::Existing(ticket) if ticket == issued
+        ));
+    }
+
+    #[test]
+    fn issued_ticket_is_consumed_once_and_capacity_replay_precedes_limits() {
+        let mut context = TestContext::new();
+        context.config.max_outstanding_tickets = 2;
+        context.config.max_ticket_issues_per_window = 1;
+        let first =
+            context.ticket_issue([0x91; 16], [0x92; 16], [0x93; 32], NOW + 1_000, NOW + 300);
+        let second =
+            context.ticket_issue([0x94; 16], [0x95; 16], [0x96; 32], NOW + 1_000, NOW + 300);
+        let store = context.open_with_ticket_issuer();
+        let ticket = match store.issue_ticket(&first, NOW).unwrap() {
+            AnonymousMailboxTicketIssueOutcome::Issued(ticket) => ticket,
+            other => panic!("unexpected issue result: {other:?}"),
+        };
+        assert_eq!(
+            store.issue_ticket(&second, NOW + 1).unwrap(),
+            AnonymousMailboxTicketIssueOutcome::AtCapacity
+        );
+        assert!(matches!(
+            store.issue_ticket(&first, NOW + 1).unwrap(),
+            AnonymousMailboxTicketIssueOutcome::Existing(existing) if existing == ticket
+        ));
+        let lease = context.lease_for_issued_ticket([0x93; 32], NOW + 1_000, ticket.clone());
+        assert!(matches!(
+            store.create(&lease, NOW + 2).unwrap(),
+            AnonymousMailboxCreateOutcome::Created(_)
+        ));
+        assert!(matches!(
+            store.create(&lease, NOW + 3).unwrap(),
+            AnonymousMailboxCreateOutcome::Existing(_)
+        ));
+        assert!(matches!(
+            store.issue_ticket(&first, NOW + 3).unwrap(),
+            AnonymousMailboxTicketIssueOutcome::Existing(existing) if existing == ticket
+        ));
+        assert!(matches!(
+            store.issue_ticket(&second, NOW + 60).unwrap(),
+            AnonymousMailboxTicketIssueOutcome::Issued(_)
+        ));
+    }
+
+    #[test]
+    fn expired_issued_ticket_is_not_served_and_cleanup_is_bounded() {
+        let context = TestContext::new();
+        let request =
+            context.ticket_issue([0xa1; 16], [0xa2; 16], [0xa3; 32], NOW + 1_000, NOW + 10);
+        let store = context.open_with_ticket_issuer();
+        assert!(matches!(
+            store.issue_ticket(&request, NOW).unwrap(),
+            AnonymousMailboxTicketIssueOutcome::Issued(_)
+        ));
+        assert!(matches!(
+            store.issue_ticket(&request, NOW + 11),
+            Err(AnonymousMailboxStoreError::Rejected)
+        ));
+        let report = store.cleanup(NOW + 11).unwrap();
+        assert_eq!(report.issued_tickets_removed, 1);
+    }
+
+    #[test]
+    fn invalid_ticket_issue_proof_is_rejected_without_persistence() {
+        let context = TestContext::new();
+        let valid =
+            context.ticket_issue([0xb1; 16], [0xb2; 16], [0xb3; 32], NOW + 1_000, NOW + 300);
+        let invalid = (valid.proof_nonce.saturating_add(1)..u64::MAX)
+            .find_map(|nonce| {
+                let candidate = AnonymousMailboxTicketIssueV1::new(
+                    valid.request_id,
+                    valid.ticket_id,
+                    valid.target_node_id,
+                    valid.lease_claims_commitment,
+                    valid.issued_at,
+                    valid.expires_at,
+                    nonce,
+                )
+                .unwrap();
+                (candidate.proof_digest().unwrap()[0] & 0x80 != 0).then_some(candidate)
+            })
+            .expect("invalid one-bit proof");
+        let store = context.open_with_ticket_issuer();
+        assert!(matches!(
+            store.issue_ticket(&invalid, NOW),
+            Err(AnonymousMailboxStoreError::Rejected)
+        ));
+        let connection = store.connection.lock();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM anonymous_mailbox_issued_tickets",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn v1_store_migrates_additively_and_reopens_with_ticket_journal() {
+        let context = TestContext::new();
+        drop(context.open());
+        let connection = Connection::open(&context.config.db_path).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX anonymous_mailbox_issued_ticket_expiry;
+                 DROP TABLE anonymous_mailbox_issued_tickets;
+                 ALTER TABLE anonymous_mailbox_meta DROP COLUMN outstanding_tickets;
+                 ALTER TABLE anonymous_mailbox_meta DROP COLUMN issuance_window_started_at;
+                 ALTER TABLE anonymous_mailbox_meta DROP COLUMN issues_in_window;
+                 UPDATE anonymous_mailbox_meta SET schema_version = 1;
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let reopened = context.open_with_ticket_issuer();
+        let connection = reopened.connection.lock();
+        assert_eq!(schema_user_version(&connection), 2);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT schema_version FROM anonymous_mailbox_meta WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'anonymous_mailbox_issued_tickets'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
         );
     }
 

@@ -13,7 +13,9 @@
 //! kinds, and limits below are public compatibility contracts. Unknown version,
 //! kind, trailing bytes, malformed claims, and oversized input fail closed.
 //!
-//! Last Modified: v1.2.0-AnonymousMailboxSourceTerminalCarrier — Added the
+//! Last Modified: v1.3.0-AnonymousMailboxTicketIssuer — Added the bounded,
+//! target-issued admission-ticket request/response building block.
+//! v1.2.0-AnonymousMailboxSourceTerminalCarrier — Added the
 //! canonical, non-circular request carrier that conveys the compact response
 //! reply key and its request-frame binding to the terminal.
 //! v1.1.0-AnonymousMailboxSourceSeal — Froze the padded pull result codec,
@@ -35,6 +37,9 @@ use crate::crypto::{E2eSession, EphemeralKeyPair, IdentityKeyPair, IdentityPubli
 use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
 
 const TICKET_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-AdmissionTicket-v1";
+const TICKET_ISSUE_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-TicketIssue-v1";
+const TICKET_ISSUE_WORK_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-TicketIssueWork-v1";
+const TICKET_ISSUE_RESPONSE_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-TicketIssueResponse-v1";
 const LEASE_CLAIMS_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-LeaseClaims-v1";
 const LEASE_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-LeaseCreate-v1";
 const PUT_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-Put-v1";
@@ -87,6 +92,11 @@ pub const MAX_ANONYMOUS_MAILBOX_LEASE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 pub const MAX_ANONYMOUS_MAILBOX_ITEM_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// Maximum accepted future request skew.
 pub const MAX_ANONYMOUS_MAILBOX_REQUEST_SKEW_SECS: u64 = 120;
+/// Largest configurable proof-of-work difficulty for anonymous ticket issue.
+///
+/// The target supplies the actual non-zero difficulty; this hard ceiling keeps
+/// an accidentally hostile configuration from making the protocol unusable.
+pub const MAX_ANONYMOUS_MAILBOX_TICKET_ISSUE_WORK_BITS: u8 = 24;
 
 const MAGIC: [u8; 2] = [0x41, 0x4d];
 const HEADER_BYTES: usize = 8;
@@ -139,6 +149,9 @@ pub enum AnonymousMailboxProtocolError {
     /// A signing key or signature is invalid.
     #[error("anonymous mailbox signature was rejected")]
     SignatureRejected,
+    /// A target-bound anonymous admission proof did not satisfy policy.
+    #[error("anonymous mailbox admission proof was rejected")]
+    ProofRejected,
 }
 
 /// Frozen response operation identifiers.
@@ -153,6 +166,8 @@ pub enum AnonymousMailboxOperationV1 {
     PullOne = 3,
     /// Acknowledge one item.
     Ack = 4,
+    /// Target-issued admission ticket.
+    TicketIssue = 5,
 }
 
 impl AnonymousMailboxOperationV1 {
@@ -470,6 +485,298 @@ impl AnonymousMailboxAdmissionTicketV1 {
     /// Returns the exact signed ticket retry commitment.
     pub fn request_commitment(&self) -> Result<[u8; 32], AnonymousMailboxProtocolError> {
         Ok(exact(&self.signing_bytes()?, &self.signature))
+    }
+}
+
+/// Anonymous, target-bound request for one short-lived admission ticket.
+///
+/// The request intentionally contains no sender, receiver, wallet, route, IP,
+/// or client signature. Its target-bound proof of work is a coarse resource
+/// admission signal, not an identity. The target signs the returned
+/// [`AnonymousMailboxAdmissionTicketV1`] only after durable exact-replay and
+/// capacity checks in the local custody repository.
+///
+/// [ANONYMOUS-MAILBOX-TICKET-ISSUER 2026-09-03 by Codex] `request_id` and
+/// `ticket_id` are distinct: the former binds terminal/route replay while the
+/// latter is consumed once by LeaseCreate. Reusing either for a different
+/// canonical request is a conflict, never a replacement.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnonymousMailboxTicketIssueV1 {
+    /// Schema version.
+    pub version: u8,
+    /// Exact terminal request retry identifier.
+    pub request_id: [u8; 16],
+    /// One-time ticket identifier later consumed by LeaseCreate.
+    pub ticket_id: [u8; 16],
+    /// Exact custody target expected to sign the ticket.
+    pub target_node_id: [u8; 32],
+    /// Commitment to every immutable lease claim.
+    pub lease_claims_commitment: [u8; 32],
+    /// Request issue time in Unix seconds.
+    pub issued_at: u64,
+    /// Requested ticket expiry in Unix seconds.
+    pub expires_at: u64,
+    /// Target-bound proof-of-work nonce.
+    pub proof_nonce: u64,
+}
+
+impl AnonymousMailboxTicketIssueV1 {
+    /// Creates one canonical ticket issuance request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        request_id: [u8; 16],
+        ticket_id: [u8; 16],
+        target_node_id: [u8; 32],
+        lease_claims_commitment: [u8; 32],
+        issued_at: u64,
+        expires_at: u64,
+        proof_nonce: u64,
+    ) -> Result<Self, AnonymousMailboxProtocolError> {
+        let value = Self {
+            version: ANONYMOUS_MAILBOX_VERSION_V1,
+            request_id,
+            ticket_id,
+            target_node_id,
+            lease_claims_commitment,
+            issued_at,
+            expires_at,
+            proof_nonce,
+        };
+        value.shape()?;
+        Ok(value)
+    }
+
+    /// Returns the domain-separated canonical request transcript.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, AnonymousMailboxProtocolError> {
+        self.shape()?;
+        let mut data =
+            Vec::with_capacity(TICKET_ISSUE_DOMAIN.len() + 1 + 16 + 16 + 32 + 32 + 8 + 8 + 8);
+        data.extend_from_slice(TICKET_ISSUE_DOMAIN);
+        data.push(self.version);
+        data.extend_from_slice(&self.request_id);
+        data.extend_from_slice(&self.ticket_id);
+        data.extend_from_slice(&self.target_node_id);
+        data.extend_from_slice(&self.lease_claims_commitment);
+        data.extend_from_slice(&self.issued_at.to_le_bytes());
+        data.extend_from_slice(&self.expires_at.to_le_bytes());
+        data.extend_from_slice(&self.proof_nonce.to_le_bytes());
+        Ok(data)
+    }
+
+    /// Returns the exact durable replay commitment for this unsigned request.
+    pub fn request_commitment(&self) -> Result<[u8; 32], AnonymousMailboxProtocolError> {
+        let bytes = self.signing_bytes()?;
+        let mut hash = Sha256::new();
+        hash.update(EXACT_REQUEST_DOMAIN);
+        hash.update(bytes);
+        Ok(hash.finalize().into())
+    }
+
+    /// Returns the target-bound proof-of-work digest.
+    pub fn proof_digest(&self) -> Result<[u8; 32], AnonymousMailboxProtocolError> {
+        let mut hash = Sha256::new();
+        hash.update(TICKET_ISSUE_WORK_DOMAIN);
+        hash.update(self.signing_bytes()?);
+        Ok(hash.finalize().into())
+    }
+
+    /// Verifies target, short lifetime, and configured proof-of-work.
+    pub fn verify_for_target(
+        &self,
+        target_node_id: &[u8; 32],
+        now: u64,
+        work_bits: u8,
+    ) -> Result<(), AnonymousMailboxProtocolError> {
+        self.shape()?;
+        if work_bits == 0 || work_bits > MAX_ANONYMOUS_MAILBOX_TICKET_ISSUE_WORK_BITS {
+            return Err(AnonymousMailboxProtocolError::ProofRejected);
+        }
+        if &self.target_node_id != target_node_id {
+            return Err(AnonymousMailboxProtocolError::ClaimsConflict);
+        }
+        window(
+            self.issued_at,
+            self.expires_at,
+            now,
+            MAX_ANONYMOUS_MAILBOX_ADMISSION_TTL_SECS,
+        )?;
+        if leading_zero_bits(&self.proof_digest()?) < u32::from(work_bits) {
+            return Err(AnonymousMailboxProtocolError::ProofRejected);
+        }
+        Ok(())
+    }
+
+    fn shape(&self) -> Result<(), AnonymousMailboxProtocolError> {
+        version(self.version)?;
+        IdentityPublicKey::from_bytes(&self.target_node_id)
+            .map_err(|_| AnonymousMailboxProtocolError::SignatureRejected)?;
+        window(
+            self.issued_at,
+            self.expires_at,
+            self.issued_at,
+            MAX_ANONYMOUS_MAILBOX_ADMISSION_TTL_SECS,
+        )
+    }
+}
+
+fn leading_zero_bits(digest: &[u8; 32]) -> u32 {
+    digest
+        .iter()
+        .map(|byte| byte.leading_zeros())
+        .scan(true, |prefix, bits| {
+            let current = *prefix;
+            *prefix &= bits == 8;
+            Some((current, bits))
+        })
+        .take_while(|(prefix, _)| *prefix)
+        .map(|(_, bits)| bits)
+        .sum()
+}
+
+impl fmt::Debug for AnonymousMailboxTicketIssueV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnonymousMailboxTicketIssueV1")
+            .field("version", &self.version)
+            .field("capabilities", &"<redacted>")
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Target-signed canonical result for one ticket issue request.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnonymousMailboxTicketIssueResponseV1 {
+    /// Schema version.
+    pub version: u8,
+    /// Exact request retry identifier.
+    pub request_id: [u8; 16],
+    /// Commitment to the complete canonical issue request.
+    pub request_commitment: [u8; 32],
+    /// Coarse issuance result.
+    pub outcome: AnonymousMailboxOutcomeV1,
+    /// Present only for a durably issued ticket.
+    pub ticket: Option<AnonymousMailboxAdmissionTicketV1>,
+    /// Target response time in Unix seconds.
+    pub responded_at: u64,
+    /// Target node that signed this response.
+    pub responder_node_id: [u8; 32],
+    /// Target-node signature.
+    #[serde(with = "bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl AnonymousMailboxTicketIssueResponseV1 {
+    /// Creates one target-signed, request-bound ticket result.
+    pub fn signed(
+        request: &AnonymousMailboxTicketIssueV1,
+        outcome: AnonymousMailboxOutcomeV1,
+        ticket: Option<AnonymousMailboxAdmissionTicketV1>,
+        responded_at: u64,
+        responder: &IdentityKeyPair,
+    ) -> Result<Self, AnonymousMailboxProtocolError> {
+        if responder.public_key_bytes() != request.target_node_id {
+            return Err(AnonymousMailboxProtocolError::ClaimsConflict);
+        }
+        let mut value = Self {
+            version: ANONYMOUS_MAILBOX_VERSION_V1,
+            request_id: request.request_id,
+            request_commitment: request.request_commitment()?,
+            outcome,
+            ticket,
+            responded_at,
+            responder_node_id: responder.public_key_bytes(),
+            signature: [0; 64],
+        };
+        value.validate_binding(request, &value.responder_node_id)?;
+        value.signature = responder.sign(&value.signing_bytes()?);
+        Ok(value)
+    }
+
+    /// Returns the frozen response signing transcript.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, AnonymousMailboxProtocolError> {
+        version(self.version)?;
+        let ticket = bincode::serialize(&self.ticket)
+            .map_err(|_| AnonymousMailboxProtocolError::Malformed)?;
+        let ticket_len =
+            u16::try_from(ticket.len()).map_err(|_| AnonymousMailboxProtocolError::TooLarge)?;
+        let mut data = Vec::with_capacity(
+            TICKET_ISSUE_RESPONSE_DOMAIN.len() + 1 + 16 + 32 + 1 + 2 + ticket.len() + 8 + 32,
+        );
+        data.extend_from_slice(TICKET_ISSUE_RESPONSE_DOMAIN);
+        data.push(self.version);
+        data.extend_from_slice(&self.request_id);
+        data.extend_from_slice(&self.request_commitment);
+        data.push(self.outcome.code());
+        data.extend_from_slice(&ticket_len.to_le_bytes());
+        data.extend_from_slice(&ticket);
+        data.extend_from_slice(&self.responded_at.to_le_bytes());
+        data.extend_from_slice(&self.responder_node_id);
+        Ok(data)
+    }
+
+    /// Verifies response/target/request binding without exposing ticket data.
+    pub fn verify_for_request(
+        &self,
+        request: &AnonymousMailboxTicketIssueV1,
+        responder: &[u8; 32],
+    ) -> Result<(), AnonymousMailboxProtocolError> {
+        self.validate_binding(request, responder)?;
+        verify(
+            &self.responder_node_id,
+            &self.signing_bytes()?,
+            &self.signature,
+        )
+    }
+
+    fn validate_binding(
+        &self,
+        request: &AnonymousMailboxTicketIssueV1,
+        responder: &[u8; 32],
+    ) -> Result<(), AnonymousMailboxProtocolError> {
+        version(self.version)?;
+        if self.request_id != request.request_id
+            || self.request_commitment != request.request_commitment()?
+            || &self.responder_node_id != responder
+            || &request.target_node_id != responder
+        {
+            return Err(AnonymousMailboxProtocolError::ClaimsConflict);
+        }
+        match (self.outcome, &self.ticket) {
+            (AnonymousMailboxOutcomeV1::Accepted, Some(ticket)) => {
+                if ticket.ticket_id != request.ticket_id
+                    || ticket.target_node_id != request.target_node_id
+                    || ticket.lease_claims_commitment != request.lease_claims_commitment
+                    || ticket.issued_at != request.issued_at
+                    || ticket.expires_at != request.expires_at
+                {
+                    return Err(AnonymousMailboxProtocolError::ClaimsConflict);
+                }
+                ticket.verify_at(
+                    &request.target_node_id,
+                    &request.lease_claims_commitment,
+                    request.issued_at,
+                )?;
+            }
+            (AnonymousMailboxOutcomeV1::Accepted, None) | (_, Some(_)) => {
+                return Err(AnonymousMailboxProtocolError::Malformed);
+            }
+            (_, None) => {}
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for AnonymousMailboxTicketIssueResponseV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnonymousMailboxTicketIssueResponseV1")
+            .field("version", &self.version)
+            .field("outcome", &self.outcome)
+            .field("ticket", &self.ticket.as_ref().map(|_| "<redacted>"))
+            .field("responded_at", &self.responded_at)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1785,6 +2092,8 @@ pub enum AnonymousMailboxTerminalFrameV1 {
     PullOne(AnonymousMailboxPullOneV1),
     /// Kind 4.
     Ack(AnonymousMailboxAckV1),
+    /// Kind 5.
+    TicketIssue(AnonymousMailboxTicketIssueV1),
     /// Kind 129.
     LeaseCreateResponse(AnonymousMailboxTerminalResponseV1),
     /// Kind 130.
@@ -1793,6 +2102,8 @@ pub enum AnonymousMailboxTerminalFrameV1 {
     PullOneResponse(AnonymousMailboxTerminalResponseV1),
     /// Kind 132.
     AckResponse(AnonymousMailboxTerminalResponseV1),
+    /// Kind 133.
+    TicketIssueResponse(AnonymousMailboxTicketIssueResponseV1),
 }
 
 impl AnonymousMailboxTerminalFrameV1 {
@@ -1804,10 +2115,12 @@ impl AnonymousMailboxTerminalFrameV1 {
             Self::Put(_) => 2,
             Self::PullOne(_) => 3,
             Self::Ack(_) => 4,
+            Self::TicketIssue(_) => 5,
             Self::LeaseCreateResponse(_) => 129,
             Self::PutResponse(_) => 130,
             Self::PullOneResponse(_) => 131,
             Self::AckResponse(_) => 132,
+            Self::TicketIssueResponse(_) => 133,
         }
     }
 }
@@ -1832,6 +2145,9 @@ fn response_operation(
             Some(AnonymousMailboxOperationV1::PullOne)
         }
         AnonymousMailboxTerminalFrameV1::AckResponse(_) => Some(AnonymousMailboxOperationV1::Ack),
+        AnonymousMailboxTerminalFrameV1::TicketIssueResponse(_) => {
+            Some(AnonymousMailboxOperationV1::TicketIssue)
+        }
         _ => None,
     }
 }
@@ -1857,6 +2173,10 @@ pub fn encode_anonymous_mailbox_terminal_frame(
             value.signing_bytes()?;
             encode_bincode_bounded(value, BODY_BYTES)
         }
+        AnonymousMailboxTerminalFrameV1::TicketIssue(value) => {
+            value.signing_bytes()?;
+            encode_bincode_bounded(value, BODY_BYTES)
+        }
         AnonymousMailboxTerminalFrameV1::LeaseCreateResponse(value)
         | AnonymousMailboxTerminalFrameV1::PutResponse(value)
         | AnonymousMailboxTerminalFrameV1::PullOneResponse(value)
@@ -1864,6 +2184,10 @@ pub fn encode_anonymous_mailbox_terminal_frame(
             if response_operation(frame) != Some(value.operation) {
                 return Err(AnonymousMailboxProtocolError::ClaimsConflict);
             }
+            value.signing_bytes()?;
+            encode_bincode_bounded(value, BODY_BYTES)
+        }
+        AnonymousMailboxTerminalFrameV1::TicketIssueResponse(value) => {
             value.signing_bytes()?;
             encode_bincode_bounded(value, BODY_BYTES)
         }
@@ -1909,10 +2233,12 @@ pub fn decode_anonymous_mailbox_terminal_frame(
         2 => AnonymousMailboxTerminalFrameV1::Put(decode_body(body)?),
         3 => AnonymousMailboxTerminalFrameV1::PullOne(decode_body(body)?),
         4 => AnonymousMailboxTerminalFrameV1::Ack(decode_body(body)?),
+        5 => AnonymousMailboxTerminalFrameV1::TicketIssue(decode_body(body)?),
         129 => AnonymousMailboxTerminalFrameV1::LeaseCreateResponse(decode_body(body)?),
         130 => AnonymousMailboxTerminalFrameV1::PutResponse(decode_body(body)?),
         131 => AnonymousMailboxTerminalFrameV1::PullOneResponse(decode_body(body)?),
         132 => AnonymousMailboxTerminalFrameV1::AckResponse(decode_body(body)?),
+        133 => AnonymousMailboxTerminalFrameV1::TicketIssueResponse(decode_body(body)?),
         _ => return Err(AnonymousMailboxProtocolError::UnsupportedOperation),
     };
     if encode_anonymous_mailbox_terminal_frame(&frame)? != encoded {
@@ -1929,14 +2255,16 @@ fn validate_canonical_terminal_request_frame(
         AnonymousMailboxTerminalFrameV1::LeaseCreate(_)
         | AnonymousMailboxTerminalFrameV1::Put(_)
         | AnonymousMailboxTerminalFrameV1::PullOne(_)
-        | AnonymousMailboxTerminalFrameV1::Ack(_) => Ok(()),
+        | AnonymousMailboxTerminalFrameV1::Ack(_)
+        | AnonymousMailboxTerminalFrameV1::TicketIssue(_) => Ok(()),
         // [ANONYMOUS-MAILBOX-SOURCE-CARRIER 2026-09-02 by Codex] A source
         // carrier is terminal input only. Admitting a response kind here would
         // let an untrusted relay payload bypass M13C's request-only dispatcher.
         AnonymousMailboxTerminalFrameV1::LeaseCreateResponse(_)
         | AnonymousMailboxTerminalFrameV1::PutResponse(_)
         | AnonymousMailboxTerminalFrameV1::PullOneResponse(_)
-        | AnonymousMailboxTerminalFrameV1::AckResponse(_) => {
+        | AnonymousMailboxTerminalFrameV1::AckResponse(_)
+        | AnonymousMailboxTerminalFrameV1::TicketIssueResponse(_) => {
             Err(AnonymousMailboxProtocolError::UnsupportedOperation)
         }
     }
@@ -1995,6 +2323,26 @@ mod tests {
         )
         .expect("lease");
         (lease, target, deposit, reader)
+    }
+
+    fn ticket_issue_fixture() -> (AnonymousMailboxTicketIssueV1, IdentityKeyPair) {
+        let target = IdentityKeyPair::from_bytes(&[0x31; 32]).expect("target");
+        for nonce in 0..u64::MAX {
+            let request = AnonymousMailboxTicketIssueV1::new(
+                [0x71; 16],
+                [0x72; 16],
+                target.public_key_bytes(),
+                [0x73; 32],
+                1_800_000_000,
+                1_800_000_300,
+                nonce,
+            )
+            .expect("ticket issue");
+            if leading_zero_bits(&request.proof_digest().expect("work")) >= 4 {
+                return (request, target);
+            }
+        }
+        unreachable!("a four-bit proof must be reachable")
     }
 
     fn request_terminal_frames() -> (
@@ -2223,7 +2571,7 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_terminal_kinds_roundtrip_canonically() {
+    fn all_ten_terminal_kinds_roundtrip_canonically() {
         let (lease, target, deposit, reader) = lease_fixture();
         let put = AnonymousMailboxPutV1::new(
             lease.mailbox_id,
@@ -2263,11 +2611,29 @@ mod tests {
             )
             .expect("response")
         };
+        let (ticket_issue, ticket_target) = ticket_issue_fixture();
+        let issued_ticket = AnonymousMailboxAdmissionTicketV1::issue(
+            ticket_issue.ticket_id,
+            ticket_issue.lease_claims_commitment,
+            ticket_issue.issued_at,
+            ticket_issue.expires_at,
+            &ticket_target,
+        )
+        .expect("issued ticket");
+        let ticket_response = AnonymousMailboxTicketIssueResponseV1::signed(
+            &ticket_issue,
+            AnonymousMailboxOutcomeV1::Accepted,
+            Some(issued_ticket),
+            1_800_000_010,
+            &ticket_target,
+        )
+        .expect("ticket response");
         let frames = vec![
             AnonymousMailboxTerminalFrameV1::LeaseCreate(lease.clone()),
             AnonymousMailboxTerminalFrameV1::Put(put.clone()),
             AnonymousMailboxTerminalFrameV1::PullOne(pull.clone()),
             AnonymousMailboxTerminalFrameV1::Ack(ack.clone()),
+            AnonymousMailboxTerminalFrameV1::TicketIssue(ticket_issue),
             AnonymousMailboxTerminalFrameV1::LeaseCreateResponse(response(
                 AnonymousMailboxOperationV1::LeaseCreate,
                 lease.admission.ticket_id,
@@ -2288,8 +2654,9 @@ mod tests {
                 ack.request_id,
                 ack.request_commitment().expect("ack"),
             )),
+            AnonymousMailboxTerminalFrameV1::TicketIssueResponse(ticket_response),
         ];
-        let kinds = [1, 2, 3, 4, 129, 130, 131, 132];
+        let kinds = [1, 2, 3, 4, 5, 129, 130, 131, 132, 133];
         for (frame, kind) in frames.into_iter().zip(kinds) {
             let encoded = encode_anonymous_mailbox_terminal_frame(&frame).expect("encode");
             assert_eq!(&encoded[..4], &[0x41, 0x4d, 1, kind]);
@@ -2298,6 +2665,40 @@ mod tests {
                 frame
             );
         }
+    }
+
+    #[test]
+    fn ticket_issue_transcript_is_target_bound_and_canonical() {
+        let (request, target) = ticket_issue_fixture();
+        request
+            .verify_for_target(&target.public_key_bytes(), 1_800_000_100, 4)
+            .expect("valid target-bound proof");
+        assert_eq!(
+            hex::encode(request.request_commitment().expect("commitment")),
+            "ddcdf5fc2eb795deae806d3c14e27420d88a7496a64d84dbf948081c2a4bba89"
+        );
+
+        let mut changed_target = request.clone();
+        changed_target.target_node_id = IdentityKeyPair::from_bytes(&[0x34; 32])
+            .expect("other target")
+            .public_key_bytes();
+        assert!(changed_target
+            .verify_for_target(&target.public_key_bytes(), 1_800_000_100, 4)
+            .is_err());
+        let mut changed_nonce = request.clone();
+        changed_nonce.proof_nonce = changed_nonce.proof_nonce.wrapping_add(1);
+        assert_ne!(
+            changed_nonce.proof_digest().expect("changed work"),
+            request.proof_digest().expect("original work")
+        );
+
+        let encoded = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::TicketIssue(request),
+        )
+        .expect("encode");
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode_anonymous_mailbox_terminal_frame(&trailing).is_err());
     }
 
     #[test]
@@ -2401,6 +2802,13 @@ mod tests {
                 }
                 AnonymousMailboxOperationV1::Ack => {
                     AnonymousMailboxTerminalFrameV1::AckResponse(terminal_response)
+                }
+                // Ticket issuance has a dedicated response transcript that
+                // carries the signed admission ticket, so it is covered by
+                // the terminal-codec control rather than this generic
+                // compact-response fixture.
+                AnonymousMailboxOperationV1::TicketIssue => {
+                    unreachable!("specialized ticket response")
                 }
             };
             let response_frame =
