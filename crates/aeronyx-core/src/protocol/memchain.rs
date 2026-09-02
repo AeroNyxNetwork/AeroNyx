@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.25-VerifiedSubmitResponseCorrelation
+// Version: 2.8.26-AnonymousMailboxCanonicalOuter
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -57,6 +57,9 @@
 //   v2.8.25-VerifiedSubmitResponseCorrelation — Added request correlation for
 //   every result state and centralized terminal receipt verification internals.
 //   Existing wire bytes remain unchanged.
+//   v2.8.26-AnonymousMailboxCanonicalOuter — New anonymous-mailbox route
+//   variants reject trailing or otherwise non-canonical outer bytes while
+//   preserving the legacy trailing-byte policy for every older variant.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -98,6 +101,8 @@
 //     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.26-AnonymousMailboxCanonicalOuter — Added a variant-selective
+//                        canonical decode gate for variants 40-41
 //   v2.8.25-VerifiedSubmitResponseCorrelation — Added all-result correlation
 //   v2.8.24-VerifiedSubmitRequestBinding — Added exact-request response verifier
 //   v2.8.23-ChatSessionSenderBinding — Reused core envelope identity binding
@@ -1807,11 +1812,31 @@ pub fn encode_memchain(msg: &MemChainMessage) -> std::result::Result<Vec<u8>, bi
 /// # Errors
 /// Returns `bincode::Error` for malformed or oversized payloads.
 pub fn decode_memchain(payload: &[u8]) -> std::result::Result<MemChainMessage, bincode::Error> {
-    decode_bincode_bounded(
+    let message = decode_bincode_bounded(
         payload,
         MAX_MEMCHAIN_PAYLOAD_BYTES,
         TrailingBytesPolicy::Allow,
-    )
+    )?;
+
+    // [ANONYMOUS-MAILBOX-CANONICAL-OUTER 2026-09-02 by Codex] Legacy
+    // MemChain variants retain their deployed trailing-byte compatibility,
+    // but the new mailbox carriers have no legacy non-canonical form. Requiring
+    // the exact canonical bytes prevents an authenticated request from being
+    // padded into a different outer wire value with the same retry commitment.
+    if matches!(
+        &message,
+        MemChainMessage::AnonymousMailboxRouteV1(_)
+            | MemChainMessage::AnonymousMailboxRouteResponseV1(_)
+    ) {
+        let canonical = encode_bincode_bounded(&message, MAX_MEMCHAIN_PAYLOAD_BYTES)?;
+        if canonical.as_slice() != payload {
+            return Err(Box::new(bincode::ErrorKind::Custom(
+                "anonymous mailbox outer frame is non-canonical".to_string(),
+            )));
+        }
+    }
+
+    Ok(message)
 }
 
 // ============================================
@@ -1919,6 +1944,90 @@ mod tests {
             decode_memchain(&padded).is_err(),
             "ignored trailing padding must not bypass the complete input ceiling"
         );
+    }
+
+    fn anonymous_mailbox_route_fixtures() -> (
+        AnonymousMailboxRouteRequestV1,
+        AnonymousMailboxRouteResponseV1,
+    ) {
+        let source = IdentityKeyPair::from_bytes(&[0xE8; 32]).expect("source identity");
+        let target = IdentityKeyPair::from_bytes(&[0xE9; 32]).expect("target identity");
+        let request = AnonymousMailboxRouteRequestV1::signed(
+            [0xEA; 16],
+            target.public_key_bytes(),
+            vec![0xEB; 96],
+            1_800_000_100,
+            &source,
+        )
+        .expect("route request");
+        let response = AnonymousMailboxRouteResponseV1::signed(
+            &request,
+            crate::protocol::anonymous_mailbox::AnonymousMailboxOutcomeV1::Accepted,
+            vec![0xEC; 80],
+            1_800_000_101,
+            &target,
+        )
+        .expect("route response");
+        (request, response)
+    }
+
+    #[test]
+    fn anonymous_mailbox_request_rejects_trailing_outer_bytes() {
+        let (request, _) = anonymous_mailbox_route_fixtures();
+        let mut encoded = encode_memchain(&MemChainMessage::AnonymousMailboxRouteV1(request))
+            .expect("encode request");
+        encoded.push(0xA5);
+        assert!(
+            decode_memchain(&encoded[1..]).is_err(),
+            "mailbox request must reject an otherwise valid frame with trailing bytes"
+        );
+    }
+
+    #[test]
+    fn anonymous_mailbox_response_rejects_trailing_outer_bytes() {
+        let (_, response) = anonymous_mailbox_route_fixtures();
+        let mut encoded =
+            encode_memchain(&MemChainMessage::AnonymousMailboxRouteResponseV1(response))
+                .expect("encode response");
+        encoded.push(0x5A);
+        assert!(
+            decode_memchain(&encoded[1..]).is_err(),
+            "mailbox response must reject an otherwise valid frame with trailing bytes"
+        );
+    }
+
+    #[test]
+    fn anonymous_mailbox_canonical_roundtrip_preserves_request_commitment() {
+        let (request, response) = anonymous_mailbox_route_fixtures();
+        let expected_commitment = request.request_commitment().expect("request commitment");
+
+        let request_encoded =
+            encode_memchain(&MemChainMessage::AnonymousMailboxRouteV1(request.clone()))
+                .expect("encode request");
+        let decoded_request = match decode_memchain(&request_encoded[1..]).expect("decode request")
+        {
+            MemChainMessage::AnonymousMailboxRouteV1(value) => value,
+            other => panic!("expected anonymous mailbox request, got {other:?}"),
+        };
+        assert_eq!(decoded_request, request);
+        assert_eq!(
+            decoded_request
+                .request_commitment()
+                .expect("decoded request commitment"),
+            expected_commitment
+        );
+
+        let response_encoded = encode_memchain(&MemChainMessage::AnonymousMailboxRouteResponseV1(
+            response.clone(),
+        ))
+        .expect("encode response");
+        let decoded_response =
+            match decode_memchain(&response_encoded[1..]).expect("decode response") {
+                MemChainMessage::AnonymousMailboxRouteResponseV1(value) => value,
+                other => panic!("expected anonymous mailbox response, got {other:?}"),
+            };
+        assert_eq!(decoded_response, response);
+        assert_eq!(decoded_response.request_commitment, expected_commitment);
     }
 
     #[test]
