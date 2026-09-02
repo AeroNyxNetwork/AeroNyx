@@ -943,7 +943,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, trace, warn};
 
 use aeronyx_core::protocol::auth::{
-    verify_signed_message, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_CHAT_PULL_V2,
+    verify_signed_message, AuthError, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_CHAT_PULL_V2,
     DOMAIN_DEVICE_REGISTER, DOMAIN_SESSION_CLOSE_V1, DOMAIN_WALLET_PRESENCE,
 };
 use aeronyx_core::protocol::chat::{
@@ -15041,6 +15041,22 @@ impl Server {
         traffic_tracker.remove_wallet(&termination.wallet_hex);
     }
 
+    /// Verifies both signed layers without treating timestamp freshness as
+    /// authority to create a new relay or custody effect.
+    fn verified_submit_signatures_are_valid_without_freshness(
+        request: &ChatRelayVerifiedSubmitRequestV1,
+    ) -> bool {
+        if request.envelope.verify_signature().is_err() {
+            return false;
+        }
+        let Ok(sender) = IdentityPublicKey::from_bytes(&request.envelope.sender) else {
+            return false;
+        };
+        sender
+            .verify(&request.signing_digest(), &request.signature)
+            .is_ok()
+    }
+
     /// Handles one opt-in client request that requires terminal-verifiable
     /// onion delivery without changing legacy `ChatRelay` availability.
     ///
@@ -15064,11 +15080,37 @@ impl Server {
             )
         };
 
-        if request.verify_authentication().is_err()
-            || !request
-                .envelope
-                .sender_matches_authenticated_identity(&session.client_public_key.to_bytes())
-        {
+        let sender_matches_session = request
+            .envelope
+            .sender_matches_authenticated_identity(&session.client_public_key.to_bytes());
+        // [CHAT-VERIFIED-SUBMIT-STALE-REPLAY 2026-09-02 by Codex] A stale
+        // request must still prove both signed layers and the live session
+        // identity before it may query private replay state. Freshness gates
+        // every new effect below, while an exact completed result remains
+        // replayable for its independently bounded durable lifetime.
+        let request_is_fresh = match request.verify_authentication() {
+            Ok(()) => true,
+            Err(AuthError::TimestampOutOfWindow)
+                if sender_matches_session
+                    && Self::verified_submit_signatures_are_valid_without_freshness(&request) =>
+            {
+                false
+            }
+            Err(_) => {
+                let response = rejected();
+                if let Some(relay) = chat_relay.as_ref() {
+                    // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] Count
+                    // rejected explicit submissions only as an aggregate result.
+                    relay.record_verified_submit_result(unix_now_secs(), response.result);
+                }
+                warn!(
+                    reason = "verified_submit_authentication_failed",
+                    "[CHAT_RELAY] Verified submit rejected"
+                );
+                return response;
+            }
+        };
+        if !sender_matches_session {
             let response = rejected();
             if let Some(relay) = chat_relay.as_ref() {
                 // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] Count
@@ -15126,6 +15168,16 @@ impl Server {
                 );
                 return response;
             }
+        }
+
+        if !request_is_fresh {
+            let response = rejected();
+            relay.record_verified_submit_result(unix_now_secs(), response.result);
+            warn!(
+                reason = "verified_submit_stale_replay_unavailable",
+                "[CHAT_RELAY] Verified submit rejected"
+            );
+            return response;
         }
 
         // [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] Reserve
@@ -16704,11 +16756,13 @@ mod tests {
     use crate::config_chat_relay::ChatRelayConfig;
     use crate::error::RuntimeTaskJoinFailureKind;
     use crate::services::chat_relay::{
-        VerifiedSubmitAdmission, VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS,
+        VerifiedSubmitAdmission, VerifiedSubmitCacheLookup,
+        VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS,
     };
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
     use aeronyx_core::ledger::{RecordCommitmentBlockV1, GENESIS_PREV_HASH};
+    use aeronyx_core::protocol::auth::TIMESTAMP_WINDOW_SECS;
     use aeronyx_core::protocol::chat::{
         encode_envelope, BlindRelayDeliveryReceipt, ChatContentType, ChatEnvelope,
     };
@@ -16718,8 +16772,9 @@ mod tests {
         RouteDomainAttestationV1,
     };
     use aeronyx_core::protocol::memchain::{
-        ChatRelayVerifiedSubmitRequestV1, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
-        CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1, CHAT_VERIFIED_SUBMIT_REJECTED_V1,
+        ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1,
+        CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1, CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1,
+        CHAT_VERIFIED_SUBMIT_REJECTED_V1,
     };
     use aeronyx_core::protocol::onion::is_onion_blob;
     use aeronyx_core::protocol::{
@@ -16831,6 +16886,84 @@ mod tests {
             ChatRelayService::new(test_chat_relay_config(db_path), node_secret)
                 .expect("initialize test chat relay service"),
         )
+    }
+
+    fn test_verified_submit_request(
+        sender: &IdentityKeyPair,
+        request_id: [u8; 16],
+        message_id: [u8; 16],
+        request_timestamp: u64,
+        marker: u8,
+    ) -> ChatRelayVerifiedSubmitRequestV1 {
+        let mut envelope = ChatEnvelope {
+            message_id,
+            sender: sender.public_key_bytes(),
+            receiver: [marker.wrapping_add(1); 32],
+            timestamp: request_timestamp,
+            ciphertext: vec![marker; 32],
+            nonce: [marker.wrapping_add(2); 24],
+            content_type: ChatContentType::Text,
+            signature: [0_u8; 64],
+        };
+        envelope.signature = sender.sign(&envelope.sign_data());
+        ChatRelayVerifiedSubmitRequestV1::signed(request_id, envelope, request_timestamp, sender)
+            .expect("sign test verified submit request")
+    }
+
+    fn test_verified_submit_session(
+        sender: &IdentityKeyPair,
+        marker: u8,
+    ) -> Arc<crate::services::Session> {
+        Arc::new(crate::services::Session::new(
+            aeronyx_common::types::SessionId::generate(),
+            sender.public_key(),
+            aeronyx_core::crypto::SessionKey::from_bytes([marker; 32]),
+            Ipv4Addr::new(100, 64, 0, marker.max(1)),
+            format!("127.0.0.1:{}", 10_000_u16 + u16::from(marker))
+                .parse()
+                .expect("parse test verified submit endpoint"),
+        ))
+    }
+
+    fn seed_completed_verified_submit(
+        relay: &ChatRelayService,
+        request: &ChatRelayVerifiedSubmitRequestV1,
+    ) -> ChatRelayVerifiedSubmitResponseV1 {
+        assert_eq!(
+            relay
+                .reserve_verified_submit(request)
+                .expect("reserve completed verified submit fixture"),
+            VerifiedSubmitAdmission::Reserved
+        );
+        let response = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            request.request_id,
+            request.envelope.message_id,
+            false,
+            true,
+            None,
+        );
+        relay
+            .remember_verified_submit_response(request, &response)
+            .expect("persist completed verified submit fixture");
+        response
+    }
+
+    fn assert_no_verified_submit_delivery_effects(
+        relay: &ChatRelayService,
+        sender: &IdentityKeyPair,
+    ) {
+        assert_eq!(
+            relay
+                .storage_usage()
+                .expect("read verified submit storage usage")
+                .pending_messages,
+            0
+        );
+        assert!(relay
+            .wallet_routes
+            .lookup(&sender.public_key_bytes())
+            .is_empty());
+        assert_eq!(relay.peer_status().outbound_rounds, 0);
     }
 
     /// Captures exact v3 ACK bodies and truncates the first one after custody.
@@ -19927,6 +20060,264 @@ mod tests {
             verified_status.entry_recovery.last_outcome.as_deref(),
             Some("completed")
         );
+    }
+
+    #[tokio::test]
+    async fn verified_submit_stale_exact_completed_replays_in_process_and_after_restart() {
+        // [CHAT-VERIFIED-SUBMIT-STALE-REPLAY 2026-09-02 by Codex] An exact
+        // completed result remains the sole authority for a request whose
+        // signed timestamp is one second outside the admission window. Both
+        // memory and durable recovery paths must return the original result
+        // without repeating route selection or entry custody.
+        let directory = tempfile::tempdir().expect("stale replay directory");
+        let db_path = directory.path().join("stale-replay.sqlite3");
+        let secret = [0x91; 32];
+        let sender = IdentityKeyPair::generate();
+        let source_node = IdentityKeyPair::generate();
+        let request = test_verified_submit_request(
+            &sender,
+            [0x92; 16],
+            [0x93; 16],
+            unix_now_secs().saturating_sub(TIMESTAMP_WINDOW_SECS + 1),
+            0x94,
+        );
+        let session = test_verified_submit_session(&sender, 0x95);
+        let store = PeerStore::new();
+        let expected = {
+            let relay = test_chat_relay_service(&db_path, secret);
+            let expected = seed_completed_verified_submit(&relay, &request);
+            let relay_option = Some(Arc::clone(&relay));
+            let replayed = Server::handle_verified_chat_submit(
+                request.clone(),
+                &session,
+                &relay_option,
+                &store,
+                &source_node.public_key_bytes(),
+                &source_node,
+                None,
+            )
+            .await;
+            assert_eq!(replayed, expected);
+            assert_no_verified_submit_delivery_effects(&relay, &sender);
+            expected
+        };
+
+        let restarted = test_chat_relay_service(&db_path, secret);
+        let restarted_option = Some(Arc::clone(&restarted));
+        let replayed = Server::handle_verified_chat_submit(
+            request,
+            &session,
+            &restarted_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(replayed, expected);
+        assert_no_verified_submit_delivery_effects(&restarted, &sender);
+    }
+
+    #[tokio::test]
+    async fn verified_submit_freshness_and_completed_retention_boundaries_are_closed() {
+        let directory = tempfile::tempdir().expect("verified submit boundary directory");
+        let sender = IdentityKeyPair::generate();
+        let source_node = IdentityKeyPair::generate();
+        let session = test_verified_submit_session(&sender, 0x96);
+        let store = PeerStore::new();
+
+        // The signed freshness window is symmetric. A request exactly sixty
+        // seconds in the future is admitted and may create entry custody.
+        let fresh_relay =
+            test_chat_relay_service(&directory.path().join("fresh-boundary.sqlite3"), [0x97; 32]);
+        let fresh_request = test_verified_submit_request(
+            &sender,
+            [0x98; 16],
+            [0x99; 16],
+            unix_now_secs().saturating_add(TIMESTAMP_WINDOW_SECS),
+            0x9A,
+        );
+        fresh_request
+            .verify_authentication()
+            .expect("sixty-second boundary remains fresh");
+        let fresh_option = Some(Arc::clone(&fresh_relay));
+        let fresh_response = Server::handle_verified_chat_submit(
+            fresh_request.clone(),
+            &session,
+            &fresh_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(fresh_response.result, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1);
+        fresh_response
+            .validate_for_request(&fresh_request)
+            .expect("fresh boundary response remains request-bound");
+        assert_eq!(
+            fresh_relay
+                .storage_usage()
+                .expect("read fresh boundary custody")
+                .pending_messages,
+            1
+        );
+
+        // A completed response is still live at the inclusive 121-second
+        // durable boundary. Restart clears the process-local cache so this
+        // exercises the SQLite result before any new admission or custody.
+        let durable_path = directory.path().join("retention-boundary.sqlite3");
+        let secret = [0x9B; 32];
+        let stale_request = test_verified_submit_request(
+            &sender,
+            [0x9C; 16],
+            [0x9D; 16],
+            unix_now_secs().saturating_sub(TIMESTAMP_WINDOW_SECS + 1),
+            0x9E,
+        );
+        let expected = {
+            let relay = test_chat_relay_service(&durable_path, secret);
+            seed_completed_verified_submit(&relay, &stale_request)
+        };
+        let retention_boundary =
+            i64::try_from(unix_now_secs().saturating_sub(TIMESTAMP_WINDOW_SECS * 2 + 1))
+                .expect("retention boundary fits SQLite");
+        rusqlite::Connection::open(&durable_path)
+            .expect("open retention boundary database")
+            .execute(
+                "UPDATE relay_verified_submit_responses SET completed_at = ?1",
+                rusqlite::params![retention_boundary],
+            )
+            .expect("age completed response to retention boundary");
+        let restarted = test_chat_relay_service(&durable_path, secret);
+        let restarted_option = Some(Arc::clone(&restarted));
+        let boundary_response = Server::handle_verified_chat_submit(
+            stale_request,
+            &session,
+            &restarted_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(boundary_response, expected);
+        assert_no_verified_submit_delivery_effects(&restarted, &sender);
+    }
+
+    #[tokio::test]
+    async fn verified_submit_stale_noncompleted_states_reject_without_delivery_effects() {
+        let directory = tempfile::tempdir().expect("stale rejection directory");
+        let relay = test_chat_relay_service(
+            &directory.path().join("stale-rejections.sqlite3"),
+            [0xA1; 32],
+        );
+        let relay_option = Some(Arc::clone(&relay));
+        let sender = IdentityKeyPair::generate();
+        let source_node = IdentityKeyPair::generate();
+        let session = test_verified_submit_session(&sender, 0xA2);
+        let store = PeerStore::new();
+        let stale_timestamp = unix_now_secs().saturating_sub(TIMESTAMP_WINDOW_SECS + 1);
+
+        let miss =
+            test_verified_submit_request(&sender, [0xA3; 16], [0xA4; 16], stale_timestamp, 0xA5);
+        let miss_response = Server::handle_verified_chat_submit(
+            miss.clone(),
+            &session,
+            &relay_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(miss_response.result, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
+        assert!(matches!(
+            relay
+                .verified_submit_cache_lookup(&miss)
+                .expect("recheck stale miss"),
+            VerifiedSubmitCacheLookup::Miss
+        ));
+
+        let pending =
+            test_verified_submit_request(&sender, [0xA6; 16], [0xA7; 16], stale_timestamp, 0xA8);
+        assert_eq!(
+            relay
+                .reserve_verified_submit(&pending)
+                .expect("seed stale pending reservation"),
+            VerifiedSubmitAdmission::Reserved
+        );
+        let pending_response = Server::handle_verified_chat_submit(
+            pending.clone(),
+            &session,
+            &relay_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(pending_response.result, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
+        assert!(matches!(
+            relay
+                .verified_submit_cache_lookup(&pending)
+                .expect("recheck stale pending reservation"),
+            VerifiedSubmitCacheLookup::Pending
+        ));
+
+        let completed =
+            test_verified_submit_request(&sender, [0xA9; 16], [0xAA; 16], stale_timestamp, 0xAB);
+        let completed_response = seed_completed_verified_submit(&relay, &completed);
+        let conflict = test_verified_submit_request(
+            &sender,
+            completed.request_id,
+            [0xAC; 16],
+            stale_timestamp,
+            0xAD,
+        );
+        let conflict_response = Server::handle_verified_chat_submit(
+            conflict.clone(),
+            &session,
+            &relay_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(conflict_response.result, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
+        assert!(matches!(
+            relay
+                .verified_submit_cache_lookup(&conflict)
+                .expect("recheck stale conflict"),
+            VerifiedSubmitCacheLookup::Conflict
+        ));
+        let VerifiedSubmitCacheLookup::Exact(still_completed) = relay
+            .verified_submit_cache_lookup(&completed)
+            .expect("retain original completed response")
+        else {
+            panic!("stale conflict must not replace completed response");
+        };
+        assert_eq!(still_completed, completed_response);
+
+        let mut invalid_signature = completed.clone();
+        invalid_signature.signature[0] ^= 0x01;
+        let invalid_response = Server::handle_verified_chat_submit(
+            invalid_signature.clone(),
+            &session,
+            &relay_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(invalid_response.result, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
+        invalid_response
+            .validate_for_request(&invalid_signature)
+            .expect("invalid-signature rejection remains request-bound");
+
+        assert_no_verified_submit_delivery_effects(&relay, &sender);
     }
 
     #[tokio::test]
