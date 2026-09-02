@@ -417,6 +417,9 @@
 // 152. [RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex] Projects the shared
 //      exact-generation recovery-anchor status into the signed management
 //      heartbeat through one bounded, testable aggregate builder.
+// 153. [CHAT-DISPATCH-STORAGE-DECOUPLING 2026-09-02 by Codex] Dispatches chat
+//      runtime frames independently from optional MemChain persistence while
+//      rejecting storage-owned frames through a typed privacy-safe gate.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -4286,6 +4289,103 @@ pub struct Server {
     shutdown: Arc<AtomicBool>,
     shutdown_tx: broadcast::Sender<()>,
     custody_witness_runtime: Arc<CustodyWitnessRuntimeTelemetry>,
+}
+
+// [CHAT-DISPATCH-STORAGE-DECOUPLING 2026-09-02 by Codex] Keep optional
+// persistence requirements explicit instead of using the existence of one
+// storage tuple as an implicit gate for every MemChain wire variant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemChainStorageRequirement {
+    IndependentRuntime,
+    FactAof,
+    RecordStore,
+}
+
+#[derive(Clone, Copy)]
+enum MemChainStorageAccess<'a> {
+    IndependentRuntime,
+    FactAof {
+        mempool: &'a Arc<MemPool>,
+        aof_writer: &'a Arc<TokioMutex<AofWriter>>,
+    },
+    RecordStore {
+        storage: &'a Arc<MemoryStorage>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemChainDispatchGateError {
+    FactAofUnavailable,
+    RecordStoreUnavailable,
+}
+
+impl MemChainDispatchGateError {
+    const fn reason_bucket(self) -> &'static str {
+        match self {
+            Self::FactAofUnavailable => "fact_aof_unavailable",
+            Self::RecordStoreUnavailable => "record_store_unavailable",
+        }
+    }
+
+    const fn family_bucket(self) -> &'static str {
+        match self {
+            Self::FactAofUnavailable => "fact",
+            Self::RecordStoreUnavailable => "record",
+        }
+    }
+}
+
+impl MemChainStorageRequirement {
+    fn for_message(message: &MemChainMessage) -> Self {
+        match message {
+            MemChainMessage::ChatRelay(_)
+            | MemChainMessage::ChatRelayVerifiedSubmitV1(_)
+            | MemChainMessage::ChatRelayVerifiedSubmitResponseV1(_)
+            | MemChainMessage::ChatPull { .. }
+            | MemChainMessage::ChatPullV2 { .. }
+            | MemChainMessage::ChatAck { .. }
+            | MemChainMessage::DeviceRegister { .. }
+            | MemChainMessage::WalletPresence { .. } => Self::IndependentRuntime,
+            MemChainMessage::BroadcastRecord(_)
+            | MemChainMessage::SyncRecordRequest { .. }
+            | MemChainMessage::SyncRecordResponse { .. } => Self::RecordStore,
+            // Preserve the historical storage gate for every non-chat variant.
+            // New wire variants therefore fail closed until they are explicitly
+            // assigned to an independently configured runtime.
+            _ => Self::FactAof,
+        }
+    }
+
+    fn authorize<'a>(
+        self,
+        mempool: Option<&'a Arc<MemPool>>,
+        aof_writer: Option<&'a Arc<TokioMutex<AofWriter>>>,
+        storage: &'a Option<Arc<MemoryStorage>>,
+    ) -> std::result::Result<MemChainStorageAccess<'a>, MemChainDispatchGateError> {
+        match self {
+            Self::IndependentRuntime => Ok(MemChainStorageAccess::IndependentRuntime),
+            Self::FactAof => match (mempool, aof_writer) {
+                (Some(mempool), Some(aof_writer)) => Ok(MemChainStorageAccess::FactAof {
+                    mempool,
+                    aof_writer,
+                }),
+                _ => Err(MemChainDispatchGateError::FactAofUnavailable),
+            },
+            Self::RecordStore => {
+                // Record messages historically passed through the same
+                // MemPool/AOF outer gate before consulting MemoryStorage.
+                // Preserve that prerequisite even though their handler only
+                // needs the record store after admission.
+                if mempool.is_none() || aof_writer.is_none() {
+                    return Err(MemChainDispatchGateError::FactAofUnavailable);
+                }
+                storage
+                    .as_ref()
+                    .map(|storage| MemChainStorageAccess::RecordStore { storage })
+                    .ok_or(MemChainDispatchGateError::RecordStoreUnavailable)
+            }
+        }
+    }
 }
 
 impl Server {
@@ -14955,16 +15055,19 @@ impl Server {
                                                     }
                                                     continue;
                                                 }
-                                                if let (Some(ref mp), Some(ref aw)) = (&mempool, &aof_writer) {
-                                                    Self::handle_memchain_message(
-                                                        msg, mp, aw, &storage, &vector_index,
-                                                        &memchain_config, &server_pubkey_hex,
-                                                        &session, &udp_reply, &crypto,
-                                                        &sessions, &chat_relay, &peer_store,
-                                                        &self_node_id, &node_identity,
-                                                        Some(control_http_client.as_ref()),
-                                                    ).await;
-                                                }
+                                                // [CHAT-DISPATCH-STORAGE-DECOUPLING 2026-09-02 by Codex]
+                                                // Chat runtime admission is independent from the
+                                                // optional Fact/AOF and record stores. The handler's
+                                                // typed gate rejects only messages whose own effect
+                                                // requires unavailable persistence.
+                                                Self::handle_memchain_message(
+                                                    msg, mempool.as_ref(), aof_writer.as_ref(),
+                                                    &storage, &vector_index, &memchain_config,
+                                                    &server_pubkey_hex, &session, &udp_reply,
+                                                    &crypto, &sessions, &chat_relay, &peer_store,
+                                                    &self_node_id, &node_identity,
+                                                    Some(control_http_client.as_ref()),
+                                                ).await;
                                             }
                                         }
                                     }
@@ -15331,8 +15434,8 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     async fn handle_memchain_message(
         msg: MemChainMessage,
-        mempool: &Arc<MemPool>,
-        aof_writer: &Arc<TokioMutex<AofWriter>>,
+        mempool: Option<&Arc<MemPool>>,
+        aof_writer: Option<&Arc<TokioMutex<AofWriter>>>,
         storage: &Option<Arc<MemoryStorage>>,
         vector_index: &Option<Arc<VectorIndex>>,
         config: &MemChainConfig,
@@ -15347,8 +15450,36 @@ impl Server {
         node_identity: &IdentityKeyPair,
         chat_peer_client: Option<&reqwest::Client>,
     ) {
+        let storage_access = match MemChainStorageRequirement::for_message(&msg)
+            .authorize(mempool, aof_writer, storage)
+        {
+            Ok(access) => access,
+            Err(error) => {
+                // [CHAT-DISPATCH-STORAGE-DECOUPLING 2026-09-02 by Codex]
+                // Missing optional persistence is routine in chat-only mode;
+                // retain only fixed aggregate buckets without per-frame warning
+                // amplification. Internal access mismatches remain warnings/errors.
+                debug!(
+                    reason = error.reason_bucket(),
+                    family = error.family_bucket(),
+                    "[MEMCHAIN] Storage-owned message rejected"
+                );
+                return;
+            }
+        };
         match msg {
             MemChainMessage::BroadcastFact(fact) => {
+                let MemChainStorageAccess::FactAof {
+                    mempool,
+                    aof_writer,
+                } = storage_access
+                else {
+                    error!(
+                        reason = "dispatch_gate_invariant",
+                        "[MEMCHAIN] Message rejected"
+                    );
+                    return;
+                };
                 let origin_hex = hex::encode(fact.origin);
                 let sig_ok = match IdentityPublicKey::from_bytes(&fact.origin) {
                     Ok(pk) => pk.verify(&fact.fact_id, &fact.signature).is_ok(),
@@ -15368,6 +15499,13 @@ impl Server {
                 }
             }
             MemChainMessage::BroadcastRecord(record) => {
+                let MemChainStorageAccess::RecordStore { storage } = storage_access else {
+                    error!(
+                        reason = "dispatch_gate_invariant",
+                        "[MEMCHAIN] Message rejected"
+                    );
+                    return;
+                };
                 let owner_hex = record.owner_hex();
                 let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
                     Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
@@ -15385,33 +15523,49 @@ impl Server {
                     warn!(owner = %owner_hex, id = hex::encode(record.record_id), "[MEMCHAIN] record_id hash mismatch");
                     return;
                 }
-                if let Some(ref st) = storage {
-                    if st.insert(&record, "p2p-remote").await {
-                        info!(
-                            id = hex::encode(record.record_id),
-                            "[MEMCHAIN] BroadcastRecord stored"
-                        );
-                        if record.has_embedding() {
-                            if let Some(ref vi) = vector_index {
-                                vi.upsert(
-                                    record.record_id,
-                                    record.embedding.clone(),
-                                    record.layer,
-                                    record.timestamp,
-                                    &record.owner,
-                                    "p2p-remote",
-                                );
-                            }
+                if storage.insert(&record, "p2p-remote").await {
+                    info!(
+                        id = hex::encode(record.record_id),
+                        "[MEMCHAIN] BroadcastRecord stored"
+                    );
+                    if record.has_embedding() {
+                        if let Some(ref vi) = vector_index {
+                            vi.upsert(
+                                record.record_id,
+                                record.embedding.clone(),
+                                record.layer,
+                                record.timestamp,
+                                &record.owner,
+                                "p2p-remote",
+                            );
                         }
                     }
                 }
             }
             MemChainMessage::SyncRequest { last_known_hash } => {
+                let MemChainStorageAccess::FactAof { mempool, .. } = storage_access else {
+                    error!(
+                        reason = "dispatch_gate_invariant",
+                        "[MEMCHAIN] Message rejected"
+                    );
+                    return;
+                };
                 let facts = mempool.get_facts_after(last_known_hash);
                 let resp = MemChainMessage::SyncResponse { facts };
                 Self::send_to_session(&resp, session, udp, crypto).await;
             }
             MemChainMessage::SyncResponse { facts } => {
+                let MemChainStorageAccess::FactAof {
+                    mempool,
+                    aof_writer,
+                } = storage_access
+                else {
+                    error!(
+                        reason = "dispatch_gate_invariant",
+                        "[MEMCHAIN] Message rejected"
+                    );
+                    return;
+                };
                 for fact in facts {
                     let origin_hex = hex::encode(fact.origin);
                     let sig_ok = match IdentityPublicKey::from_bytes(&fact.origin) {
@@ -15431,33 +15585,43 @@ impl Server {
                 owner,
                 after_timestamp,
             } => {
-                if let Some(ref st) = storage {
-                    let records = st.query_by_owner_after(&owner, after_timestamp).await;
-                    let resp = MemChainMessage::SyncRecordResponse { records };
-                    Self::send_to_session(&resp, session, udp, crypto).await;
-                }
+                let MemChainStorageAccess::RecordStore { storage } = storage_access else {
+                    error!(
+                        reason = "dispatch_gate_invariant",
+                        "[MEMCHAIN] Message rejected"
+                    );
+                    return;
+                };
+                let records = storage.query_by_owner_after(&owner, after_timestamp).await;
+                let resp = MemChainMessage::SyncRecordResponse { records };
+                Self::send_to_session(&resp, session, udp, crypto).await;
             }
             MemChainMessage::SyncRecordResponse { records } => {
-                if let Some(ref st) = storage {
-                    for record in records {
-                        let owner_hex = record.owner_hex();
-                        let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
-                            Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
-                            Err(_) => false,
-                        };
-                        if !sig_ok {
-                            warn!(owner = %owner_hex, "[MEMCHAIN] SyncRecordResponse sig failed");
-                            continue;
-                        }
-                        if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
-                            continue;
-                        }
-                        if !record.verify_id() {
-                            warn!(owner = %owner_hex, id = hex::encode(record.record_id), "[MEMCHAIN] SyncRecordResponse hash mismatch");
-                            continue;
-                        }
-                        let _ = st.insert(&record, "p2p-sync").await;
+                let MemChainStorageAccess::RecordStore { storage } = storage_access else {
+                    error!(
+                        reason = "dispatch_gate_invariant",
+                        "[MEMCHAIN] Message rejected"
+                    );
+                    return;
+                };
+                for record in records {
+                    let owner_hex = record.owner_hex();
+                    let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
+                        Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
+                        Err(_) => false,
+                    };
+                    if !sig_ok {
+                        warn!(owner = %owner_hex, "[MEMCHAIN] SyncRecordResponse sig failed");
+                        continue;
                     }
+                    if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
+                        continue;
+                    }
+                    if !record.verify_id() {
+                        warn!(owner = %owner_hex, id = hex::encode(record.record_id), "[MEMCHAIN] SyncRecordResponse hash mismatch");
+                        continue;
+                    }
+                    let _ = storage.insert(&record, "p2p-sync").await;
                 }
             }
             MemChainMessage::BlockAnnounce(header) => {
@@ -16721,7 +16885,8 @@ mod tests {
         DirectoryProofGossipPeerState, DirectoryProofGossipResult, DiscoveryGossipExecution,
         DiscoveryGossipFailure, DiscoveryGossipFailureKind, DiscoveryGossipPhase,
         DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport, DiscoveryPeerIdentityHints,
-        PeerHttpClients, PeerStoreCacheDocument, PeerStoreCachePersistOutcome,
+        MemChainDispatchGateError, MemChainStorageRequirement, PeerHttpClients,
+        PeerStoreCacheDocument, PeerStoreCachePersistOutcome,
         PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryAnchorState,
         PeerStoreVerifiedClientDeliveryCacheEvidence,
         PeerStoreVerifiedClientDeliveryExternalWitnessDecision, RequiredApiListenerExit,
@@ -16759,6 +16924,7 @@ mod tests {
         VerifiedSubmitAdmission, VerifiedSubmitCacheLookup,
         VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS,
     };
+    use aeronyx_core::crypto::transport::{DefaultTransportCrypto, TransportCrypto};
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
     use aeronyx_core::ledger::{RecordCommitmentBlockV1, GENESIS_PREV_HASH};
@@ -16772,7 +16938,7 @@ mod tests {
         RouteDomainAttestationV1,
     };
     use aeronyx_core::protocol::memchain::{
-        ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1,
+        ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1, MemChainMessage,
         CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1, CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1,
         CHAT_VERIFIED_SUBMIT_REJECTED_V1,
     };
@@ -16781,7 +16947,7 @@ mod tests {
         NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor, NodeDiscoveryMessage,
         NodeProtocolFeature, OnionRoutePurpose, SignedNodeDescriptor,
     };
-    use aeronyx_transport::UdpTransport;
+    use aeronyx_transport::{Transport, UdpTransport};
     use axum::{
         body::{to_bytes, Body},
         extract::{Request, State},
@@ -16802,7 +16968,7 @@ mod tests {
     use std::os::unix::net::UnixDatagram;
 
     use crate::api::discovery::{DiscoveryLocalCapabilityStatus, GossipResponse};
-    use crate::config::{DiscoveryConfig, ServerConfig};
+    use crate::config::{DiscoveryConfig, MemChainConfig, MemChainMode, ServerConfig};
 
     #[test]
     fn session_close_authentication_binds_transport_identity_and_id() {
@@ -16856,9 +17022,10 @@ mod tests {
     use crate::services::memchain::MemoryStorage;
     use crate::services::peer_store::PeerStoreVerifiedDeliveryWitnessRound;
     use crate::services::{
-        ChatRelayService, DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore,
-        DirectoryReplicaSyncRuntime, PeerStore, PeerStoreImportReport, SessionManager,
+        AofWriter, ChatRelayService, DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore,
+        DirectoryReplicaSyncRuntime, MemPool, PeerStore, PeerStoreImportReport, SessionManager,
     };
+    use tokio::sync::Mutex as TokioMutex;
 
     fn test_peer_http_client() -> Arc<reqwest::Client> {
         // [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Exercise the same
@@ -16964,6 +17131,237 @@ mod tests {
             .lookup(&sender.public_key_bytes())
             .is_empty());
         assert_eq!(relay.peer_status().outbound_rounds, 0);
+    }
+
+    #[tokio::test]
+    async fn storage_disabled_dispatch_gate_preserves_chat_and_rejects_storage_only_variants() {
+        // [CHAT-DISPATCH-STORAGE-DECOUPLING 2026-09-02 by Codex] Classification
+        // is closed over every storage-backed legacy family while only the
+        // explicit chat handler variants remain admissible without storage.
+        let sender = IdentityKeyPair::generate();
+        let now = unix_now_secs();
+        let verified = test_verified_submit_request(&sender, [0x41; 16], [0x42; 16], now, 0x43);
+        let chat_runtime_messages = vec![
+            MemChainMessage::ChatRelay(verified.envelope.clone()),
+            MemChainMessage::ChatRelayVerifiedSubmitV1(verified.clone()),
+            MemChainMessage::ChatPull {
+                wallet: sender.public_key_bytes(),
+                after_timestamp: 0,
+                cursor: [0; 16],
+                limit: 1,
+                request_timestamp: now,
+                signature: [0; 64],
+            },
+            MemChainMessage::ChatPullV2 {
+                wallet: sender.public_key_bytes(),
+                after_timestamp: 0,
+                cursor: Vec::new(),
+                limit: 1,
+                request_timestamp: now,
+                signature: [0; 64],
+            },
+            MemChainMessage::ChatAck {
+                message_ids: vec![[0x44; 16]],
+                wallet: sender.public_key_bytes(),
+                ack_timestamp: now,
+                signature: [0; 64],
+            },
+        ];
+        let no_record_storage = None;
+        for message in &chat_runtime_messages {
+            let requirement = MemChainStorageRequirement::for_message(message);
+            assert_eq!(requirement, MemChainStorageRequirement::IndependentRuntime);
+            assert!(requirement
+                .authorize(None, None, &no_record_storage)
+                .is_ok());
+        }
+
+        let fact_message = MemChainMessage::SyncRequest {
+            last_known_hash: [0x46; 32],
+        };
+        let record_message = MemChainMessage::SyncRecordRequest {
+            owner: [0x47; 32],
+            after_timestamp: now,
+        };
+        let legacy_block_message =
+            MemChainMessage::BlockAnnounce(aeronyx_core::ledger::BlockHeader {
+                height: 1,
+                timestamp: now,
+                prev_block_hash: GENESIS_PREV_HASH,
+                merkle_root: [0x48; 32],
+                block_type: 1,
+            });
+        let commitment_block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now,
+            GENESIS_PREV_HASH,
+            vec![[0x49; 32]],
+            &sender,
+        );
+        let record_block_message = MemChainMessage::RecordBlockAnnounceV1 {
+            header: commitment_block.header,
+            proposer_signature: commitment_block.proposer_signature,
+        };
+        assert!(matches!(
+            MemChainStorageRequirement::for_message(&fact_message).authorize(
+                None,
+                None,
+                &no_record_storage,
+            ),
+            Err(MemChainDispatchGateError::FactAofUnavailable)
+        ));
+        assert!(matches!(
+            MemChainStorageRequirement::for_message(&record_message).authorize(
+                None,
+                None,
+                &no_record_storage,
+            ),
+            Err(MemChainDispatchGateError::FactAofUnavailable)
+        ));
+
+        let partial_directory = tempfile::tempdir().expect("partial runtime directory");
+        let mempool = Arc::new(MemPool::new());
+        let aof_writer = Arc::new(TokioMutex::new(
+            AofWriter::open(partial_directory.path().join("partial-runtime.aof"))
+                .await
+                .expect("open partial runtime AOF"),
+        ));
+        let record_storage = Some(Arc::new(
+            MemoryStorage::open(":memory:", None).expect("open partial record store"),
+        ));
+        let record_requirement = MemChainStorageRequirement::for_message(&record_message);
+        for (partial_mempool, partial_aof, partial_storage, expected_error) in [
+            (
+                None,
+                None,
+                &record_storage,
+                MemChainDispatchGateError::FactAofUnavailable,
+            ),
+            (
+                Some(&mempool),
+                None,
+                &record_storage,
+                MemChainDispatchGateError::FactAofUnavailable,
+            ),
+            (
+                None,
+                Some(&aof_writer),
+                &record_storage,
+                MemChainDispatchGateError::FactAofUnavailable,
+            ),
+            (
+                Some(&mempool),
+                Some(&aof_writer),
+                &no_record_storage,
+                MemChainDispatchGateError::RecordStoreUnavailable,
+            ),
+        ] {
+            assert_eq!(
+                record_requirement
+                    .authorize(partial_mempool, partial_aof, partial_storage)
+                    .err(),
+                Some(expected_error),
+                "partial record runtime must remain rejected"
+            );
+        }
+        assert!(record_requirement
+            .authorize(Some(&mempool), Some(&aof_writer), &record_storage,)
+            .is_ok());
+        for message in [&legacy_block_message, &record_block_message] {
+            let requirement = MemChainStorageRequirement::for_message(message);
+            assert_eq!(requirement, MemChainStorageRequirement::FactAof);
+            assert!(matches!(
+                requirement.authorize(None, None, &no_record_storage),
+                Err(MemChainDispatchGateError::FactAofUnavailable)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_submit_dispatches_and_responds_with_memchain_storage_off() {
+        // [CHAT-DISPATCH-STORAGE-DECOUPLING 2026-09-02 by Codex] Exercise the
+        // real handler and encrypted UDP response with no MemPool, AOF writer,
+        // MemoryStorage, or vector index, matching the production canary mode.
+        let directory = tempfile::tempdir().expect("chat dispatch directory");
+        let relay =
+            test_chat_relay_service(&directory.path().join("chat-dispatch.sqlite3"), [0x51; 32]);
+        let relay_option = Some(Arc::clone(&relay));
+        let sender = IdentityKeyPair::generate();
+        let node_identity = IdentityKeyPair::generate();
+        let request =
+            test_verified_submit_request(&sender, [0x52; 16], [0x53; 16], unix_now_secs(), 0x54);
+        let client_udp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let server_udp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let session = Arc::new(crate::services::Session::new(
+            aeronyx_common::types::SessionId::generate(),
+            sender.public_key(),
+            aeronyx_core::crypto::SessionKey::from_bytes([0x55; 32]),
+            Ipv4Addr::new(100, 64, 0, 85),
+            client_udp.local_addr().expect("client UDP address"),
+        ));
+        let sessions = Arc::new(SessionManager::new(16, Duration::from_secs(60)));
+        let peer_store = Arc::new(PeerStore::new());
+        let mut config = MemChainConfig::default();
+        config.mode = MemChainMode::Off;
+        assert!(!config.is_enabled());
+        let no_storage = None;
+        let no_vector_index = None;
+        let crypto = DefaultTransportCrypto::new();
+
+        Server::handle_memchain_message(
+            MemChainMessage::ChatRelayVerifiedSubmitV1(request.clone()),
+            None,
+            None,
+            &no_storage,
+            &no_vector_index,
+            &config,
+            "unused-while-storage-off",
+            &session,
+            &server_udp,
+            &crypto,
+            &sessions,
+            &relay_option,
+            &peer_store,
+            &node_identity.public_key_bytes(),
+            &node_identity,
+            None,
+        )
+        .await;
+
+        let mut datagram = vec![0_u8; 65_535];
+        let (received, _) =
+            tokio::time::timeout(Duration::from_secs(2), client_udp.recv(&mut datagram))
+                .await
+                .expect("verified submit response timeout")
+                .expect("receive verified submit response");
+        let packet = aeronyx_core::protocol::codec::decode_data_packet(&datagram[..received])
+            .expect("decode encrypted response packet");
+        assert_eq!(packet.session_id, *session.id.as_bytes());
+        let mut plaintext = vec![0_u8; packet.encrypted_payload.len()];
+        let plaintext_len = crypto
+            .decrypt(
+                &session.session_key,
+                packet.counter,
+                session.id.as_bytes(),
+                &packet.encrypted_payload,
+                &mut plaintext,
+            )
+            .expect("decrypt verified submit response");
+        plaintext.truncate(plaintext_len);
+        assert_eq!(
+            plaintext.first().copied(),
+            Some(aeronyx_core::protocol::memchain::MEMCHAIN_MAGIC)
+        );
+        let response = aeronyx_core::protocol::memchain::decode_memchain(&plaintext[1..])
+            .expect("decode verified submit response");
+        let MemChainMessage::ChatRelayVerifiedSubmitResponseV1(response) = response else {
+            panic!("unexpected response variant");
+        };
+        response
+            .validate_for_request(&request)
+            .expect("response must bind exact verified submit");
+        assert_eq!(response.result, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1);
+        assert_eq!(relay.peer_status().verified_submit.total, 1);
     }
 
     /// Captures exact v3 ACK bodies and truncates the first one after custody.
