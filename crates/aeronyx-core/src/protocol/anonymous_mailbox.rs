@@ -12,15 +12,23 @@
 //! [ANONYMOUS-MAILBOX-V1 2026-09-02 by Codex] All transcript domains, terminal
 //! kinds, and limits below are public compatibility contracts. Unknown version,
 //! kind, trailing bytes, malformed claims, and oversized input fail closed.
+//!
+//! Last Modified: v1.1.0-AnonymousMailboxSourceSeal — Froze the padded pull
+//! result codec, the compact source-sealed response carrier, and the reduced
+//! 159-KiB admitted item ceiling under unchanged outer route limits.
 
 use std::fmt;
 
+use hkdf::Hkdf;
+use rand::{rngs::OsRng, RngCore};
 use serde::de::{DeserializeOwned, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
-use crate::crypto::{IdentityKeyPair, IdentityPublicKey};
+use crate::crypto::{E2eSession, EphemeralKeyPair, IdentityKeyPair, IdentityPublicKey};
 use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
 
 const TICKET_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-AdmissionTicket-v1";
@@ -37,7 +45,7 @@ const EXACT_REQUEST_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-ExactRequest-v1";
 /// Initial anonymous mailbox protocol version.
 pub const ANONYMOUS_MAILBOX_VERSION_V1: u8 = 1;
 /// Maximum sealed ChatEnvelope bytes in one Put.
-pub const MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES: usize = 160 * 1024;
+pub const MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES: usize = 159 * 1024;
 /// Maximum complete terminal frame including its explicit header.
 pub const MAX_ANONYMOUS_MAILBOX_TERMINAL_FRAME_BYTES: usize = 176 * 1024;
 /// Maximum sealed terminal bytes in a routed request or response.
@@ -48,6 +56,14 @@ pub const MAX_ANONYMOUS_MAILBOX_TERMINAL_FRAME_BYTES: usize = 176 * 1024;
 pub const MAX_ANONYMOUS_MAILBOX_SEALED_TERMINAL_BYTES: usize = 191 * 1024;
 /// Maximum opaque pull cursor.
 pub const MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES: usize = 256;
+/// Maximum bytes carried inside one signed terminal response payload.
+pub const MAX_ANONYMOUS_MAILBOX_TERMINAL_RESPONSE_PAYLOAD_BYTES: usize = 160 * 1024;
+/// Maximum encoded bytes of one compact source-sealed terminal response.
+pub const MAX_ANONYMOUS_MAILBOX_SOURCE_SEALED_RESPONSE_BYTES: usize =
+    MAX_ANONYMOUS_MAILBOX_SEALED_TERMINAL_BYTES;
+/// Maximum plaintext bytes admitted by the compact source-sealed carrier.
+pub const MAX_ANONYMOUS_MAILBOX_SOURCE_SEALED_RESPONSE_PAYLOAD_BYTES: usize =
+    MAX_ANONYMOUS_MAILBOX_SOURCE_SEALED_RESPONSE_BYTES - SOURCE_SEALED_RESPONSE_OVERHEAD_BYTES;
 /// Maximum admitted items per lease.
 pub const MAX_ANONYMOUS_MAILBOX_ITEMS_PER_LEASE: u16 = 1_024;
 /// Maximum admitted bytes per lease.
@@ -64,6 +80,26 @@ pub const MAX_ANONYMOUS_MAILBOX_REQUEST_SKEW_SECS: u64 = 120;
 const MAGIC: [u8; 2] = [0x41, 0x4d];
 const HEADER_BYTES: usize = 8;
 const BODY_BYTES: u64 = (MAX_ANONYMOUS_MAILBOX_TERMINAL_FRAME_BYTES - HEADER_BYTES) as u64;
+const PULL_RESULT_MAGIC: [u8; 4] = [0x41, 0x4d, 0x01, 0x01];
+const SOURCE_SEALED_RESPONSE_MAGIC: [u8; 4] = *b"AMSR";
+const SOURCE_SEALED_RESPONSE_VERSION_V1: u8 = 1;
+const SOURCE_SEALED_RESPONSE_PREFIX_BYTES: usize = 4 + 1 + 32 + 24 + 4;
+const SOURCE_SEALED_RESPONSE_AEAD_TAG_BYTES: usize = 16;
+const SOURCE_SEALED_RESPONSE_OVERHEAD_BYTES: usize =
+    SOURCE_SEALED_RESPONSE_PREFIX_BYTES + SOURCE_SEALED_RESPONSE_AEAD_TAG_BYTES;
+const SOURCE_SEALED_RESPONSE_KEY_SALT: &[u8] = b"AeroNyx-AnonymousMailbox-SourceSeal-Key-v1";
+const SOURCE_SEALED_RESPONSE_RESTART_MAGIC: [u8; 4] = *b"AMSS";
+const SOURCE_SEALED_RESPONSE_RESTART_VERSION_V1: u16 = 1;
+const SOURCE_SEALED_RESPONSE_RESTART_BYTES: usize = 4 + 2 + 16 + 32 + 32 + 32 + 32;
+
+/// Exact fixed wire bytes for one canonical padded pull result.
+pub const ANONYMOUS_MAILBOX_PULL_RESULT_BYTES: usize = 4
+    + 16
+    + 32
+    + 4
+    + 2
+    + MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES
+    + MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES;
 
 /// Privacy-safe, coarse mailbox protocol failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -189,6 +225,9 @@ fn cursor_bytes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D
 fn route_bytes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
     bounded_bytes::<D, MAX_ANONYMOUS_MAILBOX_SEALED_TERMINAL_BYTES>(deserializer)
 }
+fn response_payload_bytes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    bounded_bytes::<D, MAX_ANONYMOUS_MAILBOX_TERMINAL_RESPONSE_PAYLOAD_BYTES>(deserializer)
+}
 
 fn version(value: u8) -> Result<(), AnonymousMailboxProtocolError> {
     (value == ANONYMOUS_MAILBOX_VERSION_V1)
@@ -245,6 +284,41 @@ fn opaque(
     data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     data.extend_from_slice(&Sha256::digest(bytes));
     Ok(())
+}
+
+fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N], AnonymousMailboxProtocolError> {
+    bytes
+        .try_into()
+        .map_err(|_| AnonymousMailboxProtocolError::Malformed)
+}
+
+fn source_sealed_response_size(
+    ciphertext_len: usize,
+) -> Result<usize, AnonymousMailboxProtocolError> {
+    SOURCE_SEALED_RESPONSE_PREFIX_BYTES
+        .checked_add(ciphertext_len)
+        .ok_or(AnonymousMailboxProtocolError::TooLarge)
+}
+
+fn derive_source_sealed_response_key(
+    route_id: &[u8; 16],
+    request_context_commitment: &[u8; 32],
+    expected_terminal_node_id: &[u8; 32],
+    reply_public_key: &[u8; 32],
+    ephemeral_public_key: &[u8; 32],
+    shared_secret: &[u8; 32],
+) -> Result<[u8; 32], AnonymousMailboxProtocolError> {
+    let mut info = Vec::with_capacity(16 + 32 + 32 + 32);
+    info.extend_from_slice(route_id);
+    info.extend_from_slice(request_context_commitment);
+    info.extend_from_slice(expected_terminal_node_id);
+    info.extend_from_slice(reply_public_key);
+    info.extend_from_slice(ephemeral_public_key);
+    let hkdf = Hkdf::<Sha256>::new(Some(SOURCE_SEALED_RESPONSE_KEY_SALT), shared_secret);
+    let mut key = [0u8; 32];
+    hkdf.expand(&info, &mut key)
+        .map_err(|_| AnonymousMailboxProtocolError::Malformed)?;
+    Ok(key)
 }
 
 /// Short-lived target-node authority over one exact lease claim set.
@@ -744,7 +818,7 @@ pub struct AnonymousMailboxTerminalResponseV1 {
     /// Coarse disposition.
     pub outcome: AnonymousMailboxOutcomeV1,
     /// Optional source-sealed result; PullOne carries its item here.
-    #[serde(deserialize_with = "item_bytes")]
+    #[serde(deserialize_with = "response_payload_bytes")]
     pub sealed_payload: Vec<u8>,
     /// Response time.
     pub responded_at: u64,
@@ -794,7 +868,7 @@ impl AnonymousMailboxTerminalResponseV1 {
         opaque(
             &mut data,
             &self.sealed_payload,
-            MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES,
+            MAX_ANONYMOUS_MAILBOX_TERMINAL_RESPONSE_PAYLOAD_BYTES,
         )?;
         data.extend_from_slice(&self.responded_at.to_le_bytes());
         data.extend_from_slice(&self.responder_node_id);
@@ -1011,6 +1085,474 @@ impl fmt::Debug for AnonymousMailboxRouteResponseV1 {
     }
 }
 
+/// Canonical fixed-width pull result carried inside a terminal response.
+///
+/// [ANONYMOUS-MAILBOX-PULL-RESULT 2026-09-02 by Codex] This freezes the exact
+/// 163130-byte wire image so future field reordering, omitted metadata, or
+/// relaxed padding checks fail closed during decode and fixture replay.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AnonymousMailboxPullResultV1 {
+    /// Durable item identifier.
+    pub item_id: [u8; 16],
+    /// Commitment to the unpadded sealed item bytes.
+    pub sealed_commitment: [u8; 32],
+    /// Opaque cursor prefix; the remaining fixed field bytes are zero padding.
+    pub cursor: Vec<u8>,
+    /// Opaque sealed item prefix; the remaining fixed field bytes are zero padding.
+    pub sealed_item: Vec<u8>,
+}
+
+impl AnonymousMailboxPullResultV1 {
+    /// Builds one canonical pull result from opaque stored bytes.
+    pub fn new(
+        item_id: [u8; 16],
+        cursor: Vec<u8>,
+        sealed_item: Vec<u8>,
+    ) -> Result<Self, AnonymousMailboxProtocolError> {
+        if cursor.len() > MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES
+            || sealed_item.len() > MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES
+        {
+            return Err(AnonymousMailboxProtocolError::TooLarge);
+        }
+        if sealed_item.is_empty() {
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        Ok(Self {
+            item_id,
+            sealed_commitment: Sha256::digest(&sealed_item).into(),
+            cursor,
+            sealed_item,
+        })
+    }
+
+    /// Returns the exact fixed-width wire bytes.
+    pub fn encode(&self) -> Result<Vec<u8>, AnonymousMailboxProtocolError> {
+        if self.cursor.len() > MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES
+            || self.sealed_item.len() > MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES
+        {
+            return Err(AnonymousMailboxProtocolError::TooLarge);
+        }
+        if self.sealed_item.is_empty() {
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        let expected_commitment: [u8; 32] = Sha256::digest(&self.sealed_item).into();
+        if self.sealed_commitment != expected_commitment {
+            return Err(AnonymousMailboxProtocolError::ClaimsConflict);
+        }
+        let cursor_len = u16::try_from(self.cursor.len())
+            .map_err(|_| AnonymousMailboxProtocolError::TooLarge)?;
+        let sealed_len = u32::try_from(self.sealed_item.len())
+            .map_err(|_| AnonymousMailboxProtocolError::TooLarge)?;
+        let mut encoded = Vec::with_capacity(ANONYMOUS_MAILBOX_PULL_RESULT_BYTES);
+        encoded.extend_from_slice(&PULL_RESULT_MAGIC);
+        encoded.extend_from_slice(&self.item_id);
+        encoded.extend_from_slice(&self.sealed_commitment);
+        encoded.extend_from_slice(&sealed_len.to_le_bytes());
+        encoded.extend_from_slice(&cursor_len.to_le_bytes());
+        encoded.extend_from_slice(&self.cursor);
+        encoded.resize(58 + MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES, 0);
+        encoded.extend_from_slice(&self.sealed_item);
+        encoded.resize(ANONYMOUS_MAILBOX_PULL_RESULT_BYTES, 0);
+        Ok(encoded)
+    }
+
+    /// Decodes one exact canonical padded pull result and rejects drift.
+    pub fn decode(encoded: &[u8]) -> Result<Self, AnonymousMailboxProtocolError> {
+        if encoded.len() != ANONYMOUS_MAILBOX_PULL_RESULT_BYTES || encoded[..4] != PULL_RESULT_MAGIC
+        {
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        let item_id = fixed::<16>(&encoded[4..20])?;
+        let sealed_commitment = fixed::<32>(&encoded[20..52])?;
+        let sealed_len = u32::from_le_bytes(fixed::<4>(&encoded[52..56])?) as usize;
+        let cursor_len = u16::from_le_bytes(fixed::<2>(&encoded[56..58])?) as usize;
+        if sealed_len == 0
+            || sealed_len > MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES
+            || cursor_len > MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES
+        {
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        let cursor_block = &encoded[58..58 + MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES];
+        let item_block = &encoded[58 + MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES..];
+        if cursor_block[cursor_len..].iter().any(|byte| *byte != 0)
+            || item_block[sealed_len..].iter().any(|byte| *byte != 0)
+        {
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        let cursor = cursor_block[..cursor_len].to_vec();
+        let sealed_item = item_block[..sealed_len].to_vec();
+        let expected_commitment: [u8; 32] = Sha256::digest(&sealed_item).into();
+        if sealed_commitment != expected_commitment {
+            return Err(AnonymousMailboxProtocolError::ClaimsConflict);
+        }
+        Ok(Self {
+            item_id,
+            sealed_commitment,
+            cursor,
+            sealed_item,
+        })
+    }
+}
+
+impl fmt::Debug for AnonymousMailboxPullResultV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnonymousMailboxPullResultV1")
+            .field("cursor_bytes", &self.cursor.len())
+            .field("sealed_item_bytes", &self.sealed_item.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Zeroizing private session bytes accepted only by an authenticated journal.
+pub struct AnonymousMailboxSourceSealSessionRestartState {
+    bytes: Vec<u8>,
+}
+
+impl AnonymousMailboxSourceSealSessionRestartState {
+    /// Returns the opaque journal bytes for this single-use session.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for AnonymousMailboxSourceSealSessionRestartState {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+/// Coarse restart-state restore failures for the compact source-seal session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonymousMailboxSourceSealSessionRestartError {
+    /// Stored bytes are truncated or structurally invalid.
+    Malformed,
+    /// The opaque restart-state version is not supported.
+    UnsupportedVersion,
+    /// The retained reply key or bound context is unusable.
+    InvalidSession,
+}
+
+struct RecoverableAnonymousMailboxReplyKey {
+    secret: Option<StaticSecret>,
+    public: X25519PublicKey,
+}
+
+impl RecoverableAnonymousMailboxReplyKey {
+    fn generate() -> Self {
+        let secret = StaticSecret::new(OsRng);
+        let public = X25519PublicKey::from(&secret);
+        Self {
+            secret: Some(secret),
+            public,
+        }
+    }
+
+    fn public_key_bytes(&self) -> [u8; 32] {
+        self.public.to_bytes()
+    }
+
+    fn persistence_secret(
+        &self,
+    ) -> Result<[u8; 32], AnonymousMailboxSourceSealSessionRestartError> {
+        self.secret
+            .as_ref()
+            .map(StaticSecret::to_bytes)
+            .ok_or(AnonymousMailboxSourceSealSessionRestartError::InvalidSession)
+    }
+
+    fn from_persistence_secret(
+        mut secret_bytes: [u8; 32],
+        public_bytes: [u8; 32],
+    ) -> Result<Self, AnonymousMailboxSourceSealSessionRestartError> {
+        if secret_bytes == [0; 32] {
+            secret_bytes.zeroize();
+            return Err(AnonymousMailboxSourceSealSessionRestartError::InvalidSession);
+        }
+        let secret = StaticSecret::from(secret_bytes);
+        secret_bytes.zeroize();
+        let public = X25519PublicKey::from(&secret);
+        if public.to_bytes() != public_bytes {
+            return Err(AnonymousMailboxSourceSealSessionRestartError::InvalidSession);
+        }
+        Ok(Self {
+            secret: Some(secret),
+            public,
+        })
+    }
+
+    fn exchange(
+        &mut self,
+        peer_public: &[u8; 32],
+    ) -> Result<[u8; 32], AnonymousMailboxProtocolError> {
+        let secret = self
+            .secret
+            .take()
+            .ok_or(AnonymousMailboxProtocolError::Malformed)?;
+        let peer = X25519PublicKey::from(*peer_public);
+        let shared = secret.diffie_hellman(&peer);
+        Ok(*shared.as_bytes())
+    }
+}
+
+/// Private single-use state for one mailbox-specific compact response.
+///
+/// [ANONYMOUS-MAILBOX-SOURCE-SEAL 2026-09-02 by Codex] The caller persists the
+/// restart state only inside an authenticated encrypted journal and must delete
+/// that journal entry after the first successful or terminally failed open.
+pub struct AnonymousMailboxSourceSealSessionV1 {
+    route_id: [u8; 16],
+    expected_terminal_node_id: [u8; 32],
+    request_context_commitment: [u8; 32],
+    reply_key: RecoverableAnonymousMailboxReplyKey,
+}
+
+impl AnonymousMailboxSourceSealSessionV1 {
+    /// Creates one single-use source session and returns its reply public key.
+    pub fn prepare(
+        route_id: [u8; 16],
+        expected_terminal_node_id: [u8; 32],
+        request_context_commitment: [u8; 32],
+    ) -> Result<([u8; 32], Self), AnonymousMailboxProtocolError> {
+        IdentityPublicKey::from_bytes(&expected_terminal_node_id)
+            .map_err(|_| AnonymousMailboxProtocolError::SignatureRejected)?;
+        let reply_key = RecoverableAnonymousMailboxReplyKey::generate();
+        let reply_public_key = reply_key.public_key_bytes();
+        Ok((
+            reply_public_key,
+            Self {
+                route_id,
+                expected_terminal_node_id,
+                request_context_commitment,
+                reply_key,
+            },
+        ))
+    }
+
+    /// Returns the single-use X25519 reply public key bound to this session.
+    pub fn reply_public_key(&self) -> [u8; 32] {
+        self.reply_key.public_key_bytes()
+    }
+
+    /// Encodes opaque restart state for immediate encrypted journaling only.
+    pub fn encode_restart_state(
+        &self,
+    ) -> Result<
+        AnonymousMailboxSourceSealSessionRestartState,
+        AnonymousMailboxSourceSealSessionRestartError,
+    > {
+        let mut secret_bytes = self.reply_key.persistence_secret()?;
+        let mut bytes = Vec::with_capacity(SOURCE_SEALED_RESPONSE_RESTART_BYTES);
+        bytes.extend_from_slice(&SOURCE_SEALED_RESPONSE_RESTART_MAGIC);
+        bytes.extend_from_slice(&SOURCE_SEALED_RESPONSE_RESTART_VERSION_V1.to_be_bytes());
+        bytes.extend_from_slice(&self.route_id);
+        bytes.extend_from_slice(&self.expected_terminal_node_id);
+        bytes.extend_from_slice(&self.request_context_commitment);
+        bytes.extend_from_slice(&self.reply_key.public_key_bytes());
+        bytes.extend_from_slice(&secret_bytes);
+        secret_bytes.zeroize();
+        Ok(AnonymousMailboxSourceSealSessionRestartState { bytes })
+    }
+
+    /// Restores one unconsumed session from authenticated journal bytes.
+    pub fn decode_restart_state(
+        bytes: &[u8],
+    ) -> Result<Self, AnonymousMailboxSourceSealSessionRestartError> {
+        if bytes.len() != SOURCE_SEALED_RESPONSE_RESTART_BYTES
+            || bytes[..4] != SOURCE_SEALED_RESPONSE_RESTART_MAGIC
+        {
+            return Err(AnonymousMailboxSourceSealSessionRestartError::Malformed);
+        }
+        if u16::from_be_bytes([bytes[4], bytes[5]]) != SOURCE_SEALED_RESPONSE_RESTART_VERSION_V1 {
+            return Err(AnonymousMailboxSourceSealSessionRestartError::UnsupportedVersion);
+        }
+        let route_id = fixed::<16>(&bytes[6..22])
+            .map_err(|_| AnonymousMailboxSourceSealSessionRestartError::Malformed)?;
+        let expected_terminal_node_id = fixed::<32>(&bytes[22..54])
+            .map_err(|_| AnonymousMailboxSourceSealSessionRestartError::Malformed)?;
+        IdentityPublicKey::from_bytes(&expected_terminal_node_id)
+            .map_err(|_| AnonymousMailboxSourceSealSessionRestartError::InvalidSession)?;
+        let request_context_commitment = fixed::<32>(&bytes[54..86])
+            .map_err(|_| AnonymousMailboxSourceSealSessionRestartError::Malformed)?;
+        let public_bytes = fixed::<32>(&bytes[86..118])
+            .map_err(|_| AnonymousMailboxSourceSealSessionRestartError::Malformed)?;
+        let secret_bytes = fixed::<32>(&bytes[118..150])
+            .map_err(|_| AnonymousMailboxSourceSealSessionRestartError::Malformed)?;
+        let reply_key = RecoverableAnonymousMailboxReplyKey::from_persistence_secret(
+            secret_bytes,
+            public_bytes,
+        )?;
+        Ok(Self {
+            route_id,
+            expected_terminal_node_id,
+            request_context_commitment,
+            reply_key,
+        })
+    }
+
+    /// Opens the one compact response bound to this exact route context.
+    pub fn open(
+        &mut self,
+        encoded_response: &[u8],
+    ) -> Result<Vec<u8>, AnonymousMailboxProtocolError> {
+        let response = AnonymousMailboxSourceSealedResponseV1::decode(encoded_response)?;
+        let reply_public_key = self.reply_key.public_key_bytes();
+        let mut shared_secret = self.reply_key.exchange(&response.ephemeral_public_key)?;
+        if shared_secret.iter().all(|byte| *byte == 0) {
+            shared_secret.zeroize();
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        let mut key = derive_source_sealed_response_key(
+            &self.route_id,
+            &self.request_context_commitment,
+            &self.expected_terminal_node_id,
+            &reply_public_key,
+            &response.ephemeral_public_key,
+            &shared_secret,
+        )?;
+        shared_secret.zeroize();
+        let session = E2eSession::new(key, response.ephemeral_public_key);
+        key.zeroize();
+        session
+            .decrypt_raw(&response.ciphertext, &response.nonce)
+            .map_err(|_| AnonymousMailboxProtocolError::SignatureRejected)
+    }
+}
+
+/// Compact mailbox-specific source-sealed route response bytes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AnonymousMailboxSourceSealedResponseV1 {
+    /// Schema version.
+    pub version: u8,
+    /// Terminal-chosen ephemeral X25519 public key.
+    pub ephemeral_public_key: [u8; 32],
+    /// AEAD nonce.
+    pub nonce: [u8; 24],
+    /// Ciphertext including the XChaCha20-Poly1305 tag.
+    pub ciphertext: Vec<u8>,
+}
+
+impl AnonymousMailboxSourceSealedResponseV1 {
+    fn validate_shape(&self) -> Result<(), AnonymousMailboxProtocolError> {
+        if self.version != SOURCE_SEALED_RESPONSE_VERSION_V1 {
+            return Err(AnonymousMailboxProtocolError::UnsupportedVersion);
+        }
+        if self.ciphertext.len() < SOURCE_SEALED_RESPONSE_AEAD_TAG_BYTES {
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        if source_sealed_response_size(self.ciphertext.len())?
+            > MAX_ANONYMOUS_MAILBOX_SEALED_TERMINAL_BYTES
+            || self.ciphertext.len() > u32::MAX as usize
+        {
+            return Err(AnonymousMailboxProtocolError::TooLarge);
+        }
+        Ok(())
+    }
+
+    /// Encrypts already terminal-signed route-response bytes for the source.
+    pub fn seal(
+        route_id: [u8; 16],
+        request_context_commitment: [u8; 32],
+        expected_terminal_node_id: [u8; 32],
+        reply_public_key: [u8; 32],
+        payload: &[u8],
+        terminal_identity: &IdentityKeyPair,
+    ) -> Result<Self, AnonymousMailboxProtocolError> {
+        IdentityPublicKey::from_bytes(&expected_terminal_node_id)
+            .map_err(|_| AnonymousMailboxProtocolError::SignatureRejected)?;
+        if terminal_identity.public_key_bytes() != expected_terminal_node_id {
+            return Err(AnonymousMailboxProtocolError::ClaimsConflict);
+        }
+        if payload.is_empty() {
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        if payload.len() > MAX_ANONYMOUS_MAILBOX_SOURCE_SEALED_RESPONSE_PAYLOAD_BYTES {
+            return Err(AnonymousMailboxProtocolError::TooLarge);
+        }
+
+        let ephemeral = EphemeralKeyPair::generate();
+        let ephemeral_public_key = ephemeral.public_key_bytes();
+        let mut shared_secret = ephemeral.exchange(&reply_public_key);
+        if shared_secret.iter().all(|byte| *byte == 0) {
+            shared_secret.zeroize();
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        let mut key = derive_source_sealed_response_key(
+            &route_id,
+            &request_context_commitment,
+            &expected_terminal_node_id,
+            &reply_public_key,
+            &ephemeral_public_key,
+            &shared_secret,
+        )?;
+        shared_secret.zeroize();
+        let mut nonce = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce);
+        let session = E2eSession::new(key, reply_public_key);
+        key.zeroize();
+        let ciphertext = session
+            .encrypt_raw(payload, &nonce)
+            .map_err(|_| AnonymousMailboxProtocolError::Malformed)?;
+        let response = Self {
+            version: SOURCE_SEALED_RESPONSE_VERSION_V1,
+            ephemeral_public_key,
+            nonce,
+            ciphertext,
+        };
+        response.validate_shape()?;
+        Ok(response)
+    }
+
+    /// Returns the exact compact transport bytes with no trailing slack.
+    pub fn encode(&self) -> Result<Vec<u8>, AnonymousMailboxProtocolError> {
+        self.validate_shape()?;
+        let ciphertext_len = u32::try_from(self.ciphertext.len())
+            .map_err(|_| AnonymousMailboxProtocolError::TooLarge)?;
+        let mut encoded = Vec::with_capacity(source_sealed_response_size(self.ciphertext.len())?);
+        encoded.extend_from_slice(&SOURCE_SEALED_RESPONSE_MAGIC);
+        encoded.push(self.version);
+        encoded.extend_from_slice(&self.ephemeral_public_key);
+        encoded.extend_from_slice(&self.nonce);
+        encoded.extend_from_slice(&ciphertext_len.to_be_bytes());
+        encoded.extend_from_slice(&self.ciphertext);
+        Ok(encoded)
+    }
+
+    /// Decodes one exact compact transport value and rejects trailing bytes.
+    pub fn decode(encoded: &[u8]) -> Result<Self, AnonymousMailboxProtocolError> {
+        if encoded.len() < SOURCE_SEALED_RESPONSE_PREFIX_BYTES
+            || encoded[..4] != SOURCE_SEALED_RESPONSE_MAGIC
+        {
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        let version = encoded[4];
+        let ephemeral_public_key = fixed::<32>(&encoded[5..37])?;
+        let nonce = fixed::<24>(&encoded[37..61])?;
+        let ciphertext_len = u32::from_be_bytes(fixed::<4>(&encoded[61..65])?) as usize;
+        if ciphertext_len < SOURCE_SEALED_RESPONSE_AEAD_TAG_BYTES
+            || encoded.len() != SOURCE_SEALED_RESPONSE_PREFIX_BYTES + ciphertext_len
+        {
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        let value = Self {
+            version,
+            ephemeral_public_key,
+            nonce,
+            ciphertext: encoded[65..].to_vec(),
+        };
+        value.validate_shape()?;
+        Ok(value)
+    }
+}
+
+impl fmt::Debug for AnonymousMailboxSourceSealedResponseV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnonymousMailboxSourceSealedResponseV1")
+            .field("version", &self.version)
+            .field("ciphertext_bytes", &self.ciphertext.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Explicit terminal frame variants with frozen outer kind values.
 #[derive(Clone, PartialEq, Eq)]
 pub enum AnonymousMailboxTerminalFrameV1 {
@@ -1166,6 +1708,10 @@ fn decode_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, AnonymousMailboxPr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+
+    use crate::protocol::memchain::{decode_memchain, encode_memchain, MemChainMessage};
 
     fn lease_fixture() -> (
         AnonymousMailboxLeaseCreateV1,
@@ -1207,6 +1753,95 @@ mod tests {
         )
         .expect("lease");
         (lease, target, deposit, reader)
+    }
+
+    struct RoutedPullFixture {
+        route_request: AnonymousMailboxRouteRequestV1,
+        pull_request: AnonymousMailboxPullOneV1,
+        terminal_frame: Vec<u8>,
+        sealed_terminal_response: Vec<u8>,
+        route_response: AnonymousMailboxRouteResponseV1,
+        terminal: IdentityKeyPair,
+        session: AnonymousMailboxSourceSealSessionV1,
+    }
+
+    fn pull_result_fixture() -> AnonymousMailboxPullResultV1 {
+        AnonymousMailboxPullResultV1::new([0x11; 16], vec![0x33, 0x44], vec![0xaa, 0xbb, 0xcc])
+            .expect("pull result")
+    }
+
+    fn routed_pull_fixture(pull_result: &AnonymousMailboxPullResultV1) -> RoutedPullFixture {
+        let source = IdentityKeyPair::from_bytes(&[0x91; 32]).expect("source");
+        let terminal = IdentityKeyPair::from_bytes(&[0x92; 32]).expect("terminal");
+        let reader = IdentityKeyPair::from_bytes(&[0x93; 32]).expect("reader");
+        let route_request = AnonymousMailboxRouteRequestV1::signed(
+            [0x94; 16],
+            terminal.public_key_bytes(),
+            vec![0xa5; 96],
+            1_800_000_000,
+            &source,
+        )
+        .expect("route request");
+        let route_commitment = route_request
+            .request_commitment()
+            .expect("route commitment");
+        let (reply_public_key, session) = AnonymousMailboxSourceSealSessionV1::prepare(
+            route_request.request_id,
+            terminal.public_key_bytes(),
+            route_commitment,
+        )
+        .expect("session");
+        assert_eq!(session.reply_public_key(), reply_public_key);
+        let pull_request = AnonymousMailboxPullOneV1::new(
+            [0xb1; 32],
+            [0xb2; 16],
+            vec![0xc3; 12],
+            1_800_000_001,
+            &reader,
+        )
+        .expect("pull");
+        let terminal_response = AnonymousMailboxTerminalResponseV1::signed(
+            AnonymousMailboxOperationV1::PullOne,
+            pull_request.request_id,
+            pull_request.request_commitment().expect("pull commitment"),
+            AnonymousMailboxOutcomeV1::Accepted,
+            pull_result.encode().expect("pull result bytes"),
+            1_800_000_002,
+            &terminal,
+        )
+        .expect("terminal response");
+        let terminal_frame = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::PullOneResponse(terminal_response),
+        )
+        .expect("terminal frame");
+        let sealed_terminal_response = AnonymousMailboxSourceSealedResponseV1::seal(
+            route_request.request_id,
+            route_commitment,
+            terminal.public_key_bytes(),
+            reply_public_key,
+            &terminal_frame,
+            &terminal,
+        )
+        .expect("seal")
+        .encode()
+        .expect("encode");
+        let route_response = AnonymousMailboxRouteResponseV1::signed(
+            &route_request,
+            AnonymousMailboxOutcomeV1::Accepted,
+            sealed_terminal_response.clone(),
+            1_800_000_003,
+            &terminal,
+        )
+        .expect("route response");
+        RoutedPullFixture {
+            route_request,
+            pull_request,
+            terminal_frame,
+            sealed_terminal_response,
+            route_response,
+            terminal,
+            session,
+        }
     }
 
     #[test]
@@ -1459,5 +2094,360 @@ mod tests {
             ),
             Err(AnonymousMailboxProtocolError::TooLarge)
         ));
+    }
+
+    #[test]
+    fn pull_result_v1_wire_layout_golden_is_frozen() {
+        let mut encoded = Vec::with_capacity(ANONYMOUS_MAILBOX_PULL_RESULT_BYTES);
+        encoded.extend_from_slice(&PULL_RESULT_MAGIC);
+        encoded.extend_from_slice(&[0x11; 16]);
+        encoded.extend_from_slice(&[0x22; 32]);
+        encoded.extend_from_slice(&3u32.to_le_bytes());
+        encoded.extend_from_slice(&2u16.to_le_bytes());
+        encoded.extend_from_slice(&[0x33, 0x44]);
+        encoded.resize(58 + MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES, 0);
+        encoded.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        encoded.resize(ANONYMOUS_MAILBOX_PULL_RESULT_BYTES, 0);
+        assert_eq!(encoded.len(), ANONYMOUS_MAILBOX_PULL_RESULT_BYTES);
+        assert_eq!(
+            hex::encode(Sha256::digest(&encoded)),
+            "6104e3a1e464cff1c757364fadf6c07852732958b5b18a6b405570427c546826"
+        );
+        assert_eq!(
+            hex::encode(&encoded[..24]),
+            "414d01011111111111111111111111111111111122222222"
+        );
+        assert_eq!(hex::encode(&encoded[52..64]), "030000000200334400000000");
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode(&encoded),
+            Err(AnonymousMailboxProtocolError::ClaimsConflict)
+        );
+    }
+
+    #[test]
+    fn pull_result_v1_valid_roundtrip_is_canonical() {
+        let fixture = pull_result_fixture();
+        let encoded = fixture.encode().expect("encode");
+        let decoded = AnonymousMailboxPullResultV1::decode(&encoded).expect("decode");
+        assert_eq!(decoded, fixture);
+        assert_eq!(decoded.encode().expect("re-encode"), encoded);
+    }
+
+    #[test]
+    fn pull_result_v1_rejects_noncanonical_padding_lengths_and_commitment() {
+        let encoded = pull_result_fixture().encode().expect("encode");
+
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode(&encoded[..encoded.len() - 1]),
+            Err(AnonymousMailboxProtocolError::Malformed)
+        );
+
+        let mut bad = encoded.clone();
+        bad.push(0);
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode(&bad),
+            Err(AnonymousMailboxProtocolError::Malformed)
+        );
+
+        let mut bad = encoded.clone();
+        bad[52..56].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode(&bad),
+            Err(AnonymousMailboxProtocolError::Malformed)
+        );
+
+        let mut bad = encoded.clone();
+        bad[52..56].copy_from_slice(
+            &(u32::try_from(MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES + 1).expect("oversize"))
+                .to_le_bytes(),
+        );
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode(&bad),
+            Err(AnonymousMailboxProtocolError::Malformed)
+        );
+
+        let mut bad = encoded.clone();
+        bad[56..58].copy_from_slice(&257u16.to_le_bytes());
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode(&bad),
+            Err(AnonymousMailboxProtocolError::Malformed)
+        );
+
+        let mut bad = encoded.clone();
+        bad[60] = 1;
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode(&bad),
+            Err(AnonymousMailboxProtocolError::Malformed)
+        );
+
+        let mut bad = encoded.clone();
+        *bad.last_mut().expect("last") = 1;
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode(&bad),
+            Err(AnonymousMailboxProtocolError::Malformed)
+        );
+
+        let mut bad = encoded;
+        bad[20] ^= 1;
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode(&bad),
+            Err(AnonymousMailboxProtocolError::ClaimsConflict)
+        );
+    }
+
+    #[test]
+    fn terminal_response_payload_cap_stays_at_160_kib() {
+        let responder = IdentityKeyPair::from_bytes(&[0xa1; 32]).expect("responder");
+        AnonymousMailboxTerminalResponseV1::signed(
+            AnonymousMailboxOperationV1::PullOne,
+            [0xa2; 16],
+            [0xa3; 32],
+            AnonymousMailboxOutcomeV1::Accepted,
+            vec![0xa4; MAX_ANONYMOUS_MAILBOX_TERMINAL_RESPONSE_PAYLOAD_BYTES],
+            1_800_000_010,
+            &responder,
+        )
+        .expect("max response payload");
+        assert!(matches!(
+            AnonymousMailboxTerminalResponseV1::signed(
+                AnonymousMailboxOperationV1::PullOne,
+                [0xa2; 16],
+                [0xa3; 32],
+                AnonymousMailboxOutcomeV1::Accepted,
+                vec![0xa4; MAX_ANONYMOUS_MAILBOX_TERMINAL_RESPONSE_PAYLOAD_BYTES + 1],
+                1_800_000_010,
+                &responder,
+            ),
+            Err(AnonymousMailboxProtocolError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn compact_source_seal_roundtrip_is_single_use_and_restartable() {
+        let pull_result = pull_result_fixture();
+        let fixture = routed_pull_fixture(&pull_result);
+        fixture
+            .route_response
+            .verify_for_request(&fixture.route_request, &fixture.terminal.public_key_bytes())
+            .expect("outer response");
+
+        let mut session = fixture.session;
+        let opened = session
+            .open(&fixture.sealed_terminal_response)
+            .expect("first open");
+        assert_eq!(opened, fixture.terminal_frame);
+        match decode_anonymous_mailbox_terminal_frame(&opened).expect("terminal decode") {
+            AnonymousMailboxTerminalFrameV1::PullOneResponse(response) => {
+                response
+                    .verify_for_request(
+                        AnonymousMailboxOperationV1::PullOne,
+                        &fixture.pull_request.request_id,
+                        &fixture
+                            .pull_request
+                            .request_commitment()
+                            .expect("pull commitment"),
+                        &fixture.terminal.public_key_bytes(),
+                    )
+                    .expect("response verify");
+                assert_eq!(
+                    response.sealed_payload,
+                    pull_result.encode().expect("payload")
+                );
+            }
+            other => panic!("unexpected terminal frame kind: {}", other.kind()),
+        }
+        assert_eq!(
+            session.open(&fixture.sealed_terminal_response),
+            Err(AnonymousMailboxProtocolError::Malformed)
+        );
+
+        {
+            let fixture = routed_pull_fixture(&pull_result);
+            let restart = fixture.session.encode_restart_state().expect("restart");
+            let mut restored =
+                AnonymousMailboxSourceSealSessionV1::decode_restart_state(restart.as_bytes())
+                    .expect("restore");
+            let opened = restored
+                .open(&fixture.sealed_terminal_response)
+                .expect("restore open");
+            assert_eq!(opened, fixture.terminal_frame);
+        };
+    }
+
+    #[test]
+    fn compact_source_seal_rejects_context_substitution_and_tamper() {
+        let pull_result = pull_result_fixture();
+        let fixture = routed_pull_fixture(&pull_result);
+        let route_commitment = fixture
+            .route_request
+            .request_commitment()
+            .expect("route commitment");
+
+        let mut wrong_route = AnonymousMailboxSourceSealSessionV1::prepare(
+            [0xd1; 16],
+            fixture.terminal.public_key_bytes(),
+            route_commitment,
+        )
+        .expect("wrong route")
+        .1;
+        assert_eq!(
+            wrong_route.open(&fixture.sealed_terminal_response),
+            Err(AnonymousMailboxProtocolError::SignatureRejected)
+        );
+
+        let mut wrong_request = AnonymousMailboxSourceSealSessionV1::prepare(
+            fixture.route_request.request_id,
+            fixture.terminal.public_key_bytes(),
+            [0xd2; 32],
+        )
+        .expect("wrong request")
+        .1;
+        assert_eq!(
+            wrong_request.open(&fixture.sealed_terminal_response),
+            Err(AnonymousMailboxProtocolError::SignatureRejected)
+        );
+
+        let wrong_terminal = IdentityKeyPair::from_bytes(&[0xd3; 32]).expect("wrong terminal");
+        let mut wrong_target = AnonymousMailboxSourceSealSessionV1::prepare(
+            fixture.route_request.request_id,
+            wrong_terminal.public_key_bytes(),
+            route_commitment,
+        )
+        .expect("wrong target")
+        .1;
+        assert_eq!(
+            wrong_target.open(&fixture.sealed_terminal_response),
+            Err(AnonymousMailboxProtocolError::SignatureRejected)
+        );
+
+        let mut wrong_key = AnonymousMailboxSourceSealSessionV1::prepare(
+            fixture.route_request.request_id,
+            fixture.terminal.public_key_bytes(),
+            route_commitment,
+        )
+        .expect("wrong key")
+        .1;
+        assert_eq!(
+            wrong_key.open(&fixture.sealed_terminal_response),
+            Err(AnonymousMailboxProtocolError::SignatureRejected)
+        );
+
+        let mut tampered = fixture.sealed_terminal_response.clone();
+        *tampered.last_mut().expect("ciphertext") ^= 1;
+        let mut tampered_session = routed_pull_fixture(&pull_result).session;
+        assert_eq!(
+            tampered_session.open(&tampered),
+            Err(AnonymousMailboxProtocolError::SignatureRejected)
+        );
+
+        let mut bad_version = fixture.sealed_terminal_response.clone();
+        bad_version[4] = 0;
+        assert_eq!(
+            AnonymousMailboxSourceSealedResponseV1::decode(&bad_version),
+            Err(AnonymousMailboxProtocolError::UnsupportedVersion)
+        );
+
+        let route_commitment = fixture
+            .route_request
+            .request_commitment()
+            .expect("route commitment");
+        let (reply_public_key, _) = AnonymousMailboxSourceSealSessionV1::prepare(
+            fixture.route_request.request_id,
+            fixture.terminal.public_key_bytes(),
+            route_commitment,
+        )
+        .expect("reply key");
+        assert_eq!(
+            AnonymousMailboxSourceSealedResponseV1::seal(
+                fixture.route_request.request_id,
+                route_commitment,
+                fixture.terminal.public_key_bytes(),
+                reply_public_key,
+                &fixture.terminal_frame,
+                &wrong_terminal,
+            ),
+            Err(AnonymousMailboxProtocolError::ClaimsConflict)
+        );
+    }
+
+    #[test]
+    fn compact_source_seal_and_outer_route_fit_frozen_sizes() {
+        let item = vec![0xee; MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES];
+        let cursor = vec![0xdd; MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES];
+        let pull_result =
+            AnonymousMailboxPullResultV1::new([0xcc; 16], cursor, item).expect("max pull result");
+        let pull_result_bytes = pull_result.encode().expect("pull result bytes");
+        assert_eq!(pull_result_bytes.len(), 163_130);
+
+        let fixture = routed_pull_fixture(&pull_result);
+        assert_eq!(fixture.terminal_frame.len(), 163_307);
+        assert_eq!(fixture.sealed_terminal_response.len(), 163_388);
+
+        let encoded_route_payload = bincode::serialize(
+            &MemChainMessage::AnonymousMailboxRouteResponseV1(fixture.route_response.clone()),
+        )
+        .expect("memchain route response payload");
+        match decode_memchain(&encoded_route_payload).expect("decode route response") {
+            MemChainMessage::AnonymousMailboxRouteResponseV1(value) => {
+                value
+                    .verify_for_request(
+                        &fixture.route_request,
+                        &fixture.terminal.public_key_bytes(),
+                    )
+                    .expect("decoded route response verify");
+            }
+            _ => panic!("unexpected MemChain variant"),
+        }
+        assert_eq!(encoded_route_payload.len(), 163_557);
+        assert_eq!(STANDARD.encode(&encoded_route_payload).len(), 218_076);
+
+        let encoded_route = encode_memchain(&MemChainMessage::AnonymousMailboxRouteResponseV1(
+            fixture.route_response.clone(),
+        ))
+        .expect("memchain route response");
+        assert_eq!(&encoded_route[1..], encoded_route_payload.as_slice());
+        assert_eq!(encoded_route.len(), 163_558);
+    }
+
+    #[test]
+    fn compact_source_seal_rejects_max_plus_one_payload() {
+        let terminal = IdentityKeyPair::from_bytes(&[0xe1; 32]).expect("terminal");
+        let (reply_public_key, _) = AnonymousMailboxSourceSealSessionV1::prepare(
+            [0xe2; 16],
+            terminal.public_key_bytes(),
+            [0xe3; 32],
+        )
+        .expect("reply");
+        let max_payload = vec![
+            0x44;
+            MAX_ANONYMOUS_MAILBOX_SEALED_TERMINAL_BYTES
+                - SOURCE_SEALED_RESPONSE_OVERHEAD_BYTES
+        ];
+        AnonymousMailboxSourceSealedResponseV1::seal(
+            [0xe2; 16],
+            [0xe3; 32],
+            terminal.public_key_bytes(),
+            reply_public_key,
+            &max_payload,
+            &terminal,
+        )
+        .expect("exact max payload");
+        let plus_one = vec![
+            0x44;
+            MAX_ANONYMOUS_MAILBOX_SEALED_TERMINAL_BYTES
+                - SOURCE_SEALED_RESPONSE_OVERHEAD_BYTES
+                + 1
+        ];
+        assert_eq!(
+            AnonymousMailboxSourceSealedResponseV1::seal(
+                [0xe2; 16],
+                [0xe3; 32],
+                terminal.public_key_bytes(),
+                reply_public_key,
+                &plus_one,
+                &terminal,
+            ),
+            Err(AnonymousMailboxProtocolError::TooLarge)
+        );
     }
 }

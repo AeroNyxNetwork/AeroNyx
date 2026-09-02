@@ -1037,6 +1037,9 @@ fn decode_payload(bytes: &[u8]) -> Result<OnionHopPayload, CoreError> {
 
 #[cfg(test)]
 mod tests {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+
     use super::*;
     use crate::protocol::anonymous_mailbox::{
         AnonymousMailboxRouteRequestV1, MAX_ANONYMOUS_MAILBOX_SEALED_TERMINAL_BYTES,
@@ -1294,9 +1297,14 @@ mod tests {
         validate_blind_relay_envelope_size(&envelope).expect("legacy relay blob cap");
         let encoded = encode_blind_relay_envelope(&envelope).expect("legacy relay frame cap");
         assert!(encoded.len() < 256 * 1024);
+        // [ANONYMOUS-MAILBOX-SIZE-GUARD 2026-09-02 by Codex] Request-side
+        // base64 remains frozen so the PullResult reduction never widens the
+        // deployed three-hop relay envelopes while terminal responses move to
+        // their dedicated compact source-sealed carrier.
         assert_eq!(payload.len(), 195_718);
         assert_eq!(envelope.encrypted_blob.len(), 196_019);
         assert_eq!(encoded.len(), 196_148);
+        assert_eq!(STANDARD.encode(encoded).len(), 261_532);
     }
 
     #[test]
