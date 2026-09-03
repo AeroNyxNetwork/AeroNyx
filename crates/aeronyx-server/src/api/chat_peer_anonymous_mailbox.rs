@@ -8,7 +8,7 @@
 //! content-key, or plaintext fields.
 //!
 //! ## Last Modified
-//! v1.0.0-AnonymousMailboxTerminal — M13C bounded terminal wiring.
+//! v1.0.1-RealStoreVertical — M13C.2 real-store terminal lifecycle proof.
 
 use std::sync::Arc;
 
@@ -343,10 +343,13 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::config_chat_relay::AnonymousMailboxStoreConfig;
     use crate::services::chat_relay_mailbox::AnonymousMailboxCleanupReport;
+    use crate::services::chat_relay_mailbox::SqliteAnonymousMailboxStore;
     use aeronyx_core::protocol::anonymous_mailbox::{
         decode_anonymous_mailbox_terminal_frame, encode_anonymous_mailbox_terminal_frame,
-        AnonymousMailboxAdmissionTicketV1, AnonymousMailboxPullOneV1,
+        AnonymousMailboxAckV1, AnonymousMailboxAdmissionTicketV1, AnonymousMailboxLeaseCreateV1,
+        AnonymousMailboxPullOneV1, AnonymousMailboxPullResultV1, AnonymousMailboxPutV1,
         AnonymousMailboxSourceSealSessionV1, AnonymousMailboxTicketIssueV1,
     };
     use aeronyx_core::protocol::memchain::encode_memchain;
@@ -445,11 +448,19 @@ mod tests {
         target: &IdentityKeyPair,
         request: AnonymousMailboxTicketIssueV1,
     ) -> (Vec<u8>, AnonymousMailboxSourceSealSessionV1) {
-        let source = IdentityKeyPair::from_bytes(&[0x71; 32]).expect("source");
         let terminal_frame = encode_anonymous_mailbox_terminal_frame(
             &AnonymousMailboxTerminalFrameV1::TicketIssue(request),
         )
         .expect("terminal frame");
+        routed_terminal_frame(route_id, target, terminal_frame)
+    }
+
+    fn routed_terminal_frame(
+        route_id: [u8; 16],
+        target: &IdentityKeyPair,
+        terminal_frame: Vec<u8>,
+    ) -> (Vec<u8>, AnonymousMailboxSourceSealSessionV1) {
+        let source = IdentityKeyPair::from_bytes(&[0x71; 32]).expect("source");
         let (carrier, session) = AnonymousMailboxSourceTerminalCarrierV1::prepare(
             route_id,
             target.public_key_bytes(),
@@ -468,6 +479,25 @@ mod tests {
             encode_memchain(&MemChainMessage::AnonymousMailboxRouteV1(route)).expect("outer"),
             session,
         )
+    }
+
+    fn execute_terminal_frame(
+        repository: Arc<dyn AnonymousMailboxCustodyRepository>,
+        target: &IdentityKeyPair,
+        route_id: [u8; 16],
+        request: AnonymousMailboxTerminalFrameV1,
+    ) -> AnonymousMailboxTerminalFrameV1 {
+        let terminal_frame =
+            encode_anonymous_mailbox_terminal_frame(&request).expect("terminal frame");
+        let (encoded, mut session) = routed_terminal_frame(route_id, target, terminal_frame);
+        let sealed =
+            PreparedAnonymousMailboxTerminal::decode(&encoded, route_id, target.public_key_bytes())
+                .expect("canonical terminal request")
+                .execute(repository, Arc::new(target.clone()), 1_800_000_000)
+                .expect("terminal response");
+        let sealed = BASE64.decode(sealed).expect("base64 AMSR");
+        decode_anonymous_mailbox_terminal_frame(&session.open(&sealed).expect("one-shot AMSR open"))
+            .expect("canonical response frame")
     }
 
     fn execute_ticket(
@@ -642,5 +672,297 @@ mod tests {
             Err(AnonymousMailboxTerminalFailure::Rejected)
         );
         assert_eq!(repository.issue_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn real_store_terminal_lifecycle_survives_restart_and_exact_retries() {
+        // [BLIND-RELAY-ANONYMOUS-MAILBOX-VERTICAL 2026-09-03 by Codex] This
+        // exercises the production adapter and SQLite repository together;
+        // no socket, participant identity, clear receipt, or fallback peer is
+        // involved.
+        let directory = tempfile::tempdir().expect("private temporary directory");
+        let private_directory = std::fs::canonicalize(directory.path()).expect("canonical path");
+        let config = AnonymousMailboxStoreConfig {
+            enabled: true,
+            db_path: private_directory
+                .join("anonymous-mailbox.sqlite")
+                .display()
+                .to_string(),
+            max_leases_total: 4,
+            max_items_total: 1_024,
+            max_bytes_total: 1024 * 1024,
+            max_in_flight: 4,
+            cleanup_batch_size: 8,
+            max_outstanding_tickets: 4,
+            max_ticket_issues_per_window: 1,
+            ticket_issuance_window_secs: 60,
+            ticket_issue_work_bits: 1,
+        };
+        let target = IdentityKeyPair::from_bytes(&[0x91; 32]).expect("target");
+        let depositor = IdentityKeyPair::from_bytes(&[0x92; 32]).expect("depositor");
+        let reader = IdentityKeyPair::from_bytes(&[0x93; 32]).expect("reader");
+        let mailbox_id = [0x94; 32];
+        let ticket_id = [0x95; 16];
+        let lease_expires_at = 1_800_001_000;
+        let claims = AnonymousMailboxLeaseCreateV1::lease_claims_commitment(
+            &mailbox_id,
+            &depositor.public_key_bytes(),
+            &reader.public_key_bytes(),
+            4,
+            16 * 1024,
+            1_800_000_000,
+            lease_expires_at,
+        );
+        let ticket_request = (0..u64::MAX)
+            .find_map(|proof_nonce| {
+                let request = AnonymousMailboxTicketIssueV1::new(
+                    [0x96; 16],
+                    ticket_id,
+                    target.public_key_bytes(),
+                    claims,
+                    1_800_000_000,
+                    1_800_000_300,
+                    proof_nonce,
+                )
+                .expect("ticket request");
+                (request.proof_digest().expect("proof digest")[0] & 0x80 == 0).then_some(request)
+            })
+            .expect("one-bit proof");
+
+        let store = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                config.clone(),
+                target.clone(),
+                [0x97; 32],
+            )
+            .expect("open real store"),
+        );
+
+        let (encoded, _) = routed_ticket_issue([0x98; 16], &target, ticket_request.clone());
+        assert!(matches!(
+            PreparedAnonymousMailboxTerminal::decode(
+                &encoded,
+                [0x99; 16],
+                target.public_key_bytes()
+            ),
+            Err(AnonymousMailboxTerminalFailure::Rejected)
+        ));
+        assert!(matches!(
+            PreparedAnonymousMailboxTerminal::decode(&encoded, [0x98; 16], [0x9a; 32]),
+            Err(AnonymousMailboxTerminalFailure::Rejected)
+        ));
+
+        let issued = execute_terminal_frame(
+            store.clone(),
+            &target,
+            [0x98; 16],
+            AnonymousMailboxTerminalFrameV1::TicketIssue(ticket_request.clone()),
+        );
+        let AnonymousMailboxTerminalFrameV1::TicketIssueResponse(issued) = issued else {
+            panic!("ticket response kind");
+        };
+        issued
+            .verify_for_request(&ticket_request, &target.public_key_bytes())
+            .expect("target-bound ticket response");
+        assert_eq!(issued.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        let ticket = issued.ticket.expect("durable ticket");
+
+        let replayed = execute_terminal_frame(
+            store.clone(),
+            &target,
+            [0x9b; 16],
+            AnonymousMailboxTerminalFrameV1::TicketIssue(ticket_request.clone()),
+        );
+        let AnonymousMailboxTerminalFrameV1::TicketIssueResponse(replayed) = replayed else {
+            panic!("ticket replay response kind");
+        };
+        assert_eq!(replayed.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        assert!(replayed.ticket.as_ref() == Some(&ticket));
+
+        let conflicting_ticket = (0..u64::MAX)
+            .find_map(|proof_nonce| {
+                let request = AnonymousMailboxTicketIssueV1::new(
+                    ticket_request.request_id,
+                    [0x9c; 16],
+                    target.public_key_bytes(),
+                    claims,
+                    1_800_000_000,
+                    1_800_000_300,
+                    proof_nonce,
+                )
+                .expect("conflicting ticket request");
+                (request.proof_digest().expect("proof digest")[0] & 0x80 == 0).then_some(request)
+            })
+            .expect("one-bit conflict proof");
+        let conflict = execute_terminal_frame(
+            store.clone(),
+            &target,
+            [0x9d; 16],
+            AnonymousMailboxTerminalFrameV1::TicketIssue(conflicting_ticket),
+        );
+        let AnonymousMailboxTerminalFrameV1::TicketIssueResponse(conflict) = conflict else {
+            panic!("ticket conflict response kind");
+        };
+        assert_eq!(conflict.outcome, AnonymousMailboxOutcomeV1::Conflict);
+        assert!(conflict.ticket.is_none());
+
+        let lease = AnonymousMailboxLeaseCreateV1::new(
+            mailbox_id,
+            depositor.public_key_bytes(),
+            4,
+            16 * 1024,
+            1_800_000_000,
+            lease_expires_at,
+            ticket,
+            &reader,
+        )
+        .expect("lease request");
+        for route_id in [[0xa0; 16], [0xa1; 16]] {
+            let response = execute_terminal_frame(
+                store.clone(),
+                &target,
+                route_id,
+                AnonymousMailboxTerminalFrameV1::LeaseCreate(lease.clone()),
+            );
+            let AnonymousMailboxTerminalFrameV1::LeaseCreateResponse(response) = response else {
+                panic!("lease response kind");
+            };
+            assert_eq!(response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+            assert!(response.sealed_payload.is_empty());
+        }
+
+        let opaque_item = vec![0xa2; 4096];
+        let put = AnonymousMailboxPutV1::new(
+            mailbox_id,
+            [0xa3; 16],
+            opaque_item.clone(),
+            1_800_000_000,
+            1_800_000_600,
+            &depositor,
+        )
+        .expect("put request");
+        for route_id in [[0xa4; 16], [0xa5; 16]] {
+            let response = execute_terminal_frame(
+                store.clone(),
+                &target,
+                route_id,
+                AnonymousMailboxTerminalFrameV1::Put(put.clone()),
+            );
+            let AnonymousMailboxTerminalFrameV1::PutResponse(response) = response else {
+                panic!("put response kind");
+            };
+            assert_eq!(response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        }
+        let changed = AnonymousMailboxPutV1::new(
+            mailbox_id,
+            put.item_id,
+            vec![0xa6; 4096],
+            put.issued_at,
+            put.expires_at,
+            &depositor,
+        )
+        .expect("conflicting put");
+        let response = execute_terminal_frame(
+            store.clone(),
+            &target,
+            [0xa7; 16],
+            AnonymousMailboxTerminalFrameV1::Put(changed),
+        );
+        let AnonymousMailboxTerminalFrameV1::PutResponse(response) = response else {
+            panic!("put conflict response kind");
+        };
+        assert_eq!(response.outcome, AnonymousMailboxOutcomeV1::Conflict);
+        drop(store);
+
+        let reopened = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                config.clone(),
+                target.clone(),
+                [0x97; 32],
+            )
+            .expect("restart store"),
+        );
+        let pull = AnonymousMailboxPullOneV1::new(
+            mailbox_id,
+            [0xa8; 16],
+            Vec::new(),
+            1_800_000_001,
+            &reader,
+        )
+        .expect("pull request");
+        let response = execute_terminal_frame(
+            reopened.clone(),
+            &target,
+            [0xa9; 16],
+            AnonymousMailboxTerminalFrameV1::PullOne(pull.clone()),
+        );
+        let AnonymousMailboxTerminalFrameV1::PullOneResponse(response) = response else {
+            panic!("pull response kind");
+        };
+        response
+            .verify_for_request(
+                AnonymousMailboxOperationV1::PullOne,
+                &pull.request_id,
+                &pull.request_commitment().expect("pull commitment"),
+                &target.public_key_bytes(),
+            )
+            .expect("pull response binding");
+        assert_eq!(response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        let pulled = AnonymousMailboxPullResultV1::decode(&response.sealed_payload)
+            .expect("canonical pull result");
+        assert_eq!(pulled.item_id, put.item_id);
+        assert_eq!(pulled.sealed_item, opaque_item);
+        assert_eq!(pulled.sealed_commitment, put.sealed_commitment());
+
+        let ack = AnonymousMailboxAckV1::new(
+            mailbox_id,
+            [0xaa; 16],
+            pulled.item_id,
+            pulled.sealed_commitment,
+            1_800_000_002,
+            &reader,
+        )
+        .expect("ack request");
+        for route_id in [[0xab; 16], [0xac; 16]] {
+            let response = execute_terminal_frame(
+                reopened.clone(),
+                &target,
+                route_id,
+                AnonymousMailboxTerminalFrameV1::Ack(ack.clone()),
+            );
+            let AnonymousMailboxTerminalFrameV1::AckResponse(response) = response else {
+                panic!("ack response kind");
+            };
+            assert_eq!(response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        }
+        drop(reopened);
+
+        let restarted = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                config,
+                target.clone(),
+                [0x97; 32],
+            )
+            .expect("second restart"),
+        );
+        let empty_pull = AnonymousMailboxPullOneV1::new(
+            mailbox_id,
+            [0xad; 16],
+            Vec::new(),
+            1_800_000_003,
+            &reader,
+        )
+        .expect("empty pull request");
+        let response = execute_terminal_frame(
+            restarted,
+            &target,
+            [0xae; 16],
+            AnonymousMailboxTerminalFrameV1::PullOne(empty_pull),
+        );
+        let AnonymousMailboxTerminalFrameV1::PullOneResponse(response) = response else {
+            panic!("empty pull response kind");
+        };
+        assert_eq!(response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        assert!(response.sealed_payload.is_empty());
     }
 }
