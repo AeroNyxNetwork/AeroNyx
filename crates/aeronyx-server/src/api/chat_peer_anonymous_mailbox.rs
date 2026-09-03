@@ -8,7 +8,7 @@
 //! content-key, or plaintext fields.
 //!
 //! ## Last Modified
-//! v1.0.1-RealStoreVertical — M13C.2 real-store terminal lifecycle proof.
+//! v1.0.2-CrossEntryVertical — M13G source-to-custody cross-entry proof.
 
 use std::sync::Arc;
 
@@ -343,7 +343,12 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::config_chat_relay::AnonymousMailboxStoreConfig;
+    use crate::config_chat_relay::{AnonymousMailboxSourceConfig, AnonymousMailboxStoreConfig};
+    use crate::services::chat_relay_anonymous_mailbox_source::{
+        AnonymousMailboxSourceCoordinator, AnonymousMailboxSourceResult,
+        ExactAnonymousMailboxTargetPin, ExactAnonymousMailboxTargetResolver,
+        SqliteAnonymousMailboxSourceJournal,
+    };
     use crate::services::chat_relay_mailbox::AnonymousMailboxCleanupReport;
     use crate::services::chat_relay_mailbox::SqliteAnonymousMailboxStore;
     use aeronyx_core::protocol::anonymous_mailbox::{
@@ -352,12 +357,35 @@ mod tests {
         AnonymousMailboxPullOneV1, AnonymousMailboxPullResultV1, AnonymousMailboxPutV1,
         AnonymousMailboxSourceSealSessionV1, AnonymousMailboxTicketIssueV1,
     };
+    use aeronyx_core::protocol::discovery::{
+        DirectoryDescriptorCommitmentV1, NodeCapability, NodeDescriptor, NodeProtocolFeature,
+        SignedNodeDescriptor,
+    };
     use aeronyx_core::protocol::memchain::encode_memchain;
+    use aeronyx_core::protocol::onion::open_onion_layer;
+    use rusqlite::Connection;
 
     struct TicketRepository {
         outcomes:
             Mutex<VecDeque<Result<AnonymousMailboxTicketIssueOutcome, AnonymousMailboxStoreError>>>,
         issue_calls: AtomicUsize,
+    }
+
+    struct CrossEntryExactResolver {
+        descriptor: SignedNodeDescriptor,
+        exact_calls: AtomicUsize,
+        wrong_target_calls: AtomicUsize,
+    }
+
+    impl ExactAnonymousMailboxTargetResolver for CrossEntryExactResolver {
+        fn get_valid_exact(&self, node_id: &[u8; 32], _now: u64) -> Option<SignedNodeDescriptor> {
+            if node_id != &self.descriptor.descriptor.node_id {
+                self.wrong_target_calls.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            self.exact_calls.fetch_add(1, Ordering::Relaxed);
+            Some(self.descriptor.clone())
+        }
     }
 
     impl TicketRepository {
@@ -524,6 +552,115 @@ mod tests {
             .verify_for_request(&request, &target.public_key_bytes())
             .expect("request-bound target response");
         response
+    }
+
+    fn cross_entry_descriptor(target: &IdentityKeyPair) -> SignedNodeDescriptor {
+        let mut descriptor = NodeDescriptor::new(
+            target.public_key_bytes(),
+            17,
+            1_799_999_999,
+            1_800_000_120,
+            "cross-entry-test",
+        )
+        .with_x25519_kem(target.x25519_public_key_bytes())
+        .with_protocol_features([
+            NodeProtocolFeature::AnonymousMailboxV1,
+            NodeProtocolFeature::OnionReplyV1,
+            NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+            NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+        ]);
+        descriptor.public_endpoint = Some("https://8.8.8.8".into());
+        descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        SignedNodeDescriptor::sign(descriptor, target).expect("signed cross-entry descriptor")
+    }
+
+    fn cross_entry_coordinator(
+        source_seed: u8,
+        resolver: Arc<CrossEntryExactResolver>,
+        journal_key: u8,
+    ) -> AnonymousMailboxSourceCoordinator {
+        let config = AnonymousMailboxSourceConfig {
+            enabled: true,
+            max_journal_entries: 16,
+            max_journal_bytes: 8 * 1024 * 1024,
+            ..AnonymousMailboxSourceConfig::default()
+        };
+        let journal = SqliteAnonymousMailboxSourceJournal::new(
+            Connection::open_in_memory().expect("source journal"),
+            [journal_key; 32],
+            &config,
+        )
+        .expect("source journal schema");
+        AnonymousMailboxSourceCoordinator::new(
+            Arc::new(IdentityKeyPair::from_bytes(&[source_seed; 32]).expect("source identity")),
+            resolver,
+            Arc::new(journal),
+        )
+    }
+
+    fn dispatch_cross_entry_terminal(
+        coordinator: &AnonymousMailboxSourceCoordinator,
+        repository: Arc<dyn AnonymousMailboxCustodyRepository>,
+        target: &IdentityKeyPair,
+        descriptor_commitment: DirectoryDescriptorCommitmentV1,
+        route_id: [u8; 16],
+        request: AnonymousMailboxTerminalFrameV1,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let terminal_frame =
+            encode_anonymous_mailbox_terminal_frame(&request).expect("terminal frame");
+        let prepared = coordinator
+            .prepare(
+                ExactAnonymousMailboxTargetPin::new(
+                    target.public_key_bytes(),
+                    descriptor_commitment,
+                ),
+                route_id,
+                terminal_frame,
+                1_800_000_000,
+            )
+            .expect("source prepare");
+        let outbound = coordinator
+            .begin_dispatch(route_id, 1_800_000_000)
+            .expect("source exact-target dispatch");
+        assert_eq!(prepared.body(), outbound.body());
+        assert_eq!(outbound.target_node_id(), &target.public_key_bytes());
+
+        let (target_kem_secret, _) = target.to_x25519();
+        let peel = open_onion_layer(
+            &outbound.request().envelope.encrypted_blob,
+            &target_kem_secret,
+        )
+        .expect("target peels one-hop source route");
+        assert!(peel.next_hop.is_none());
+        let sealed = PreparedAnonymousMailboxTerminal::decode(
+            &peel.inner,
+            route_id,
+            target.public_key_bytes(),
+        )
+        .expect("target decodes source carrier")
+        .execute(repository, Arc::new(target.clone()), 1_800_000_000)
+        .expect("target executes terminal request");
+        (
+            outbound.body().to_vec(),
+            BASE64.decode(sealed).expect("source-sealed response"),
+        )
+    }
+
+    fn complete_cross_entry_response(
+        coordinator: &AnonymousMailboxSourceCoordinator,
+        route_id: [u8; 16],
+        sealed_response: &[u8],
+    ) -> AnonymousMailboxTerminalFrameV1 {
+        coordinator
+            .open_response(route_id, sealed_response)
+            .expect("source verifies terminal response");
+        let AnonymousMailboxSourceResult::Completed(response) = coordinator
+            .result(route_id)
+            .expect("source terminal result")
+        else {
+            panic!("source request must be completed");
+        };
+        decode_anonymous_mailbox_terminal_frame(&response).expect("canonical completed response")
     }
 
     fn routed_pull(route_id: [u8; 16], target: &IdentityKeyPair) -> Vec<u8> {
@@ -964,5 +1101,256 @@ mod tests {
         };
         assert_eq!(response.outcome, AnonymousMailboxOutcomeV1::Accepted);
         assert!(response.sealed_payload.is_empty());
+    }
+
+    #[test]
+    fn cross_entry_source_terminal_store_pull_and_ack_are_exact_targeted() {
+        // [ANONYMOUS-MAILBOX-CROSS-ENTRY 2026-09-03 by Codex] Model sender
+        // entry M and later receiver entry R as distinct source coordinators.
+        // Both receive only the same receiver-provided T pin. The generated
+        // onion is peeled by T, whose real SQLite store survives between Put
+        // and Pull/Ack. No socket, alternate candidate, wallet or identity
+        // locator participates in the proof.
+        let directory = tempfile::tempdir().expect("private temporary directory");
+        let private_directory = std::fs::canonicalize(directory.path()).expect("canonical path");
+        let store_config = AnonymousMailboxStoreConfig {
+            enabled: true,
+            db_path: private_directory
+                .join("cross-entry-mailbox.sqlite")
+                .display()
+                .to_string(),
+            max_leases_total: 4,
+            max_items_total: 1_024,
+            max_bytes_total: 1024 * 1024,
+            max_in_flight: 4,
+            cleanup_batch_size: 8,
+            max_outstanding_tickets: 4,
+            max_ticket_issues_per_window: 2,
+            ticket_issuance_window_secs: 60,
+            ticket_issue_work_bits: 1,
+        };
+        let target = IdentityKeyPair::from_bytes(&[0xb1; 32]).expect("target T");
+        let descriptor = cross_entry_descriptor(&target);
+        let descriptor_commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
+                .expect("descriptor commitment");
+        let m_resolver = Arc::new(CrossEntryExactResolver {
+            descriptor: descriptor.clone(),
+            exact_calls: AtomicUsize::new(0),
+            wrong_target_calls: AtomicUsize::new(0),
+        });
+        let r_resolver = Arc::new(CrossEntryExactResolver {
+            descriptor,
+            exact_calls: AtomicUsize::new(0),
+            wrong_target_calls: AtomicUsize::new(0),
+        });
+        let entry_m = cross_entry_coordinator(0xb2, Arc::clone(&m_resolver), 0xb3);
+        let entry_r = cross_entry_coordinator(0xb4, Arc::clone(&r_resolver), 0xb5);
+        let depositor = IdentityKeyPair::from_bytes(&[0xb6; 32]).expect("deposit capability");
+        let reader = IdentityKeyPair::from_bytes(&[0xb7; 32]).expect("read capability");
+        let mailbox_id = [0xb8; 32];
+        let ticket_id = [0xb9; 16];
+        let lease_expires_at = 1_800_001_000;
+        let claims = AnonymousMailboxLeaseCreateV1::lease_claims_commitment(
+            &mailbox_id,
+            &depositor.public_key_bytes(),
+            &reader.public_key_bytes(),
+            4,
+            16 * 1024,
+            1_800_000_000,
+            lease_expires_at,
+        );
+        let ticket_request = (0..u64::MAX)
+            .find_map(|proof_nonce| {
+                let request = AnonymousMailboxTicketIssueV1::new(
+                    [0xba; 16],
+                    ticket_id,
+                    target.public_key_bytes(),
+                    claims,
+                    1_800_000_000,
+                    1_800_000_300,
+                    proof_nonce,
+                )
+                .expect("ticket request");
+                (request.proof_digest().expect("proof digest")[0] & 0x80 == 0).then_some(request)
+            })
+            .expect("one-bit proof");
+        let cursor_secret = [0xbb; 32];
+        let store = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                store_config.clone(),
+                target.clone(),
+                cursor_secret,
+            )
+            .expect("open target store"),
+        );
+
+        let ticket_route = [0xbc; 16];
+        let (_, sealed_ticket) = dispatch_cross_entry_terminal(
+            &entry_m,
+            store.clone(),
+            &target,
+            descriptor_commitment,
+            ticket_route,
+            AnonymousMailboxTerminalFrameV1::TicketIssue(ticket_request.clone()),
+        );
+        let AnonymousMailboxTerminalFrameV1::TicketIssueResponse(ticket_response) =
+            complete_cross_entry_response(&entry_m, ticket_route, &sealed_ticket)
+        else {
+            panic!("ticket response kind");
+        };
+        ticket_response
+            .verify_for_request(&ticket_request, &target.public_key_bytes())
+            .expect("target-bound ticket response");
+        let ticket = ticket_response.ticket.expect("issued ticket");
+
+        let lease = AnonymousMailboxLeaseCreateV1::new(
+            mailbox_id,
+            depositor.public_key_bytes(),
+            4,
+            16 * 1024,
+            1_800_000_000,
+            lease_expires_at,
+            ticket,
+            &reader,
+        )
+        .expect("lease request");
+        let lease_route = [0xbd; 16];
+        let (_, sealed_lease) = dispatch_cross_entry_terminal(
+            &entry_m,
+            store.clone(),
+            &target,
+            descriptor_commitment,
+            lease_route,
+            AnonymousMailboxTerminalFrameV1::LeaseCreate(lease),
+        );
+        let AnonymousMailboxTerminalFrameV1::LeaseCreateResponse(lease_response) =
+            complete_cross_entry_response(&entry_m, lease_route, &sealed_lease)
+        else {
+            panic!("lease response kind");
+        };
+        assert_eq!(lease_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+
+        let opaque_item = vec![0xbe; 4096];
+        let put = AnonymousMailboxPutV1::new(
+            mailbox_id,
+            [0xbf; 16],
+            opaque_item.clone(),
+            1_800_000_000,
+            1_800_000_600,
+            &depositor,
+        )
+        .expect("put request");
+        let put_route = [0xc0; 16];
+        let (put_body, sealed_put) = dispatch_cross_entry_terminal(
+            &entry_m,
+            store.clone(),
+            &target,
+            descriptor_commitment,
+            put_route,
+            AnonymousMailboxTerminalFrameV1::Put(put.clone()),
+        );
+        let replay = entry_m
+            .begin_dispatch(put_route, 1_800_000_001)
+            .expect("exact armed replay");
+        assert_eq!(replay.body(), put_body, "lost response replays exact bytes");
+        let AnonymousMailboxTerminalFrameV1::PutResponse(put_response) =
+            complete_cross_entry_response(&entry_m, put_route, &sealed_put)
+        else {
+            panic!("put response kind");
+        };
+        assert_eq!(put_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        drop(store);
+
+        let restarted = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                store_config,
+                target.clone(),
+                cursor_secret,
+            )
+            .expect("restart target store"),
+        );
+        let pull = AnonymousMailboxPullOneV1::new(
+            mailbox_id,
+            [0xc1; 16],
+            Vec::new(),
+            1_800_000_001,
+            &reader,
+        )
+        .expect("pull request");
+        let pull_route = [0xc2; 16];
+        let (_, sealed_pull) = dispatch_cross_entry_terminal(
+            &entry_r,
+            restarted.clone(),
+            &target,
+            descriptor_commitment,
+            pull_route,
+            AnonymousMailboxTerminalFrameV1::PullOne(pull),
+        );
+        let AnonymousMailboxTerminalFrameV1::PullOneResponse(pull_response) =
+            complete_cross_entry_response(&entry_r, pull_route, &sealed_pull)
+        else {
+            panic!("pull response kind");
+        };
+        let pulled = AnonymousMailboxPullResultV1::decode(&pull_response.sealed_payload)
+            .expect("pull result");
+        assert_eq!(pulled.item_id, put.item_id);
+        assert_eq!(pulled.sealed_commitment, put.sealed_commitment());
+        assert_eq!(pulled.sealed_item, opaque_item);
+
+        let ack = AnonymousMailboxAckV1::new(
+            mailbox_id,
+            [0xc3; 16],
+            pulled.item_id,
+            pulled.sealed_commitment,
+            1_800_000_002,
+            &reader,
+        )
+        .expect("ack request");
+        let ack_route = [0xc4; 16];
+        let (_, sealed_ack) = dispatch_cross_entry_terminal(
+            &entry_r,
+            restarted.clone(),
+            &target,
+            descriptor_commitment,
+            ack_route,
+            AnonymousMailboxTerminalFrameV1::Ack(ack),
+        );
+        let AnonymousMailboxTerminalFrameV1::AckResponse(ack_response) =
+            complete_cross_entry_response(&entry_r, ack_route, &sealed_ack)
+        else {
+            panic!("ack response kind");
+        };
+        assert_eq!(ack_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+
+        let empty_pull = AnonymousMailboxPullOneV1::new(
+            mailbox_id,
+            [0xc5; 16],
+            Vec::new(),
+            1_800_000_003,
+            &reader,
+        )
+        .expect("empty pull request");
+        let empty_route = [0xc6; 16];
+        let (_, sealed_empty) = dispatch_cross_entry_terminal(
+            &entry_r,
+            restarted,
+            &target,
+            descriptor_commitment,
+            empty_route,
+            AnonymousMailboxTerminalFrameV1::PullOne(empty_pull),
+        );
+        let AnonymousMailboxTerminalFrameV1::PullOneResponse(empty_response) =
+            complete_cross_entry_response(&entry_r, empty_route, &sealed_empty)
+        else {
+            panic!("empty response kind");
+        };
+        assert_eq!(empty_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        assert!(empty_response.sealed_payload.is_empty());
+
+        assert_eq!(m_resolver.wrong_target_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(r_resolver.wrong_target_calls.load(Ordering::Relaxed), 0);
+        assert!(m_resolver.exact_calls.load(Ordering::Relaxed) >= 6);
+        assert!(r_resolver.exact_calls.load(Ordering::Relaxed) >= 6);
     }
 }
