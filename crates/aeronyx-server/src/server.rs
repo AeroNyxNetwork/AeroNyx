@@ -993,13 +993,14 @@ use crate::api::chat_handlers::build_chat_router;
 #[cfg(test)]
 use crate::api::chat_peer::blind_relay_delivery_receipt_is_valid;
 use crate::api::chat_peer::{
-    build_chat_peer_router, prepare_peer_blind_relay_http_request_with,
-    prepare_peer_chat_relay_request_v1, prepare_peer_chat_relay_request_v2,
-    prepare_peer_chat_relay_request_v3, verify_blind_relay_delivery_receipt,
-    verify_peer_chat_relay_receipt, BlindRelayDeliveryReceiptVerificationFailure,
-    BlindRelayRequestPreparationError, DirectRelayReceiptVerificationFailure,
-    PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayResponse, PeerChatRelayResponseV2,
-    PreparedAuthenticatedPeerChatRelayHttpRequest, PreparedPeerChatRelayHttpRequest,
+    build_chat_peer_router, build_chat_peer_router_with_anonymous_mailbox,
+    prepare_peer_blind_relay_http_request_with, prepare_peer_chat_relay_request_v1,
+    prepare_peer_chat_relay_request_v2, prepare_peer_chat_relay_request_v3,
+    verify_blind_relay_delivery_receipt, verify_peer_chat_relay_receipt,
+    BlindRelayDeliveryReceiptVerificationFailure, BlindRelayRequestPreparationError,
+    DirectRelayReceiptVerificationFailure, PeerBlindRelayRequest, PeerBlindRelayResponse,
+    PeerChatRelayResponse, PeerChatRelayResponseV2, PreparedAuthenticatedPeerChatRelayHttpRequest,
+    PreparedPeerChatRelayHttpRequest,
 };
 use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica_and_runtime;
 use crate::api::directory_replica_status::{
@@ -1060,6 +1061,9 @@ use crate::services::chat_relay::{
     derive_node_secret, ChatRelayOutboundFailureReason, ChatRelayPeerStatus, ChatRelayService,
     ExpiredNotification, VerifiedSubmitAdmission, VerifiedSubmitCacheLookup,
     VerifiedSubmitRecoveryOutcome, MAX_CHAT_ACK_MESSAGE_IDS,
+};
+use crate::services::chat_relay_mailbox::{
+    AnonymousMailboxCustodyRepository, SqliteAnonymousMailboxStore,
 };
 use crate::services::memchain::derive_rawlog_key;
 use crate::services::memchain::derive_record_key;
@@ -4487,6 +4491,7 @@ impl Server {
 
         let chat_relay_enabled = self.config.memchain.is_chat_relay_enabled();
         let chat_relay = self.init_chat_relay_service()?;
+        let anonymous_mailbox = self.init_anonymous_mailbox_store()?;
         // [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Strict mode
         // consumes only already-durable local receipts. Startup does not
         // contact witnesses or let permissionless discovery supply authority.
@@ -4518,6 +4523,7 @@ impl Server {
             None
         };
         let chat_relay_runtime_ready = chat_relay.is_some();
+        let anonymous_mailbox_runtime_ready = anonymous_mailbox.is_some();
         // [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Admission
         // readiness is an observed service state, not a config synonym. Run
         // the SQLite/filesystem observation off the async startup worker.
@@ -4529,6 +4535,7 @@ impl Server {
             .init_peer_store_with_storage_runtime(
                 chat_relay_runtime_ready,
                 blind_vault_runtime_ready,
+                anonymous_mailbox_runtime_ready,
                 peer_http_clients.control.as_ref(),
             )
             .await?;
@@ -4617,6 +4624,7 @@ impl Server {
             directory_replica_store.clone(),
             chat_relay_runtime_ready,
             blind_vault.clone(),
+            anonymous_mailbox_runtime_ready,
             Arc::clone(&peer_http_clients.gossip),
         ) {
             tasks.push(("discovery-gossip", task));
@@ -5023,6 +5031,7 @@ impl Server {
                     Arc::clone(&directory_replica_sync_runtime),
                     chat_relay.clone(),
                     blind_vault.clone(),
+                    anonymous_mailbox.clone(),
                     Arc::clone(&udp),
                     &peer_http_clients,
                     commitment_sync_tip_notifier,
@@ -5262,6 +5271,7 @@ impl Server {
                     Arc::clone(&directory_replica_sync_runtime),
                     chat_relay.clone(),
                     blind_vault.clone(),
+                    anonymous_mailbox.clone(),
                     Arc::clone(&udp),
                     &peer_http_clients,
                     None,
@@ -5686,6 +5696,25 @@ impl Server {
                 );
                 ServerError::startup_failed(format!("Chat Relay initialization failed ({reason})"))
             })
+    }
+
+    /// Opens the explicitly enabled node-blind mailbox repository. Disabled
+    /// configuration performs no filesystem operation and is not advertised.
+    fn init_anonymous_mailbox_store(&self) -> Result<Option<Arc<SqliteAnonymousMailboxStore>>> {
+        let config = self.config.memchain.chat_relay.anonymous_mailbox.clone();
+        if !config.enabled {
+            return Ok(None);
+        }
+        // [BLIND-RELAY-ANONYMOUS-MAILBOX 2026-09-03 by Codex] The cursor MAC
+        // root is stable but private, independently domain-separated from the
+        // existing chat relay secret, and never logged or returned.
+        let mut hasher = Sha256::new();
+        hasher.update(b"AeroNyx/anonymous-mailbox/cursor-root/v1");
+        hasher.update(self.identity.to_bytes());
+        let cursor_secret: [u8; 32] = hasher.finalize().into();
+        SqliteAnonymousMailboxStore::open(config, self.identity.public_key_bytes(), cursor_secret)
+            .map(|store| Some(Arc::new(store)))
+            .map_err(|_| ServerError::startup_failed("Anonymous mailbox initialization failed"))
     }
 
     /// Enforces the current custody anchor against durable signed receipts.
@@ -6429,6 +6458,7 @@ impl Server {
         directory_replica_sync_runtime: Arc<DirectoryReplicaSyncRuntime>,
         chat_relay: Option<Arc<ChatRelayService>>,
         blind_vault: Option<Arc<BlindVaultService>>,
+        anonymous_mailbox: Option<Arc<SqliteAnonymousMailboxStore>>,
         udp: Arc<UdpTransport>,
         peer_http_clients: &PeerHttpClients,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
@@ -6517,6 +6547,8 @@ impl Server {
         let blind_vault_public_api_enabled = self.config.blind_vault.public_api_enabled;
         let public_blind_vault = blind_vault.clone();
         let local_blind_vault = blind_vault.clone();
+        let public_anonymous_mailbox = anonymous_mailbox.clone();
+        let local_anonymous_mailbox = anonymous_mailbox.clone();
         // [BLIND-VAULT-SHARED-ADMISSION 2026-09-01 by Codex] Both listeners
         // expose the same process capability. They must consume one pressure
         // budget rather than multiplying limits by the number of routers.
@@ -6551,6 +6583,8 @@ impl Server {
                     public_blind_vault,
                     blind_vault_public_api_enabled,
                     Arc::clone(&blind_vault_admission),
+                    public_anonymous_mailbox
+                        .map(|store| store as Arc<dyn AnonymousMailboxCustodyRepository>),
                 );
                 listener_tasks.spawn(async move {
                     Self::serve_public_discovery_api(
@@ -6598,7 +6632,7 @@ impl Server {
                     Arc::clone(&peer_store),
                     chat_relay.clone(),
                 ))
-                .merge(build_chat_peer_router(
+                .merge(build_chat_peer_router_with_anonymous_mailbox(
                     chat_relay,
                     Arc::clone(&sessions),
                     udp,
@@ -6608,6 +6642,9 @@ impl Server {
                     blind_vault_public_api_enabled
                         .then(|| blind_vault.clone())
                         .flatten(),
+                    local_anonymous_mailbox.map(|store| {
+                        store as Arc<dyn AnonymousMailboxCustodyRepository>
+                    }),
                 ))
                 // Local/VPN-only operator smoke trigger. The public discovery API
                 // intentionally does not expose this route; it actively sends a
@@ -7037,6 +7074,7 @@ impl Server {
         blind_vault: Option<Arc<BlindVaultService>>,
         blind_vault_public_api_enabled: bool,
         blind_vault_admission: Arc<BlindVaultApiAdmissionRuntime>,
+        anonymous_mailbox: Option<Arc<dyn AnonymousMailboxCustodyRepository>>,
     ) -> axum::Router {
         let block_peer_store = Arc::clone(&peer_store);
         let block_identity = Arc::clone(&node_identity);
@@ -7060,7 +7098,7 @@ impl Server {
             directory_replica_store.clone(),
             node_identity.public_key_bytes(),
         )
-        .merge(build_chat_peer_router(
+        .merge(build_chat_peer_router_with_anonymous_mailbox(
             chat_relay,
             sessions,
             udp,
@@ -7068,6 +7106,7 @@ impl Server {
             Arc::clone(&node_identity),
             peer_http_client,
             blind_vault_for_onion,
+            anonymous_mailbox,
         ))
         .merge(build_directory_replica_status_router_with_witness_carrier(
             directory_replica_store.clone(),
@@ -7760,6 +7799,7 @@ impl Server {
         self.init_peer_store_with_storage_runtime(
             chat_relay_runtime_ready,
             self.config.blind_vault.replica_advertisement_configured(),
+            false,
             control_http_client,
         )
         .await
@@ -7773,6 +7813,7 @@ impl Server {
         &self,
         chat_relay_runtime_ready: bool,
         blind_vault_runtime_ready: bool,
+        anonymous_mailbox_runtime_ready: bool,
         control_http_client: &reqwest::Client,
     ) -> Result<Arc<PeerStore>> {
         let peer_store = Arc::new(PeerStore::new());
@@ -7959,6 +8000,7 @@ impl Server {
                 now,
                 chat_relay_runtime_ready,
                 blind_vault_runtime_ready,
+                anonymous_mailbox_runtime_ready,
             ) {
                 Ok(descriptor) => match peer_store
                     .upsert_verified_from_source(descriptor, now, "self")
@@ -10330,6 +10372,7 @@ impl Server {
         directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
         chat_relay_runtime_ready: bool,
         blind_vault: Option<Arc<BlindVaultService>>,
+        anonymous_mailbox_runtime_ready: bool,
         gossip_http_client: Arc<reqwest::Client>,
     ) -> Option<JoinHandle<()>> {
         if !self.config.discovery.enabled || !self.config.discovery.gossip_enabled {
@@ -10394,6 +10437,7 @@ impl Server {
                     now,
                     chat_relay_runtime_ready,
                     blind_vault_runtime_ready,
+                    anonymous_mailbox_runtime_ready,
                 ) else {
                     warn!("[DISCOVERY] Skipping outbound gossip; self descriptor build failed");
                     peer_store.record_gossip_round(
@@ -13971,6 +14015,7 @@ impl Server {
             now,
             chat_relay_runtime_ready,
             self.config.blind_vault.replica_advertisement_configured(),
+            false,
         )
     }
 
@@ -13979,6 +14024,7 @@ impl Server {
         now: u64,
         chat_relay_runtime_ready: bool,
         blind_vault_runtime_ready: bool,
+        anonymous_mailbox_runtime_ready: bool,
     ) -> Result<SignedNodeDescriptor> {
         Self::build_self_discovery_descriptor_for_runtime_state(
             &self.config,
@@ -13986,6 +14032,7 @@ impl Server {
             now,
             chat_relay_runtime_ready,
             blind_vault_runtime_ready,
+            anonymous_mailbox_runtime_ready,
         )
     }
 
@@ -13999,6 +14046,7 @@ impl Server {
             identity,
             now,
             config.memchain.is_chat_relay_enabled(),
+            false,
         )
     }
 
@@ -14007,6 +14055,7 @@ impl Server {
         identity: &IdentityKeyPair,
         now: u64,
         chat_relay_runtime_ready: bool,
+        anonymous_mailbox_runtime_ready: bool,
     ) -> Result<SignedNodeDescriptor> {
         Self::build_self_discovery_descriptor_for_runtime_state(
             config,
@@ -14014,6 +14063,7 @@ impl Server {
             now,
             chat_relay_runtime_ready,
             config.blind_vault.replica_advertisement_configured(),
+            anonymous_mailbox_runtime_ready,
         )
     }
 
@@ -14023,24 +14073,15 @@ impl Server {
         now: u64,
         chat_relay_runtime_ready: bool,
         blind_vault_runtime_ready: bool,
+        anonymous_mailbox_runtime_ready: bool,
     ) -> Result<SignedNodeDescriptor> {
         let ttl = config.discovery.descriptor_ttl_secs;
         let expires_at = now.saturating_add(ttl);
         // [SIGNED-PROTOCOL-FEATURES 2026-08-11 by Codex] The exact feature
         // token is covered by the existing descriptor signature and remains a
         // valid opaque version string to pre-feature decoders.
-        let mut descriptor = NodeDescriptor::new(
-            identity.public_key_bytes(),
-            now,
-            now,
-            expires_at,
-            env!("CARGO_PKG_VERSION"),
-        )
-        .with_protocol_features([
+        let mut protocol_features = vec![
             NodeProtocolFeature::BlindRelayFailureReceiptV1,
-            // [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] These two
-            // signed tokens activate hop-local success authentication and the
-            // topology-hiding v2 reply contract only on upgraded paths.
             NodeProtocolFeature::BlindRelaySuccessReceiptV1,
             NodeProtocolFeature::PurposeBoundDeliveryReceiptV2,
             NodeProtocolFeature::DirectPeerRelayAuthV2,
@@ -14048,9 +14089,6 @@ impl Server {
             NodeProtocolFeature::DirectPeerRelayTargetBindingV3,
             NodeProtocolFeature::OnionReplyV1,
             NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
-            // [BLIND-VAULT-LARGE-PULL-NEGOTIATION 2026-08-30 by Codex]
-            // Every upgraded hop can carry the protocol-bounded maximum
-            // anonymous recovery response through its bounded ACK decoder.
             NodeProtocolFeature::OnionBlindVaultLargePullV1,
             NodeProtocolFeature::OnionBlindLeaseAdmissionV1,
             NodeProtocolFeature::OnionBlindVaultPutReceiptV1,
@@ -14058,12 +14096,22 @@ impl Server {
             NodeProtocolFeature::OnionBlindVaultLeaseRenewalV1,
             NodeProtocolFeature::OnionBlindVaultLeaseStatusV1,
             NodeProtocolFeature::OnionBlindVaultLeaseInventoryV1,
-            // [ONION-BLIND-VAULT-ENCRYPTED-FAILURE 2026-08-28 by Codex]
-            // Signed negotiation prevents upgraded sources from assuming the
-            // source-only failure contract during a rolling fleet upgrade.
             NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
-        ]);
-
+        ];
+        if anonymous_mailbox_runtime_ready {
+            // [BLIND-RELAY-ANONYMOUS-MAILBOX 2026-09-03 by Codex] Sign this
+            // token only after the default-off store opened successfully and
+            // was injected into both peer routers.
+            protocol_features.push(NodeProtocolFeature::AnonymousMailboxV1);
+        }
+        let mut descriptor = NodeDescriptor::new(
+            identity.public_key_bytes(),
+            now,
+            now,
+            expires_at,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_protocol_features(protocol_features);
         descriptor.public_endpoint = config
             .discovery
             .public_endpoint
@@ -21477,6 +21525,7 @@ mod tests {
             &config,
             &IdentityKeyPair::generate(),
             1_800_000_000,
+            false,
             false,
         )
         .unwrap();

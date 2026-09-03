@@ -501,6 +501,7 @@ pub mod chat_handlers;
 pub mod chat_peer;
 mod chat_peer_abuse_guard;
 mod chat_peer_admission;
+mod chat_peer_anonymous_mailbox;
 mod chat_peer_observer;
 mod chat_peer_replay;
 mod chat_peer_response;

@@ -45,6 +45,9 @@
 
 use std::time::Duration;
 
+use aeronyx_core::protocol::anonymous_mailbox::{
+    AnonymousMailboxSourceSealedResponseV1, MAX_ANONYMOUS_MAILBOX_SOURCE_SEALED_RESPONSE_BYTES,
+};
 use aeronyx_core::protocol::{
     decode_onion_sealed_response, BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS,
     ONION_REPLY_RESPONSE_SIZE_CLASSES,
@@ -242,9 +245,31 @@ fn validate_opaque_terminal_response(
     if ack.delivery_receipt.is_none() && !source_sealed_terminal_proof_allowed {
         return Err("opaque_response_receipt_missing");
     }
+    // [BLIND-RELAY-ANONYMOUS-MAILBOX 2026-09-03 by Codex] Decode only the
+    // explicitly bounded compact mailbox response before invoking a codec.
+    // A middle hop validates neither terminal operation nor target: the
+    // source's one-shot AMSR session authenticates those hidden bindings.
+    let max_opaque_bytes = MAX_ANONYMOUS_MAILBOX_SOURCE_SEALED_RESPONSE_BYTES
+        .max(ONION_REPLY_RESPONSE_SIZE_CLASSES[ONION_REPLY_RESPONSE_SIZE_CLASSES.len() - 1]);
+    let max_opaque_b64 = 4 * max_opaque_bytes.div_ceil(3);
+    if encoded.len() > max_opaque_b64 {
+        return Err("opaque_response_base64_invalid");
+    }
     let bytes = BASE64
         .decode(encoded)
         .map_err(|_| "opaque_response_base64_invalid")?;
+    if bytes.starts_with(b"AMSR") {
+        // [BLIND-RELAY-ANONYMOUS-MAILBOX 2026-09-03 by Codex] A source-sealed
+        // delivery must not propagate a clear terminal receipt: that would
+        // disclose final-terminal topology to a forwarding hop. The existing
+        // immediate-hop success receipt commits these exact opaque bytes.
+        if !source_sealed_terminal_proof_allowed || ack.delivery_receipt.is_some() {
+            return Err("opaque_response_receipt_missing");
+        }
+        AnonymousMailboxSourceSealedResponseV1::decode(&bytes)
+            .map_err(|_| "opaque_response_envelope_invalid")?;
+        return Ok(());
+    }
     let response =
         decode_onion_sealed_response(&bytes).map_err(|_| "opaque_response_envelope_invalid")?;
     let response_size_class = response
@@ -306,6 +331,92 @@ fn validate_downstream_success_receipt(
         )
         .map_err(|_| "success_receipt_binding_invalid")?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aeronyx_core::crypto::IdentityKeyPair;
+    use aeronyx_core::protocol::anonymous_mailbox::{
+        AnonymousMailboxSourceSealSessionV1, AnonymousMailboxSourceSealedResponseV1,
+    };
+    use aeronyx_core::protocol::chat::BlindRelayDeliveryReceipt;
+
+    fn compact_ack(delivery_receipt: bool) -> PeerBlindRelayResponse {
+        let terminal = IdentityKeyPair::from_bytes(&[0x51; 32]).expect("terminal identity");
+        let route_id = [0x41; 16];
+        let context = [0x42; 32];
+        let (reply_public_key, _session) = AnonymousMailboxSourceSealSessionV1::prepare(
+            route_id,
+            terminal.public_key_bytes(),
+            context,
+        )
+        .expect("reply session");
+        let sealed = AnonymousMailboxSourceSealedResponseV1::seal(
+            route_id,
+            context,
+            terminal.public_key_bytes(),
+            reply_public_key,
+            b"opaque-terminal-response",
+            &terminal,
+        )
+        .expect("seal")
+        .encode()
+        .expect("encode");
+        PeerBlindRelayResponse {
+            accepted: true,
+            terminal: true,
+            forwarded: false,
+            ttl_remaining: 2,
+            reason: Some("onion_terminal_delivered".to_string()),
+            delivery_receipt: delivery_receipt.then(|| {
+                BlindRelayDeliveryReceipt::accepted(route_id, [0x43; 32], 1_800_000_000, &terminal)
+            }),
+            success_receipt: None,
+            failure_receipt: None,
+            opaque_terminal_response_b64: Some(BASE64.encode(sealed)),
+        }
+    }
+
+    #[test]
+    fn compact_mailbox_response_requires_negotiated_source_sealing_without_clear_receipt() {
+        let ack = compact_ack(false);
+        assert!(validate_opaque_terminal_response(&ack, true, false).is_ok());
+        assert_eq!(
+            validate_opaque_terminal_response(&ack, false, false),
+            Err("opaque_response_receipt_missing")
+        );
+        let receipt_leaking_ack = compact_ack(true);
+        assert_eq!(
+            validate_opaque_terminal_response(&receipt_leaking_ack, true, false),
+            Err("opaque_response_receipt_missing")
+        );
+    }
+
+    #[test]
+    fn compact_mailbox_response_rejects_trailing_bytes() {
+        let mut ack = compact_ack(false);
+        let mut bytes = BASE64
+            .decode(
+                ack.opaque_terminal_response_b64
+                    .as_deref()
+                    .expect("response"),
+            )
+            .expect("base64");
+        bytes.push(0);
+        ack.opaque_terminal_response_b64 = Some(BASE64.encode(bytes));
+        assert_eq!(
+            validate_opaque_terminal_response(&ack, true, false),
+            Err("opaque_response_envelope_invalid")
+        );
+    }
+
+    #[test]
+    fn legacy_absent_opaque_response_remains_compatible() {
+        let mut ack = compact_ack(false);
+        ack.opaque_terminal_response_b64 = None;
+        assert!(validate_opaque_terminal_response(&ack, false, false).is_ok());
+    }
 }
 
 fn evaluate_rejected_status(

@@ -536,6 +536,7 @@ use aeronyx_core::protocol::chat::{
 };
 use aeronyx_core::protocol::codec::encode_data_packet;
 use aeronyx_core::protocol::discovery::{NodeProtocolFeature, SignedNodeDescriptor};
+use aeronyx_core::protocol::memchain::MEMCHAIN_MAGIC;
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
 use aeronyx_core::protocol::onion::{is_onion_blob, try_open_onion_layer, OnionRoutePurpose};
 use aeronyx_core::protocol::{
@@ -569,6 +570,9 @@ use super::chat_peer_abuse_guard::{
 };
 use super::chat_peer_admission::{
     AuthenticatedPeerRelayReplayStart, DirectPeerAdmissionDomain, DirectPeerAdmissionPolicy,
+};
+use super::chat_peer_anonymous_mailbox::{
+    AnonymousMailboxTerminalFailure, PreparedAnonymousMailboxTerminal,
 };
 use super::chat_peer_observer::{BlindRelayForwardObserver, PeerStoreBlindRelayForwardObserver};
 #[cfg(test)]
@@ -605,6 +609,7 @@ use crate::config_chat_relay::{
 use crate::services::chat_relay::{
     BlindRelayRouteAdmission, ChatRelayError, ChatRelayInboundFailureReason,
 };
+use crate::services::chat_relay_mailbox::AnonymousMailboxCustodyRepository;
 use crate::services::peer_store::PeerStore;
 use crate::services::{
     BlindVaultPutFailureClass, BlindVaultServiceError, ChatRelayService, Session, SessionManager,
@@ -742,6 +747,7 @@ struct ChatPeerState {
     /// Optional anonymous ciphertext store used only for declared Blind Vault
     /// terminal frames. Absence is fail-closed and never falls back to chat.
     blind_vault: Option<SharedBlindVaultService>,
+    anonymous_mailbox: Option<Arc<dyn AnonymousMailboxCustodyRepository>>,
     sessions: Arc<SessionManager>,
     udp: Arc<UdpTransport>,
     peer_store: Arc<PeerStore>,
@@ -1973,6 +1979,30 @@ pub fn build_chat_peer_router(
     http_client: Arc<reqwest::Client>,
     blind_vault: Option<SharedBlindVaultService>,
 ) -> Router {
+    build_chat_peer_router_with_anonymous_mailbox(
+        chat_relay,
+        sessions,
+        udp,
+        peer_store,
+        node_identity,
+        http_client,
+        blind_vault,
+        None,
+    )
+}
+
+/// Builds peer routes with an explicitly enabled anonymous mailbox terminal.
+/// Existing callers retain the default-off constructor above.
+pub fn build_chat_peer_router_with_anonymous_mailbox(
+    chat_relay: Option<Arc<ChatRelayService>>,
+    sessions: Arc<SessionManager>,
+    udp: Arc<UdpTransport>,
+    peer_store: Arc<PeerStore>,
+    node_identity: Arc<IdentityKeyPair>,
+    http_client: Arc<reqwest::Client>,
+    blind_vault: Option<SharedBlindVaultService>,
+    anonymous_mailbox: Option<Arc<dyn AnonymousMailboxCustodyRepository>>,
+) -> Router {
     let peer_relay_requests_per_minute = chat_relay
         .as_ref()
         .map(|relay| relay.config().peer_relay_requests_per_minute)
@@ -1989,6 +2019,7 @@ pub fn build_chat_peer_router(
     let state = ChatPeerState {
         chat_relay,
         blind_vault,
+        anonymous_mailbox,
         sessions,
         udp,
         peer_store,
@@ -3710,7 +3741,8 @@ async fn process_onion_blind_relay(
             // negotiation, and chat sender authentication must finish before
             // mutation recovery is armed. Read-only vault observations stay
             // unarmed, so cancellation can release and safely retry the route.
-            let prepared = prepare_onion_terminal_payload(&state, peel.inner, now).await?;
+            let prepared =
+                prepare_onion_terminal_payload(&state, envelope.route_id, peel.inner, now).await?;
             let PreparedOnionTerminalWork {
                 proof_payload,
                 operation,
@@ -3950,6 +3982,10 @@ struct OnionTerminalDelivery {
 /// This enum deliberately has no `Debug` implementation because every variant
 /// contains either ciphertext, private capabilities, or sender routing data.
 enum PreparedOnionTerminalPayload {
+    AnonymousMailbox {
+        request: PreparedAnonymousMailboxTerminal,
+        execution_permit: OwnedSemaphorePermit,
+    },
     BlindVaultReply {
         reply: PreparedTerminalReply,
         execution_permit: OwnedSemaphorePermit,
@@ -3966,6 +4002,7 @@ enum PreparedOnionTerminalPayload {
 
 /// Parsed terminal workload before service admission or durable effects.
 enum DecodedOnionTerminalPayload {
+    AnonymousMailbox(PreparedAnonymousMailboxTerminal),
     BlindVaultReply(PreparedTerminalReply),
     LegacyBlindVaultPut(BlindVaultPutRequest),
     Message(ChatEnvelope),
@@ -3991,6 +4028,7 @@ struct PreparedOnionTerminalWork {
 impl PreparedOnionTerminalPayload {
     const fn requires_durable_guard(&self) -> bool {
         match self {
+            Self::AnonymousMailbox { .. } => true,
             Self::BlindVaultReply { reply, .. } => reply.effect().requires_durable_guard(),
             Self::LegacyBlindVaultPut { .. } | Self::Message { .. } => true,
         }
@@ -3999,8 +4037,17 @@ impl PreparedOnionTerminalPayload {
 
 fn decode_onion_terminal_payload(
     payload: &[u8],
+    route_id: [u8; 16],
+    local_target_node_id: [u8; 32],
     now_secs: u64,
 ) -> Result<DecodedOnionTerminalPayload, OnionTerminalDecodeFailure> {
+    if payload.first().copied() == Some(MEMCHAIN_MAGIC) {
+        return PreparedAnonymousMailboxTerminal::decode(payload, route_id, local_target_node_id)
+            .map(DecodedOnionTerminalPayload::AnonymousMailbox)
+            .map_err(|_| {
+                OnionTerminalDecodeFailure::Protocol(BlindRelayError::OnionTerminalPayloadRejected)
+            });
+    }
     if is_onion_reply_request(payload) {
         return prepare_blind_vault_inline_reply(payload)
             .map(DecodedOnionTerminalPayload::BlindVaultReply)
@@ -4034,11 +4081,14 @@ fn decode_onion_terminal_payload(
 /// Blind Vault or pending-message storage.
 async fn prepare_onion_terminal_payload(
     state: &ChatPeerState,
+    route_id: [u8; 16],
     payload: Vec<u8>,
     now_secs: u64,
 ) -> Result<PreparedOnionTerminalWork, BlindRelayError> {
+    let local_target_node_id = state.node_identity.public_key_bytes();
     let (proof_payload, decoded) = run_blind_relay_crypto(move || {
-        let decoded = decode_onion_terminal_payload(&payload, now_secs);
+        let decoded =
+            decode_onion_terminal_payload(&payload, route_id, local_target_node_id, now_secs);
         Ok((payload, decoded))
     })
     .await?;
@@ -4053,6 +4103,19 @@ async fn prepare_onion_terminal_payload(
     };
 
     let operation = match decoded {
+        DecodedOnionTerminalPayload::AnonymousMailbox(request) => {
+            state
+                .anonymous_mailbox
+                .as_ref()
+                .ok_or(BlindRelayError::ForwardFailed)?;
+            let execution_permit = blind_vault_terminal_admission()
+                .try_acquire_owned()
+                .map_err(|_| BlindRelayError::Backpressure)?;
+            PreparedOnionTerminalPayload::AnonymousMailbox {
+                request,
+                execution_permit,
+            }
+        }
         DecodedOnionTerminalPayload::BlindVaultReply(reply) => {
             state
                 .blind_vault
@@ -4102,6 +4165,30 @@ async fn execute_onion_terminal_payload(
     now_secs: u64,
 ) -> Result<OnionTerminalDelivery, BlindRelayError> {
     match prepared {
+        PreparedOnionTerminalPayload::AnonymousMailbox {
+            request,
+            execution_permit,
+        } => {
+            let repository = Arc::clone(
+                state
+                    .anonymous_mailbox
+                    .as_ref()
+                    .ok_or(BlindRelayError::ForwardFailed)?,
+            );
+            let terminal_identity = Arc::clone(&state.node_identity);
+            let opaque_response_b64 = tokio::task::spawn_blocking(move || {
+                let _execution_permit = execution_permit;
+                request.execute(repository, terminal_identity, now_secs)
+            })
+            .await
+            .map_err(|_| BlindRelayError::ForwardFailed)?
+            .map_err(map_anonymous_mailbox_terminal_failure)?;
+            Ok(OnionTerminalDelivery {
+                purpose: OnionRoutePurpose::AnonymousMailboxV1,
+                proof_mode: OnionReplyProofMode::SourceSealedTerminalProof,
+                opaque_response_b64: Some(opaque_response_b64),
+            })
+        }
         PreparedOnionTerminalPayload::BlindVaultReply {
             reply,
             execution_permit,
@@ -4167,6 +4254,15 @@ async fn execute_onion_terminal_payload(
             opaque_response_b64: None,
         })
         .map_err(|_| BlindRelayError::ForwardFailed),
+    }
+}
+
+fn map_anonymous_mailbox_terminal_failure(
+    failure: AnonymousMailboxTerminalFailure,
+) -> BlindRelayError {
+    match failure {
+        AnonymousMailboxTerminalFailure::Rejected => BlindRelayError::OnionTerminalPayloadRejected,
+        AnonymousMailboxTerminalFailure::Unavailable => BlindRelayError::ForwardFailed,
     }
 }
 
@@ -6683,6 +6779,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -6734,6 +6831,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -6788,6 +6886,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: Some(Arc::clone(&relay)),
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -6947,6 +7046,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: Some(Arc::clone(&recovered_relay)),
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -7031,6 +7131,7 @@ mod tests {
         let old_middle_state = ChatPeerState {
             chat_relay: Some(Arc::clone(&old_middle_relay)),
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&middle_peer_store),
@@ -7149,6 +7250,7 @@ mod tests {
         let recovered_middle_state = ChatPeerState {
             chat_relay: Some(Arc::clone(&recovered_middle_relay)),
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&middle_peer_store),
@@ -7235,6 +7337,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: Some(Arc::clone(&relay)),
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -7327,6 +7430,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: Some(Arc::clone(&vault)),
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -7410,7 +7514,7 @@ mod tests {
         );
 
         assert!(matches!(
-            prepare_onion_terminal_payload(&state, b"ANBV".to_vec(), now).await,
+            prepare_onion_terminal_payload(&state, [0; 16], b"ANBV".to_vec(), now).await,
             Err(BlindRelayError::OnionTerminalPayloadRejected)
         ));
     }
@@ -7429,6 +7533,7 @@ mod tests {
         let failed_state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -7469,6 +7574,7 @@ mod tests {
         let retry_state = ChatPeerState {
             chat_relay: Some(Arc::clone(&relay)),
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -7519,6 +7625,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: Some(relay),
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -7622,6 +7729,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -7828,6 +7936,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -7924,6 +8033,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -7983,6 +8093,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: Some(relay),
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store,
@@ -8030,6 +8141,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -8219,6 +8331,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -8303,6 +8416,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -8399,6 +8513,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: Some(relay),
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -8460,6 +8575,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -8536,6 +8652,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -8639,6 +8756,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -8762,6 +8880,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -8844,6 +8963,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -8934,6 +9054,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -9026,6 +9147,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -9150,6 +9272,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -9266,6 +9389,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -9379,6 +9503,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -9472,6 +9597,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: Some(relay),
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -9576,6 +9702,7 @@ mod tests {
         let state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
+            anonymous_mailbox: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
