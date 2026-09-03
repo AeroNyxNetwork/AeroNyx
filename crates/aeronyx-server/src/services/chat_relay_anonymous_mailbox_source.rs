@@ -17,6 +17,7 @@ use aeronyx_core::protocol::anonymous_mailbox::{
     AnonymousMailboxOperationV1, AnonymousMailboxPullResultV1, AnonymousMailboxRouteRequestV1,
     AnonymousMailboxSourceSealSessionV1, AnonymousMailboxSourceTerminalCarrierV1,
     AnonymousMailboxTerminalFrameV1, AnonymousMailboxTerminalResponseV1,
+    MAX_ANONYMOUS_MAILBOX_TERMINAL_FRAME_BYTES,
 };
 use aeronyx_core::protocol::discovery::{DirectoryDescriptorCommitmentV1, SignedNodeDescriptor};
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
@@ -38,6 +39,17 @@ const JOURNAL_NONCE_BYTES: usize = 24;
 const JOURNAL_AEAD_TAG_BYTES: usize = 16;
 const MAX_JOURNAL_DESCRIPTOR_BYTES: usize = 1024;
 const MAX_JOURNAL_BODY_BYTES: usize = 2 * 1024 * 1024;
+// [ANONYMOUS-MAILBOX-SOURCE-BOUNDS 2026-09-03 by Codex] Keep persisted
+// clear/protected state bounded by protocol frames, not operator-configurable
+// aggregate storage. The restart allowance intentionally requires an explicit
+// source-journal update if the core restart ABI ever grows beyond 256 bytes.
+const MAX_JOURNAL_RESTART_STATE_BYTES: usize = 256;
+const JOURNAL_STATE_ENVELOPE_BYTES: usize = 1 + 4 + 2 + 4;
+const MAX_JOURNAL_CLEAR_STATE_BYTES: usize = JOURNAL_STATE_ENVELOPE_BYTES
+    + (2 * MAX_ANONYMOUS_MAILBOX_TERMINAL_FRAME_BYTES)
+    + MAX_JOURNAL_RESTART_STATE_BYTES;
+const MAX_JOURNAL_PROTECTED_STATE_BYTES: usize =
+    MAX_JOURNAL_CLEAR_STATE_BYTES + JOURNAL_AEAD_TAG_BYTES;
 const JOURNAL_DOMAIN: &[u8] = b"aeronyx/anonymous-mailbox/source-journal/v1\0";
 const REQUEST_COMMITMENT_DOMAIN: &[u8] = b"aeronyx/anonymous-mailbox/source-request/v1\0";
 
@@ -241,9 +253,11 @@ impl SqliteAnonymousMailboxSourceJournal {
         else {
             return Ok(None);
         };
-        let max_protected = usize::try_from(self.max_bytes)
-            .unwrap_or(usize::MAX)
-            .saturating_add(JOURNAL_AEAD_TAG_BYTES);
+        let stored_bytes = u64::try_from(body_len).ok().and_then(|body| {
+            u64::try_from(protected_len)
+                .ok()
+                .and_then(|protected| body.checked_add(protected))
+        });
         if request_len != 32
             || target_len != 32
             || descriptor_len < 1
@@ -260,7 +274,10 @@ impl SqliteAnonymousMailboxSourceJournal {
             || protected_len < JOURNAL_AEAD_TAG_BYTES as i64
             || usize::try_from(protected_len)
                 .ok()
-                .filter(|value| *value <= max_protected)
+                .filter(|value| *value <= MAX_JOURNAL_PROTECTED_STATE_BYTES)
+                .is_none()
+            || stored_bytes
+                .filter(|value| *value <= self.max_bytes)
                 .is_none()
         {
             return Err(AnonymousMailboxSourceError::Corrupt);
@@ -375,6 +392,9 @@ impl SqliteAnonymousMailboxSourceJournal {
             &record.target_node_id,
             &record.state,
         )?;
+        if record.body.is_empty() || record.body.len() > MAX_JOURNAL_BODY_BYTES {
+            return Err(AnonymousMailboxSourceError::Rejected);
+        }
         let incoming = record
             .body
             .len()
@@ -395,6 +415,9 @@ impl SqliteAnonymousMailboxSourceJournal {
         }
         let descriptor = bincode::serialize(&record.descriptor_commitment)
             .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
+        if descriptor.is_empty() || descriptor.len() > MAX_JOURNAL_DESCRIPTOR_BYTES {
+            return Err(AnonymousMailboxSourceError::Rejected);
+        }
         transaction
             .execute(
                 "INSERT INTO anonymous_mailbox_source_journal
@@ -429,32 +452,154 @@ impl SqliteAnonymousMailboxSourceJournal {
         phase: AnonymousMailboxSourcePhase,
         state: Vec<u8>,
     ) -> Result<(), AnonymousMailboxSourceError> {
-        let (nonce, protected) = self.seal_state(
+        let desired = self.seal_state(
             &record.route_id,
             &record.request_commitment,
             &record.target_node_id,
             &state,
         )?;
-        let connection = self.connection.lock();
-        let updated = connection
+        let compact_ambiguous = if phase == AnonymousMailboxSourcePhase::Completed {
+            let (terminal_frame, _, _) = decode_state(&state)?;
+            let compact_state = encode_state(&terminal_frame, None, None)?;
+            Some(self.seal_state(
+                &record.route_id,
+                &record.request_commitment,
+                &record.target_node_id,
+                &compact_state,
+            )?)
+        } else {
+            None
+        };
+
+        // [ANONYMOUS-MAILBOX-SOURCE-BOUNDS 2026-09-03 by Codex] The phase
+        // check, replacement accounting, fallback selection, and update share
+        // one write transaction. A valid but unretainable response consumes
+        // the one-shot session into a compact Ambiguous state rather than
+        // creating a row that load() must later reject as corrupt.
+        let mut connection = self.connection.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+        let current: Option<(i64, i64, i64)> = transaction
+            .query_row(
+                "SELECT phase, length(body), length(protected_state)
+                 FROM anonymous_mailbox_source_journal
+                 WHERE route_id = ?1 AND request_commitment = ?2 AND target_node_id = ?3",
+                params![
+                    record.route_id.as_slice(),
+                    record.request_commitment.as_slice(),
+                    record.target_node_id.as_slice()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+        let Some((current_phase, body_len, old_protected_len)) = current else {
+            return Err(AnonymousMailboxSourceError::Ambiguous);
+        };
+        if AnonymousMailboxSourcePhase::decode(current_phase)? != expected {
+            return Err(AnonymousMailboxSourceError::Ambiguous);
+        }
+        if body_len < 1
+            || usize::try_from(body_len)
+                .ok()
+                .filter(|value| *value <= MAX_JOURNAL_BODY_BYTES)
+                .is_none()
+            || old_protected_len < JOURNAL_AEAD_TAG_BYTES as i64
+            || usize::try_from(old_protected_len)
+                .ok()
+                .filter(|value| *value <= MAX_JOURNAL_PROTECTED_STATE_BYTES)
+                .is_none()
+        {
+            return Err(AnonymousMailboxSourceError::Corrupt);
+        }
+        let used: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(SUM(length(body) + length(protected_state)), 0)
+                 FROM anonymous_mailbox_source_journal",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+        let used = u64::try_from(used).map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
+        let old_row_bytes = u64::try_from(body_len)
+            .ok()
+            .and_then(|body| {
+                u64::try_from(old_protected_len)
+                    .ok()
+                    .and_then(|protected| body.checked_add(protected))
+            })
+            .ok_or(AnonymousMailboxSourceError::Corrupt)?;
+        let retained_without_row = used
+            .checked_sub(old_row_bytes)
+            .ok_or(AnonymousMailboxSourceError::Corrupt)?;
+
+        let desired_row_bytes = u64::try_from(body_len)
+            .ok()
+            .and_then(|body| {
+                u64::try_from(desired.1.len())
+                    .ok()
+                    .and_then(|protected| body.checked_add(protected))
+            })
+            .ok_or(AnonymousMailboxSourceError::Rejected)?;
+        let desired_used = retained_without_row
+            .checked_add(desired_row_bytes)
+            .ok_or(AnonymousMailboxSourceError::Rejected)?;
+        let (stored_phase, nonce, protected, fell_back) = if desired_used <= self.max_bytes {
+            (phase, desired.0, desired.1, false)
+        } else if let Some((nonce, protected)) = compact_ambiguous {
+            let fallback_row_bytes = u64::try_from(body_len)
+                .ok()
+                .and_then(|body| {
+                    u64::try_from(protected.len())
+                        .ok()
+                        .and_then(|protected| body.checked_add(protected))
+                })
+                .ok_or(AnonymousMailboxSourceError::Corrupt)?;
+            if retained_without_row
+                .checked_add(fallback_row_bytes)
+                .filter(|value| *value <= self.max_bytes)
+                .is_none()
+            {
+                return Err(AnonymousMailboxSourceError::Corrupt);
+            }
+            (
+                AnonymousMailboxSourcePhase::Ambiguous,
+                nonce,
+                protected,
+                true,
+            )
+        } else {
+            return Err(AnonymousMailboxSourceError::Rejected);
+        };
+
+        let updated = transaction
             .execute(
                 "UPDATE anonymous_mailbox_source_journal
                  SET phase = ?1, state_nonce = ?2, protected_state = ?3
-                 WHERE route_id = ?4 AND request_commitment = ?5 AND phase = ?6",
+                 WHERE route_id = ?4 AND request_commitment = ?5 AND target_node_id = ?6
+                       AND phase = ?7",
                 params![
-                    phase.code(),
+                    stored_phase.code(),
                     nonce,
                     protected,
                     record.route_id.as_slice(),
                     record.request_commitment.as_slice(),
+                    record.target_node_id.as_slice(),
                     expected.code()
                 ],
             )
             .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
-        if updated == 1 {
-            Ok(())
-        } else {
+        if updated != 1 {
+            return Err(AnonymousMailboxSourceError::Ambiguous);
+        }
+        transaction
+            .commit()
+            .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+        if fell_back {
             Err(AnonymousMailboxSourceError::Ambiguous)
+        } else {
+            Ok(())
         }
     }
 
@@ -465,6 +610,9 @@ impl SqliteAnonymousMailboxSourceJournal {
         target: &[u8; 32],
         state: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), AnonymousMailboxSourceError> {
+        if state.len() > MAX_JOURNAL_CLEAR_STATE_BYTES {
+            return Err(AnonymousMailboxSourceError::Rejected);
+        }
         let mut nonce = [0u8; JOURNAL_NONCE_BYTES];
         OsRng.fill_bytes(&mut nonce);
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&self.journal_key));
@@ -477,6 +625,9 @@ impl SqliteAnonymousMailboxSourceJournal {
                 },
             )
             .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+        if protected.len() > MAX_JOURNAL_PROTECTED_STATE_BYTES {
+            return Err(AnonymousMailboxSourceError::Rejected);
+        }
         Ok((nonce.to_vec(), protected))
     }
 
@@ -488,6 +639,11 @@ impl SqliteAnonymousMailboxSourceJournal {
         nonce: &[u8],
         protected: &[u8],
     ) -> Result<Vec<u8>, AnonymousMailboxSourceError> {
+        if protected.len() < JOURNAL_AEAD_TAG_BYTES
+            || protected.len() > MAX_JOURNAL_PROTECTED_STATE_BYTES
+        {
+            return Err(AnonymousMailboxSourceError::Corrupt);
+        }
         let nonce = fixed::<JOURNAL_NONCE_BYTES>(nonce)?;
         XChaCha20Poly1305::new(Key::from_slice(&self.journal_key))
             .decrypt(
@@ -871,6 +1027,9 @@ fn encode_state(
     session: Option<&AnonymousMailboxSourceSealSessionV1>,
     completed: Option<&[u8]>,
 ) -> Result<Vec<u8>, AnonymousMailboxSourceError> {
+    if terminal_frame.len() > MAX_ANONYMOUS_MAILBOX_TERMINAL_FRAME_BYTES {
+        return Err(AnonymousMailboxSourceError::Rejected);
+    }
     let restart = session
         .map(|value| {
             value
@@ -880,11 +1039,17 @@ fn encode_state(
         .transpose()?
         .map(|value| value.as_bytes().to_vec())
         .unwrap_or_default();
+    if restart.len() > MAX_JOURNAL_RESTART_STATE_BYTES {
+        return Err(AnonymousMailboxSourceError::Corrupt);
+    }
     let terminal_len =
         u32::try_from(terminal_frame.len()).map_err(|_| AnonymousMailboxSourceError::Rejected)?;
     let restart_len =
         u16::try_from(restart.len()).map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
     let completed = completed.unwrap_or_default();
+    if completed.len() > MAX_ANONYMOUS_MAILBOX_TERMINAL_FRAME_BYTES {
+        return Err(AnonymousMailboxSourceError::Rejected);
+    }
     let completed_len =
         u32::try_from(completed.len()).map_err(|_| AnonymousMailboxSourceError::Rejected)?;
     let mut bytes =
@@ -896,6 +1061,9 @@ fn encode_state(
     bytes.extend_from_slice(&restart);
     bytes.extend_from_slice(&completed_len.to_le_bytes());
     bytes.extend_from_slice(completed);
+    if bytes.len() > MAX_JOURNAL_CLEAR_STATE_BYTES {
+        return Err(AnonymousMailboxSourceError::Rejected);
+    }
     Ok(bytes)
 }
 
@@ -909,7 +1077,10 @@ fn decode_state(
     ),
     AnonymousMailboxSourceError,
 > {
-    if bytes.first().copied() != Some(JOURNAL_STATE_VERSION) || bytes.len() < 1 + 4 + 2 + 4 {
+    if bytes.len() > MAX_JOURNAL_CLEAR_STATE_BYTES
+        || bytes.first().copied() != Some(JOURNAL_STATE_VERSION)
+        || bytes.len() < JOURNAL_STATE_ENVELOPE_BYTES
+    {
         return Err(AnonymousMailboxSourceError::Corrupt);
     }
     let mut offset = 1;
@@ -918,6 +1089,9 @@ fn decode_state(
             .try_into()
             .map_err(|_| AnonymousMailboxSourceError::Corrupt)?,
     ) as usize;
+    if terminal_len > MAX_ANONYMOUS_MAILBOX_TERMINAL_FRAME_BYTES {
+        return Err(AnonymousMailboxSourceError::Corrupt);
+    }
     offset += 4;
     let terminal_end = offset
         .checked_add(terminal_len)
@@ -936,6 +1110,9 @@ fn decode_state(
             .try_into()
             .map_err(|_| AnonymousMailboxSourceError::Corrupt)?,
     ) as usize;
+    if restart_len > MAX_JOURNAL_RESTART_STATE_BYTES {
+        return Err(AnonymousMailboxSourceError::Corrupt);
+    }
     offset += 2;
     let restart_end = offset
         .checked_add(restart_len)
@@ -957,6 +1134,9 @@ fn decode_state(
             .try_into()
             .map_err(|_| AnonymousMailboxSourceError::Corrupt)?,
     ) as usize;
+    if completed_len > MAX_ANONYMOUS_MAILBOX_TERMINAL_FRAME_BYTES {
+        return Err(AnonymousMailboxSourceError::Corrupt);
+    }
     offset += 4;
     let end = offset
         .checked_add(completed_len)
@@ -985,8 +1165,9 @@ mod tests {
 
     use aeronyx_core::protocol::anonymous_mailbox::{
         encode_anonymous_mailbox_terminal_frame, AnonymousMailboxOutcomeV1,
-        AnonymousMailboxSourceSealedResponseV1, AnonymousMailboxTicketIssueResponseV1,
-        AnonymousMailboxTicketIssueV1,
+        AnonymousMailboxPullOneV1, AnonymousMailboxSourceSealedResponseV1,
+        AnonymousMailboxTicketIssueResponseV1, AnonymousMailboxTicketIssueV1,
+        MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES,
     };
     use aeronyx_core::protocol::discovery::{NodeCapability, NodeDescriptor, NodeProtocolFeature};
 
@@ -1013,11 +1194,11 @@ mod tests {
         .expect("terminal frame")
     }
 
-    fn journal() -> SqliteAnonymousMailboxSourceJournal {
+    fn journal_with_max_bytes(max_journal_bytes: u64) -> SqliteAnonymousMailboxSourceJournal {
         let config = AnonymousMailboxSourceConfig {
             enabled: true,
             max_journal_entries: 4,
-            max_journal_bytes: 4096,
+            max_journal_bytes,
         };
         SqliteAnonymousMailboxSourceJournal::new(
             Connection::open_in_memory().expect("memory sqlite"),
@@ -1025,6 +1206,10 @@ mod tests {
             &config,
         )
         .expect("journal")
+    }
+
+    fn journal() -> SqliteAnonymousMailboxSourceJournal {
+        journal_with_max_bytes(4096)
     }
 
     struct ExactOnlyResolver {
@@ -1144,6 +1329,150 @@ mod tests {
                 .phase,
             AnonymousMailboxSourcePhase::Completed
         );
+    }
+
+    #[test]
+    fn completed_pull_over_budget_becomes_restart_safe_ambiguous() {
+        let target = target();
+        let reader = IdentityKeyPair::from_bytes(&[0x3b; 32]).expect("reader");
+        let request =
+            AnonymousMailboxPullOneV1::new([0x3c; 32], [0x3d; 16], Vec::new(), NOW, &reader)
+                .expect("pull request");
+        let terminal = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::PullOne(request.clone()),
+        )
+        .expect("pull frame");
+        let pulled = AnonymousMailboxPullResultV1::new(
+            [0x3e; 16],
+            Vec::new(),
+            vec![0x3f; MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES],
+        )
+        .and_then(|value| value.encode())
+        .expect("maximum pull result");
+        let response = AnonymousMailboxTerminalResponseV1::signed(
+            AnonymousMailboxOperationV1::PullOne,
+            request.request_id,
+            request.request_commitment().expect("request commitment"),
+            AnonymousMailboxOutcomeV1::Accepted,
+            pulled,
+            NOW,
+            &target,
+        )
+        .expect("pull response");
+        let completed = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::PullOneResponse(response),
+        )
+        .expect("response frame");
+        assert!(completed.len() <= MAX_ANONYMOUS_MAILBOX_TERMINAL_FRAME_BYTES);
+
+        let prepared_state = encode_state(&terminal, None, None).expect("prepared state");
+        let body = vec![0x40; 64];
+        let exact_prepared_budget =
+            u64::try_from(body.len() + prepared_state.len() + JOURNAL_AEAD_TAG_BYTES)
+                .expect("budget");
+        let journal = journal_with_max_bytes(exact_prepared_budget);
+        let record = SourceJournalRecord {
+            route_id: [0x41; 16],
+            request_commitment: [0x42; 32],
+            target_node_id: target.public_key_bytes(),
+            descriptor_commitment: DirectoryDescriptorCommitmentV1 {
+                node_id: target.public_key_bytes(),
+                sequence: 9,
+                descriptor_hash: [0x43; 32],
+            },
+            body,
+            phase: AnonymousMailboxSourcePhase::Prepared,
+            state: prepared_state.clone(),
+        };
+        journal.insert_or_exact(&record).expect("insert");
+        journal
+            .transition(
+                &record,
+                AnonymousMailboxSourcePhase::Prepared,
+                AnonymousMailboxSourcePhase::Armed,
+                prepared_state,
+            )
+            .expect("arm");
+        let completed_state =
+            encode_state(&terminal, None, Some(&completed)).expect("completed state");
+        assert!(matches!(
+            journal.transition(
+                &record,
+                AnonymousMailboxSourcePhase::Armed,
+                AnonymousMailboxSourcePhase::Completed,
+                completed_state,
+            ),
+            Err(AnonymousMailboxSourceError::Ambiguous)
+        ));
+
+        let loaded = journal
+            .load(&record.route_id)
+            .expect("restart load")
+            .expect("retained record");
+        assert_eq!(loaded.phase, AnonymousMailboxSourcePhase::Ambiguous);
+        let (retained_terminal, restart, retained_completed) =
+            decode_state(&loaded.state).expect("compact state");
+        assert_eq!(retained_terminal, terminal);
+        assert!(restart.is_none());
+        assert!(retained_completed.is_none());
+        let used: i64 = journal
+            .connection
+            .lock()
+            .query_row(
+                "SELECT SUM(length(body) + length(protected_state))
+                 FROM anonymous_mailbox_source_journal",
+                [],
+                |row| row.get(0),
+            )
+            .expect("aggregate bytes");
+        assert!(u64::try_from(used).expect("non-negative") <= exact_prepared_budget);
+    }
+
+    #[test]
+    fn fixed_state_bounds_reject_oversize_before_state_materialization() {
+        let journal = journal_with_max_bytes(
+            u64::try_from(MAX_JOURNAL_PROTECTED_STATE_BYTES * 2).expect("large config"),
+        );
+        assert!(matches!(
+            journal.seal_state(
+                &[0x44; 16],
+                &[0x45; 32],
+                &[0x46; 32],
+                &vec![0; MAX_JOURNAL_CLEAR_STATE_BYTES + 1],
+            ),
+            Err(AnonymousMailboxSourceError::Rejected)
+        ));
+
+        let descriptor = bincode::serialize(&DirectoryDescriptorCommitmentV1 {
+            node_id: [0x46; 32],
+            sequence: 10,
+            descriptor_hash: [0x47; 32],
+        })
+        .expect("descriptor");
+        journal
+            .connection
+            .lock()
+            .execute(
+                "INSERT INTO anonymous_mailbox_source_journal
+                   (route_id, request_commitment, target_node_id, descriptor_commitment, body,
+                    phase, state_nonce, protected_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    [0x44_u8; 16].as_slice(),
+                    [0x45_u8; 32].as_slice(),
+                    [0x46_u8; 32].as_slice(),
+                    descriptor,
+                    [0x48_u8].as_slice(),
+                    AnonymousMailboxSourcePhase::Prepared.code(),
+                    [0x49_u8; JOURNAL_NONCE_BYTES].as_slice(),
+                    vec![0x4a_u8; MAX_JOURNAL_PROTECTED_STATE_BYTES + 1],
+                ],
+            )
+            .expect("inject oversized protected state");
+        assert!(matches!(
+            journal.load(&[0x44; 16]),
+            Err(AnonymousMailboxSourceError::Corrupt)
+        ));
     }
 
     #[test]
