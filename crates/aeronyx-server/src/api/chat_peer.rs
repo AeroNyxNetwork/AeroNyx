@@ -3015,6 +3015,18 @@ where
     })?
 }
 
+/// Serializes an already-built blind-relay request without running I/O.
+///
+/// [ANONYMOUS-MAILBOX-SOURCE 2026-09-03 by Codex] The default-off anonymous
+/// mailbox source journal needs the immutable JSON body before it can arm any
+/// transport. Callers must keep this bounded CPU-only operation outside async
+/// I/O workers; the existing async wrapper remains the normal public path.
+pub(crate) fn prepare_exact_peer_blind_relay_http_request(
+    request: &PeerBlindRelayRequest,
+) -> Result<PreparedPeerBlindRelayHttpRequest, BlindRelayRequestPreparationFailure> {
+    encode_prepared_peer_blind_relay_request(request)
+}
+
 fn encode_prepared_peer_blind_relay_request(
     request: &PeerBlindRelayRequest,
 ) -> Result<PreparedPeerBlindRelayHttpRequest, BlindRelayRequestPreparationFailure> {

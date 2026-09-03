@@ -33,6 +33,8 @@
 //! deduplication capacity also bounds durable verified-submit replay evidence.
 //! v1.13.0-BlindRouteResourceBound — Added backward-compatible logical-byte
 //! and recoverable SQLite WAL-backlog admission for blind-route replay state.
+//! v1.15.0-AnonymousMailboxSource — Added a default-off exact-target source
+//! coordinator configuration without startup wiring.
 //! v1.14.0-AnonymousMailboxStore — Added a default-off, node-local custody
 //! repository configuration for opaque anonymous-mailbox capabilities.
 //!
@@ -352,6 +354,45 @@ impl AnonymousMailboxStoreConfig {
     }
 }
 
+/// Default-off bounds for durable anonymous-mailbox source request journals.
+///
+/// This block does not create a route, contact a peer, or enable server
+/// wiring. A future composition root explicitly constructs the coordinator.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnonymousMailboxSourceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_anonymous_mailbox_source_max_journal_entries")]
+    pub max_journal_entries: usize,
+    #[serde(default = "default_anonymous_mailbox_source_max_journal_bytes")]
+    pub max_journal_bytes: u64,
+}
+
+impl Default for AnonymousMailboxSourceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_journal_entries: default_anonymous_mailbox_source_max_journal_entries(),
+            max_journal_bytes: default_anonymous_mailbox_source_max_journal_bytes(),
+        }
+    }
+}
+
+impl AnonymousMailboxSourceConfig {
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.max_journal_entries == 0 || self.max_journal_bytes == 0 {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox_source",
+                "journal bounds must be non-zero when enabled",
+            ));
+        }
+        Ok(())
+    }
+}
+
 // ============================================
 // ChatRelayConfig
 // ============================================
@@ -428,6 +469,13 @@ pub struct ChatRelayConfig {
     /// block is not consumed by server startup until a later wiring milestone.
     #[serde(default)]
     pub anonymous_mailbox: AnonymousMailboxStoreConfig,
+
+    /// Default-off exact-target source coordinator journal.
+    ///
+    /// [ANONYMOUS-MAILBOX-SOURCE 2026-09-03 by Codex] This remains separate
+    /// from local custody until a later explicit server composition milestone.
+    #[serde(default)]
+    pub anonymous_mailbox_source: AnonymousMailboxSourceConfig,
 
     /// Offline message TTL in seconds (default: 259 200 = 72 hours).
     ///
@@ -654,6 +702,12 @@ fn default_anonymous_mailbox_ticket_issuance_window_secs() -> u64 {
 fn default_anonymous_mailbox_ticket_issue_work_bits() -> u8 {
     DEFAULT_ANONYMOUS_MAILBOX_TICKET_ISSUE_WORK_BITS
 }
+fn default_anonymous_mailbox_source_max_journal_entries() -> usize {
+    1_024
+}
+fn default_anonymous_mailbox_source_max_journal_bytes() -> u64 {
+    64 * 1024 * 1024
+}
 fn default_max_pending_messages_total() -> usize {
     100_000
 }
@@ -714,6 +768,7 @@ impl Default for ChatRelayConfig {
         Self {
             enabled: false,
             anonymous_mailbox: AnonymousMailboxStoreConfig::default(),
+            anonymous_mailbox_source: AnonymousMailboxSourceConfig::default(),
             offline_ttl_secs: default_chat_ttl(),
             max_pending_per_wallet: default_max_pending_per_wallet(),
             max_pending_messages_total: default_max_pending_messages_total(),
@@ -757,10 +812,17 @@ impl ChatRelayConfig {
                     "requires chat_relay.enabled = true",
                 ));
             }
+            if self.anonymous_mailbox_source.enabled {
+                return Err(ServerError::config_invalid(
+                    "memchain.chat_relay.anonymous_mailbox_source.enabled",
+                    "requires chat_relay.enabled = true",
+                ));
+            }
             return Ok(());
         }
 
         self.anonymous_mailbox.validate()?;
+        self.anonymous_mailbox_source.validate()?;
 
         if self.offline_ttl_secs == 0 {
             return Err(ServerError::config_invalid(
@@ -1009,6 +1071,7 @@ mod tests {
         let cr = ChatRelayConfig {
             enabled: false,
             anonymous_mailbox: AnonymousMailboxStoreConfig::default(),
+            anonymous_mailbox_source: AnonymousMailboxSourceConfig::default(),
             offline_ttl_secs: 0,
             max_pending_per_wallet: 0,
             max_pending_messages_total: 0,
@@ -1340,6 +1403,26 @@ custody_backup_partial_grace_secs = 172800
         assert!(!cr.anonymous_mailbox.enabled);
         assert_eq!(cr.anonymous_mailbox.db_path, "data/chat_relay_mailbox.db");
         assert!(cr.validate().is_ok());
+    }
+
+    #[test]
+    fn anonymous_mailbox_source_config_is_additive_default_off() {
+        // [ANONYMOUS-MAILBOX-SOURCE 2026-09-03 by Codex] Pre-source configs
+        // deserialize into a disabled journal and retain ordinary chat behavior.
+        let cr: ChatRelayConfig = toml::from_str("enabled = true").unwrap();
+        assert!(!cr.anonymous_mailbox_source.enabled);
+        assert_eq!(cr.anonymous_mailbox_source.max_journal_entries, 1_024);
+        assert!(cr.validate().is_ok());
+    }
+
+    #[test]
+    fn anonymous_mailbox_source_requires_chat_and_nonzero_bounds() {
+        let mut config = ChatRelayConfig::default();
+        config.anonymous_mailbox_source.enabled = true;
+        assert!(config.validate().is_err());
+        config.enabled = true;
+        config.anonymous_mailbox_source.max_journal_bytes = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]
