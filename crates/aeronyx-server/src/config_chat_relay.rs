@@ -33,8 +33,8 @@
 //! deduplication capacity also bounds durable verified-submit replay evidence.
 //! v1.13.0-BlindRouteResourceBound — Added backward-compatible logical-byte
 //! and recoverable SQLite WAL-backlog admission for blind-route replay state.
-//! v1.15.0-AnonymousMailboxSource — Added a default-off exact-target source
-//! coordinator configuration without startup wiring.
+//! v1.16.0-AnonymousMailboxSourceWiring — Added a default-off, independently
+//! durable source-journal and bounded VPN transport configuration.
 //! v1.14.0-AnonymousMailboxStore — Added a default-off, node-local custody
 //! repository configuration for opaque anonymous-mailbox capabilities.
 //!
@@ -356,24 +356,40 @@ impl AnonymousMailboxStoreConfig {
 
 /// Default-off bounds for durable anonymous-mailbox source request journals.
 ///
-/// This block does not create a route, contact a peer, or enable server
-/// wiring. A future composition root explicitly constructs the coordinator.
+/// Disabled configuration creates no journal, key, route, or outbound work.
+/// When explicitly enabled, startup composes the coordinator only into the
+/// authenticated VPN/MPI surface; node-peer and public routers remain absent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AnonymousMailboxSourceConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Owner-private SQLite journal distinct from both chat custody and the
+    /// receiver-side anonymous-mailbox repository.
+    #[serde(default = "default_anonymous_mailbox_source_db_path")]
+    pub db_path: String,
     #[serde(default = "default_anonymous_mailbox_source_max_journal_entries")]
     pub max_journal_entries: usize,
     #[serde(default = "default_anonymous_mailbox_source_max_journal_bytes")]
     pub max_journal_bytes: u64,
+    /// Process-wide bound for source API work, including blocking SQLite and
+    /// one bounded outbound peer request.
+    #[serde(default = "default_anonymous_mailbox_source_max_in_flight")]
+    pub max_in_flight: usize,
+    /// Per-attempt outbound peer deadline. An unsuccessful attempt remains
+    /// armed and may be retried only with its durable exact body.
+    #[serde(default = "default_anonymous_mailbox_source_request_timeout_secs")]
+    pub request_timeout_secs: u64,
 }
 
 impl Default for AnonymousMailboxSourceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            db_path: default_anonymous_mailbox_source_db_path(),
             max_journal_entries: default_anonymous_mailbox_source_max_journal_entries(),
             max_journal_bytes: default_anonymous_mailbox_source_max_journal_bytes(),
+            max_in_flight: default_anonymous_mailbox_source_max_in_flight(),
+            request_timeout_secs: default_anonymous_mailbox_source_request_timeout_secs(),
         }
     }
 }
@@ -383,10 +399,34 @@ impl AnonymousMailboxSourceConfig {
         if !self.enabled {
             return Ok(());
         }
-        if self.max_journal_entries == 0 || self.max_journal_bytes == 0 {
+        if self.db_path.is_empty() || self.db_path == ":memory:" {
             return Err(ServerError::config_invalid(
-                "memchain.chat_relay.anonymous_mailbox_source",
-                "journal bounds must be non-zero when enabled",
+                "memchain.chat_relay.anonymous_mailbox_source.db_path",
+                "must name a private durable database when enabled",
+            ));
+        }
+        if self.max_journal_entries == 0 || self.max_journal_entries > i64::MAX as usize {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox_source.max_journal_entries",
+                "must fit SQLite's positive signed counter domain",
+            ));
+        }
+        if self.max_journal_bytes == 0 || self.max_journal_bytes > i64::MAX as u64 {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox_source.max_journal_bytes",
+                "must fit SQLite's positive signed byte domain",
+            ));
+        }
+        if self.max_in_flight == 0 {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox_source.max_in_flight",
+                "must be non-zero when enabled",
+            ));
+        }
+        if self.request_timeout_secs == 0 || self.request_timeout_secs > MAX_SQLITE_TTL_SECS {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox_source.request_timeout_secs",
+                "must be a non-zero bounded duration",
             ));
         }
         Ok(())
@@ -705,8 +745,17 @@ fn default_anonymous_mailbox_ticket_issue_work_bits() -> u8 {
 fn default_anonymous_mailbox_source_max_journal_entries() -> usize {
     1_024
 }
+fn default_anonymous_mailbox_source_db_path() -> String {
+    "data/anonymous_mailbox_source.db".into()
+}
 fn default_anonymous_mailbox_source_max_journal_bytes() -> u64 {
     64 * 1024 * 1024
+}
+fn default_anonymous_mailbox_source_max_in_flight() -> usize {
+    8
+}
+fn default_anonymous_mailbox_source_request_timeout_secs() -> u64 {
+    15
 }
 fn default_max_pending_messages_total() -> usize {
     100_000
@@ -1407,11 +1456,18 @@ custody_backup_partial_grace_secs = 172800
 
     #[test]
     fn anonymous_mailbox_source_config_is_additive_default_off() {
-        // [ANONYMOUS-MAILBOX-SOURCE 2026-09-03 by Codex] Pre-source configs
-        // deserialize into a disabled journal and retain ordinary chat behavior.
+        // [ANONYMOUS-MAILBOX-SOURCE-WIRING 2026-09-03 by Codex] Pre-source
+        // configs remain disabled and therefore create no source key, journal,
+        // route, endpoint advertisement, or ordinary chat hook.
         let cr: ChatRelayConfig = toml::from_str("enabled = true").unwrap();
         assert!(!cr.anonymous_mailbox_source.enabled);
+        assert_eq!(
+            cr.anonymous_mailbox_source.db_path,
+            "data/anonymous_mailbox_source.db"
+        );
         assert_eq!(cr.anonymous_mailbox_source.max_journal_entries, 1_024);
+        assert_eq!(cr.anonymous_mailbox_source.max_in_flight, 8);
+        assert_eq!(cr.anonymous_mailbox_source.request_timeout_secs, 15);
         assert!(cr.validate().is_ok());
     }
 
@@ -1421,7 +1477,19 @@ custody_backup_partial_grace_secs = 172800
         config.anonymous_mailbox_source.enabled = true;
         assert!(config.validate().is_err());
         config.enabled = true;
+        config.anonymous_mailbox_source.max_journal_entries = 0;
+        assert!(config.validate().is_err());
+        config.anonymous_mailbox_source.max_journal_entries = 1_024;
         config.anonymous_mailbox_source.max_journal_bytes = 0;
+        assert!(config.validate().is_err());
+        config.anonymous_mailbox_source.max_journal_bytes = 64 * 1024 * 1024;
+        config.anonymous_mailbox_source.db_path = ":memory:".into();
+        assert!(config.validate().is_err());
+        config.anonymous_mailbox_source.db_path = "data/private-source.db".into();
+        config.anonymous_mailbox_source.max_in_flight = 0;
+        assert!(config.validate().is_err());
+        config.anonymous_mailbox_source.max_in_flight = 1;
+        config.anonymous_mailbox_source.request_timeout_secs = 0;
         assert!(config.validate().is_err());
     }
 

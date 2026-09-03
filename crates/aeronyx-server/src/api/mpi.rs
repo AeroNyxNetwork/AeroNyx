@@ -121,6 +121,7 @@ const SESSION_EMBEDDINGS_PER_KEY: usize = 5;
 use crate::services::memchain::{StoragePool, SystemDb, VectorIndexPool, VolumeRouter};
 
 use super::auth::{build_auth_router, parse_pubkey_hex, verify_jwt, AuthState};
+use super::chat_anonymous_mailbox_source::ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH;
 use super::mpi_graph_handlers;
 use super::mpi_handlers;
 use super::supernode_handlers;
@@ -472,6 +473,19 @@ mod session_embedding_cache_tests {
     use super::*;
 
     #[test]
+    fn anonymous_mailbox_source_path_is_closed_and_exact() {
+        assert!(is_anonymous_mailbox_source_path(
+            ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH
+        ));
+        assert!(!is_anonymous_mailbox_source_path(
+            "/api/chat/anonymous-mailbox/source/submit/extra"
+        ));
+        assert!(!is_anonymous_mailbox_source_path(
+            "/api/chat/peer/blind-relay"
+        ));
+    }
+
+    #[test]
     fn same_session_label_is_isolated_by_owner() {
         let mut cache = SessionEmbeddingCache::with_capacity(4);
         let owner_a = [0x11; 32];
@@ -667,6 +681,7 @@ async fn handle_saas_jwt_auth(
     mut req: Request<axum::body::Body>,
     next: Next,
 ) -> axum::response::Response {
+    let anonymous_mailbox_source = is_anonymous_mailbox_source_path(req.uri().path());
     // ── 1. Extract Bearer JWT ─────────────────────────────────────────
     let token = match extract_bearer_token(req.headers()) {
         Some(t) => t,
@@ -713,76 +728,92 @@ async fn handle_saas_jwt_auth(
     let owner = match parse_pubkey_hex(&claims.sub) {
         Ok(b) => b,
         Err(e) => {
-            warn!(
-                sub = &claims.sub[..8.min(claims.sub.len())],
-                "[MPI_AUTH_SAAS] Invalid sub claim"
-            );
+            if anonymous_mailbox_source {
+                warn!("[MPI_AUTH_SAAS] Invalid anonymous-mailbox source claim");
+            } else {
+                warn!(
+                    sub = &claims.sub[..8.min(claims.sub.len())],
+                    "[MPI_AUTH_SAAS] Invalid sub claim"
+                );
+            }
+            let error = if anonymous_mailbox_source {
+                "invalid token claims".to_owned()
+            } else {
+                format!("invalid token claims: {e}")
+            };
             return (
                 StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({ "error": format!("invalid token claims: {}", e) })),
+                Json(serde_json::json!({ "error": error })),
             )
                 .into_response();
         }
     };
 
-    // ── 4. Get or create per-user Storage from pool ───────────────────
-    let pool = match &state.storage_pool {
-        Some(p) => p,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal error" })),
-            )
-                .into_response();
-        }
-    };
+    // [ANONYMOUS-MAILBOX-SOURCE-WIRING 2026-09-03 by Codex] A source
+    // request needs authentication only; provisioning a SaaS owner's storage,
+    // vector index, or activity row would turn an anonymous transport action
+    // into an owner-linked durable side effect. Other MPI endpoints retain
+    // their historical provisioning behavior.
+    let owner_resources = if anonymous_mailbox_source {
+        None
+    } else {
+        // ── 4. Get or create per-user Storage from pool ───────────────
+        let pool = match &state.storage_pool {
+            Some(p) => p,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "internal error" })),
+                )
+                    .into_response();
+            }
+        };
+        let storage = match pool.get_or_create(&owner).await {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::error!(error = %error, "[MPI_AUTH_SAAS] StoragePool error");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "internal error" })),
+                )
+                    .into_response();
+            }
+        };
 
-    let storage = match pool.get_or_create(&owner).await {
-        Ok(s) => s,
-        Err(e) => {
-            // Do not leak volume details to the client.
-            tracing::error!(error = %e, "[MPI_AUTH_SAAS] StoragePool error");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal error" })),
-            )
-                .into_response();
-        }
-    };
+        // ── 5. Get or create per-user VectorIndex from pool ───────────
+        let vpool = match &state.vector_pool {
+            Some(pool) => pool,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "internal error" })),
+                )
+                    .into_response();
+            }
+        };
+        let vector_index = match vpool.get_or_create(&owner) {
+            Ok(vector_index) => vector_index,
+            Err(error) => {
+                tracing::error!(error = %error, "[MPI_AUTH_SAAS] VectorIndexPool error");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "internal error" })),
+                )
+                    .into_response();
+            }
+        };
 
-    // ── 5. Get or create per-user VectorIndex from pool ───────────────
-    let vpool = match &state.vector_pool {
-        Some(p) => p,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal error" })),
-            )
-                .into_response();
+        // ── 6. Update last-active timestamp (Miner scheduling) ───────
+        if let Some(ref sys_db) = state.system_db {
+            let db = Arc::clone(sys_db);
+            let owner_copy = owner;
+            // Fire-and-forget: do not block the request on this write.
+            tokio::spawn(async move {
+                let _ = db.update_last_active(&owner_copy).await;
+            });
         }
+        Some((storage, vector_index))
     };
-
-    let vector_index = match vpool.get_or_create(&owner) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(error = %e, "[MPI_AUTH_SAAS] VectorIndexPool error");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal error" })),
-            )
-                .into_response();
-        }
-    };
-
-    // ── 6. Update last-active timestamp (Miner scheduling) ───────────
-    if let Some(ref sys_db) = state.system_db {
-        let db = Arc::clone(sys_db);
-        let owner_copy = owner;
-        // Fire-and-forget: do not block the request on this write.
-        tokio::spawn(async move {
-            let _ = db.update_last_active(&owner_copy).await;
-        });
-    }
 
     // ── 7. Inject extensions (handlers use Extension<> extractors) ────
     let auth = AuthenticatedOwner::Saas {
@@ -790,8 +821,10 @@ async fn handle_saas_jwt_auth(
         owner_hex: claims.sub.clone(),
     };
     req.extensions_mut().insert(auth);
-    req.extensions_mut().insert(storage);
-    req.extensions_mut().insert(vector_index);
+    if let Some((storage, vector_index)) = owner_resources {
+        req.extensions_mut().insert(storage);
+        req.extensions_mut().insert(vector_index);
+    }
 
     debug!("[MPI_AUTH_SAAS] Authenticated");
 
@@ -950,6 +983,7 @@ async fn handle_remote_auth(
 
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
+    let anonymous_mailbox_source = is_anonymous_mailbox_source_path(&path);
     let (parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
         Ok(b) => b,
@@ -973,10 +1007,14 @@ async fn handle_remote_auth(
     let signed_msg = msg_hasher.finalize();
 
     if identity_pubkey.verify(&signed_msg, &sig_bytes).is_err() {
-        warn!(
-            "[MPI_AUTH] Ed25519 sig verification failed for {}",
-            pubkey_hex
-        );
+        if anonymous_mailbox_source {
+            warn!("[MPI_AUTH] Anonymous-mailbox source signature verification failed");
+        } else {
+            warn!(
+                "[MPI_AUTH] Ed25519 sig verification failed for {}",
+                pubkey_hex
+            );
+        }
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!(
@@ -987,34 +1025,40 @@ async fn handle_remote_auth(
     }
 
     // Check remote capacity against the single-user storage.
-    if let Some(ref storage) = state.storage {
-        if state.max_remote_owners > 0 {
-            let current = storage.count_distinct_owners().await;
-            let remote = current.saturating_sub(1);
-            let exists = storage.owner_exists(&pubkey_bytes).await;
-            if !exists && remote >= state.max_remote_owners {
-                warn!(
-                    "[MPI_AUTH] Remote capacity reached: {}/{}",
-                    remote, state.max_remote_owners
-                );
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "error": "this node has reached maximum remote user capacity",
-                        "max_remote_owners": state.max_remote_owners,
-                    })),
-                )
-                    .into_response();
+    if !anonymous_mailbox_source {
+        if let Some(ref storage) = state.storage {
+            if state.max_remote_owners > 0 {
+                let current = storage.count_distinct_owners().await;
+                let remote = current.saturating_sub(1);
+                let exists = storage.owner_exists(&pubkey_bytes).await;
+                if !exists && remote >= state.max_remote_owners {
+                    warn!(
+                        "[MPI_AUTH] Remote capacity reached: {}/{}",
+                        remote, state.max_remote_owners
+                    );
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "error": "this node has reached maximum remote user capacity",
+                            "max_remote_owners": state.max_remote_owners,
+                        })),
+                    )
+                        .into_response();
+                }
             }
         }
     }
 
-    debug!(
-        "[MPI_AUTH] Remote OK: {} ({} {})",
-        &pubkey_hex[..8],
-        method,
-        path
-    );
+    if anonymous_mailbox_source {
+        debug!("[MPI_AUTH] Anonymous-mailbox source authenticated");
+    } else {
+        debug!(
+            "[MPI_AUTH] Remote OK: {} ({} {})",
+            &pubkey_hex[..8],
+            method,
+            path
+        );
+    }
 
     let auth = AuthenticatedOwner::Remote {
         owner: pubkey_bytes,
@@ -1025,9 +1069,11 @@ async fn handle_remote_auth(
 
     // Local mode: inject the single-user storage + vector_index as extensions
     // so that handlers can use the same Extension<> extractor pattern in both modes.
-    if let (Some(ref st), Some(ref vi)) = (&state.storage, &state.vector_index) {
-        req.extensions_mut().insert(Arc::clone(st));
-        req.extensions_mut().insert(Arc::clone(vi));
+    if !anonymous_mailbox_source {
+        if let (Some(ref st), Some(ref vi)) = (&state.storage, &state.vector_index) {
+            req.extensions_mut().insert(Arc::clone(st));
+            req.extensions_mut().insert(Arc::clone(vi));
+        }
     }
 
     next.run(req).await.into_response()
@@ -1091,13 +1137,19 @@ async fn handle_local_auth(
 
     // Local mode: inject storage + vector_index as extensions for handler
     // consistency (handlers use Extension<> in both Local and SaaS modes).
-    if let (Some(ref st), Some(ref vi)) = (&state.storage, &state.vector_index) {
-        req.extensions_mut().insert(Arc::clone(st));
-        req.extensions_mut().insert(Arc::clone(vi));
+    if !is_anonymous_mailbox_source_path(req.uri().path()) {
+        if let (Some(ref st), Some(ref vi)) = (&state.storage, &state.vector_index) {
+            req.extensions_mut().insert(Arc::clone(st));
+            req.extensions_mut().insert(Arc::clone(vi));
+        }
     }
 
     req.extensions_mut().insert(auth);
     next.run(req).await.into_response()
+}
+
+fn is_anonymous_mailbox_source_path(path: &str) -> bool {
+    path == ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH
 }
 
 // ── Helper: extract Bearer token from Authorization header ───────────
@@ -1176,7 +1228,8 @@ async fn admin_auth_middleware(
 // Router
 // ============================================
 
-/// Build the complete MPI router.
+/// Builds the historical authenticated MPI surface without optional local
+/// composition routes.
 ///
 /// ## Local mode
 /// All existing routes unchanged. Auth endpoint NOT registered.
@@ -1190,6 +1243,18 @@ async fn admin_auth_middleware(
 /// - Admin routes: registered under separate admin_auth_middleware
 /// - All existing MPI routes unchanged (now use Extension<> for storage)
 pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
+    build_mpi_router_inner(state, None)
+}
+
+/// Builds MPI plus an optional VPN-local composition router under the same
+/// unified authentication middleware. The added router receives no MPI owner
+/// state directly; its handler must extract and immediately discard the typed
+/// authenticated owner before processing opaque source work.
+pub(crate) fn build_mpi_router_with_source(state: Arc<MpiState>, source_routes: Router) -> Router {
+    build_mpi_router_inner(state, Some(source_routes))
+}
+
+fn build_mpi_router_inner(state: Arc<MpiState>, source_routes: Option<Router>) -> Router {
     let is_saas = state.mode == Mode::Saas;
 
     // ── Core MPI routes (under unified_auth_middleware) ───────────────
@@ -1319,7 +1384,18 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
         ))
         .with_state(Arc::clone(&state));
 
-    let router = Router::new().merge(mpi_routes);
+    // The optional source router owns an independent application state, so it
+    // receives the identical unified middleware as a separately composed
+    // route group instead of inheriting `MpiState` as handler state.
+    let router = if let Some(source_routes) = source_routes {
+        let source_routes = source_routes.route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            unified_auth_middleware,
+        ));
+        Router::new().merge(mpi_routes).merge(source_routes)
+    } else {
+        Router::new().merge(mpi_routes)
+    };
 
     // ── SaaS-only routes ──────────────────────────────────────────────
     let router = if is_saas {

@@ -2386,14 +2386,18 @@ fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N], AnonymousMailboxStoreE
         .map_err(|_| AnonymousMailboxStoreError::Corrupt)
 }
 
-struct PrivateSqliteTarget {
-    resolved_path: PathBuf,
+/// Owner-private SQLite target reserved descriptor-relatively before a caller
+/// hands its canonical path to SQLite. This crate-private capability is shared
+/// only by node-blind stores with the same no-follow/link-count/durability
+/// contract; it exposes no custody schema or mailbox data.
+pub(crate) struct PrivateSqliteTarget {
+    pub(crate) resolved_path: PathBuf,
     #[cfg(unix)]
-    parent: File,
+    pub(crate) parent: File,
 }
 
 #[cfg(unix)]
-fn prepare_private_sqlite_target(
+pub(crate) fn prepare_private_sqlite_target(
     path: &Path,
 ) -> Result<PrivateSqliteTarget, AnonymousMailboxStoreError> {
     let name = path
@@ -2603,7 +2607,7 @@ fn effective_user_id() -> u32 {
 }
 
 #[cfg(not(unix))]
-fn prepare_private_sqlite_target(
+pub(crate) fn prepare_private_sqlite_target(
     path: &Path,
 ) -> Result<PrivateSqliteTarget, AnonymousMailboxStoreError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -2622,7 +2626,7 @@ fn prepare_private_sqlite_target(
 }
 
 #[cfg(unix)]
-fn verify_private_file(
+pub(crate) fn verify_private_file(
     path: &Path,
     require_private_mode: bool,
 ) -> Result<(), AnonymousMailboxStoreError> {
@@ -2640,7 +2644,7 @@ fn verify_private_file(
 }
 
 #[cfg(not(unix))]
-fn verify_private_file(
+pub(crate) fn verify_private_file(
     _path: &Path,
     _require_private_mode: bool,
 ) -> Result<(), AnonymousMailboxStoreError> {

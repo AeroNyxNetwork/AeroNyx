@@ -38,6 +38,8 @@
 //! - [`directory_replica_status`]: privacy-tiered replica health endpoint
 //! - [`directory_replica_sync`]: bounded concurrent outbound replica coordinator
 //! - [`chat_peer`]: v0.1.0 node-to-node encrypted chat envelope relay
+//! - `chat_anonymous_mailbox_source`: authenticated VPN-only exact-target
+//!   anonymous-mailbox source composition; never mount on peer/public routers
 //! - `chat_peer_admission`: private direct-peer admission and ACK replay domain
 //! - `chat_peer_abuse_guard`: private blind-relay abuse-control domain
 //! - `chat_peer_observer`: private aggregate forward observation capability
@@ -497,6 +499,7 @@ pub mod admin_handlers;
 pub mod local;
 // ── v1.0.0-Voice: Peer virtual IP resolution for UDP direct-connect routing ──
 pub mod blind_vault;
+pub mod chat_anonymous_mailbox_source;
 pub mod chat_handlers;
 pub mod chat_peer;
 mod chat_peer_abuse_guard;

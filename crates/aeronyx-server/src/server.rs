@@ -989,6 +989,7 @@ use crate::api::auth::ensure_jwt_secret;
 use crate::api::blind_vault::{
     build_blind_vault_router_with_admission_runtime, BlindVaultApiAdmissionRuntime,
 };
+use crate::api::chat_anonymous_mailbox_source::build_chat_anonymous_mailbox_source_router;
 use crate::api::chat_handlers::build_chat_router;
 #[cfg(test)]
 use crate::api::chat_peer::blind_relay_delivery_receipt_is_valid;
@@ -1036,7 +1037,10 @@ use crate::api::memchain_peer::{
     CommitmentSyncPageSource, CustodyAuditWitnessRound, VerifiedDeliveryAnchorWitnessRound,
     MAX_BLOCKS_PER_RESPONSE_WIRE,
 };
-use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState, SessionEmbeddingCache};
+use crate::api::mpi::{
+    build_mpi_router, build_mpi_router_with_source, BaselineSnapshot, Mode, MpiState,
+    SessionEmbeddingCache,
+};
 use crate::api::voice::build_voice_router;
 use crate::api::vpn_health::{
     build_vpn_health_router, collect_node_operator_status_value, collect_vpn_health_value,
@@ -1061,6 +1065,9 @@ use crate::services::chat_relay::{
     derive_node_secret, ChatRelayOutboundFailureReason, ChatRelayPeerStatus, ChatRelayService,
     ExpiredNotification, VerifiedSubmitAdmission, VerifiedSubmitCacheLookup,
     VerifiedSubmitRecoveryOutcome, MAX_CHAT_ACK_MESSAGE_IDS,
+};
+use crate::services::chat_relay_anonymous_mailbox_source::{
+    AnonymousMailboxSourceCoordinator, SqliteAnonymousMailboxSourceJournal,
 };
 use crate::services::chat_relay_mailbox::{
     AnonymousMailboxCustodyRepository, SqliteAnonymousMailboxStore,
@@ -4539,6 +4546,29 @@ impl Server {
                 peer_http_clients.control.as_ref(),
             )
             .await?;
+        if self
+            .config
+            .memchain
+            .chat_relay
+            .anonymous_mailbox_source
+            .enabled
+            && !(storage.is_some()
+                && vector_index.is_some()
+                && mempool.is_some()
+                && aof_writer.is_some())
+        {
+            // [ANONYMOUS-MAILBOX-SOURCE-WIRING 2026-09-03 by Codex] The
+            // source surface is deliberately authenticated by the VPN MPI
+            // app. Refuse before deriving a key or reserving its database if
+            // that app cannot exist; source must never silently become a
+            // node-peer/public route or leave an unusable private journal.
+            return Err(ServerError::startup_failed(
+                "Anonymous mailbox source requires full authenticated VPN MPI runtime",
+            ));
+        }
+        let anonymous_mailbox_source = self
+            .init_anonymous_mailbox_source_coordinator(Arc::clone(&peer_store))
+            .await?;
         if self.config.discovery.custody_audit_witness_runtime_required {
             // [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Runtime
             // custody starts only after authenticated PeerStore bootstrap.
@@ -5032,6 +5062,7 @@ impl Server {
                     chat_relay.clone(),
                     blind_vault.clone(),
                     anonymous_mailbox.clone(),
+                    anonymous_mailbox_source.clone(),
                     Arc::clone(&udp),
                     &peer_http_clients,
                     commitment_sync_tip_notifier,
@@ -5272,6 +5303,7 @@ impl Server {
                     chat_relay.clone(),
                     blind_vault.clone(),
                     anonymous_mailbox.clone(),
+                    anonymous_mailbox_source.clone(),
                     Arc::clone(&udp),
                     &peer_http_clients,
                     None,
@@ -5724,6 +5756,48 @@ impl Server {
         )
         .map(|store| Some(Arc::new(store)))
         .map_err(|_| ServerError::startup_failed("Anonymous mailbox initialization failed"))
+    }
+
+    /// Activates the optional source only after authenticated PeerStore
+    /// bootstrap. All filesystem and SQLite work stays off the async startup
+    /// worker; an enabled source either opens its own private journal or stops
+    /// startup before any VPN route can become ready.
+    async fn init_anonymous_mailbox_source_coordinator(
+        &self,
+        peer_store: Arc<PeerStore>,
+    ) -> Result<Option<Arc<AnonymousMailboxSourceCoordinator>>> {
+        let config = self
+            .config
+            .memchain
+            .chat_relay
+            .anonymous_mailbox_source
+            .clone();
+        if !config.enabled {
+            return Ok(None);
+        }
+        // [ANONYMOUS-MAILBOX-SOURCE-WIRING 2026-09-03 by Codex] Source
+        // journal encryption is domain-separated from relay custody, mailbox
+        // cursor, and every wire signature. It remains local-only and is never
+        // advertised or returned through discovery.
+        let mut hasher = Sha256::new();
+        hasher.update(b"AeroNyx/anonymous-mailbox/source-journal-key/v1");
+        hasher.update(self.identity.to_bytes());
+        let journal_key: [u8; 32] = hasher.finalize().into();
+        let source_identity = Arc::new(self.identity.clone());
+        tokio::task::spawn_blocking(move || {
+            let journal = SqliteAnonymousMailboxSourceJournal::open(config, journal_key)?;
+            Ok::<_, crate::services::chat_relay_anonymous_mailbox_source::AnonymousMailboxSourceError>(
+                Arc::new(AnonymousMailboxSourceCoordinator::new(
+                    source_identity,
+                    peer_store,
+                    Arc::new(journal),
+                )),
+            )
+        })
+        .await
+        .map_err(|_| ServerError::startup_failed("Anonymous mailbox source initialization failed"))?
+        .map(Some)
+        .map_err(|_| ServerError::startup_failed("Anonymous mailbox source initialization failed"))
     }
 
     /// Enforces the current custody anchor against durable signed receipts.
@@ -6468,11 +6542,17 @@ impl Server {
         chat_relay: Option<Arc<ChatRelayService>>,
         blind_vault: Option<Arc<BlindVaultService>>,
         anonymous_mailbox: Option<Arc<SqliteAnonymousMailboxStore>>,
+        anonymous_mailbox_source: Option<Arc<AnonymousMailboxSourceCoordinator>>,
         udp: Arc<UdpTransport>,
         peer_http_clients: &PeerHttpClients,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
         critical_failure_tx: mpsc::Sender<CriticalRuntimeFailure>,
     ) -> Result<JoinHandle<()>> {
+        if anonymous_mailbox_source.is_some() && mpi_state.is_none() {
+            return Err(ServerError::startup_failed(
+                "Anonymous mailbox source requires authenticated VPN MPI runtime",
+            ));
+        }
         let shutdown_rx = self.shutdown_tx.subscribe();
         let shutdown_rx_vpn = self.shutdown_tx.subscribe();
         let shutdown_rx_public = self.shutdown_tx.subscribe();
@@ -6558,6 +6638,13 @@ impl Server {
         let local_blind_vault = blind_vault.clone();
         let public_anonymous_mailbox = anonymous_mailbox.clone();
         let local_anonymous_mailbox = anonymous_mailbox.clone();
+        let vpn_anonymous_mailbox_source = anonymous_mailbox_source.clone();
+        let anonymous_mailbox_source_config = self
+            .config
+            .memchain
+            .chat_relay
+            .anonymous_mailbox_source
+            .clone();
         // [BLIND-VAULT-SHARED-ADMISSION 2026-09-01 by Codex] Both listeners
         // expose the same process capability. They must consume one pressure
         // budget rather than multiplying limits by the number of routers.
@@ -6877,11 +6964,6 @@ impl Server {
                     witness_carrier_route_enabled,
                     DirectoryReplicaStatusScope::LocalOperator,
                 ));
-            let app = if let Some(mpi_state) = mpi_state {
-                app.merge(build_mpi_router(mpi_state))
-            } else {
-                app
-            };
             let app = if let Some(store) = directory_chain_store {
                 app.merge(build_directory_chain_peer_router_with_replica_and_runtime(
                     store,
@@ -6912,7 +6994,27 @@ impl Server {
                 "[API] Client API also available on http://{} (VPN clients only)",
                 vpn_listen_addr
             );
-            let vpn_app = app.clone();
+            // [ANONYMOUS-MAILBOX-SOURCE-WIRING 2026-09-03 by Codex] The
+            // source request route is an MPI-unified-auth client/VPN-only
+            // composition surface. Node-peer, public discovery, ordinary
+            // ChatRelay and verified-submit routers retain their exact
+            // pre-source route set.
+            let (app, vpn_app) = if let Some(mpi_state) = mpi_state {
+                let node_mpi = build_mpi_router(Arc::clone(&mpi_state));
+                let vpn_mpi = if let Some(source) = vpn_anonymous_mailbox_source {
+                    let vpn_source_router = build_chat_anonymous_mailbox_source_router(
+                        source,
+                        Arc::clone(&peer_http_client),
+                        &anonymous_mailbox_source_config,
+                    );
+                    build_mpi_router_with_source(mpi_state, vpn_source_router)
+                } else {
+                    build_mpi_router(mpi_state)
+                };
+                (app.clone().merge(node_mpi), app.merge(vpn_mpi))
+            } else {
+                (app.clone(), app)
+            };
             listener_tasks.spawn(Self::serve_required_api_listener(
                 "vpn_client_api",
                 vpn_listen_addr,
