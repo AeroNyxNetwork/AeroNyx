@@ -5712,9 +5712,18 @@ impl Server {
         hasher.update(b"AeroNyx/anonymous-mailbox/cursor-root/v1");
         hasher.update(self.identity.to_bytes());
         let cursor_secret: [u8; 32] = hasher.finalize().into();
-        SqliteAnonymousMailboxStore::open(config, self.identity.public_key_bytes(), cursor_secret)
-            .map(|store| Some(Arc::new(store)))
-            .map_err(|_| ServerError::startup_failed("Anonymous mailbox initialization failed"))
+        // [BLIND-RELAY-ANONYMOUS-MAILBOX-TICKET 2026-09-03 by Codex] The
+        // mailbox ticket signer is precisely this node's existing identity;
+        // no global/config issuer or additional private key is introduced.
+        // Construct it before readiness advertisement so an enabled mailbox
+        // cannot claim availability while ticket issuance is unavailable.
+        SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+            config,
+            self.identity.clone(),
+            cursor_secret,
+        )
+        .map(|store| Some(Arc::new(store)))
+        .map_err(|_| ServerError::startup_failed("Anonymous mailbox initialization failed"))
     }
 
     /// Enforces the current custody anchor against durable signed receipts.
