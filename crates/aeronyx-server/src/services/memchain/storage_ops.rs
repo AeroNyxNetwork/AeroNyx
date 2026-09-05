@@ -159,6 +159,9 @@
 //!   routes, message identifiers, payloads, endpoints, or user identities.
 //!
 //! ## Modification History
+//! [MEMCHAIN-WITNESS-CLOCK 2026-09-05 by Codex] Serializes witness lease
+//! measurement and mutation behind a monotonic hold plus an OS advisory lock;
+//! restart and ambiguous commits remain conservatively fail-closed.
 //! v2.8.65-CustodyWitnessReceiptImport - Added bounded host-local receipt
 //! import without weakening the live network persistence freshness policy.
 //! v2.8.64-CustodyWitnessReceiptVault - Added bounded producer receipt
@@ -249,13 +252,15 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nix::errno::Errno;
-use nix::fcntl::{Flock, FlockArg};
+use nix::fcntl::{openat, Flock, FlockArg, OFlag};
+use nix::sys::stat::Mode;
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
@@ -289,7 +294,8 @@ use super::storage::{
     RecordCommitmentCheckpointCertificateBundle, RecordCommitmentCheckpointStatus,
     RecordCommitmentFollowerReadiness, RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent,
     RecordCommitmentSyncRuntime, RecordCommitmentSyncStatus, RecordCommitmentTipAnchorConfig,
-    StorageStats, CHECKPOINT_CERTIFICATE_CAPACITY, CHECKPOINT_EQUIVOCATION_CAPACITY,
+    RecordCommitmentWitnessLeaseClockRuntime, RecordCommitmentWitnessLeaseHold, StorageStats,
+    CHECKPOINT_CERTIFICATE_CAPACITY, CHECKPOINT_EQUIVOCATION_CAPACITY,
     CHECKPOINT_EVIDENCE_CAPACITY, CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS,
     CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY, COMMITMENT_SYNC_EVENT_CAPACITY,
     CUSTODY_WITNESS_RECEIPT_EVIDENCE_CAPACITY, MAX_CHECKPOINT_CERTIFICATE_SIGNERS,
@@ -1010,7 +1016,112 @@ const CHECKPOINT_CERTIFICATE_ANCHOR_DOMAIN: &[u8] =
     b"aeronyx.record_checkpoint_certificate_anchor.v1\0";
 /// Prevent immediate lease takeover at the exact wall-clock expiry boundary.
 const COORDINATOR_LEASE_HANDOVER_GRACE_SECS: u64 = 15;
+const WITNESS_LEASE_RESTART_HOLD_SECS: u64 =
+    MAX_COORDINATOR_LEASE_TTL_SECS_V1 as u64 + COORDINATOR_LEASE_HANDOVER_GRACE_SECS;
 static SIGNED_LOCAL_ANCHOR_TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+struct StoredCoordinatorLease {
+    coordinator: [u8; 32],
+    chain_id: [u8; 32],
+    instance_id: [u8; 32],
+    lease_epoch: u64,
+    lease_expires_at: u64,
+    updated_at: u64,
+}
+
+impl StoredCoordinatorLease {
+    fn is_released(self) -> bool {
+        self.lease_expires_at <= self.updated_at
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WitnessLeaseCommitObservation {
+    Observed,
+    #[cfg(test)]
+    UnknownAfterCommit,
+}
+
+#[derive(Clone, Copy)]
+enum WitnessLeaseClockAcquireError {
+    Contended,
+    UnsafeFile,
+    Io,
+}
+
+impl WitnessLeaseClockAcquireError {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Contended => "witness lease clock is held by another database handle",
+            Self::UnsafeFile => "witness lease clock file is unsafe",
+            Self::Io => "witness lease clock could not be acquired",
+        }
+    }
+}
+
+fn decode_stored_coordinator_lease(
+    row: (Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, i64),
+) -> Result<StoredCoordinatorLease, String> {
+    let (coordinator, chain_id, instance_id, lease_epoch, lease_expires_at, updated_at) = row;
+    Ok(StoredCoordinatorLease {
+        coordinator: coordinator.try_into().map_err(|value: Vec<u8>| {
+            format!("coordinator lease identity length {}", value.len())
+        })?,
+        chain_id: chain_id.try_into().map_err(|value: Vec<u8>| {
+            format!("coordinator lease chain id length {}", value.len())
+        })?,
+        instance_id: instance_id.try_into().map_err(|value: Vec<u8>| {
+            format!("coordinator lease instance id length {}", value.len())
+        })?,
+        lease_epoch: u64::try_from(lease_epoch)
+            .map_err(|_| "coordinator lease epoch is invalid".to_string())?,
+        lease_expires_at: u64::try_from(lease_expires_at)
+            .map_err(|_| "coordinator lease expiry is invalid".to_string())?,
+        updated_at: u64::try_from(updated_at)
+            .map_err(|_| "coordinator lease update time is invalid".to_string())?,
+    })
+}
+
+fn witness_lease_deadline(now: Instant, hold_secs: u64) -> Result<Instant, String> {
+    now.checked_add(Duration::from_secs(hold_secs))
+        .ok_or_else(|| "witness lease monotonic deadline overflow".to_string())
+}
+
+fn initialize_witness_lease_chain_clock(
+    runtime: &mut RecordCommitmentWitnessLeaseClockRuntime,
+    chain_id: &[u8; 32],
+    leases: &[StoredCoordinatorLease],
+    now: Instant,
+) -> Result<(), String> {
+    if runtime.initialized_chains.contains(chain_id) {
+        return Ok(());
+    }
+    let mut active = leases
+        .iter()
+        .copied()
+        .filter(|lease| lease.chain_id == *chain_id && !lease.is_released());
+    if let Some(first) = active.next() {
+        let (coordinator, instance_id, lease_epoch) = if active.next().is_some() {
+            // Multiple legacy unreleased rows are ambiguous. A holder that
+            // matches either row must not renew through the restart fence.
+            ([0; 32], [0; 32], first.lease_epoch)
+        } else {
+            (first.coordinator, first.instance_id, first.lease_epoch)
+        };
+        runtime.holds.insert(
+            *chain_id,
+            RecordCommitmentWitnessLeaseHold {
+                coordinator,
+                instance_id,
+                lease_epoch,
+                valid_until: witness_lease_deadline(now, WITNESS_LEASE_RESTART_HOLD_SECS)?,
+            },
+        );
+    }
+    runtime.initialized_chains.insert(*chain_id);
+    Ok(())
+}
 
 fn read_stored_record_commitment_block_row(
     row: &rusqlite::Row<'_>,
@@ -1979,6 +2090,93 @@ fn commitment_coordinator_fence_path(database_path: &Path) -> Result<PathBuf, St
     let mut lock_name = file_name.to_os_string();
     lock_name.push(".commitment-coordinator-v1.lock");
     Ok(database_path.with_file_name(lock_name))
+}
+
+fn commitment_witness_lease_clock_path(database_path: &Path) -> Result<PathBuf, String> {
+    let file_name = database_path
+        .file_name()
+        .ok_or_else(|| "witness lease database path has no file name".to_string())?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".commitment-witness-clock-v1.lock");
+    Ok(database_path.with_file_name(lock_name))
+}
+
+fn acquire_commitment_witness_lease_clock(
+    database_path: &Path,
+) -> Result<Flock<File>, WitnessLeaseClockAcquireError> {
+    let path = commitment_witness_lease_clock_path(database_path)
+        .map_err(|_| WitnessLeaseClockAcquireError::Io)?;
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or(WitnessLeaseClockAcquireError::Io)?;
+    let parent = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY)
+        .open(parent_path)
+        .map_err(|error| match error.raw_os_error() {
+            Some(nix::libc::ELOOP | nix::libc::ENOTDIR) => {
+                WitnessLeaseClockAcquireError::UnsafeFile
+            }
+            _ => WitnessLeaseClockAcquireError::Io,
+        })?;
+    let raw_fd = openat(
+        Some(parent.as_raw_fd()),
+        name,
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|error| match error {
+        Errno::ELOOP | Errno::ENOTDIR => WitnessLeaseClockAcquireError::UnsafeFile,
+        _ => WitnessLeaseClockAcquireError::Io,
+    })?;
+    // SAFETY: `openat` returned a new descriptor owned only by this value.
+    let file = unsafe { File::from_raw_fd(raw_fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|_| WitnessLeaseClockAcquireError::Io)?;
+    // Validate identity before chmod or lock effects. A hardlink to unrelated
+    // same-owner state must not be normalized through this path.
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != unsafe { nix::libc::geteuid() }
+    {
+        return Err(WitnessLeaseClockAcquireError::UnsafeFile);
+    }
+    file.set_permissions(Permissions::from_mode(0o600))
+        .map_err(|_| WitnessLeaseClockAcquireError::Io)?;
+    let revalidated = file
+        .metadata()
+        .map_err(|_| WitnessLeaseClockAcquireError::Io)?;
+    if !revalidated.file_type().is_file()
+        || revalidated.nlink() != 1
+        || revalidated.uid() != metadata.uid()
+    {
+        return Err(WitnessLeaseClockAcquireError::UnsafeFile);
+    }
+    let lock = Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, error)| {
+        if error == Errno::EWOULDBLOCK {
+            WitnessLeaseClockAcquireError::Contended
+        } else {
+            WitnessLeaseClockAcquireError::Io
+        }
+    })?;
+    Ok(lock)
+}
+
+fn ensure_commitment_witness_lease_clock(
+    runtime: &mut RecordCommitmentWitnessLeaseClockRuntime,
+    database_path: Option<&Path>,
+) -> Result<(), String> {
+    if runtime.handle.is_some() || database_path.is_none() {
+        return Ok(());
+    }
+    runtime.handle = Some(
+        acquire_commitment_witness_lease_clock(database_path.expect("checked database path"))
+            .map_err(|error| error.message().to_string())?,
+    );
+    Ok(())
 }
 
 fn acquire_commitment_coordinator_fence(
@@ -5713,6 +5911,33 @@ impl MemoryStorage {
         now: u64,
         ttl_secs: u32,
     ) -> Result<RecordCoordinatorLeaseGrantOutcome, String> {
+        self.grant_record_commitment_coordinator_lease_at(
+            chain_id,
+            coordinator,
+            instance_id,
+            expected_tip_height,
+            expected_tip_hash,
+            now,
+            ttl_secs,
+            Instant::now(),
+            WitnessLeaseCommitObservation::Observed,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn grant_record_commitment_coordinator_lease_at(
+        &self,
+        chain_id: &[u8; 32],
+        coordinator: &[u8; 32],
+        instance_id: &[u8; 32],
+        expected_tip_height: u64,
+        expected_tip_hash: &[u8; 32],
+        now: u64,
+        ttl_secs: u32,
+        monotonic_now: Instant,
+        commit_observation: WitnessLeaseCommitObservation,
+    ) -> Result<RecordCoordinatorLeaseGrantOutcome, String> {
         if !(MIN_COORDINATOR_LEASE_TTL_SECS_V1..=MAX_COORDINATOR_LEASE_TTL_SECS_V1)
             .contains(&ttl_secs)
         {
@@ -5720,10 +5945,15 @@ impl MemoryStorage {
         }
         let now_i64 = i64::try_from(now)
             .map_err(|_| "coordinator lease time is outside SQLite range".to_string())?;
-        let lease_expires_at = now.saturating_add(u64::from(ttl_secs));
-        let lease_expires_at_i64 = i64::try_from(lease_expires_at)
-            .map_err(|_| "coordinator lease expiry is outside SQLite range".to_string())?;
+        let requested_expires_at = now
+            .checked_add(u64::from(ttl_secs))
+            .ok_or_else(|| "coordinator lease expiry overflow".to_string())?;
 
+        // [MEMCHAIN-WITNESS-CLOCK 2026-09-05 by Codex] This mutex is the sole
+        // witness-side clock authority. It remains held across the SQLite
+        // transaction so durable and volatile lease decisions cannot interleave.
+        let mut clock = self.commitment_witness_lease_clock.lock().await;
+        ensure_commitment_witness_lease_clock(&mut clock, self.database_path.as_deref())?;
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -5777,59 +6007,59 @@ impl MemoryStorage {
                 .map_err(|error| format!("read coordinator chain leases: {error}"))?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|error| format!("decode coordinator chain leases: {error}"))?
+                .into_iter()
+                .map(decode_stored_coordinator_lease)
+                .collect::<Result<Vec<_>, _>>()?
         };
+
+        initialize_witness_lease_chain_clock(&mut clock, chain_id, &existing, monotonic_now)?;
+        if clock.holds.get(chain_id).is_some_and(|hold| {
+            monotonic_now < hold.valid_until
+                && (hold.coordinator != *coordinator || hold.instance_id != *instance_id)
+        }) {
+            return Ok(RecordCoordinatorLeaseGrantOutcome::Contended);
+        }
 
         let mut maximum_epoch = None::<u64>;
         let mut matching_epoch = None::<u64>;
-        for (
-            stored_coordinator,
-            stored_chain,
-            stored_instance,
-            epoch,
-            stored_expiry,
-            stored_updated_at,
-        ) in existing
-        {
-            let stored_coordinator: [u8; 32] =
-                stored_coordinator.try_into().map_err(|value: Vec<u8>| {
-                    format!("coordinator lease identity length {}", value.len())
-                })?;
-            let stored_chain: [u8; 32] = stored_chain.try_into().map_err(|value: Vec<u8>| {
-                format!("coordinator lease chain id length {}", value.len())
-            })?;
-            let stored_instance: [u8; 32] =
-                stored_instance.try_into().map_err(|value: Vec<u8>| {
-                    format!("coordinator lease instance id length {}", value.len())
-                })?;
-
-            if stored_coordinator == *coordinator && stored_chain != *chain_id {
+        let mut matching_expiry = None::<u64>;
+        for stored in existing {
+            if stored.coordinator == *coordinator && stored.chain_id != *chain_id {
                 return Err("coordinator lease chain id mismatch".to_string());
             }
-            if stored_chain != *chain_id {
+            if stored.chain_id != *chain_id {
                 continue;
             }
+            maximum_epoch = Some(maximum_epoch.map_or(stored.lease_epoch, |current| {
+                current.max(stored.lease_epoch)
+            }));
 
-            let epoch = u64::try_from(epoch)
-                .map_err(|_| "coordinator lease epoch is invalid".to_string())?;
-            let stored_expiry = u64::try_from(stored_expiry)
-                .map_err(|_| "coordinator lease expiry is invalid".to_string())?;
-            let stored_updated_at = u64::try_from(stored_updated_at)
-                .map_err(|_| "coordinator lease update time is invalid".to_string())?;
-            maximum_epoch = Some(maximum_epoch.map_or(epoch, |current| current.max(epoch)));
-
-            let same_holder = stored_coordinator == *coordinator && stored_instance == *instance_id;
-            let explicitly_released = stored_expiry <= stored_updated_at;
-            if same_holder && explicitly_released {
+            let same_holder =
+                stored.coordinator == *coordinator && stored.instance_id == *instance_id;
+            if same_holder && stored.is_released() {
                 return Ok(RecordCoordinatorLeaseGrantOutcome::Contended);
             }
             if !same_holder
-                && !explicitly_released
-                && now < stored_expiry.saturating_add(COORDINATOR_LEASE_HANDOVER_GRACE_SECS)
+                && !stored.is_released()
+                && now
+                    < stored
+                        .lease_expires_at
+                        .saturating_add(COORDINATOR_LEASE_HANDOVER_GRACE_SECS)
             {
                 return Ok(RecordCoordinatorLeaseGrantOutcome::Contended);
             }
             if same_holder {
-                matching_epoch = Some(epoch);
+                matching_epoch = Some(stored.lease_epoch);
+                matching_expiry = Some(stored.lease_expires_at);
+            }
+        }
+        if let Some(hold) = clock.holds.get(chain_id) {
+            if monotonic_now < hold.valid_until
+                && hold.coordinator == *coordinator
+                && hold.instance_id == *instance_id
+                && matching_epoch != Some(hold.lease_epoch)
+            {
+                return Err("witness lease clock epoch does not match durable row".to_string());
             }
         }
 
@@ -5844,6 +6074,13 @@ impl MemoryStorage {
         };
         let lease_epoch_i64 = i64::try_from(lease_epoch)
             .map_err(|_| "coordinator lease epoch is outside SQLite range".to_string())?;
+        // A backwards wall step must not shorten an existing holder's durable
+        // expiry even though the monotonic hold is independently renewed.
+        let lease_expires_at = matching_expiry.map_or(requested_expires_at, |stored| {
+            stored.max(requested_expires_at)
+        });
+        let lease_expires_at_i64 = i64::try_from(lease_expires_at)
+            .map_err(|_| "coordinator lease expiry is outside SQLite range".to_string())?;
         tx.execute(
             "DELETE FROM record_coordinator_leases
              WHERE chain_id=?1 AND coordinator<>?2",
@@ -5870,8 +6107,42 @@ impl MemoryStorage {
             ],
         )
         .map_err(|error| format!("persist coordinator lease: {error}"))?;
-        tx.commit()
-            .map_err(|error| format!("commit coordinator lease: {error}"))?;
+        let valid_until = witness_lease_deadline(
+            monotonic_now,
+            u64::from(ttl_secs).saturating_add(COORDINATOR_LEASE_HANDOVER_GRACE_SECS),
+        )?;
+        if let Err(error) = tx.commit() {
+            // A failed commit can be ambiguous to the caller. Retain the
+            // attempted holder locally for the full refusal window.
+            clock.holds.insert(
+                *chain_id,
+                RecordCommitmentWitnessLeaseHold {
+                    coordinator: *coordinator,
+                    instance_id: *instance_id,
+                    lease_epoch,
+                    valid_until,
+                },
+            );
+            return Err(format!("commit coordinator lease: {error}"));
+        }
+        clock.holds.insert(
+            *chain_id,
+            RecordCommitmentWitnessLeaseHold {
+                coordinator: *coordinator,
+                instance_id: *instance_id,
+                lease_epoch,
+                valid_until,
+            },
+        );
+        #[cfg(test)]
+        if matches!(
+            commit_observation,
+            WitnessLeaseCommitObservation::UnknownAfterCommit
+        ) {
+            return Err("coordinator lease commit outcome is unknown".to_string());
+        }
+        #[cfg(not(test))]
+        let _ = commit_observation;
         Ok(RecordCoordinatorLeaseGrantOutcome::Granted {
             lease_epoch,
             lease_expires_at,
@@ -5891,35 +6162,86 @@ impl MemoryStorage {
         instance_id: &[u8; 32],
         now: u64,
     ) -> Result<RecordCoordinatorLeaseReleaseOutcome, String> {
+        self.release_record_commitment_coordinator_lease_at(
+            chain_id,
+            coordinator,
+            instance_id,
+            now,
+            Instant::now(),
+            WitnessLeaseCommitObservation::Observed,
+        )
+        .await
+    }
+
+    async fn release_record_commitment_coordinator_lease_at(
+        &self,
+        chain_id: &[u8; 32],
+        coordinator: &[u8; 32],
+        instance_id: &[u8; 32],
+        now: u64,
+        monotonic_now: Instant,
+        commit_observation: WitnessLeaseCommitObservation,
+    ) -> Result<RecordCoordinatorLeaseReleaseOutcome, String> {
         let now_i64 = i64::try_from(now)
             .map_err(|_| "coordinator lease release time is outside SQLite range".to_string())?;
+        let mut clock = self.commitment_witness_lease_clock.lock().await;
+        ensure_commitment_witness_lease_clock(&mut clock, self.database_path.as_deref())?;
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("begin coordinator lease release transaction: {error}"))?;
-        let existing = tx
-            .query_row(
-                "SELECT chain_id, instance_id, lease_epoch
-                 FROM record_coordinator_leases WHERE coordinator=?1",
-                params![coordinator.as_slice()],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|error| format!("read coordinator lease for release: {error}"))?;
-        let Some((stored_chain, stored_instance, lease_epoch)) = existing else {
+        let existing = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT coordinator, chain_id, instance_id, lease_epoch,
+                            lease_expires_at, updated_at
+                     FROM record_coordinator_leases
+                     WHERE chain_id=?1 OR coordinator=?2",
+                )
+                .map_err(|error| format!("prepare coordinator lease release: {error}"))?;
+            let rows = statement
+                .query_map(
+                    params![chain_id.as_slice(), coordinator.as_slice()],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .map_err(|error| format!("read coordinator leases for release: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("decode coordinator leases for release: {error}"))?
+                .into_iter()
+                .map(decode_stored_coordinator_lease)
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        initialize_witness_lease_chain_clock(&mut clock, chain_id, &existing, monotonic_now)?;
+        let Some(stored) = existing
+            .iter()
+            .copied()
+            .find(|stored| stored.coordinator == *coordinator)
+        else {
             return Ok(RecordCoordinatorLeaseReleaseOutcome::NotHolder);
         };
-        if stored_chain.as_slice() != chain_id || stored_instance.as_slice() != instance_id {
+        if stored.chain_id != *chain_id || stored.instance_id != *instance_id {
             return Ok(RecordCoordinatorLeaseReleaseOutcome::NotHolder);
         }
-        let lease_epoch = u64::try_from(lease_epoch)
-            .map_err(|_| "coordinator lease release epoch is invalid".to_string())?;
+        let lease_epoch = stored.lease_epoch;
+        if let Some(hold) = clock.holds.get(chain_id) {
+            if monotonic_now < hold.valid_until
+                && hold.coordinator == *coordinator
+                && hold.instance_id == *instance_id
+                && hold.lease_epoch != lease_epoch
+            {
+                return Err("witness lease clock epoch does not match durable row".to_string());
+            }
+        }
         let updated = tx
             .execute(
                 "UPDATE record_coordinator_leases
@@ -5936,8 +6258,63 @@ impl MemoryStorage {
         if updated != 1 {
             return Err("coordinator lease release did not update exactly one row".to_string());
         }
-        tx.commit()
-            .map_err(|error| format!("commit coordinator lease release: {error}"))?;
+        let ambiguous_valid_until =
+            witness_lease_deadline(monotonic_now, WITNESS_LEASE_RESTART_HOLD_SECS)?;
+        if let Err(error) = tx.commit() {
+            clock
+                .holds
+                .entry(*chain_id)
+                .and_modify(|hold| {
+                    if hold.valid_until < ambiguous_valid_until {
+                        hold.valid_until = ambiguous_valid_until;
+                    }
+                })
+                .or_insert(RecordCommitmentWitnessLeaseHold {
+                    coordinator: *coordinator,
+                    instance_id: *instance_id,
+                    lease_epoch,
+                    valid_until: ambiguous_valid_until,
+                });
+            return Err(format!("commit coordinator lease release: {error}"));
+        }
+        #[cfg(test)]
+        if matches!(
+            commit_observation,
+            WitnessLeaseCommitObservation::UnknownAfterCommit
+        ) {
+            clock
+                .holds
+                .entry(*chain_id)
+                .and_modify(|hold| {
+                    if hold.valid_until < ambiguous_valid_until {
+                        hold.valid_until = ambiguous_valid_until;
+                    }
+                })
+                .or_insert(RecordCommitmentWitnessLeaseHold {
+                    coordinator: *coordinator,
+                    instance_id: *instance_id,
+                    lease_epoch,
+                    valid_until: ambiguous_valid_until,
+                });
+            return Err("coordinator lease release commit outcome is unknown".to_string());
+        }
+        #[cfg(not(test))]
+        let _ = commit_observation;
+        if existing.iter().any(|other| {
+            other.chain_id == *chain_id && other.coordinator != *coordinator && !other.is_released()
+        }) {
+            clock.holds.insert(
+                *chain_id,
+                RecordCommitmentWitnessLeaseHold {
+                    coordinator: [0; 32],
+                    instance_id: [0; 32],
+                    lease_epoch,
+                    valid_until: ambiguous_valid_until,
+                },
+            );
+        } else {
+            clock.holds.remove(chain_id);
+        }
         Ok(RecordCoordinatorLeaseReleaseOutcome::Released {
             lease_epoch,
             released_at: now,
@@ -10975,9 +11352,39 @@ mod tests {
                 )
                 .await
                 .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Contended
+        );
+        assert_eq!(
+            reopened
+                .release_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &first_instance,
+                    1_097,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseReleaseOutcome::Released {
+                lease_epoch: 1,
+                released_at: 1_097,
+            }
+        );
+        assert_eq!(
+            reopened
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    1_098,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
             RecordCoordinatorLeaseGrantOutcome::Granted {
                 lease_epoch: 2,
-                lease_expires_at: 1_156,
+                lease_expires_at: 1_158,
             }
         );
 
@@ -11069,6 +11476,347 @@ mod tests {
                 .unwrap(),
             RecordCoordinatorLeaseReleaseOutcome::NotHolder
         );
+    }
+
+    #[tokio::test]
+    async fn test_witness_lease_correlated_forward_wall_step_does_not_split_same_key() {
+        // [MEMCHAIN-WITNESS-CLOCK 2026-09-05 by Codex] Independent witness
+        // databases must not all release the same still-live holder merely
+        // because their correlated wall clocks jump forward together.
+        let directory = TempDir::new().unwrap();
+        let chain_id = AERONYX_MEMCHAIN_MAINNET_CHAIN_ID;
+        let coordinator = [0x35; 32];
+        let first_instance = [0x36; 32];
+        let second_instance = [0x37; 32];
+        let mut witnesses = Vec::new();
+        for index in 0..2 {
+            let storage = MemoryStorage::open(
+                directory
+                    .path()
+                    .join(format!("witness-forward-step-{index}.db")),
+                None,
+            )
+            .unwrap();
+            assert!(matches!(
+                storage
+                    .grant_record_commitment_coordinator_lease(
+                        &chain_id,
+                        &coordinator,
+                        &first_instance,
+                        0,
+                        &GENESIS_PREV_HASH,
+                        1_000,
+                        MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                    )
+                    .await
+                    .unwrap(),
+                RecordCoordinatorLeaseGrantOutcome::Granted { lease_epoch: 1, .. }
+            ));
+            witnesses.push(storage);
+        }
+
+        for storage in &witnesses {
+            assert_eq!(
+                storage
+                    .grant_record_commitment_coordinator_lease(
+                        &chain_id,
+                        &coordinator,
+                        &second_instance,
+                        0,
+                        &GENESIS_PREV_HASH,
+                        10_000,
+                        MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                    )
+                    .await
+                    .unwrap(),
+                RecordCoordinatorLeaseGrantOutcome::Contended
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_witness_lease_monotonic_hold_survives_forward_and_backward_wall_steps() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let chain_id = AERONYX_MEMCHAIN_MAINNET_CHAIN_ID;
+        let coordinator = [0x38; 32];
+        let first_instance = [0x39; 32];
+        let second_instance = [0x3a; 32];
+        let monotonic_start = Instant::now();
+
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease_at(
+                    &chain_id,
+                    &coordinator,
+                    &first_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    1_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                    monotonic_start,
+                    WitnessLeaseCommitObservation::Observed,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted {
+                lease_epoch: 1,
+                lease_expires_at: 1_060,
+            }
+        );
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease_at(
+                    &chain_id,
+                    &coordinator,
+                    &first_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    900,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                    monotonic_start + Duration::from_secs(1),
+                    WitnessLeaseCommitObservation::Observed,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted {
+                lease_epoch: 1,
+                lease_expires_at: 1_060,
+            }
+        );
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease_at(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    10_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                    monotonic_start + Duration::from_secs(2),
+                    WitnessLeaseCommitObservation::Observed,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Contended
+        );
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease_at(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    10_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                    monotonic_start + Duration::from_secs(76),
+                    WitnessLeaseCommitObservation::Observed,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted {
+                lease_epoch: 2,
+                lease_expires_at: 10_060,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_witness_lease_rejects_multiple_handles_for_one_database() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("witness-single-clock.db");
+        let chain_id = AERONYX_MEMCHAIN_MAINNET_CHAIN_ID;
+        let coordinator = [0x3b; 32];
+        let first_instance = [0x3c; 32];
+        let second_instance = [0x3d; 32];
+        let first = MemoryStorage::open(&db_path, None).unwrap();
+        let second = MemoryStorage::open(&db_path, None).unwrap();
+
+        assert!(matches!(
+            first
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &first_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    1_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted { .. }
+        ));
+        assert_eq!(
+            second
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    10_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap_err(),
+            "witness lease clock is held by another database handle"
+        );
+        drop(first);
+        assert_eq!(
+            second
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    10_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Contended
+        );
+    }
+
+    #[tokio::test]
+    async fn test_witness_lease_clock_rejects_hardlink_without_chmod_side_effect() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("witness-hardlink.db");
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+        let external = directory.path().join("external-state");
+        std::fs::write(&external, b"external").unwrap();
+        std::fs::set_permissions(&external, Permissions::from_mode(0o644)).unwrap();
+        let lock_path = commitment_witness_lease_clock_path(&db_path).unwrap();
+        std::fs::hard_link(&external, &lock_path).unwrap();
+
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                    &[0x41; 32],
+                    &[0x42; 32],
+                    0,
+                    &GENESIS_PREV_HASH,
+                    1_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap_err(),
+            "witness lease clock file is unsafe"
+        );
+        assert_eq!(
+            std::fs::metadata(&external).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[tokio::test]
+    async fn test_witness_lease_clock_rejects_symlink_parent() {
+        let directory = TempDir::new().unwrap();
+        let real_parent = directory.path().join("real");
+        let linked_parent = directory.path().join("linked");
+        std::fs::create_dir(&real_parent).unwrap();
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        let db_path = linked_parent.join("witness-symlink-parent.db");
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                    &[0x43; 32],
+                    &[0x44; 32],
+                    0,
+                    &GENESIS_PREV_HASH,
+                    1_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap_err(),
+            "witness lease clock file is unsafe"
+        );
+        assert!(!commitment_witness_lease_clock_path(&db_path)
+            .unwrap()
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn test_witness_lease_unknown_commit_outcomes_keep_conservative_hold() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let chain_id = AERONYX_MEMCHAIN_MAINNET_CHAIN_ID;
+        let coordinator = [0x3e; 32];
+        let first_instance = [0x3f; 32];
+        let second_instance = [0x40; 32];
+        let monotonic_start = Instant::now();
+
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease_at(
+                    &chain_id,
+                    &coordinator,
+                    &first_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    1_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                    monotonic_start,
+                    WitnessLeaseCommitObservation::UnknownAfterCommit,
+                )
+                .await
+                .unwrap_err(),
+            "coordinator lease commit outcome is unknown"
+        );
+        assert_eq!(
+            storage
+                .release_record_commitment_coordinator_lease_at(
+                    &chain_id,
+                    &coordinator,
+                    &first_instance,
+                    1_001,
+                    monotonic_start + Duration::from_secs(1),
+                    WitnessLeaseCommitObservation::UnknownAfterCommit,
+                )
+                .await
+                .unwrap_err(),
+            "coordinator lease release commit outcome is unknown"
+        );
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease_at(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    10_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                    monotonic_start + Duration::from_secs(2),
+                    WitnessLeaseCommitObservation::Observed,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Contended
+        );
+        assert!(matches!(
+            storage
+                .grant_record_commitment_coordinator_lease_at(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    10_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                    monotonic_start + Duration::from_secs(WITNESS_LEASE_RESTART_HOLD_SECS + 2),
+                    WitnessLeaseCommitObservation::Observed,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted { lease_epoch: 2, .. }
+        ));
     }
 
     #[tokio::test]
@@ -11188,6 +11936,7 @@ mod tests {
         let chain_id = AERONYX_MEMCHAIN_MAINNET_CHAIN_ID;
         let first_coordinator = [0x61_u8; 32];
         let second_coordinator = [0x62_u8; 32];
+        let second_instance = [0x72_u8; 32];
         let replacement_coordinator = [0x63; 32];
         let replacement_instance = [0x64; 32];
         let storage = MemoryStorage::open(":memory:", None).unwrap();
@@ -11213,12 +11962,42 @@ mod tests {
                 params![
                     second_coordinator.as_slice(),
                     chain_id.as_slice(),
-                    [0x72_u8; 32].as_slice(),
+                    second_instance.as_slice(),
                 ],
             )
             .unwrap();
         }
 
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &replacement_coordinator,
+                    &replacement_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    200,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Contended
+        );
+        assert_eq!(
+            storage
+                .release_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &second_coordinator,
+                    &second_instance,
+                    200,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseReleaseOutcome::Released {
+                lease_epoch: 7,
+                released_at: 200,
+            }
+        );
         assert_eq!(
             storage
                 .grant_record_commitment_coordinator_lease(

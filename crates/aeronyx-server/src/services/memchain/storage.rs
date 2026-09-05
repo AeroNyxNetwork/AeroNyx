@@ -185,6 +185,9 @@
 //!   a permit.
 //!
 //! ## Last Modified
+//! [MEMCHAIN-WITNESS-CLOCK 2026-09-05 by Codex] Added one process-local,
+//! monotonic witness-lease authority per SQLite repository while preserving
+//! the durable wall-clock lease schema and public API.
 //! v2.8.66-ManagedVolumeGrowth - Added optional managed-volume admission.
 //! v2.8.65-CustodyWitnessReceiptImport - Added schema-v18 typed receipt
 //! admission evidence for restart-safe live and air-gapped workflows.
@@ -267,7 +270,7 @@
 //!   consecutive-failure, recovery, and monotonic remaining-window evidence.
 // ============================================
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1450,6 +1453,37 @@ pub(crate) struct RecordCommitmentCoordinatorLeaseRuntime {
     pub(crate) recoveries_total: u64,
 }
 
+/// One process-local serialized clock authority for witness lease decisions.
+///
+/// [MEMCHAIN-WITNESS-CLOCK 2026-09-05 by Codex] Durable wall timestamps remain
+/// wire/data compatible, but an active holder is fenced by a monotonic deadline.
+/// On restart every unreleased row receives a fresh conservative hold before a
+/// competing grant can be evaluated. The advisory lock prevents two
+/// `MemoryStorage` handles from independently interpreting the same database.
+pub(crate) struct RecordCommitmentWitnessLeaseClockRuntime {
+    pub(crate) handle: Option<Flock<File>>,
+    pub(crate) initialized_chains: HashSet<[u8; 32]>,
+    pub(crate) holds: HashMap<[u8; 32], RecordCommitmentWitnessLeaseHold>,
+}
+
+impl Default for RecordCommitmentWitnessLeaseClockRuntime {
+    fn default() -> Self {
+        Self {
+            handle: None,
+            initialized_chains: HashSet::new(),
+            holds: HashMap::new(),
+        }
+    }
+}
+
+/// Monotonic refusal window for one durable chain lease.
+pub(crate) struct RecordCommitmentWitnessLeaseHold {
+    pub(crate) coordinator: [u8; 32],
+    pub(crate) instance_id: [u8; 32],
+    pub(crate) lease_epoch: u64,
+    pub(crate) valid_until: Instant,
+}
+
 impl Default for RecordCommitmentCoordinatorLeaseRuntime {
     fn default() -> Self {
         Self {
@@ -1625,6 +1659,9 @@ pub struct MemoryStorage {
     /// Witness-backed cross-host production authority. This remains disabled
     /// unless the operator explicitly enables strict coordinator leasing.
     pub(crate) commitment_coordinator_lease: RwLock<RecordCommitmentCoordinatorLeaseRuntime>,
+    /// Witness-side clock/lock authority. It is deliberately independent from
+    /// the coordinator's production-side lease telemetry above.
+    pub(crate) commitment_witness_lease_clock: TokioMutex<RecordCommitmentWitnessLeaseClockRuntime>,
     /// Signed local high-water mark outside SQLite. The private config never
     /// leaves this process; only aggregate status is reportable.
     pub(crate) commitment_tip_anchor: RwLock<RecordCommitmentTipAnchorRuntime>,
@@ -1709,6 +1746,9 @@ impl MemoryStorage {
             ),
             commitment_coordinator_lease: RwLock::new(
                 RecordCommitmentCoordinatorLeaseRuntime::default(),
+            ),
+            commitment_witness_lease_clock: TokioMutex::new(
+                RecordCommitmentWitnessLeaseClockRuntime::default(),
             ),
             commitment_tip_anchor: RwLock::new(RecordCommitmentTipAnchorRuntime::default()),
             commitment_checkpoint: RwLock::new(RecordCommitmentCheckpointRuntime::default()),
