@@ -365,24 +365,38 @@ fn unix_now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::anonymous_mailbox::{
-        encode_anonymous_mailbox_terminal_frame, AnonymousMailboxTerminalFrameV1,
+        decode_anonymous_mailbox_terminal_frame, encode_anonymous_mailbox_terminal_frame,
+        AnonymousMailboxOutcomeV1, AnonymousMailboxSourceTerminalCarrierV1,
+        AnonymousMailboxTerminalFrameV1, AnonymousMailboxTicketIssueResponseV1,
         AnonymousMailboxTicketIssueV1,
     };
     use aeronyx_core::protocol::chat::BlindRelaySuccessReceipt;
     use aeronyx_core::protocol::discovery::{
         NodeCapability, NodeDescriptor, NodeProtocolFeature, SignedNodeDescriptor,
     };
-    use parking_lot::Mutex;
+    use aeronyx_core::protocol::memchain::{decode_memchain, MemChainMessage, MEMCHAIN_MAGIC};
+    use aeronyx_core::protocol::onion::open_onion_layer;
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use parking_lot::{Mutex, RwLock};
     use rusqlite::Connection;
+    use sha2::{Digest, Sha256};
+    use tower::ServiceExt;
 
     use super::*;
-    use crate::api::chat_peer::PeerBlindRelayResponse;
+    use crate::api::chat_peer::{PeerBlindRelayRequest, PeerBlindRelayResponse};
+    use crate::api::mpi::{
+        build_mpi_router, build_mpi_router_with_source, Mode, MpiState, SessionEmbeddingCache,
+    };
     use crate::services::chat_relay_anonymous_mailbox_source::{
-        ExactAnonymousMailboxTargetResolver, SqliteAnonymousMailboxSourceJournal,
+        AnonymousMailboxSourcePhase, ExactAnonymousMailboxTargetResolver,
+        SqliteAnonymousMailboxSourceJournal,
     };
 
     const NOW: u64 = 1_800_000_000;
@@ -562,5 +576,563 @@ mod tests {
         altered[0] ^= 1;
         tampered.opaque_terminal_response_b64 = Some(STANDARD.encode(altered));
         assert!(validate_terminal_response(&tampered, &outbound, NOW).is_err());
+    }
+
+    // [M13J 2026-09-05 by Codex] Router admission uses the production MPI
+    // middleware and real body-bound Ed25519 signatures. Durable retry and
+    // terminal-proof tests use the coordinator's existing typed I/O boundary,
+    // so they remain deterministic and never open a socket or contact a peer.
+    struct RecordingResolver {
+        descriptor: SignedNodeDescriptor,
+        exact_calls: AtomicUsize,
+        unexpected_calls: AtomicUsize,
+    }
+
+    impl ExactAnonymousMailboxTargetResolver for RecordingResolver {
+        fn get_valid_exact(&self, node_id: &[u8; 32], _: u64) -> Option<SignedNodeDescriptor> {
+            if node_id == &self.descriptor.descriptor.node_id {
+                self.exact_calls.fetch_add(1, Ordering::Relaxed);
+                Some(self.descriptor.clone())
+            } else {
+                self.unexpected_calls.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    struct SourceRouterFixture {
+        coordinator: Arc<AnonymousMailboxSourceCoordinator>,
+        resolver: Arc<RecordingResolver>,
+        config: AnonymousMailboxSourceConfig,
+        target: IdentityKeyPair,
+        route_id: [u8; 16],
+        commitment: DirectoryDescriptorCommitmentV1,
+        terminal_frame: Vec<u8>,
+        _source_store: tempfile::TempDir,
+    }
+
+    fn source_mpi_state() -> Arc<MpiState> {
+        let identity = IdentityKeyPair::from_bytes(&[0xB1; 32]).expect("test MPI identity");
+        let owner_key = identity.public_key_bytes();
+        Arc::new(MpiState {
+            mode: Mode::Local,
+            storage: None,
+            vector_index: None,
+            identity,
+            identity_cache: RwLock::new(HashMap::new()),
+            index_ready: AtomicBool::new(true),
+            user_weights: Arc::new(RwLock::new(HashMap::new())),
+            mvf_alpha: 0.0,
+            mvf_enabled: false,
+            session_embeddings: RwLock::new(SessionEmbeddingCache::default()),
+            mvf_baseline: RwLock::new(None),
+            owner_key,
+            api_secret: Some("m13j-router-test-secret".into()),
+            embed_engine: None,
+            // Remote body-bound auth is the production admission path for the
+            // source route; it must not allocate regular MPI storage.
+            allow_remote_storage: true,
+            blind_storage_enabled: false,
+            max_remote_owners: 0,
+            ner_engine: None,
+            graph_enabled: false,
+            entropy_filter_enabled: false,
+            reranker_engine: None,
+            rawlog_key: Some([0xB2; 32]),
+            llm_router: None,
+            storage_pool: None,
+            vector_pool: None,
+            volume_router: None,
+            system_db: None,
+            jwt_secret: None,
+            token_ttl_secs: 86_400,
+            pool_max_connections: 0,
+            pool_idle_timeout_secs: 0,
+        })
+    }
+
+    fn canonical_ticket_terminal(
+        target: &IdentityKeyPair,
+        request_id: [u8; 16],
+        now: u64,
+    ) -> Vec<u8> {
+        let request = AnonymousMailboxTicketIssueV1::new(
+            request_id,
+            [0xB4; 16],
+            target.public_key_bytes(),
+            [0xB5; 32],
+            now,
+            now.saturating_add(30),
+            0,
+        )
+        .expect("canonical ticket request");
+        encode_anonymous_mailbox_terminal_frame(&AnonymousMailboxTerminalFrameV1::TicketIssue(
+            request,
+        ))
+        .expect("canonical terminal frame")
+    }
+
+    fn source_router_fixture() -> SourceRouterFixture {
+        let target = IdentityKeyPair::from_bytes(&[0xB3; 32]).expect("test terminal identity");
+        let now = unix_now_secs();
+        let mut descriptor = NodeDescriptor::new(
+            target.public_key_bytes(),
+            11,
+            now.saturating_sub(1),
+            now.saturating_add(60),
+            "m13j-router-test",
+        )
+        .with_x25519_kem(target.x25519_public_key_bytes())
+        .with_protocol_features([
+            NodeProtocolFeature::AnonymousMailboxV1,
+            NodeProtocolFeature::OnionReplyV1,
+            NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+            NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+        ]);
+        // This is an unroutable test target. The deterministic coordinator
+        // seam below never opens a connection to it.
+        descriptor.public_endpoint = Some("http://8.8.8.8".into());
+        descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        let descriptor = SignedNodeDescriptor::sign(descriptor, &target).expect("descriptor");
+        let commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).expect("pin");
+        let resolver = Arc::new(RecordingResolver {
+            descriptor,
+            exact_calls: AtomicUsize::new(0),
+            unexpected_calls: AtomicUsize::new(0),
+        });
+        let source_store = tempfile::tempdir().expect("private source store");
+        let source_db = std::fs::canonicalize(source_store.path())
+            .expect("canonical private source store")
+            .join("source.sqlite");
+        let config = AnonymousMailboxSourceConfig {
+            enabled: true,
+            db_path: source_db.to_string_lossy().into_owned(),
+            max_journal_entries: 8,
+            max_journal_bytes: 512 * 1024,
+            max_in_flight: 2,
+            request_timeout_secs: 2,
+        };
+        let journal = SqliteAnonymousMailboxSourceJournal::open(config.clone(), [0xB6; 32])
+            .expect("private source journal");
+        let coordinator = Arc::new(AnonymousMailboxSourceCoordinator::new(
+            Arc::new(IdentityKeyPair::from_bytes(&[0xB7; 32]).expect("source identity")),
+            resolver.clone(),
+            Arc::new(journal),
+        ));
+        SourceRouterFixture {
+            coordinator,
+            resolver,
+            config,
+            target: target.clone(),
+            route_id: [0xB8; 16],
+            commitment,
+            terminal_frame: canonical_ticket_terminal(&target, [0xB9; 16], now),
+            _source_store: source_store,
+        }
+    }
+
+    fn submit_body(
+        route_id: [u8; 16],
+        commitment: DirectoryDescriptorCommitmentV1,
+        terminal_frame: &[u8],
+    ) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "version": SOURCE_SUBMIT_VERSION,
+            "route_id_b64": STANDARD.encode(route_id),
+            "target": {
+                "node_id_b64": STANDARD.encode(commitment.node_id),
+                "sequence": commitment.sequence,
+                "descriptor_hash_b64": STANDARD.encode(commitment.descriptor_hash),
+            },
+            "terminal_frame_b64": STANDARD.encode(terminal_frame),
+        }))
+        .expect("source submit JSON")
+    }
+
+    fn signed_remote_request(
+        method: Method,
+        path: &str,
+        signed_body: &[u8],
+        body: Vec<u8>,
+        signer: &IdentityKeyPair,
+    ) -> Request<Body> {
+        let timestamp = unix_now_secs().to_string();
+        let body_hash = Sha256::digest(signed_body);
+        let mut digest = Sha256::new();
+        digest.update(timestamp.as_bytes());
+        digest.update(method.as_str().as_bytes());
+        digest.update(path.as_bytes());
+        digest.update(body_hash);
+        let signature = signer.sign(&digest.finalize());
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header(
+                "x-memchain-publickey",
+                hex::encode(signer.public_key_bytes()),
+            )
+            .header("x-memchain-timestamp", timestamp)
+            .header("x-memchain-signature", hex::encode(signature))
+            .body(Body::from(body))
+            .expect("authenticated source request")
+    }
+
+    fn source_app(
+        state: Arc<MpiState>,
+        fixture: &SourceRouterFixture,
+        client: reqwest::Client,
+    ) -> Router {
+        let source = build_chat_anonymous_mailbox_source_router(
+            Arc::clone(&fixture.coordinator),
+            Arc::new(client),
+            &fixture.config,
+        );
+        build_mpi_router_with_source(state, source)
+    }
+
+    fn direct_test_client() -> reqwest::Client {
+        // Avoid the host proxy discovery provider: source transport never
+        // inherits it in production, and router tests need no network.
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("direct test client")
+    }
+
+    fn terminal_peer_response(peer_body: &[u8], target: &IdentityKeyPair) -> (Vec<u8>, Vec<u8>) {
+        let request: PeerBlindRelayRequest =
+            serde_json::from_slice(peer_body).expect("canonical peer request");
+        let (terminal_kem_secret, _) = target.to_x25519();
+        let peeled = open_onion_layer(&request.envelope.encrypted_blob, &terminal_kem_secret)
+            .expect("target peels source onion");
+        assert!(peeled.next_hop.is_none(), "source route has one exact hop");
+        assert_eq!(peeled.inner.first().copied(), Some(MEMCHAIN_MAGIC));
+        let MemChainMessage::AnonymousMailboxRouteV1(route) =
+            decode_memchain(&peeled.inner[1..]).expect("source route payload")
+        else {
+            panic!("source payload must be an anonymous-mailbox route");
+        };
+        let carrier = AnonymousMailboxSourceTerminalCarrierV1::decode_for_terminal(
+            &route.sealed_terminal_frame,
+            request.envelope.route_id,
+            target.public_key_bytes(),
+        )
+        .expect("canonical terminal carrier");
+        let AnonymousMailboxTerminalFrameV1::TicketIssue(ticket) =
+            decode_anonymous_mailbox_terminal_frame(carrier.terminal_frame())
+                .expect("canonical ticket terminal")
+        else {
+            panic!("fixture only sends ticket issue");
+        };
+        let now = unix_now_secs();
+        let terminal_frame = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::TicketIssueResponse(
+                AnonymousMailboxTicketIssueResponseV1::signed(
+                    &ticket,
+                    AnonymousMailboxOutcomeV1::Rejected,
+                    None,
+                    now,
+                    target,
+                )
+                .expect("signed terminal response"),
+            ),
+        )
+        .expect("canonical terminal response");
+        let sealed = AnonymousMailboxSourceSealedResponseV1::seal(
+            request.envelope.route_id,
+            carrier.context_commitment(),
+            target.public_key_bytes(),
+            carrier.reply_public_key(),
+            &terminal_frame,
+            target,
+        )
+        .and_then(|value| value.encode())
+        .expect("source sealed response");
+        let encoded = STANDARD.encode(&sealed);
+        let receipt = BlindRelaySuccessReceipt::terminal(
+            &request.envelope,
+            1,
+            None,
+            None,
+            Some(encoded.as_bytes()),
+            now,
+            target,
+        );
+        let response = PeerBlindRelayResponse {
+            accepted: true,
+            terminal: true,
+            forwarded: false,
+            ttl_remaining: 1,
+            reason: None,
+            delivery_receipt: None,
+            success_receipt: Some(receipt),
+            failure_receipt: None,
+            opaque_terminal_response_b64: Some(encoded),
+        };
+        (
+            serde_json::to_vec(&response).expect("peer response JSON"),
+            terminal_frame,
+        )
+    }
+
+    #[tokio::test]
+    async fn source_router_rejects_before_journal_or_exact_target_io() {
+        let fixture = source_router_fixture();
+        let state = source_mpi_state();
+        let app = source_app(state.clone(), &fixture, direct_test_client());
+        let signer = IdentityKeyPair::from_bytes(&[0xBA; 32]).expect("remote signer");
+        let valid = submit_body(
+            fixture.route_id,
+            fixture.commitment,
+            &fixture.terminal_frame,
+        );
+
+        let missing_auth = Request::builder()
+            .method(Method::POST)
+            .uri(ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(valid.clone()))
+            .expect("request");
+        assert_eq!(
+            app.clone()
+                .oneshot(missing_auth)
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut tampered = valid.clone();
+        *tampered.last_mut().expect("non-empty body") ^= 1;
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_remote_request(
+                    Method::POST,
+                    ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                    &valid,
+                    tampered,
+                    &signer,
+                ))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_remote_request(
+                    Method::GET,
+                    ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                    &valid,
+                    valid.clone(),
+                    &signer,
+                ))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        let extra_path = "/api/chat/anonymous-mailbox/source/submit/extra";
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_remote_request(
+                    Method::POST,
+                    extra_path,
+                    &valid,
+                    valid.clone(),
+                    &signer,
+                ))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let oversized = vec![b'x'; SOURCE_SUBMIT_BODY_MAX_BYTES.saturating_add(1)];
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_remote_request(
+                    Method::POST,
+                    ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                    &oversized,
+                    oversized.clone(),
+                    &signer,
+                ))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let malformed = submit_body(fixture.route_id, fixture.commitment, &[0x01]);
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_remote_request(
+                    Method::POST,
+                    ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                    &malformed,
+                    malformed.clone(),
+                    &signer,
+                ))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        // An ordinary peer path is never a source ingress, even with a valid
+        // source-style signature and body.
+        assert_eq!(
+            app.oneshot(signed_remote_request(
+                Method::POST,
+                "/api/chat/peer/blind-relay",
+                &valid,
+                valid.clone(),
+                &signer,
+            ))
+            .await
+            .expect("response")
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(fixture.resolver.exact_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fixture.resolver.unexpected_calls.load(Ordering::Relaxed), 0);
+
+        // The disabled composition is the base MPI router: it owns no source
+        // coordinator, journal, key, route or outbound client.
+        let disabled = build_mpi_router(state);
+        let disabled_body = submit_body(
+            fixture.route_id,
+            fixture.commitment,
+            &fixture.terminal_frame,
+        );
+        assert_eq!(
+            disabled
+                .oneshot(signed_remote_request(
+                    Method::POST,
+                    ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                    &disabled_body,
+                    disabled_body.clone(),
+                    &signer,
+                ))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn source_coordinator_preserves_exact_body_across_response_loss_retry_and_completion() {
+        let fixture = source_router_fixture();
+        let now = unix_now_secs();
+        let prepared = fixture
+            .coordinator
+            .prepare(
+                ExactAnonymousMailboxTargetPin::new(
+                    fixture.target.public_key_bytes(),
+                    fixture.commitment,
+                ),
+                fixture.route_id,
+                fixture.terminal_frame.clone(),
+                now,
+            )
+            .expect("durable source preparation");
+        let first_outbound = fixture
+            .coordinator
+            .begin_dispatch(fixture.route_id, now)
+            .expect("first exact target dispatch");
+        assert_eq!(prepared.body(), first_outbound.body());
+
+        // Model a response lost after the exact body was released: no terminal
+        // response is opened, so the retained armed record is the only retry.
+        let stored_body = fixture
+            .coordinator
+            .resume(fixture.route_id)
+            .expect("armed source retry")
+            .body()
+            .to_vec();
+        assert_eq!(stored_body, first_outbound.body());
+        let retry_outbound = fixture
+            .coordinator
+            .begin_dispatch(fixture.route_id, now)
+            .expect("exact durable retry dispatch");
+        assert_eq!(
+            retry_outbound.body(),
+            first_outbound.body(),
+            "retry sends exact durable bytes"
+        );
+
+        let (peer_response, expected_terminal) =
+            terminal_peer_response(retry_outbound.body(), &fixture.target);
+        let peer_response: PeerBlindRelayResponse =
+            serde_json::from_slice(&peer_response).expect("canonical terminal peer response");
+        let sealed_response =
+            validate_terminal_response(&peer_response, &retry_outbound, unix_now_secs())
+                .expect("receipt and envelope-bound terminal response");
+        fixture
+            .coordinator
+            .open_response(fixture.route_id, &sealed_response)
+            .expect("complete exact terminal response");
+        let completed = match fixture
+            .coordinator
+            .result(fixture.route_id)
+            .expect("result")
+        {
+            AnonymousMailboxSourceResult::Completed(response) => response,
+            _ => panic!("source request must complete"),
+        };
+        assert_eq!(
+            completed, expected_terminal,
+            "completion retains canonical terminal bytes"
+        );
+        assert_eq!(fixture.resolver.exact_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(fixture.resolver.unexpected_calls.load(Ordering::Relaxed), 0);
+
+        // Completion is terminal: the matching submit yields the same durable
+        // body/result without descriptor resolution or another dispatch.
+        let completed_retry = fixture
+            .coordinator
+            .prepare(
+                ExactAnonymousMailboxTargetPin::new(
+                    fixture.target.public_key_bytes(),
+                    fixture.commitment,
+                ),
+                fixture.route_id,
+                fixture.terminal_frame.clone(),
+                now,
+            )
+            .expect("matching completed retry");
+        assert_eq!(
+            completed_retry.phase(),
+            AnonymousMailboxSourcePhase::Completed
+        );
+        assert_eq!(completed_retry.body(), first_outbound.body());
+        assert!(matches!(
+            fixture.coordinator.result(fixture.route_id),
+            Ok(AnonymousMailboxSourceResult::Completed(response)) if response == completed
+        ));
+        assert_eq!(fixture.resolver.exact_calls.load(Ordering::Relaxed), 3);
+
+        let conflicting_terminal =
+            canonical_ticket_terminal(&fixture.target, [0xBC; 16], unix_now_secs());
+        assert!(matches!(
+            fixture.coordinator.prepare(
+                ExactAnonymousMailboxTargetPin::new(
+                    fixture.target.public_key_bytes(),
+                    fixture.commitment,
+                ),
+                fixture.route_id,
+                conflicting_terminal,
+                now,
+            ),
+            Err(AnonymousMailboxSourceError::Conflict)
+        ));
+        assert_eq!(fixture.resolver.exact_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(fixture.resolver.unexpected_calls.load(Ordering::Relaxed), 0);
     }
 }
