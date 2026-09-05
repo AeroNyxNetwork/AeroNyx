@@ -162,6 +162,9 @@
 //! [MEMCHAIN-WITNESS-CLOCK 2026-09-05 by Codex] Serializes witness lease
 //! measurement and mutation behind a monotonic hold plus an OS advisory lock;
 //! restart and ambiguous commits remain conservatively fail-closed.
+//! [MEMCHAIN-WITNESS-CLOCK-PROCESS 2026-09-05 by Codex] Adds deterministic
+//! child-process coverage for OS-lock exclusion, clean release, and
+//! unreleased crash recovery without changing production semantics.
 //! v2.8.65-CustodyWitnessReceiptImport - Added bounded host-local receipt
 //! import without weakening the live network persistence freshness policy.
 //! v2.8.64-CustodyWitnessReceiptVault - Added bounded producer receipt
@@ -9325,7 +9328,9 @@ mod tests {
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::ledger::MemoryRecord;
     use aeronyx_core::protocol::chat::CUSTODY_AUDIT_WITNESS_GAP_V1;
+    use std::process::{ExitStatus, Stdio};
     use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn blocking_anchor_writer_redacts_panic_payload() {
@@ -11476,6 +11481,316 @@ mod tests {
                 .unwrap(),
             RecordCoordinatorLeaseReleaseOutcome::NotHolder
         );
+    }
+
+    const WITNESS_LEASE_PROCESS_STAGE_ENV: &str = "AERONYX_TEST_WITNESS_LEASE_PROCESS_STAGE";
+    const WITNESS_LEASE_PROCESS_DB_ENV: &str = "AERONYX_TEST_WITNESS_LEASE_PROCESS_DB";
+    const WITNESS_LEASE_PROCESS_WORKER: &str = concat!(
+        "services::memchain::storage_ops::tests::",
+        "test_witness_lease_cross_process_worker"
+    );
+    const WITNESS_LEASE_PROCESS_CRASH_EXIT_CODE: i32 = 74;
+    const WITNESS_LEASE_PROCESS_COMMITTED_SIGNAL: &str = "witness-lease-committed";
+
+    struct WitnessLeaseChildOutput {
+        status: ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    }
+
+    async fn run_witness_lease_child(stage: &str, db_path: &Path) -> WitnessLeaseChildOutput {
+        // [MEMCHAIN-WITNESS-CLOCK-PROCESS 2026-09-05 by Codex] Re-execute the
+        // current test binary so no process-local mutex, Instant, or flock
+        // handle is shared with the parent. The deadline is supervision only;
+        // lease correctness never depends on elapsed sleep time.
+        let executable = std::env::current_exe().expect("resolve witness lease test binary");
+        let mut command = crate::isolated_child_command(executable);
+        command
+            .arg(WITNESS_LEASE_PROCESS_WORKER)
+            .arg("--exact")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(WITNESS_LEASE_PROCESS_STAGE_ENV, stage)
+            .env(WITNESS_LEASE_PROCESS_DB_ENV, db_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("spawn witness lease child");
+        let mut stdout = child.stdout.take().expect("capture witness child stdout");
+        let mut stderr = child.stderr.take().expect("capture witness child stderr");
+        let stdout_reader = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stdout
+                .read_to_end(&mut bytes)
+                .await
+                .expect("read witness child stdout");
+            bytes
+        });
+        let stderr_reader = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stderr
+                .read_to_end(&mut bytes)
+                .await
+                .expect("read witness child stderr");
+            bytes
+        });
+
+        let status = match tokio::time::timeout(Duration::from_secs(20), child.wait()).await {
+            Ok(result) => result.expect("wait for witness lease child"),
+            Err(_) => {
+                child.kill().await.expect("kill timed-out witness child");
+                let status = child.wait().await.expect("reap timed-out witness child");
+                let stdout = stdout_reader
+                    .await
+                    .expect("join timed-out witness stdout reader");
+                let stderr = stderr_reader
+                    .await
+                    .expect("join timed-out witness stderr reader");
+                panic!(
+                    "witness child {stage} exceeded deadline with status {:?}\nstdout:\n{}\nstderr:\n{}",
+                    status.code(),
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+        };
+        WitnessLeaseChildOutput {
+            status,
+            stdout: stdout_reader.await.expect("join witness stdout reader"),
+            stderr: stderr_reader.await.expect("join witness stderr reader"),
+        }
+    }
+
+    fn assert_witness_lease_child_succeeded(stage: &str, output: &WitnessLeaseChildOutput) {
+        assert!(
+            output.status.success(),
+            "witness child {stage} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_witness_lease_os_authority_excludes_child_until_durable_release() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("witness-process-release.db");
+        let chain_id = AERONYX_MEMCHAIN_MAINNET_CHAIN_ID;
+        let coordinator = [0x45; 32];
+        let first_instance = [0x46; 32];
+        let parent = MemoryStorage::open(&db_path, None).unwrap();
+
+        assert_eq!(
+            parent
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &first_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    1_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted {
+                lease_epoch: 1,
+                lease_expires_at: 1_060,
+            }
+        );
+        for stage in ["grant_while_parent_locked", "release_while_parent_locked"] {
+            let output = run_witness_lease_child(stage, &db_path).await;
+            assert_witness_lease_child_succeeded(stage, &output);
+        }
+
+        assert_eq!(
+            parent
+                .release_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &first_instance,
+                    1_001,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseReleaseOutcome::Released {
+                lease_epoch: 1,
+                released_at: 1_001,
+            }
+        );
+        drop(parent);
+
+        let output = run_witness_lease_child("grant_after_parent_release", &db_path).await;
+        assert_witness_lease_child_succeeded("grant_after_parent_release", &output);
+    }
+
+    #[tokio::test]
+    async fn test_witness_lease_unreleased_child_crash_keeps_restart_hold() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("witness-process-crash.db");
+        let crashed = run_witness_lease_child("seed_unreleased_crash", &db_path).await;
+        assert_eq!(
+            crashed.status.code(),
+            Some(WITNESS_LEASE_PROCESS_CRASH_EXIT_CODE),
+            "crash worker did not reach the committed lease boundary\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&crashed.stdout),
+            String::from_utf8_lossy(&crashed.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&crashed.stdout)
+                .contains(WITNESS_LEASE_PROCESS_COMMITTED_SIGNAL),
+            "crash worker did not flush its post-commit barrier"
+        );
+
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+        let chain_id = AERONYX_MEMCHAIN_MAINNET_CHAIN_ID;
+        let coordinator = [0x45; 32];
+        let first_instance = [0x46; 32];
+        let second_instance = [0x47; 32];
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    20_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Contended
+        );
+        assert_eq!(
+            storage
+                .release_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &first_instance,
+                    20_001,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseReleaseOutcome::Released {
+                lease_epoch: 1,
+                released_at: 20_001,
+            }
+        );
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    20_002,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted {
+                lease_epoch: 2,
+                lease_expires_at: 20_062,
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "invoked only as an isolated child of witness lease process tests"]
+    async fn test_witness_lease_cross_process_worker() {
+        let Ok(stage) = std::env::var(WITNESS_LEASE_PROCESS_STAGE_ENV) else {
+            return;
+        };
+        let db_path = std::env::var_os(WITNESS_LEASE_PROCESS_DB_ENV)
+            .map(PathBuf::from)
+            .expect("witness child database path");
+        let storage = MemoryStorage::open(db_path, None).unwrap();
+        let chain_id = AERONYX_MEMCHAIN_MAINNET_CHAIN_ID;
+        let coordinator = [0x45; 32];
+        let first_instance = [0x46; 32];
+        let second_instance = [0x47; 32];
+
+        match stage.as_str() {
+            "grant_while_parent_locked" => assert_eq!(
+                storage
+                    .grant_record_commitment_coordinator_lease(
+                        &chain_id,
+                        &coordinator,
+                        &second_instance,
+                        0,
+                        &GENESIS_PREV_HASH,
+                        10_000,
+                        MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                    )
+                    .await
+                    .unwrap_err(),
+                "witness lease clock is held by another database handle"
+            ),
+            "release_while_parent_locked" => assert_eq!(
+                storage
+                    .release_record_commitment_coordinator_lease(
+                        &chain_id,
+                        &coordinator,
+                        &first_instance,
+                        1_001,
+                    )
+                    .await
+                    .unwrap_err(),
+                "witness lease clock is held by another database handle"
+            ),
+            "grant_after_parent_release" => assert_eq!(
+                storage
+                    .grant_record_commitment_coordinator_lease(
+                        &chain_id,
+                        &coordinator,
+                        &second_instance,
+                        0,
+                        &GENESIS_PREV_HASH,
+                        1_002,
+                        MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                    )
+                    .await
+                    .unwrap(),
+                RecordCoordinatorLeaseGrantOutcome::Granted {
+                    lease_epoch: 2,
+                    lease_expires_at: 1_062,
+                }
+            ),
+            "seed_unreleased_crash" => {
+                assert_eq!(
+                    storage
+                        .grant_record_commitment_coordinator_lease(
+                            &chain_id,
+                            &coordinator,
+                            &first_instance,
+                            0,
+                            &GENESIS_PREV_HASH,
+                            2_000,
+                            MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                        )
+                        .await
+                        .unwrap(),
+                    RecordCoordinatorLeaseGrantOutcome::Granted {
+                        lease_epoch: 1,
+                        lease_expires_at: 2_060,
+                    }
+                );
+                // Deliberately skip MemoryStorage/Flock destructors after the
+                // SQLite commit; the parent owns and reaps this exact child.
+                let mut stdout = std::io::stdout();
+                writeln!(stdout, "{WITNESS_LEASE_PROCESS_COMMITTED_SIGNAL}")
+                    .expect("write witness child post-commit barrier");
+                stdout
+                    .flush()
+                    .expect("flush witness child post-commit barrier");
+                std::process::exit(WITNESS_LEASE_PROCESS_CRASH_EXIT_CODE);
+            }
+            other => panic!("unsupported witness lease child stage: {other}"),
+        }
     }
 
     #[tokio::test]
