@@ -611,7 +611,8 @@ mod tests {
     }
 
     struct PinnedTargetResolver {
-        descriptor: SignedNodeDescriptor,
+        exact_node_id: [u8; 32],
+        descriptor: RwLock<Option<SignedNodeDescriptor>>,
         alternate_node_id: [u8; 32],
         exact_calls: AtomicUsize,
         alternate_calls: AtomicUsize,
@@ -620,9 +621,9 @@ mod tests {
 
     impl ExactAnonymousMailboxTargetResolver for PinnedTargetResolver {
         fn get_valid_exact(&self, node_id: &[u8; 32], _: u64) -> Option<SignedNodeDescriptor> {
-            if node_id == &self.descriptor.descriptor.node_id {
+            if node_id == &self.exact_node_id {
                 self.exact_calls.fetch_add(1, Ordering::Relaxed);
-                return Some(self.descriptor.clone());
+                return self.descriptor.read().clone();
             }
             if node_id == &self.alternate_node_id {
                 self.alternate_calls.fetch_add(1, Ordering::Relaxed);
@@ -630,6 +631,12 @@ mod tests {
                 self.unknown_calls.fetch_add(1, Ordering::Relaxed);
             }
             None
+        }
+    }
+
+    impl PinnedTargetResolver {
+        fn replace_exact_descriptor(&self, descriptor: Option<SignedNodeDescriptor>) {
+            *self.descriptor.write() = descriptor;
         }
     }
 
@@ -648,6 +655,9 @@ mod tests {
         coordinator: Arc<AnonymousMailboxSourceCoordinator>,
         resolver: Arc<PinnedTargetResolver>,
         config: AnonymousMailboxSourceConfig,
+        source_seed: u8,
+        journal_key: u8,
+        alternate_node_id: [u8; 32],
         _source_store: tempfile::TempDir,
     }
 
@@ -670,7 +680,8 @@ mod tests {
             request_timeout_secs: 2,
         };
         let resolver = Arc::new(PinnedTargetResolver {
-            descriptor,
+            exact_node_id: descriptor.descriptor.node_id,
+            descriptor: RwLock::new(Some(descriptor)),
             alternate_node_id,
             exact_calls: AtomicUsize::new(0),
             alternate_calls: AtomicUsize::new(0),
@@ -687,7 +698,54 @@ mod tests {
             coordinator,
             resolver,
             config,
+            source_seed,
+            journal_key,
+            alternate_node_id,
             _source_store: source_store,
+        }
+    }
+
+    // [E6-EXACT-TARGET-RECOVERY-GUARD 2026-09-05 by Codex] Transfer only the
+    // test-owned private journal directory into a fresh coordinator. This
+    // models source-process journal reopening without changing the production
+    // recovery path or adding a test-only route/session bypass.
+    fn reopen_real_source_entry(
+        entry: RealSourceEntry,
+        descriptor: SignedNodeDescriptor,
+    ) -> RealSourceEntry {
+        let RealSourceEntry {
+            config,
+            source_seed,
+            journal_key,
+            alternate_node_id,
+            _source_store,
+            ..
+        } = entry;
+        let resolver = Arc::new(PinnedTargetResolver {
+            exact_node_id: descriptor.descriptor.node_id,
+            descriptor: RwLock::new(Some(descriptor)),
+            alternate_node_id,
+            exact_calls: AtomicUsize::new(0),
+            alternate_calls: AtomicUsize::new(0),
+            unknown_calls: AtomicUsize::new(0),
+        });
+        let journal = SqliteAnonymousMailboxSourceJournal::open(config.clone(), [journal_key; 32])
+            .expect("reopen private source journal");
+        let coordinator = Arc::new(AnonymousMailboxSourceCoordinator::new(
+            Arc::new(
+                IdentityKeyPair::from_bytes(&[source_seed; 32]).expect("reopened source identity"),
+            ),
+            resolver.clone(),
+            Arc::new(journal),
+        ));
+        RealSourceEntry {
+            coordinator,
+            resolver,
+            config,
+            source_seed,
+            journal_key,
+            alternate_node_id,
+            _source_store,
         }
     }
 
@@ -1906,6 +1964,203 @@ mod tests {
         assert_eq!(entry_r.resolver.unknown_calls.load(Ordering::Relaxed), 0);
         assert!(entry_m.resolver.exact_calls.load(Ordering::Relaxed) >= 7);
         assert!(entry_r.resolver.exact_calls.load(Ordering::Relaxed) >= 6);
+    }
+
+    #[tokio::test]
+    async fn source_router_reopened_armed_retry_never_falls_back_after_exact_target_drift() {
+        // [E6-EXACT-TARGET-RECOVERY-GUARD 2026-09-05 by Codex] Model the
+        // bounded loss boundary after one real terminal mutation, then reopen
+        // only S's private journal. A rotated or missing exact descriptor must
+        // leave its immutable Armed request off-network; only the unchanged
+        // descriptor control may release the already-stored peer body again.
+        let now = unix_now_secs();
+        let target = IdentityKeyPair::from_bytes(&[0xF7; 32]).expect("target identity");
+        let mut descriptor = NodeDescriptor::new(
+            target.public_key_bytes(),
+            29,
+            now.saturating_sub(1),
+            now.saturating_add(60),
+            "e6-local-test",
+        )
+        .with_x25519_kem(target.x25519_public_key_bytes())
+        .with_protocol_features([
+            NodeProtocolFeature::AnonymousMailboxV1,
+            NodeProtocolFeature::OnionReplyV1,
+            NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+            NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+        ]);
+        descriptor.public_endpoint = Some("http://8.8.8.8".into());
+        descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        let descriptor = SignedNodeDescriptor::sign(descriptor, &target).expect("descriptor");
+        let commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).expect("pin");
+        let entry = real_source_entry(descriptor.clone(), 0xF8, 0xF9, [0xFA; 32]);
+        let state = source_mpi_state();
+        let signer = IdentityKeyPair::from_bytes(&[0xFB; 32]).expect("remote signer");
+        let private_directory = tempfile::tempdir().expect("private target store");
+        let store_path = std::fs::canonicalize(private_directory.path())
+            .expect("canonical target store")
+            .join("terminal.sqlite");
+        let store = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                AnonymousMailboxStoreConfig {
+                    enabled: true,
+                    db_path: store_path.to_string_lossy().into_owned(),
+                    max_leases_total: 4,
+                    max_items_total: 1_024,
+                    max_bytes_total: 1024 * 1024,
+                    max_in_flight: 2,
+                    cleanup_batch_size: 8,
+                    max_outstanding_tickets: 4,
+                    max_ticket_issues_per_window: 4,
+                    ticket_issuance_window_secs: 60,
+                    ticket_issue_work_bits: 1,
+                },
+                target.clone(),
+                [0xFC; 32],
+            )
+            .expect("real SQLite target store"),
+        );
+        let ticket_request =
+            ticket_request_with_one_bit_proof(&target, [0xFD; 16], [0xFE; 16], [0xFF; 32], now);
+        let terminal = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::TicketIssue(ticket_request.clone()),
+        )
+        .expect("ticket terminal");
+        let route_id = [0xA0; 16];
+        let body = submit_body(route_id, commitment, &terminal);
+
+        let (status, first_peer_body) = source_request_lost_after_real_terminal(
+            state.clone(),
+            &entry,
+            target.clone(),
+            store.clone(),
+            body.clone(),
+            &signer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(matches!(
+            entry.coordinator.result(route_id),
+            Ok(AnonymousMailboxSourceResult::Armed)
+        ));
+        let issued_ticket = match store
+            .issue_ticket(&ticket_request, unix_now_secs())
+            .expect("read first terminal mutation")
+        {
+            AnonymousMailboxTicketIssueOutcome::Existing(ticket) => ticket,
+            _ => panic!("response loss must not mint a second ticket"),
+        };
+
+        let entry = reopen_real_source_entry(entry, descriptor.clone());
+        assert_eq!(
+            entry
+                .coordinator
+                .resume(route_id)
+                .expect("reopened Armed request")
+                .body(),
+            first_peer_body
+        );
+
+        let mut rotated_body = descriptor.descriptor.clone();
+        rotated_body.sequence = rotated_body.sequence.saturating_add(1);
+        let rotated =
+            SignedNodeDescriptor::sign(rotated_body, &target).expect("rotated descriptor");
+        entry.resolver.replace_exact_descriptor(Some(rotated));
+        let rotated_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback drift observer");
+        let rotated = source_app_for(
+            state.clone(),
+            Arc::clone(&entry.coordinator),
+            &entry.config,
+            loopback_proxy_client(&rotated_listener),
+        )
+        .oneshot(signed_remote_request(
+            Method::POST,
+            ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+            &body,
+            body.clone(),
+            &signer,
+        ))
+        .await
+        .expect("drift response");
+        assert_eq!(rotated.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_no_proxy_connection(&rotated_listener).await;
+        assert!(matches!(
+            entry.coordinator.result(route_id),
+            Ok(AnonymousMailboxSourceResult::Armed)
+        ));
+
+        entry.resolver.replace_exact_descriptor(None);
+        let missing_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback missing observer");
+        let missing = source_app_for(
+            state.clone(),
+            Arc::clone(&entry.coordinator),
+            &entry.config,
+            loopback_proxy_client(&missing_listener),
+        )
+        .oneshot(signed_remote_request(
+            Method::POST,
+            ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+            &body,
+            body.clone(),
+            &signer,
+        ))
+        .await
+        .expect("missing response");
+        assert_eq!(missing.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_no_proxy_connection(&missing_listener).await;
+        assert!(matches!(
+            entry.coordinator.result(route_id),
+            Ok(AnonymousMailboxSourceResult::Armed)
+        ));
+        assert_eq!(entry.resolver.alternate_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.resolver.unknown_calls.load(Ordering::Relaxed), 0);
+
+        entry
+            .resolver
+            .replace_exact_descriptor(Some(descriptor.clone()));
+        let (status, source_body, control_peer_body) = source_request_with_real_terminal(
+            state,
+            &entry,
+            target.clone(),
+            store.clone(),
+            body,
+            &signer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            control_peer_body, first_peer_body,
+            "control retries exact bytes"
+        );
+        let AnonymousMailboxTerminalFrameV1::TicketIssueResponse(control_ticket) =
+            completed_terminal_frame(&source_body)
+        else {
+            panic!("control ticket response kind");
+        };
+        control_ticket
+            .verify_for_request(&ticket_request, &target.public_key_bytes())
+            .expect("request-bound control ticket response");
+        assert!(
+            control_ticket.ticket.as_ref() == Some(&issued_ticket),
+            "control retry must retain the first terminal ticket"
+        );
+        assert!(matches!(
+            store
+                .issue_ticket(&ticket_request, unix_now_secs())
+                .expect("read retained terminal ticket"),
+            AnonymousMailboxTicketIssueOutcome::Existing(ticket) if ticket == issued_ticket
+        ));
+        assert!(matches!(
+            entry.coordinator.result(route_id),
+            Ok(AnonymousMailboxSourceResult::Completed(_))
+        ));
+        assert_eq!(entry.resolver.alternate_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.resolver.unknown_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
