@@ -373,9 +373,10 @@ mod tests {
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::anonymous_mailbox::{
         decode_anonymous_mailbox_terminal_frame, encode_anonymous_mailbox_terminal_frame,
-        AnonymousMailboxOutcomeV1, AnonymousMailboxSourceTerminalCarrierV1,
-        AnonymousMailboxTerminalFrameV1, AnonymousMailboxTicketIssueResponseV1,
-        AnonymousMailboxTicketIssueV1,
+        AnonymousMailboxAckV1, AnonymousMailboxLeaseCreateV1, AnonymousMailboxOutcomeV1,
+        AnonymousMailboxPullOneV1, AnonymousMailboxPullResultV1, AnonymousMailboxPutV1,
+        AnonymousMailboxSourceTerminalCarrierV1, AnonymousMailboxTerminalFrameV1,
+        AnonymousMailboxTicketIssueResponseV1, AnonymousMailboxTicketIssueV1,
     };
     use aeronyx_core::protocol::chat::BlindRelaySuccessReceipt;
     use aeronyx_core::protocol::discovery::{
@@ -394,12 +395,17 @@ mod tests {
 
     use super::*;
     use crate::api::chat_peer::{PeerBlindRelayRequest, PeerBlindRelayResponse};
+    use crate::api::chat_peer_anonymous_mailbox::PreparedAnonymousMailboxTerminal;
     use crate::api::mpi::{
         build_mpi_router, build_mpi_router_with_source, Mode, MpiState, SessionEmbeddingCache,
     };
+    use crate::config_chat_relay::AnonymousMailboxStoreConfig;
     use crate::services::chat_relay_anonymous_mailbox_source::{
         AnonymousMailboxSourcePhase, ExactAnonymousMailboxTargetResolver,
         SqliteAnonymousMailboxSourceJournal,
+    };
+    use crate::services::chat_relay_mailbox::{
+        AnonymousMailboxCustodyRepository, SqliteAnonymousMailboxStore,
     };
 
     const NOW: u64 = 1_800_000_000;
@@ -603,6 +609,29 @@ mod tests {
         }
     }
 
+    struct PinnedTargetResolver {
+        descriptor: SignedNodeDescriptor,
+        alternate_node_id: [u8; 32],
+        exact_calls: AtomicUsize,
+        alternate_calls: AtomicUsize,
+        unknown_calls: AtomicUsize,
+    }
+
+    impl ExactAnonymousMailboxTargetResolver for PinnedTargetResolver {
+        fn get_valid_exact(&self, node_id: &[u8; 32], _: u64) -> Option<SignedNodeDescriptor> {
+            if node_id == &self.descriptor.descriptor.node_id {
+                self.exact_calls.fetch_add(1, Ordering::Relaxed);
+                return Some(self.descriptor.clone());
+            }
+            if node_id == &self.alternate_node_id {
+                self.alternate_calls.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.unknown_calls.fetch_add(1, Ordering::Relaxed);
+            }
+            None
+        }
+    }
+
     struct SourceRouterFixture {
         coordinator: Arc<AnonymousMailboxSourceCoordinator>,
         resolver: Arc<RecordingResolver>,
@@ -612,6 +641,53 @@ mod tests {
         commitment: DirectoryDescriptorCommitmentV1,
         terminal_frame: Vec<u8>,
         _source_store: tempfile::TempDir,
+    }
+
+    struct RealSourceEntry {
+        coordinator: Arc<AnonymousMailboxSourceCoordinator>,
+        resolver: Arc<PinnedTargetResolver>,
+        config: AnonymousMailboxSourceConfig,
+        _source_store: tempfile::TempDir,
+    }
+
+    fn real_source_entry(
+        descriptor: SignedNodeDescriptor,
+        source_seed: u8,
+        journal_key: u8,
+        alternate_node_id: [u8; 32],
+    ) -> RealSourceEntry {
+        let source_store = tempfile::tempdir().expect("private source store");
+        let source_db = std::fs::canonicalize(source_store.path())
+            .expect("canonical private source store")
+            .join("source.sqlite");
+        let config = AnonymousMailboxSourceConfig {
+            enabled: true,
+            db_path: source_db.to_string_lossy().into_owned(),
+            max_journal_entries: 16,
+            max_journal_bytes: 512 * 1024,
+            max_in_flight: 2,
+            request_timeout_secs: 2,
+        };
+        let resolver = Arc::new(PinnedTargetResolver {
+            descriptor,
+            alternate_node_id,
+            exact_calls: AtomicUsize::new(0),
+            alternate_calls: AtomicUsize::new(0),
+            unknown_calls: AtomicUsize::new(0),
+        });
+        let journal = SqliteAnonymousMailboxSourceJournal::open(config.clone(), [journal_key; 32])
+            .expect("private source journal");
+        let coordinator = Arc::new(AnonymousMailboxSourceCoordinator::new(
+            Arc::new(IdentityKeyPair::from_bytes(&[source_seed; 32]).expect("source identity")),
+            resolver.clone(),
+            Arc::new(journal),
+        ));
+        RealSourceEntry {
+            coordinator,
+            resolver,
+            config,
+            _source_store: source_store,
+        }
     }
 
     fn source_mpi_state() -> Arc<MpiState> {
@@ -787,11 +863,22 @@ mod tests {
         fixture: &SourceRouterFixture,
         client: reqwest::Client,
     ) -> Router {
-        let source = build_chat_anonymous_mailbox_source_router(
+        source_app_for(
+            state,
             Arc::clone(&fixture.coordinator),
-            Arc::new(client),
             &fixture.config,
-        );
+            client,
+        )
+    }
+
+    fn source_app_for(
+        state: Arc<MpiState>,
+        coordinator: Arc<AnonymousMailboxSourceCoordinator>,
+        config: &AnonymousMailboxSourceConfig,
+        client: reqwest::Client,
+    ) -> Router {
+        let source =
+            build_chat_anonymous_mailbox_source_router(coordinator, Arc::new(client), config);
         build_mpi_router_with_source(state, source)
     }
 
@@ -878,6 +965,171 @@ mod tests {
             serde_json::to_vec(&response).expect("peer response JSON"),
             terminal_frame,
         )
+    }
+
+    // [M13J-E3 2026-09-05 by Codex] The loopback carrier below is only a
+    // synthetic HTTP transport.  Its response is produced by the production
+    // terminal adapter and a real private SQLite custody store; it is not an
+    // onion middle hop, a fleet node, or an externally reachable peer.
+    fn real_terminal_peer_response(
+        peer_body: &[u8],
+        target: &IdentityKeyPair,
+        repository: Arc<dyn AnonymousMailboxCustodyRepository>,
+    ) -> Vec<u8> {
+        let request: PeerBlindRelayRequest =
+            serde_json::from_slice(peer_body).expect("canonical peer request");
+        let (terminal_kem_secret, _) = target.to_x25519();
+        let peeled = open_onion_layer(&request.envelope.encrypted_blob, &terminal_kem_secret)
+            .expect("target peels source onion");
+        assert!(peeled.next_hop.is_none(), "source route has one exact hop");
+        let encoded = PreparedAnonymousMailboxTerminal::decode(
+            &peeled.inner,
+            request.envelope.route_id,
+            target.public_key_bytes(),
+        )
+        .expect("canonical terminal request")
+        .execute(repository, Arc::new(target.clone()), unix_now_secs())
+        .expect("real terminal response");
+        let receipt = BlindRelaySuccessReceipt::terminal(
+            &request.envelope,
+            1,
+            None,
+            None,
+            Some(encoded.as_bytes()),
+            unix_now_secs(),
+            target,
+        );
+        serde_json::to_vec(&PeerBlindRelayResponse {
+            accepted: true,
+            terminal: true,
+            forwarded: false,
+            ttl_remaining: 1,
+            reason: None,
+            delivery_receipt: None,
+            success_receipt: Some(receipt),
+            failure_receipt: None,
+            opaque_terminal_response_b64: Some(encoded),
+        })
+        .expect("real peer response JSON")
+    }
+
+    async fn source_request_with_real_terminal(
+        state: Arc<MpiState>,
+        entry: &RealSourceEntry,
+        target: IdentityKeyPair,
+        repository: Arc<dyn AnonymousMailboxCustodyRepository>,
+        body: Vec<u8>,
+        signer: &IdentityKeyPair,
+    ) -> (StatusCode, Vec<u8>, Vec<u8>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback real-terminal proxy");
+        let client = loopback_proxy_client(&listener);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("one proxy connection");
+            let (_, peer_body) = read_proxy_request(&mut stream).await;
+            let response = real_terminal_peer_response(&peer_body, &target, repository);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("response headers");
+            stream.write_all(&response).await.expect("response body");
+            peer_body
+        });
+        let response = source_app_for(state, Arc::clone(&entry.coordinator), &entry.config, client)
+            .oneshot(signed_remote_request(
+                Method::POST,
+                ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                &body,
+                body.clone(),
+                signer,
+            ))
+            .await
+            .expect("source terminal response");
+        let status = response.status();
+        let source_body = axum::body::to_bytes(response.into_body(), SOURCE_SUBMIT_BODY_MAX_BYTES)
+            .await
+            .expect("bounded source response")
+            .to_vec();
+        (
+            status,
+            source_body,
+            server.await.expect("real-terminal proxy task"),
+        )
+    }
+
+    async fn source_request_lost_after_real_terminal(
+        state: Arc<MpiState>,
+        entry: &RealSourceEntry,
+        target: IdentityKeyPair,
+        repository: Arc<dyn AnonymousMailboxCustodyRepository>,
+        body: Vec<u8>,
+        signer: &IdentityKeyPair,
+    ) -> (StatusCode, Vec<u8>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback response-loss proxy");
+        let client = loopback_proxy_client(&listener);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("one proxy connection");
+            let (_, peer_body) = read_proxy_request(&mut stream).await;
+            let _ = real_terminal_peer_response(&peer_body, &target, repository);
+            // Drop after the durable terminal effect and before any HTTP
+            // response reaches the source.  The next attempt must reuse the
+            // source journal's exact armed body.
+            peer_body
+        });
+        let response = source_app_for(state, Arc::clone(&entry.coordinator), &entry.config, client)
+            .oneshot(signed_remote_request(
+                Method::POST,
+                ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                &body,
+                body.clone(),
+                signer,
+            ))
+            .await
+            .expect("response-loss result");
+        (
+            response.status(),
+            server.await.expect("response-loss proxy task"),
+        )
+    }
+
+    fn completed_terminal_frame(source_body: &[u8]) -> AnonymousMailboxTerminalFrameV1 {
+        let result: serde_json::Value =
+            serde_json::from_slice(source_body).expect("completed source JSON");
+        assert_eq!(result["state"], "completed");
+        let response = result["terminal_response_b64"]
+            .as_str()
+            .expect("terminal response");
+        decode_anonymous_mailbox_terminal_frame(
+            &STANDARD.decode(response).expect("terminal response base64"),
+        )
+        .expect("terminal response frame")
+    }
+
+    fn assert_outer_peer_carrier_is_opaque(
+        peer_body: &[u8],
+        terminal_frame: &[u8],
+        reader: &IdentityKeyPair,
+    ) {
+        let request: PeerBlindRelayRequest =
+            serde_json::from_slice(peer_body).expect("canonical peer request");
+        assert!(request.onward_envelope.is_none());
+        assert!(request.onward_descriptor_hint.is_none());
+        let raw = std::str::from_utf8(peer_body).expect("JSON peer carrier");
+        assert!(
+            !raw.contains(&STANDARD.encode(terminal_frame)),
+            "outer peer carrier must not project the canonical terminal frame"
+        );
+        assert!(
+            !raw.contains(&STANDARD.encode(reader.public_key_bytes())),
+            "outer peer carrier must not project the receiver verifier"
+        );
     }
 
     // [M13J-E2 2026-09-05 by Codex] This is a synthetic host-local HTTP proxy
@@ -1262,6 +1514,321 @@ mod tests {
         assert_no_proxy_connection(&conflicting_listener).await;
         assert_eq!(fixture.resolver.exact_calls.load(Ordering::Relaxed), 3);
         assert_eq!(fixture.resolver.unexpected_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn source_router_real_terminal_store_survives_response_loss_and_receiver_entry() {
+        // [M13J-E3 2026-09-05 by Codex] This is the source HTTP/real terminal
+        // adapter acceptance boundary.  M and R are distinct source journals;
+        // each can resolve only the same descriptor-pinned T.  The only socket
+        // is the synthetic local proxy carrying the production peer body.
+        let now = unix_now_secs();
+        let target = IdentityKeyPair::from_bytes(&[0xD1; 32]).expect("target identity");
+        let mut descriptor = NodeDescriptor::new(
+            target.public_key_bytes(),
+            19,
+            now.saturating_sub(1),
+            now.saturating_add(60),
+            "m13j-e3-local-test",
+        )
+        .with_x25519_kem(target.x25519_public_key_bytes())
+        .with_protocol_features([
+            NodeProtocolFeature::AnonymousMailboxV1,
+            NodeProtocolFeature::OnionReplyV1,
+            NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+            NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+        ]);
+        descriptor.public_endpoint = Some("http://8.8.8.8".into());
+        descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        let descriptor = SignedNodeDescriptor::sign(descriptor, &target).expect("descriptor");
+        let commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).expect("pin");
+        let alternate_node_id = [0xD2; 32];
+        let entry_m = real_source_entry(descriptor.clone(), 0xD3, 0xD4, alternate_node_id);
+        let entry_r = real_source_entry(descriptor, 0xD5, 0xD6, alternate_node_id);
+        let state = source_mpi_state();
+        let signer = IdentityKeyPair::from_bytes(&[0xD7; 32]).expect("remote signer");
+        let private_directory = tempfile::tempdir().expect("private target store");
+        let store_path = std::fs::canonicalize(private_directory.path())
+            .expect("canonical target store")
+            .join("terminal.sqlite");
+        let store_config = AnonymousMailboxStoreConfig {
+            enabled: true,
+            db_path: store_path.to_string_lossy().into_owned(),
+            max_leases_total: 4,
+            max_items_total: 1_024,
+            max_bytes_total: 1024 * 1024,
+            max_in_flight: 4,
+            cleanup_batch_size: 8,
+            max_outstanding_tickets: 4,
+            max_ticket_issues_per_window: 2,
+            ticket_issuance_window_secs: 60,
+            ticket_issue_work_bits: 1,
+        };
+        let depositor = IdentityKeyPair::from_bytes(&[0xD8; 32]).expect("deposit capability");
+        let reader = IdentityKeyPair::from_bytes(&[0xD9; 32]).expect("read capability");
+        let mailbox_id = [0xDA; 32];
+        let lease_expires_at = now.saturating_add(3_600);
+        let claims = AnonymousMailboxLeaseCreateV1::lease_claims_commitment(
+            &mailbox_id,
+            &depositor.public_key_bytes(),
+            &reader.public_key_bytes(),
+            4,
+            16 * 1024,
+            now,
+            lease_expires_at,
+        );
+        let ticket_request = (0..u64::MAX)
+            .find_map(|proof_nonce| {
+                let request = AnonymousMailboxTicketIssueV1::new(
+                    [0xDB; 16],
+                    [0xDC; 16],
+                    target.public_key_bytes(),
+                    claims,
+                    now,
+                    now.saturating_add(300),
+                    proof_nonce,
+                )
+                .expect("ticket request");
+                (request.proof_digest().expect("proof digest")[0] & 0x80 == 0).then_some(request)
+            })
+            .expect("one-bit ticket proof");
+        let store = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                store_config.clone(),
+                target.clone(),
+                [0xDD; 32],
+            )
+            .expect("real SQLite target store"),
+        );
+
+        let ticket_route = [0xDE; 16];
+        let ticket_terminal = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::TicketIssue(ticket_request.clone()),
+        )
+        .expect("ticket terminal");
+        let (status, source_body, ticket_peer_body) = source_request_with_real_terminal(
+            state.clone(),
+            &entry_m,
+            target.clone(),
+            store.clone(),
+            submit_body(ticket_route, commitment, &ticket_terminal),
+            &signer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let AnonymousMailboxTerminalFrameV1::TicketIssueResponse(ticket_response) =
+            completed_terminal_frame(&source_body)
+        else {
+            panic!("ticket response kind");
+        };
+        ticket_response
+            .verify_for_request(&ticket_request, &target.public_key_bytes())
+            .expect("request-bound ticket response");
+        assert_outer_peer_carrier_is_opaque(&ticket_peer_body, &ticket_terminal, &reader);
+        let ticket = ticket_response.ticket.expect("issued ticket");
+
+        let lease = AnonymousMailboxLeaseCreateV1::new(
+            mailbox_id,
+            depositor.public_key_bytes(),
+            4,
+            16 * 1024,
+            now,
+            lease_expires_at,
+            ticket,
+            &reader,
+        )
+        .expect("lease request");
+        let lease_terminal = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::LeaseCreate(lease),
+        )
+        .expect("lease terminal");
+        let (status, source_body, lease_peer_body) = source_request_with_real_terminal(
+            state.clone(),
+            &entry_m,
+            target.clone(),
+            store.clone(),
+            submit_body([0xDF; 16], commitment, &lease_terminal),
+            &signer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let AnonymousMailboxTerminalFrameV1::LeaseCreateResponse(lease_response) =
+            completed_terminal_frame(&source_body)
+        else {
+            panic!("lease response kind");
+        };
+        assert_eq!(lease_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        assert_outer_peer_carrier_is_opaque(&lease_peer_body, &lease_terminal, &reader);
+
+        let opaque_item = vec![0xE0; 4096];
+        let put = AnonymousMailboxPutV1::new(
+            mailbox_id,
+            [0xE1; 16],
+            opaque_item.clone(),
+            now,
+            now.saturating_add(600),
+            &depositor,
+        )
+        .expect("put request");
+        let put_route = [0xE2; 16];
+        let put_terminal = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::Put(put.clone()),
+        )
+        .expect("put terminal");
+        let put_body = submit_body(put_route, commitment, &put_terminal);
+        let (status, first_peer_body) = source_request_lost_after_real_terminal(
+            state.clone(),
+            &entry_m,
+            target.clone(),
+            store.clone(),
+            put_body.clone(),
+            &signer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let armed = entry_m
+            .coordinator
+            .begin_dispatch(put_route, unix_now_secs())
+            .expect("durable exact retry");
+        assert_eq!(armed.body(), first_peer_body);
+        assert_outer_peer_carrier_is_opaque(&first_peer_body, &put_terminal, &reader);
+
+        // The target committed the Put before the source observed a response.
+        // Reopening only durable SQLite state proves the retry remains an exact
+        // source body and has one terminal custody effect.
+        drop(store);
+        let restarted = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                store_config.clone(),
+                target.clone(),
+                [0xDD; 32],
+            )
+            .expect("restart real SQLite target store"),
+        );
+        let (status, source_body, second_peer_body) = source_request_with_real_terminal(
+            state.clone(),
+            &entry_m,
+            target.clone(),
+            restarted.clone(),
+            put_body,
+            &signer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            second_peer_body, first_peer_body,
+            "retry sends exact peer body"
+        );
+        let AnonymousMailboxTerminalFrameV1::PutResponse(put_response) =
+            completed_terminal_frame(&source_body)
+        else {
+            panic!("put response kind");
+        };
+        assert_eq!(put_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+
+        let pull = AnonymousMailboxPullOneV1::new(
+            mailbox_id,
+            [0xE3; 16],
+            Vec::new(),
+            unix_now_secs(),
+            &reader,
+        )
+        .expect("pull request");
+        let pull_terminal = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::PullOne(pull),
+        )
+        .expect("pull terminal");
+        let (status, source_body, pull_peer_body) = source_request_with_real_terminal(
+            state.clone(),
+            &entry_r,
+            target.clone(),
+            restarted.clone(),
+            submit_body([0xE4; 16], commitment, &pull_terminal),
+            &signer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let AnonymousMailboxTerminalFrameV1::PullOneResponse(pull_response) =
+            completed_terminal_frame(&source_body)
+        else {
+            panic!("pull response kind");
+        };
+        assert_eq!(pull_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        let pulled = AnonymousMailboxPullResultV1::decode(&pull_response.sealed_payload)
+            .expect("real pull result");
+        assert_eq!(pulled.item_id, put.item_id);
+        assert_eq!(pulled.sealed_commitment, put.sealed_commitment());
+        assert_eq!(pulled.sealed_item, opaque_item);
+        assert_outer_peer_carrier_is_opaque(&pull_peer_body, &pull_terminal, &reader);
+
+        let ack = AnonymousMailboxAckV1::new(
+            mailbox_id,
+            [0xE5; 16],
+            pulled.item_id,
+            pulled.sealed_commitment,
+            unix_now_secs(),
+            &reader,
+        )
+        .expect("ack request");
+        let ack_terminal =
+            encode_anonymous_mailbox_terminal_frame(&AnonymousMailboxTerminalFrameV1::Ack(ack))
+                .expect("ack terminal");
+        let (status, source_body, ack_peer_body) = source_request_with_real_terminal(
+            state.clone(),
+            &entry_r,
+            target.clone(),
+            restarted.clone(),
+            submit_body([0xE6; 16], commitment, &ack_terminal),
+            &signer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let AnonymousMailboxTerminalFrameV1::AckResponse(ack_response) =
+            completed_terminal_frame(&source_body)
+        else {
+            panic!("ack response kind");
+        };
+        assert_eq!(ack_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        assert_outer_peer_carrier_is_opaque(&ack_peer_body, &ack_terminal, &reader);
+
+        let empty_pull = AnonymousMailboxPullOneV1::new(
+            mailbox_id,
+            [0xE7; 16],
+            Vec::new(),
+            unix_now_secs(),
+            &reader,
+        )
+        .expect("empty pull request");
+        let empty_terminal = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::PullOne(empty_pull),
+        )
+        .expect("empty pull terminal");
+        let (status, source_body, empty_peer_body) = source_request_with_real_terminal(
+            state,
+            &entry_r,
+            target,
+            restarted,
+            submit_body([0xE8; 16], commitment, &empty_terminal),
+            &signer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let AnonymousMailboxTerminalFrameV1::PullOneResponse(empty_response) =
+            completed_terminal_frame(&source_body)
+        else {
+            panic!("empty pull response kind");
+        };
+        assert_eq!(empty_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        assert!(empty_response.sealed_payload.is_empty());
+        assert_outer_peer_carrier_is_opaque(&empty_peer_body, &empty_terminal, &reader);
+
+        assert_eq!(entry_m.resolver.alternate_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(entry_r.resolver.alternate_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(entry_m.resolver.unknown_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(entry_r.resolver.unknown_calls.load(Ordering::Relaxed), 0);
+        assert!(entry_m.resolver.exact_calls.load(Ordering::Relaxed) >= 7);
+        assert!(entry_r.resolver.exact_calls.load(Ordering::Relaxed) >= 6);
     }
 
     #[test]
