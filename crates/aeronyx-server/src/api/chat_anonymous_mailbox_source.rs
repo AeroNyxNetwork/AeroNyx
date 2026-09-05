@@ -368,6 +368,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::anonymous_mailbox::{
@@ -387,6 +388,8 @@ mod tests {
     use parking_lot::{Mutex, RwLock};
     use rusqlite::Connection;
     use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
     use tower::ServiceExt;
 
     use super::*;
@@ -877,6 +880,61 @@ mod tests {
         )
     }
 
+    // [M13J-E2 2026-09-05 by Codex] This is a synthetic host-local HTTP proxy
+    // fixture. It intercepts the descriptor-pinned public test URL at an
+    // ephemeral loopback port and never models an onion hop, a fleet node, or
+    // an externally reachable endpoint.
+    async fn read_proxy_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0u8; 2048];
+            let read = stream.read(&mut chunk).await.expect("proxy read");
+            assert_ne!(read, 0, "HTTP client closed before sending a request");
+            bytes.extend_from_slice(&chunk[..read]);
+            let Some(headers_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let body_start = headers_end + 4;
+            let headers = std::str::from_utf8(&bytes[..headers_end]).expect("ASCII headers");
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .expect("content length");
+            if bytes.len() < body_start + content_length {
+                continue;
+            }
+            let request_line = headers.lines().next().expect("request line").to_owned();
+            return (
+                request_line,
+                bytes[body_start..body_start + content_length].to_vec(),
+            );
+        }
+    }
+
+    fn loopback_proxy_client(listener: &TcpListener) -> reqwest::Client {
+        let address = listener.local_addr().expect("loopback proxy address");
+        reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::all(format!("http://{address}")).expect("proxy URL"))
+            .build()
+            .expect("loopback proxy client")
+    }
+
+    async fn assert_no_proxy_connection(listener: &TcpListener) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "source request unexpectedly reached the local proxy"
+        );
+    }
+
     #[tokio::test]
     async fn source_router_rejects_before_journal_or_exact_target_io() {
         let fixture = source_router_fixture();
@@ -1024,6 +1082,186 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn source_router_local_socket_retries_exact_body_and_completes_once() {
+        let fixture = source_router_fixture();
+        let state = source_mpi_state();
+        let signer = IdentityKeyPair::from_bytes(&[0xBD; 32]).expect("remote signer");
+        let body = submit_body(
+            fixture.route_id,
+            fixture.commitment,
+            &fixture.terminal_frame,
+        );
+
+        // Authentication fails in MPI middleware before a source record or
+        // transport attempt can exist.
+        let rejected_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback proxy");
+        let rejected = source_app(
+            state.clone(),
+            &fixture,
+            loopback_proxy_client(&rejected_listener),
+        )
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH)
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .expect("unsigned request"),
+        )
+        .await
+        .expect("middleware rejection");
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_no_proxy_connection(&rejected_listener).await;
+        assert_eq!(fixture.resolver.exact_calls.load(Ordering::Relaxed), 0);
+
+        // A proxy that reads and drops the connection models a response loss
+        // after the exact body has left the coordinator, without any external
+        // connection. The request must remain Armed for one exact retry.
+        let loss_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback loss proxy");
+        let loss_client = loopback_proxy_client(&loss_listener);
+        let lost_request = tokio::spawn(async move {
+            let (mut stream, _) = loss_listener.accept().await.expect("one proxy connection");
+            read_proxy_request(&mut stream).await
+        });
+        let first = source_app(state.clone(), &fixture, loss_client)
+            .oneshot(signed_remote_request(
+                Method::POST,
+                ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                &body,
+                body.clone(),
+                &signer,
+            ))
+            .await
+            .expect("lost response result");
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let (first_line, first_peer_body) = lost_request.await.expect("loss proxy task");
+        assert_eq!(
+            first_line,
+            "POST http://8.8.8.8/api/chat/peer/blind-relay HTTP/1.1"
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .resume(fixture.route_id)
+                .expect("armed durable request")
+                .body(),
+            first_peer_body
+        );
+
+        let reply_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback reply proxy");
+        let reply_client = loopback_proxy_client(&reply_listener);
+        let target = fixture.target.clone();
+        let delivered_request = tokio::spawn(async move {
+            let (mut stream, _) = reply_listener.accept().await.expect("one proxy connection");
+            let (request_line, peer_body) = read_proxy_request(&mut stream).await;
+            let (response, terminal_frame) = terminal_peer_response(&peer_body, &target);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("response headers");
+            stream.write_all(&response).await.expect("response body");
+            (request_line, peer_body, terminal_frame)
+        });
+        let second = source_app(state.clone(), &fixture, reply_client)
+            .oneshot(signed_remote_request(
+                Method::POST,
+                ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                &body,
+                body.clone(),
+                &signer,
+            ))
+            .await
+            .expect("terminal response result");
+        assert_eq!(second.status(), StatusCode::OK);
+        let completed_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(second.into_body(), SOURCE_SUBMIT_BODY_MAX_BYTES)
+                .await
+                .expect("bounded completion body"),
+        )
+        .expect("completion JSON");
+        assert_eq!(completed_json["state"], "completed");
+        let terminal_b64 = completed_json["terminal_response_b64"]
+            .as_str()
+            .expect("terminal response");
+        let (second_line, second_peer_body, expected_terminal) =
+            delivered_request.await.expect("reply proxy task");
+        assert_eq!(
+            second_line,
+            "POST http://8.8.8.8/api/chat/peer/blind-relay HTTP/1.1"
+        );
+        assert_eq!(second_peer_body, first_peer_body, "retry sends exact bytes");
+        assert_eq!(
+            STANDARD
+                .decode(terminal_b64)
+                .expect("base64 terminal response"),
+            expected_terminal
+        );
+
+        // Completion and same-route conflicts never open the proxy again.
+        let completed_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback completion proxy");
+        let completed_retry = source_app(
+            state.clone(),
+            &fixture,
+            loopback_proxy_client(&completed_listener),
+        )
+        .oneshot(signed_remote_request(
+            Method::POST,
+            ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+            &body,
+            body.clone(),
+            &signer,
+        ))
+        .await
+        .expect("completed retry result");
+        assert_eq!(completed_retry.status(), StatusCode::OK);
+        let completed_retry_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(completed_retry.into_body(), SOURCE_SUBMIT_BODY_MAX_BYTES)
+                .await
+                .expect("bounded completed retry body"),
+        )
+        .expect("completed retry JSON");
+        assert_eq!(completed_retry_json, completed_json);
+        assert_no_proxy_connection(&completed_listener).await;
+
+        let conflicting_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback conflict proxy");
+        let conflicting_terminal =
+            canonical_ticket_terminal(&fixture.target, [0xBE; 16], unix_now_secs());
+        let conflicting = submit_body(fixture.route_id, fixture.commitment, &conflicting_terminal);
+        let conflict = source_app(
+            state,
+            &fixture,
+            loopback_proxy_client(&conflicting_listener),
+        )
+        .oneshot(signed_remote_request(
+            Method::POST,
+            ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+            &conflicting,
+            conflicting.clone(),
+            &signer,
+        ))
+        .await
+        .expect("conflict result");
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_no_proxy_connection(&conflicting_listener).await;
+        assert_eq!(fixture.resolver.exact_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(fixture.resolver.unexpected_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
