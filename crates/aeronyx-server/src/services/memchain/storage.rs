@@ -185,6 +185,9 @@
 //!   a permit.
 //!
 //! ## Last Modified
+//! [MEMCHAIN-WITNESS-DB-IDENTITY 2026-09-05 by Codex] Bound witness lease
+//! authority to a verified SQLite device/inode identity rather than a
+//! caller-controlled database path spelling.
 //! [MEMCHAIN-WITNESS-CLOCK 2026-09-05 by Codex] Added one process-local,
 //! monotonic witness-lease authority per SQLite repository while preserving
 //! the durable wall-clock lease schema and public API.
@@ -271,7 +274,8 @@
 // ============================================
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1484,6 +1488,45 @@ pub(crate) struct RecordCommitmentWitnessLeaseHold {
     pub(crate) valid_until: Instant,
 }
 
+/// Stable host-local identity of the on-disk SQLite main database.
+///
+/// [MEMCHAIN-WITNESS-DB-IDENTITY 2026-09-05 by Codex] Witness authority uses
+/// device/inode identity rather than a caller-controlled path spelling. The
+/// values remain process-local and are never serialized, logged, or exposed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StorageDatabaseFileIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+/// Opens the final database component without following a symlink and returns
+/// a single-link, current-user regular-file identity. `Ok(None)` means the
+/// candidate does not exist yet; all other uncertainty is fail-closed.
+pub(crate) fn probe_storage_database_file_identity(
+    path: &Path,
+) -> Result<Option<StorageDatabaseFileIdentity>, ()> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != unsafe { nix::libc::geteuid() }
+    {
+        return Err(());
+    }
+    Ok(Some(StorageDatabaseFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }))
+}
+
 impl Default for RecordCommitmentCoordinatorLeaseRuntime {
     fn default() -> Self {
         Self {
@@ -1631,6 +1674,10 @@ pub struct MemoryStorage {
     /// On-disk `SQLite` path used only to derive the private coordinator fence.
     /// `None` denotes an isolated in-memory database used by tests/tools.
     pub(crate) database_path: Option<PathBuf>,
+    /// Verified main-database identity captured across SQLite open. `None`
+    /// for in-memory or unsafe/ambiguous file candidates; ordinary storage
+    /// remains compatible, while witness authority refuses such candidates.
+    pub(crate) database_identity: Option<StorageDatabaseFileIdentity>,
     pub(crate) total_inserted: AtomicU64,
     pub(crate) total_rejected: AtomicU64,
     pub(crate) cache: RwLock<LruCache>,
@@ -1686,8 +1733,8 @@ impl MemoryStorage {
     pub fn open(path: impl AsRef<Path>, record_key: Option<[u8; 32]>) -> Result<Self, String> {
         let path = path.as_ref();
 
-        let conn = if path.to_str() == Some(":memory:") {
-            Connection::open_in_memory()
+        let (conn, database_identity_before) = if path.to_str() == Some(":memory:") {
+            (Connection::open_in_memory(), None)
         } else {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -1700,9 +1747,10 @@ impl MemoryStorage {
                     })?;
                 }
             }
-            Connection::open(path)
-        }
-        .map_err(|e| format!("Failed to open SQLite: {}", e))?;
+            let identity = Some(probe_storage_database_file_identity(path));
+            (Connection::open(path), identity)
+        };
+        let conn = conn.map_err(|e| format!("Failed to open SQLite: {}", e))?;
 
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -1715,6 +1763,15 @@ impl MemoryStorage {
 
         Self::create_schema(&conn)?;
         Self::maybe_migrate(&conn)?;
+
+        let database_identity = database_identity_before.and_then(|before| {
+            let after = probe_storage_database_file_identity(path);
+            match (before, after) {
+                (Ok(None), Ok(Some(after))) => Some(after),
+                (Ok(Some(before)), Ok(Some(after))) if before == after => Some(after),
+                _ => None,
+            }
+        });
 
         let mode = if record_key.is_some() {
             "encrypted"
@@ -1731,6 +1788,7 @@ impl MemoryStorage {
         Ok(Self {
             conn: TokioMutex::new(conn),
             database_path: (path.to_str() != Some(":memory:")).then(|| path.to_path_buf()),
+            database_identity,
             total_inserted: AtomicU64::new(0),
             total_rejected: AtomicU64::new(0),
             cache: RwLock::new(LruCache::new(LRU_CACHE_CAPACITY)),

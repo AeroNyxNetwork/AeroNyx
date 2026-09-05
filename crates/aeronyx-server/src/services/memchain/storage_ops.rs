@@ -165,6 +165,9 @@
 //! [MEMCHAIN-WITNESS-CLOCK-PROCESS 2026-09-05 by Codex] Adds deterministic
 //! child-process coverage for OS-lock exclusion, clean release, and
 //! unreleased crash recovery without changing production semantics.
+//! [MEMCHAIN-WITNESS-DB-IDENTITY 2026-09-05 by Codex] Derives the host-local
+//! witness lock from verified SQLite device/inode identity, closing symlink,
+//! hardlink, rename, and replacement path-spelling ambiguity.
 //! v2.8.65-CustodyWitnessReceiptImport - Added bounded host-local receipt
 //! import without weakening the live network persistence freshness policy.
 //! v2.8.64-CustodyWitnessReceiptVault - Added bounded producer receipt
@@ -289,20 +292,21 @@ use aeronyx_core::protocol::memchain::{
 use crate::error::RuntimeTaskJoinFailureKind;
 
 use super::storage::{
-    LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentAnnouncementDisposition,
-    RecordCommitmentAuthoritySyncDisposition, RecordCommitmentBlockPagePullDisposition,
-    RecordCommitmentCertificateBackfillDisposition, RecordCommitmentCertificatePolicyReadiness,
-    RecordCommitmentCertificateSyncDisposition, RecordCommitmentCheckpointCertificateAnchorConfig,
+    probe_storage_database_file_identity, LayerCounts, MemoryStorage, RawLogRow,
+    RecordCommitmentAnnouncementDisposition, RecordCommitmentAuthoritySyncDisposition,
+    RecordCommitmentBlockPagePullDisposition, RecordCommitmentCertificateBackfillDisposition,
+    RecordCommitmentCertificatePolicyReadiness, RecordCommitmentCertificateSyncDisposition,
+    RecordCommitmentCheckpointCertificateAnchorConfig,
     RecordCommitmentCheckpointCertificateAnchorRuntime,
     RecordCommitmentCheckpointCertificateBundle, RecordCommitmentCheckpointStatus,
     RecordCommitmentFollowerReadiness, RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent,
     RecordCommitmentSyncRuntime, RecordCommitmentSyncStatus, RecordCommitmentTipAnchorConfig,
-    RecordCommitmentWitnessLeaseClockRuntime, RecordCommitmentWitnessLeaseHold, StorageStats,
-    CHECKPOINT_CERTIFICATE_CAPACITY, CHECKPOINT_EQUIVOCATION_CAPACITY,
-    CHECKPOINT_EVIDENCE_CAPACITY, CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS,
-    CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY, COMMITMENT_SYNC_EVENT_CAPACITY,
-    CUSTODY_WITNESS_RECEIPT_EVIDENCE_CAPACITY, MAX_CHECKPOINT_CERTIFICATE_SIGNERS,
-    MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES,
+    RecordCommitmentWitnessLeaseClockRuntime, RecordCommitmentWitnessLeaseHold,
+    StorageDatabaseFileIdentity, StorageStats, CHECKPOINT_CERTIFICATE_CAPACITY,
+    CHECKPOINT_EQUIVOCATION_CAPACITY, CHECKPOINT_EVIDENCE_CAPACITY,
+    CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS, CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY,
+    COMMITMENT_SYNC_EVENT_CAPACITY, CUSTODY_WITNESS_RECEIPT_EVIDENCE_CAPACITY,
+    MAX_CHECKPOINT_CERTIFICATE_SIGNERS, MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES,
 };
 use super::storage_crypto::{
     decrypt_rawlog_content, decrypt_record_content, encrypt_rawlog_content, encrypt_record_content,
@@ -2095,24 +2099,26 @@ fn commitment_coordinator_fence_path(database_path: &Path) -> Result<PathBuf, St
     Ok(database_path.with_file_name(lock_name))
 }
 
-fn commitment_witness_lease_clock_path(database_path: &Path) -> Result<PathBuf, String> {
-    let file_name = database_path
-        .file_name()
-        .ok_or_else(|| "witness lease database path has no file name".to_string())?;
-    let mut lock_name = file_name.to_os_string();
-    lock_name.push(".commitment-witness-clock-v1.lock");
-    Ok(database_path.with_file_name(lock_name))
+#[cfg(target_os = "macos")]
+const WITNESS_LEASE_CLOCK_DIRECTORY: &str = "/private/tmp";
+#[cfg(not(target_os = "macos"))]
+const WITNESS_LEASE_CLOCK_DIRECTORY: &str = "/tmp";
+
+fn commitment_witness_lease_clock_path(identity: StorageDatabaseFileIdentity) -> PathBuf {
+    // [MEMCHAIN-WITNESS-DB-IDENTITY 2026-09-05 by Codex] A fixed host-local
+    // namespace plus device/inode makes every safe spelling of one repository
+    // contend on the same advisory lock. No database path enters the artifact.
+    Path::new(WITNESS_LEASE_CLOCK_DIRECTORY).join(format!(
+        ".aeronyx-commitment-witness-clock-v2-{:016x}-{:016x}.lock",
+        identity.device, identity.inode
+    ))
 }
 
 fn acquire_commitment_witness_lease_clock(
-    database_path: &Path,
+    identity: StorageDatabaseFileIdentity,
 ) -> Result<Flock<File>, WitnessLeaseClockAcquireError> {
-    let path = commitment_witness_lease_clock_path(database_path)
-        .map_err(|_| WitnessLeaseClockAcquireError::Io)?;
-    let parent_path = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let path = commitment_witness_lease_clock_path(identity);
+    let parent_path = Path::new(WITNESS_LEASE_CLOCK_DIRECTORY);
     let name = path.file_name().ok_or(WitnessLeaseClockAcquireError::Io)?;
     let parent = OpenOptions::new()
         .read(true)
@@ -2171,12 +2177,20 @@ fn acquire_commitment_witness_lease_clock(
 fn ensure_commitment_witness_lease_clock(
     runtime: &mut RecordCommitmentWitnessLeaseClockRuntime,
     database_path: Option<&Path>,
+    database_identity: Option<StorageDatabaseFileIdentity>,
 ) -> Result<(), String> {
     if runtime.handle.is_some() || database_path.is_none() {
         return Ok(());
     }
+    let identity =
+        database_identity.ok_or_else(|| "witness lease database identity is unsafe".to_string())?;
+    if probe_storage_database_file_identity(database_path.expect("checked database path"))
+        != Ok(Some(identity))
+    {
+        return Err("witness lease database identity is unsafe".to_string());
+    }
     runtime.handle = Some(
-        acquire_commitment_witness_lease_clock(database_path.expect("checked database path"))
+        acquire_commitment_witness_lease_clock(identity)
             .map_err(|error| error.message().to_string())?,
     );
     Ok(())
@@ -5956,7 +5970,11 @@ impl MemoryStorage {
         // witness-side clock authority. It remains held across the SQLite
         // transaction so durable and volatile lease decisions cannot interleave.
         let mut clock = self.commitment_witness_lease_clock.lock().await;
-        ensure_commitment_witness_lease_clock(&mut clock, self.database_path.as_deref())?;
+        ensure_commitment_witness_lease_clock(
+            &mut clock,
+            self.database_path.as_deref(),
+            self.database_identity,
+        )?;
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -6188,7 +6206,11 @@ impl MemoryStorage {
         let now_i64 = i64::try_from(now)
             .map_err(|_| "coordinator lease release time is outside SQLite range".to_string())?;
         let mut clock = self.commitment_witness_lease_clock.lock().await;
-        ensure_commitment_witness_lease_clock(&mut clock, self.database_path.as_deref())?;
+        ensure_commitment_witness_lease_clock(
+            &mut clock,
+            self.database_path.as_deref(),
+            self.database_identity,
+        )?;
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -11700,6 +11722,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_witness_lease_hardlink_alias_path_cannot_create_authority() {
+        // [MEMCHAIN-WITNESS-DB-IDENTITY 2026-09-05 by Codex] A path-derived
+        // sidecar gives each hardlink spelling a different lock even though
+        // both SQLite handles mutate the same main database inode.
+        let directory = TempDir::new().unwrap();
+        let primary_path = directory.path().join("witness-hardlink-primary.db");
+        let alias_path = directory.path().join("witness-hardlink-alias.db");
+        drop(MemoryStorage::open(&primary_path, None).unwrap());
+        std::fs::hard_link(&primary_path, &alias_path).unwrap();
+        let primary = MemoryStorage::open(&primary_path, None).unwrap();
+        let alias = MemoryStorage::open(&alias_path, None).unwrap();
+
+        for (storage, instance) in [(&primary, [0x49; 32]), (&alias, [0x4a; 32])] {
+            assert_eq!(
+                storage
+                    .grant_record_commitment_coordinator_lease(
+                        &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                        &[0x48; 32],
+                        &instance,
+                        0,
+                        &GENESIS_PREV_HASH,
+                        1_000,
+                        MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                    )
+                    .await
+                    .unwrap_err(),
+                "witness lease database identity is unsafe"
+            );
+        }
+        drop(primary);
+        drop(alias);
+        let connection = rusqlite::Connection::open(&primary_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM record_coordinator_leases",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_witness_lease_symlink_alias_path_cannot_split_authority() {
+        let directory = TempDir::new().unwrap();
+        let primary_path = directory.path().join("witness-symlink-primary.db");
+        let alias_path = directory.path().join("witness-symlink-alias.db");
+        drop(MemoryStorage::open(&primary_path, None).unwrap());
+        std::os::unix::fs::symlink(&primary_path, &alias_path).unwrap();
+        let primary = MemoryStorage::open(&primary_path, None).unwrap();
+        let alias = MemoryStorage::open(&alias_path, None).unwrap();
+        let monotonic_start = Instant::now();
+
+        assert!(matches!(
+            primary
+                .grant_record_commitment_coordinator_lease_at(
+                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                    &[0x4b; 32],
+                    &[0x4c; 32],
+                    0,
+                    &GENESIS_PREV_HASH,
+                    2_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                    monotonic_start,
+                    WitnessLeaseCommitObservation::Observed,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted { lease_epoch: 1, .. }
+        ));
+        let first_alias_attempt = alias
+            .grant_record_commitment_coordinator_lease_at(
+                &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                &[0x4b; 32],
+                &[0x4d; 32],
+                0,
+                &GENESIS_PREV_HASH,
+                20_000,
+                MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                monotonic_start,
+                WitnessLeaseCommitObservation::Observed,
+            )
+            .await;
+        let expired_restart_hold_attempt = alias
+            .grant_record_commitment_coordinator_lease_at(
+                &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                &[0x4b; 32],
+                &[0x4d; 32],
+                0,
+                &GENESIS_PREV_HASH,
+                20_001,
+                MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                monotonic_start + Duration::from_secs(WITNESS_LEASE_RESTART_HOLD_SECS + 1),
+                WitnessLeaseCommitObservation::Observed,
+            )
+            .await;
+        assert_eq!(
+            expired_restart_hold_attempt.unwrap_err(),
+            "witness lease database identity is unsafe"
+        );
+        assert_eq!(
+            first_alias_attempt.unwrap_err(),
+            "witness lease database identity is unsafe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_witness_lease_database_replacement_before_authority_is_fail_closed() {
+        let directory = TempDir::new().unwrap();
+        let active_path = directory.path().join("witness-replaced-active.db");
+        let displaced_path = directory.path().join("witness-replaced-displaced.db");
+        let replacement_path = directory.path().join("witness-replacement.db");
+        let storage = MemoryStorage::open(&active_path, None).unwrap();
+        drop(MemoryStorage::open(&replacement_path, None).unwrap());
+        std::fs::rename(&active_path, &displaced_path).unwrap();
+        std::fs::rename(&replacement_path, &active_path).unwrap();
+
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                    &[0x4e; 32],
+                    &[0x4f; 32],
+                    0,
+                    &GENESIS_PREV_HASH,
+                    3_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap_err(),
+            "witness lease database identity is unsafe"
+        );
+        assert_eq!(
+            storage
+                .release_record_commitment_coordinator_lease(
+                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                    &[0x4e; 32],
+                    &[0x4f; 32],
+                    3_001,
+                )
+                .await
+                .unwrap_err(),
+            "witness lease database identity is unsafe"
+        );
+        assert_eq!(
+            storage
+                .conn
+                .lock()
+                .await
+                .query_row(
+                    "SELECT COUNT(*) FROM record_coordinator_leases",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "invoked only as an isolated child of witness lease process tests"]
     async fn test_witness_lease_cross_process_worker() {
         let Ok(stage) = std::env::var(WITNESS_LEASE_PROCESS_STAGE_ENV) else {
@@ -12004,7 +12188,10 @@ mod tests {
         let external = directory.path().join("external-state");
         std::fs::write(&external, b"external").unwrap();
         std::fs::set_permissions(&external, Permissions::from_mode(0o644)).unwrap();
-        let lock_path = commitment_witness_lease_clock_path(&db_path).unwrap();
+        let lock_path = commitment_witness_lease_clock_path(storage.database_identity.unwrap());
+        if lock_path.exists() {
+            std::fs::remove_file(&lock_path).unwrap();
+        }
         std::fs::hard_link(&external, &lock_path).unwrap();
 
         assert_eq!(
@@ -12026,20 +12213,23 @@ mod tests {
             std::fs::metadata(&external).unwrap().permissions().mode() & 0o777,
             0o644
         );
+        std::fs::remove_file(lock_path).unwrap();
     }
 
     #[tokio::test]
-    async fn test_witness_lease_clock_rejects_symlink_parent() {
+    async fn test_witness_lease_clock_converges_across_symlink_parent() {
         let directory = TempDir::new().unwrap();
         let real_parent = directory.path().join("real");
         let linked_parent = directory.path().join("linked");
         std::fs::create_dir(&real_parent).unwrap();
         std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
-        let db_path = linked_parent.join("witness-symlink-parent.db");
-        let storage = MemoryStorage::open(&db_path, None).unwrap();
+        let linked_path = linked_parent.join("witness-symlink-parent.db");
+        let real_path = real_parent.join("witness-symlink-parent.db");
+        let linked = MemoryStorage::open(&linked_path, None).unwrap();
+        let real = MemoryStorage::open(&real_path, None).unwrap();
 
-        assert_eq!(
-            storage
+        assert!(matches!(
+            linked
                 .grant_record_commitment_coordinator_lease(
                     &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
                     &[0x43; 32],
@@ -12050,12 +12240,23 @@ mod tests {
                     MIN_COORDINATOR_LEASE_TTL_SECS_V1,
                 )
                 .await
-                .unwrap_err(),
-            "witness lease clock file is unsafe"
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted { lease_epoch: 1, .. }
+        ));
+        assert_eq!(
+            real.grant_record_commitment_coordinator_lease(
+                &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                &[0x43; 32],
+                &[0x45; 32],
+                0,
+                &GENESIS_PREV_HASH,
+                10_000,
+                MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            )
+            .await
+            .unwrap_err(),
+            "witness lease clock is held by another database handle"
         );
-        assert!(!commitment_witness_lease_clock_path(&db_path)
-            .unwrap()
-            .exists());
     }
 
     #[tokio::test]
