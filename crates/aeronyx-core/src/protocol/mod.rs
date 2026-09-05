@@ -239,6 +239,9 @@
 // [ANONYMOUS-MAILBOX-V1 2026-09-02 by Codex] Core-only node-blind mailbox
 // domain; runtime storage and routing composition remain separate milestones.
 pub mod anonymous_mailbox;
+// [M13J 2026-09-05 by Codex] Client-shared deposit-only bearer codec; this is
+// not a server terminal operation or public mailbox locator.
+pub mod anonymous_mailbox_deposit_invitation;
 pub mod auth;
 pub mod blind_vault;
 pub mod blind_vault_replica_workflow;
@@ -258,6 +261,16 @@ pub use anonymous_mailbox::{
     AnonymousMailboxPullOneV1, AnonymousMailboxPutV1, AnonymousMailboxRouteRequestV1,
     AnonymousMailboxRouteResponseV1, AnonymousMailboxTerminalFrameV1,
     AnonymousMailboxTerminalResponseV1,
+};
+pub use anonymous_mailbox_deposit_invitation::{
+    AnonymousMailboxDepositInvitationError, AnonymousMailboxDepositInvitationSummaryV1,
+    AnonymousMailboxDepositInvitationV1, AnonymousMailboxDepositTargetPinV1,
+    ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_VERSION_V1,
+    DEFAULT_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_RUNWAY_SECS,
+    MAX_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_BYTES,
+    MAX_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_RUNWAY_SECS,
+    MAX_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_TTL_SECS,
+    MIN_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_RUNWAY_SECS,
 };
 
 // Re-export primary types
