@@ -8,6 +8,8 @@
 //! content-key, or plaintext fields.
 //!
 //! ## Last Modified
+//! v1.0.3-LeaseReplay — Preserve durable exact lease-create replay after
+//! admission-ticket freshness expires.
 //! v1.0.2-CrossEntryVertical — M13G source-to-custody cross-entry proof.
 
 use std::sync::Arc;
@@ -124,9 +126,12 @@ impl PreparedAnonymousMailboxTerminal {
         }
         let (operation, request_id, request_commitment, outcome, payload) = match &self.request {
             AnonymousMailboxTerminalFrameV1::LeaseCreate(request) => {
-                request
-                    .verify_for_target(&terminal_identity.public_key_bytes(), now)
-                    .map_err(|_| AnonymousMailboxTerminalFailure::Rejected)?;
+                // [M13J 2026-09-05 by Codex] The repository owns the typed
+                // exact-replay boundary: it checks the durable full request
+                // commitment before freshness, while a miss is fully target,
+                // signature, claims, and time verified before any mutation.
+                // Repeating freshness here would reject a durable Accepted
+                // lease after its one-time admission ticket expires.
                 let outcome = map_create(repository.create(request, now))?;
                 (
                     AnonymousMailboxOperationV1::LeaseCreate,
@@ -515,17 +520,69 @@ mod tests {
         route_id: [u8; 16],
         request: AnonymousMailboxTerminalFrameV1,
     ) -> AnonymousMailboxTerminalFrameV1 {
+        execute_terminal_frame_at(repository, target, route_id, request, 1_800_000_000)
+    }
+
+    fn execute_terminal_frame_at(
+        repository: Arc<dyn AnonymousMailboxCustodyRepository>,
+        target: &IdentityKeyPair,
+        route_id: [u8; 16],
+        request: AnonymousMailboxTerminalFrameV1,
+        now: u64,
+    ) -> AnonymousMailboxTerminalFrameV1 {
         let terminal_frame =
             encode_anonymous_mailbox_terminal_frame(&request).expect("terminal frame");
         let (encoded, mut session) = routed_terminal_frame(route_id, target, terminal_frame);
         let sealed =
             PreparedAnonymousMailboxTerminal::decode(&encoded, route_id, target.public_key_bytes())
                 .expect("canonical terminal request")
-                .execute(repository, Arc::new(target.clone()), 1_800_000_000)
+                .execute(repository, Arc::new(target.clone()), now)
                 .expect("terminal response");
         let sealed = BASE64.decode(sealed).expect("base64 AMSR");
         decode_anonymous_mailbox_terminal_frame(&session.open(&sealed).expect("one-shot AMSR open"))
             .expect("canonical response frame")
+    }
+
+    fn durable_admission_state(db_path: &str) -> (i64, i64, i64, i64, i64) {
+        let connection = Connection::open(db_path).expect("open durable state for audit");
+        let (leases, outstanding, issues): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT total_leases, outstanding_tickets, issues_in_window
+                   FROM anonymous_mailbox_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("durable counters");
+        let consumed: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM anonymous_mailbox_tickets",
+                [],
+                |row| row.get(0),
+            )
+            .expect("consumed ticket count");
+        let issued_consumed: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM anonymous_mailbox_issued_tickets
+                  WHERE consumed_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("issuer token count");
+        (leases, outstanding, issues, consumed, issued_consumed)
+    }
+
+    fn execute_terminal_result_at(
+        repository: Arc<dyn AnonymousMailboxCustodyRepository>,
+        target: &IdentityKeyPair,
+        route_id: [u8; 16],
+        request: AnonymousMailboxTerminalFrameV1,
+        now: u64,
+    ) -> Result<String, AnonymousMailboxTerminalFailure> {
+        let terminal_frame =
+            encode_anonymous_mailbox_terminal_frame(&request).expect("terminal frame");
+        let (encoded, _session) = routed_terminal_frame(route_id, target, terminal_frame);
+        PreparedAnonymousMailboxTerminal::decode(&encoded, route_id, target.public_key_bytes())?
+            .execute(repository, Arc::new(target.clone()), now)
     }
 
     fn execute_ticket(
@@ -809,6 +866,250 @@ mod tests {
             Err(AnonymousMailboxTerminalFailure::Rejected)
         );
         assert_eq!(repository.issue_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn lease_exact_replay_after_ticket_expiry_survives_restart_without_mutation() {
+        // [M13J 2026-09-05 by Codex] A lost Accepted response must not turn a
+        // durable lease into a terminal rejection merely because its one-time
+        // admission ticket expired before the source retried.  The fresh
+        // response time attests the replay lookup; it is not the original
+        // acceptance time.
+        const NOW: u64 = 1_800_100_000;
+        const RETRY_NOW: u64 = NOW + 301;
+        let directory = tempfile::tempdir().expect("private temporary directory");
+        let private_directory = std::fs::canonicalize(directory.path()).expect("canonical path");
+        let config = AnonymousMailboxStoreConfig {
+            enabled: true,
+            db_path: private_directory
+                .join("lease-replay.sqlite")
+                .display()
+                .to_string(),
+            max_leases_total: 4,
+            max_items_total: 1_024,
+            max_bytes_total: 64 * 1024,
+            max_in_flight: 4,
+            cleanup_batch_size: 8,
+            max_outstanding_tickets: 4,
+            max_ticket_issues_per_window: 4,
+            ticket_issuance_window_secs: 60,
+            ticket_issue_work_bits: 1,
+        };
+        let target = IdentityKeyPair::from_bytes(&[0xc1; 32]).expect("target");
+        let depositor = IdentityKeyPair::from_bytes(&[0xc2; 32]).expect("depositor");
+        let reader = IdentityKeyPair::from_bytes(&[0xc3; 32]).expect("reader");
+        let mailbox_id = [0xc4; 32];
+        let lease_expires_at = NOW + 3_600;
+        let claims = AnonymousMailboxLeaseCreateV1::lease_claims_commitment(
+            &mailbox_id,
+            &depositor.public_key_bytes(),
+            &reader.public_key_bytes(),
+            4,
+            16 * 1024,
+            NOW,
+            lease_expires_at,
+        );
+        let ticket_request = (0..u64::MAX)
+            .find_map(|proof_nonce| {
+                let request = AnonymousMailboxTicketIssueV1::new(
+                    [0xc5; 16],
+                    [0xc6; 16],
+                    target.public_key_bytes(),
+                    claims,
+                    NOW,
+                    NOW + 300,
+                    proof_nonce,
+                )
+                .expect("ticket request");
+                (request.proof_digest().expect("proof digest")[0] & 0x80 == 0).then_some(request)
+            })
+            .expect("one-bit proof");
+        let store = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                config.clone(),
+                target.clone(),
+                [0xc7; 32],
+            )
+            .expect("open real store"),
+        );
+        let ticket_response = execute_terminal_frame_at(
+            store.clone(),
+            &target,
+            [0xc8; 16],
+            AnonymousMailboxTerminalFrameV1::TicketIssue(ticket_request.clone()),
+            NOW,
+        );
+        let AnonymousMailboxTerminalFrameV1::TicketIssueResponse(ticket_response) = ticket_response
+        else {
+            panic!("ticket response kind");
+        };
+        let ticket = ticket_response.ticket.expect("issued ticket");
+        let lease = AnonymousMailboxLeaseCreateV1::new(
+            mailbox_id,
+            depositor.public_key_bytes(),
+            4,
+            16 * 1024,
+            NOW,
+            lease_expires_at,
+            ticket,
+            &reader,
+        )
+        .expect("lease request");
+        let first = execute_terminal_frame_at(
+            store.clone(),
+            &target,
+            [0xc9; 16],
+            AnonymousMailboxTerminalFrameV1::LeaseCreate(lease.clone()),
+            NOW,
+        );
+        let AnonymousMailboxTerminalFrameV1::LeaseCreateResponse(first) = first else {
+            panic!("lease response kind");
+        };
+        assert_eq!(first.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        assert_eq!(first.responded_at, NOW);
+        drop(store); // The source lost `first`; restart from only durable state.
+
+        let accepted_state = durable_admission_state(&config.db_path);
+        assert_eq!(accepted_state, (1, 0, 1, 1, 1));
+        let reopened = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                config.clone(),
+                target.clone(),
+                [0xc7; 32],
+            )
+            .expect("restart real store"),
+        );
+        let replay = execute_terminal_frame_at(
+            reopened.clone(),
+            &target,
+            [0xca; 16],
+            AnonymousMailboxTerminalFrameV1::LeaseCreate(lease.clone()),
+            RETRY_NOW,
+        );
+        let AnonymousMailboxTerminalFrameV1::LeaseCreateResponse(replay) = replay else {
+            panic!("lease replay response kind");
+        };
+        assert_eq!(replay.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        assert_eq!(replay.responded_at, RETRY_NOW);
+
+        let mut changed_bytes = lease.clone();
+        changed_bytes.signature[0] ^= 0x80;
+        let changed = execute_terminal_frame_at(
+            reopened.clone(),
+            &target,
+            [0xcb; 16],
+            AnonymousMailboxTerminalFrameV1::LeaseCreate(changed_bytes),
+            RETRY_NOW,
+        );
+        let AnonymousMailboxTerminalFrameV1::LeaseCreateResponse(changed) = changed else {
+            panic!("changed lease response kind");
+        };
+        assert_eq!(changed.outcome, AnonymousMailboxOutcomeV1::Conflict);
+
+        let wrong_reader = IdentityKeyPair::from_bytes(&[0xcc; 32]).expect("wrong reader");
+        let mut wrong_key = lease.clone();
+        wrong_key.read_verifier = wrong_reader.public_key_bytes();
+        wrong_key.signature =
+            wrong_reader.sign(&wrong_key.signing_bytes().expect("wrong-key body"));
+        let wrong_key_response = execute_terminal_frame_at(
+            reopened.clone(),
+            &target,
+            [0xcd; 16],
+            AnonymousMailboxTerminalFrameV1::LeaseCreate(wrong_key),
+            RETRY_NOW,
+        );
+        let AnonymousMailboxTerminalFrameV1::LeaseCreateResponse(wrong_key_response) =
+            wrong_key_response
+        else {
+            panic!("wrong-key response kind");
+        };
+        assert_eq!(
+            wrong_key_response.outcome,
+            AnonymousMailboxOutcomeV1::Conflict
+        );
+
+        let stale_mailbox = [0xce; 32];
+        let stale_claims = AnonymousMailboxLeaseCreateV1::lease_claims_commitment(
+            &stale_mailbox,
+            &depositor.public_key_bytes(),
+            &reader.public_key_bytes(),
+            1,
+            1024,
+            NOW,
+            lease_expires_at,
+        );
+        let stale_ticket = AnonymousMailboxAdmissionTicketV1::issue(
+            [0xcf; 16],
+            stale_claims,
+            NOW,
+            NOW + 300,
+            &target,
+        )
+        .expect("stale ticket fixture");
+        let stale_miss = AnonymousMailboxLeaseCreateV1::new(
+            stale_mailbox,
+            depositor.public_key_bytes(),
+            1,
+            1024,
+            NOW,
+            lease_expires_at,
+            stale_ticket,
+            &reader,
+        )
+        .expect("stale miss fixture");
+        assert_eq!(
+            execute_terminal_result_at(
+                reopened.clone(),
+                &target,
+                [0xd0; 16],
+                AnonymousMailboxTerminalFrameV1::LeaseCreate(stale_miss),
+                RETRY_NOW,
+            ),
+            Err(AnonymousMailboxTerminalFailure::Rejected)
+        );
+
+        let foreign_target = IdentityKeyPair::from_bytes(&[0xd1; 32]).expect("foreign target");
+        let foreign_mailbox = [0xd2; 32];
+        let foreign_claims = AnonymousMailboxLeaseCreateV1::lease_claims_commitment(
+            &foreign_mailbox,
+            &depositor.public_key_bytes(),
+            &reader.public_key_bytes(),
+            1,
+            1024,
+            NOW,
+            lease_expires_at,
+        );
+        let foreign_ticket = AnonymousMailboxAdmissionTicketV1::issue(
+            [0xd3; 16],
+            foreign_claims,
+            NOW,
+            NOW + 300,
+            &foreign_target,
+        )
+        .expect("foreign ticket fixture");
+        let wrong_target = AnonymousMailboxLeaseCreateV1::new(
+            foreign_mailbox,
+            depositor.public_key_bytes(),
+            1,
+            1024,
+            NOW,
+            lease_expires_at,
+            foreign_ticket,
+            &reader,
+        )
+        .expect("wrong-target lease fixture");
+        assert_eq!(
+            execute_terminal_result_at(
+                reopened.clone(),
+                &target,
+                [0xd4; 16],
+                AnonymousMailboxTerminalFrameV1::LeaseCreate(wrong_target),
+                NOW + 1,
+            ),
+            Err(AnonymousMailboxTerminalFailure::Rejected)
+        );
+        drop(reopened);
+        assert_eq!(durable_admission_state(&config.db_path), accepted_state);
     }
 
     #[test]

@@ -16,6 +16,8 @@
 //! the future composition root.
 //!
 //! ## Last modified
+//! v1.1.1-LeaseReplayContract — Document and test durable exact replay before
+//! admission-ticket freshness.
 //! v1.1.0-AnonymousMailboxTicketIssuer — Added durable, target-identity
 //! signed, rate-bounded anonymous admission-ticket issuance.
 //! v1.0.0-AnonymousMailboxStore — Initial node-local custody repository.
@@ -294,6 +296,9 @@ pub trait AnonymousMailboxCustodyRepository: Send + Sync {
         now: u64,
     ) -> Result<AnonymousMailboxTicketIssueOutcome, AnonymousMailboxStoreError>;
 
+    /// [M13J 2026-09-05 by Codex] Resolves a durable exact full-request replay
+    /// before freshness; a miss must fully authenticate the target, claims,
+    /// signature, and time before any lease or ticket mutation.
     fn create(
         &self,
         request: &AnonymousMailboxLeaseCreateV1,
@@ -2926,13 +2931,13 @@ mod tests {
         drop(store);
         let reopened = context.open();
         assert!(matches!(
-            reopened.create(&request, NOW + 2).unwrap(),
+            reopened.create(&request, NOW + 301).unwrap(),
             AnonymousMailboxCreateOutcome::Existing(_)
         ));
 
         let conflicting = context.lease([0x12; 32], [0x21; 16], 2, 32, NOW + 1_000);
         assert_eq!(
-            reopened.create(&conflicting, NOW + 2).unwrap(),
+            reopened.create(&conflicting, NOW + 301).unwrap(),
             AnonymousMailboxCreateOutcome::Conflict
         );
     }
