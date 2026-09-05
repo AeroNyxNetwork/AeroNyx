@@ -17118,7 +17118,7 @@ mod tests {
     };
     use sha2::{Digest, Sha256};
     use std::net::Ipv4Addr;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
@@ -17212,6 +17212,192 @@ mod tests {
             ChatRelayService::new(test_chat_relay_config(db_path), node_secret)
                 .expect("initialize test chat relay service"),
         )
+    }
+
+    // [ANONYMOUS-MAILBOX-SOURCE-STARTUP-ACCEPTANCE 2026-09-05 by Codex]
+    // These fixtures call the production coordinator initializer directly, but
+    // own only a synthetic temporary path and an empty in-memory peer view.
+    // They neither start Server::run nor contact a peer.
+    fn test_anonymous_mailbox_source_server(enabled: bool, db_path: &std::path::Path) -> Server {
+        let mut config = ServerConfig::default();
+        config.memchain.chat_relay.anonymous_mailbox_source.enabled = enabled;
+        config.memchain.chat_relay.anonymous_mailbox_source.db_path =
+            db_path.to_string_lossy().into_owned();
+        Server::new(config, IdentityKeyPair::generate(), None)
+    }
+
+    #[tokio::test]
+    async fn anonymous_mailbox_source_disabled_startup_creates_no_private_path() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let missing_parent = directory.path().join("not-created");
+        let db_path = missing_parent.join("source.sqlite");
+        let server = test_anonymous_mailbox_source_server(false, &db_path);
+
+        let source = server
+            .init_anonymous_mailbox_source_coordinator(Arc::new(PeerStore::new()))
+            .await
+            .expect("disabled source must remain optional");
+
+        assert!(source.is_none());
+        assert!(
+            !missing_parent.exists(),
+            "disabled startup must not create the configured private parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_mailbox_source_enabled_startup_opens_and_reopens_private_journal() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let private_parent =
+            std::fs::canonicalize(directory.path()).expect("canonical test private parent");
+        let db_path = private_parent.join("source.sqlite");
+        let server = test_anonymous_mailbox_source_server(true, &db_path);
+
+        let first = server
+            .init_anonymous_mailbox_source_coordinator(Arc::new(PeerStore::new()))
+            .await
+            .expect("enabled source must open a private journal");
+        assert!(first.is_some());
+        assert!(db_path.is_file());
+        drop(first);
+
+        let reopened = server
+            .init_anonymous_mailbox_source_coordinator(Arc::new(PeerStore::new()))
+            .await
+            .expect("enabled source must reopen its private journal");
+        assert!(reopened.is_some());
+    }
+
+    #[tokio::test]
+    async fn anonymous_mailbox_source_startup_rejects_foreign_schema_without_readiness() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let private_parent =
+            std::fs::canonicalize(directory.path()).expect("canonical test private parent");
+        let db_path = private_parent.join("foreign.sqlite");
+        let connection = rusqlite::Connection::open(&db_path).expect("foreign sqlite");
+        connection
+            .execute_batch("CREATE TABLE foreign_state (value INTEGER NOT NULL);")
+            .expect("foreign schema");
+        drop(connection);
+        let server = test_anonymous_mailbox_source_server(true, &db_path);
+
+        let error = match server
+            .init_anonymous_mailbox_source_coordinator(Arc::new(PeerStore::new()))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("foreign schema must not produce source readiness"),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Server failed to start: Anonymous mailbox source initialization failed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn anonymous_mailbox_source_startup_rejects_unsafe_symlink_without_readiness() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("test directory");
+        let private_parent =
+            std::fs::canonicalize(directory.path()).expect("canonical test private parent");
+        let target = private_parent.join("target.sqlite");
+        std::fs::File::create(&target).expect("test-owned target");
+        let unsafe_path = private_parent.join("source-link.sqlite");
+        symlink(&target, &unsafe_path).expect("test-owned symlink");
+        let server = test_anonymous_mailbox_source_server(true, &unsafe_path);
+
+        let error = match server
+            .init_anonymous_mailbox_source_coordinator(Arc::new(PeerStore::new()))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("symlink target must not produce source readiness"),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Server failed to start: Anonymous mailbox source initialization failed"
+        );
+        assert_eq!(
+            std::fs::metadata(target)
+                .expect("test target metadata")
+                .len(),
+            0,
+            "unsafe path rejection must not initialize the linked target"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_mailbox_source_without_mpi_is_rejected_before_api_routes_start() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let private_parent =
+            std::fs::canonicalize(directory.path()).expect("canonical test private parent");
+        let db_path = private_parent.join("source.sqlite");
+        let server = test_anonymous_mailbox_source_server(true, &db_path);
+        let peer_store = Arc::new(PeerStore::new());
+        let source = server
+            .init_anonymous_mailbox_source_coordinator(Arc::clone(&peer_store))
+            .await
+            .expect("source journal")
+            .expect("enabled source");
+        let (ip_pool, sessions, routing) = server.init_services().expect("test services");
+        let node_policy = Arc::new(crate::services::NodePolicyRuntime::default());
+        let encrypted_message_counter = Arc::new(AtomicU64::new(0));
+        let packet_handler = Arc::new(crate::handlers::PacketHandler::new(
+            Arc::clone(&sessions),
+            routing,
+            Arc::new(crate::services::traffic_tracker::TrafficTracker::new()),
+            Arc::clone(&encrypted_message_counter),
+            Arc::clone(&node_policy),
+        ));
+        // The existing API constructor takes ownership of the UDP transport
+        // type even though this fail-closed branch returns before any API bind,
+        // request handling, route construction, or transport traffic.
+        let udp = Arc::new(
+            UdpTransport::bind("127.0.0.1:0")
+                .await
+                .expect("test-only loopback UDP transport"),
+        );
+        let peer_http_clients =
+            PeerHttpClients::build(&server.config).expect("local proxy-free HTTP client profiles");
+        let (critical_failure_tx, _critical_failure_rx) = tokio::sync::mpsc::channel(1);
+
+        let error = match server
+            .start_combined_api(
+                "127.0.0.1:0".parse().expect("loopback API address"),
+                None,
+                ip_pool,
+                sessions,
+                node_policy,
+                Arc::new(crate::voucher_verifier::VoucherVerifier::new()),
+                encrypted_message_counter,
+                packet_handler,
+                peer_store,
+                None,
+                None,
+                Arc::new(DirectoryReplicaSyncRuntime::default()),
+                None,
+                None,
+                None,
+                Some(source),
+                udp,
+                &peer_http_clients,
+                None,
+                critical_failure_tx,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("missing MPI must reject before API startup"),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Server failed to start: Anonymous mailbox source requires authenticated VPN MPI runtime"
+        );
     }
 
     fn test_verified_submit_request(
