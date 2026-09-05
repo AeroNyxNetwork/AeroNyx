@@ -405,7 +405,8 @@ mod tests {
         SqliteAnonymousMailboxSourceJournal,
     };
     use crate::services::chat_relay_mailbox::{
-        AnonymousMailboxCustodyRepository, SqliteAnonymousMailboxStore,
+        AnonymousMailboxCustodyRepository, AnonymousMailboxTicketIssueOutcome,
+        SqliteAnonymousMailboxStore,
     };
 
     const NOW: u64 = 1_800_000_000;
@@ -751,6 +752,30 @@ mod tests {
         .expect("canonical terminal frame")
     }
 
+    fn ticket_request_with_one_bit_proof(
+        target: &IdentityKeyPair,
+        request_id: [u8; 16],
+        ticket_id: [u8; 16],
+        claims_commitment: [u8; 32],
+        now: u64,
+    ) -> AnonymousMailboxTicketIssueV1 {
+        (0..u64::MAX)
+            .find_map(|proof_nonce| {
+                let request = AnonymousMailboxTicketIssueV1::new(
+                    request_id,
+                    ticket_id,
+                    target.public_key_bytes(),
+                    claims_commitment,
+                    now,
+                    now.saturating_add(300),
+                    proof_nonce,
+                )
+                .expect("ticket request");
+                (request.proof_digest().expect("proof digest")[0] & 0x80 == 0).then_some(request)
+            })
+            .expect("one-bit ticket proof")
+    }
+
     fn source_router_fixture() -> SourceRouterFixture {
         let target = IdentityKeyPair::from_bytes(&[0xB3; 32]).expect("test terminal identity");
         let now = unix_now_secs();
@@ -1013,6 +1038,66 @@ mod tests {
         .expect("real peer response JSON")
     }
 
+    async fn write_peer_response(stream: &mut TcpStream, response: &[u8]) {
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            response.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .expect("response headers");
+        stream.write_all(response).await.expect("response body");
+    }
+
+    // [M13J-E4 2026-09-05 by Codex] This barrier owns only test-created
+    // loopback tasks. It signals after production terminal execution has
+    // durably completed, holds the first HTTP response, and releases no
+    // response until the test cancels its own source future. It is neither a
+    // server shutdown/drain model nor a live relay peer.
+    async fn held_real_terminal_proxy(
+        target: IdentityKeyPair,
+        repository: Arc<dyn AnonymousMailboxCustodyRepository>,
+        accepted_connections: Arc<AtomicUsize>,
+    ) -> (
+        reqwest::Client,
+        tokio::sync::oneshot::Receiver<Vec<u8>>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Vec<Vec<u8>>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback held real-terminal proxy");
+        let client = loopback_proxy_client(&listener);
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first_stream, _) = listener.accept().await.expect("first proxy connection");
+            accepted_connections.fetch_add(1, Ordering::Relaxed);
+            let (_, first_body) = read_proxy_request(&mut first_stream).await;
+            let _ = real_terminal_peer_response(&first_body, &target, repository.clone());
+            committed_tx
+                .send(first_body.clone())
+                .expect("first durable effect signal");
+            release_rx
+                .await
+                .expect("test-owned source cancellation release");
+            drop(first_stream);
+
+            let mut bodies = vec![first_body];
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("follow-up proxy connection");
+                accepted_connections.fetch_add(1, Ordering::Relaxed);
+                let (_, peer_body) = read_proxy_request(&mut stream).await;
+                let response = real_terminal_peer_response(&peer_body, &target, repository.clone());
+                write_peer_response(&mut stream, &response).await;
+                bodies.push(peer_body);
+            }
+            bodies
+        });
+        (client, committed_rx, release_tx, server)
+    }
+
     async fn source_request_with_real_terminal(
         state: Arc<MpiState>,
         entry: &RealSourceEntry,
@@ -1029,15 +1114,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.expect("one proxy connection");
             let (_, peer_body) = read_proxy_request(&mut stream).await;
             let response = real_terminal_peer_response(&peer_body, &target, repository);
-            let headers = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                response.len()
-            );
-            stream
-                .write_all(headers.as_bytes())
-                .await
-                .expect("response headers");
-            stream.write_all(&response).await.expect("response body");
+            write_peer_response(&mut stream, &response).await;
             peer_body
         });
         let response = source_app_for(state, Arc::clone(&entry.coordinator), &entry.config, client)
@@ -1829,6 +1906,233 @@ mod tests {
         assert_eq!(entry_r.resolver.unknown_calls.load(Ordering::Relaxed), 0);
         assert!(entry_m.resolver.exact_calls.load(Ordering::Relaxed) >= 7);
         assert!(entry_r.resolver.exact_calls.load(Ordering::Relaxed) >= 6);
+    }
+
+    #[tokio::test]
+    async fn source_router_cancellation_releases_bounded_admission_without_replaying_effect() {
+        // [M13J-E4 2026-09-05 by Codex] Exercise only request-future
+        // cancellation at the source handler boundary. This is deliberately
+        // not a process shutdown, service drain, onion-middle, or fleet test.
+        let now = unix_now_secs();
+        let target = IdentityKeyPair::from_bytes(&[0xE9; 32]).expect("target identity");
+        let mut descriptor = NodeDescriptor::new(
+            target.public_key_bytes(),
+            23,
+            now.saturating_sub(1),
+            now.saturating_add(60),
+            "m13j-e4-local-test",
+        )
+        .with_x25519_kem(target.x25519_public_key_bytes())
+        .with_protocol_features([
+            NodeProtocolFeature::AnonymousMailboxV1,
+            NodeProtocolFeature::OnionReplyV1,
+            NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+            NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+        ]);
+        descriptor.public_endpoint = Some("http://8.8.8.8".into());
+        descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        let descriptor = SignedNodeDescriptor::sign(descriptor, &target).expect("descriptor");
+        let commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).expect("pin");
+        let entry = real_source_entry(descriptor, 0xEA, 0xEB, [0xEC; 32]);
+        let mut constrained_config = entry.config.clone();
+        constrained_config.max_in_flight = 1;
+        constrained_config.request_timeout_secs = 10;
+        let state = source_mpi_state();
+        let signer = IdentityKeyPair::from_bytes(&[0xED; 32]).expect("remote signer");
+        let private_directory = tempfile::tempdir().expect("private target store");
+        let store_path = std::fs::canonicalize(private_directory.path())
+            .expect("canonical target store")
+            .join("terminal.sqlite");
+        let store_config = AnonymousMailboxStoreConfig {
+            enabled: true,
+            db_path: store_path.to_string_lossy().into_owned(),
+            max_leases_total: 4,
+            max_items_total: 1_024,
+            max_bytes_total: 1024 * 1024,
+            max_in_flight: 4,
+            cleanup_batch_size: 8,
+            max_outstanding_tickets: 4,
+            max_ticket_issues_per_window: 4,
+            ticket_issuance_window_secs: 60,
+            ticket_issue_work_bits: 1,
+        };
+        let store = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                store_config,
+                target.clone(),
+                [0xEE; 32],
+            )
+            .expect("real SQLite target store"),
+        );
+        let first_ticket =
+            ticket_request_with_one_bit_proof(&target, [0xEF; 16], [0xF0; 16], [0xF1; 32], now);
+        let first_terminal = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::TicketIssue(first_ticket.clone()),
+        )
+        .expect("first ticket terminal");
+        let first_route = [0xF2; 16];
+        let first_body = submit_body(first_route, commitment, &first_terminal);
+        let later_ticket =
+            ticket_request_with_one_bit_proof(&target, [0xF3; 16], [0xF4; 16], [0xF5; 32], now);
+        let later_terminal = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::TicketIssue(later_ticket.clone()),
+        )
+        .expect("later ticket terminal");
+        let later_route = [0xF6; 16];
+        let later_body = submit_body(later_route, commitment, &later_terminal);
+        let accepted_connections = Arc::new(AtomicUsize::new(0));
+        let (client, committed, release, server) = held_real_terminal_proxy(
+            target.clone(),
+            store.clone(),
+            Arc::clone(&accepted_connections),
+        )
+        .await;
+        let app = source_app_for(
+            state,
+            Arc::clone(&entry.coordinator),
+            &constrained_config,
+            client,
+        );
+        let first_request = signed_remote_request(
+            Method::POST,
+            ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+            &first_body,
+            first_body.clone(),
+            &signer,
+        );
+        let first_app = app.clone();
+        let first_source = tokio::spawn(async move { first_app.oneshot(first_request).await });
+
+        let first_peer_body = tokio::time::timeout(Duration::from_secs(2), committed)
+            .await
+            .expect("first terminal effect supervision")
+            .expect("first terminal effect signal");
+        assert!(matches!(
+            entry.coordinator.result(first_route),
+            Ok(AnonymousMailboxSourceResult::Armed)
+        ));
+        assert_eq!(accepted_connections.load(Ordering::Relaxed), 1);
+
+        let exact_before_busy = entry.resolver.exact_calls.load(Ordering::Relaxed);
+        let busy = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.clone().oneshot(signed_remote_request(
+                Method::POST,
+                ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                &later_body,
+                later_body.clone(),
+                &signer,
+            )),
+        )
+        .await
+        .expect("busy admission supervision")
+        .expect("busy admission response");
+        assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(matches!(
+            entry.coordinator.result(later_route),
+            Err(AnonymousMailboxSourceError::Rejected)
+        ));
+        assert_eq!(
+            entry.resolver.exact_calls.load(Ordering::Relaxed),
+            exact_before_busy
+        );
+        assert_eq!(accepted_connections.load(Ordering::Relaxed), 1);
+
+        first_source.abort();
+        assert!(tokio::time::timeout(Duration::from_secs(2), first_source)
+            .await
+            .expect("source cancellation supervision")
+            .expect_err("test-owned source future must cancel")
+            .is_cancelled());
+        release
+            .send(())
+            .expect("release held test-owned proxy after cancellation");
+        assert!(matches!(
+            entry.coordinator.result(first_route),
+            Ok(AnonymousMailboxSourceResult::Armed)
+        ));
+
+        let retry = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.clone().oneshot(signed_remote_request(
+                Method::POST,
+                ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                &first_body,
+                first_body.clone(),
+                &signer,
+            )),
+        )
+        .await
+        .expect("exact retry supervision")
+        .expect("exact retry response");
+        assert_eq!(retry.status(), StatusCode::OK);
+        let retry_body = axum::body::to_bytes(retry.into_body(), SOURCE_SUBMIT_BODY_MAX_BYTES)
+            .await
+            .expect("bounded exact retry response");
+        let AnonymousMailboxTerminalFrameV1::TicketIssueResponse(retry_ticket) =
+            completed_terminal_frame(&retry_body)
+        else {
+            panic!("exact retry ticket response kind");
+        };
+        retry_ticket
+            .verify_for_request(&first_ticket, &target.public_key_bytes())
+            .expect("request-bound exact retry receipt");
+        let expected_first_ticket = match store
+            .issue_ticket(&first_ticket, unix_now_secs())
+            .expect("read existing first ticket")
+        {
+            AnonymousMailboxTicketIssueOutcome::Existing(ticket) => ticket,
+            _ => panic!("cancelled request must not issue a second ticket"),
+        };
+        assert!(retry_ticket.ticket.as_ref() == Some(&expected_first_ticket));
+        assert!(matches!(
+            entry.coordinator.result(first_route),
+            Ok(AnonymousMailboxSourceResult::Completed(_))
+        ));
+
+        let later = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.oneshot(signed_remote_request(
+                Method::POST,
+                ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                &later_body,
+                later_body.clone(),
+                &signer,
+            )),
+        )
+        .await
+        .expect("post-cancellation admission supervision")
+        .expect("post-cancellation admission response");
+        assert_eq!(later.status(), StatusCode::OK);
+        let later_response = axum::body::to_bytes(later.into_body(), SOURCE_SUBMIT_BODY_MAX_BYTES)
+            .await
+            .expect("bounded later response");
+        let AnonymousMailboxTerminalFrameV1::TicketIssueResponse(later_ticket_response) =
+            completed_terminal_frame(&later_response)
+        else {
+            panic!("later ticket response kind");
+        };
+        later_ticket_response
+            .verify_for_request(&later_ticket, &target.public_key_bytes())
+            .expect("request-bound later receipt");
+        assert!(later_ticket_response.ticket.is_some());
+        assert!(matches!(
+            entry.coordinator.result(later_route),
+            Ok(AnonymousMailboxSourceResult::Completed(_))
+        ));
+
+        let peer_bodies = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("proxy completion supervision")
+            .expect("proxy task");
+        assert_eq!(peer_bodies.len(), 3);
+        assert_eq!(peer_bodies[0], first_peer_body);
+        assert_eq!(peer_bodies[0], peer_bodies[1]);
+        assert_ne!(peer_bodies[1], peer_bodies[2]);
+        assert_eq!(accepted_connections.load(Ordering::Relaxed), 3);
+        assert_eq!(entry.resolver.alternate_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.resolver.unknown_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
