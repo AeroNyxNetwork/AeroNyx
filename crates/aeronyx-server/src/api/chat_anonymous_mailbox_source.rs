@@ -366,6 +366,9 @@ fn unix_now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::net::TcpListener as StdTcpListener;
+    use std::path::{Path, PathBuf};
+    use std::process::Stdio;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -391,6 +394,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::process::Child;
     use tower::ServiceExt;
 
     use super::*;
@@ -410,6 +414,15 @@ mod tests {
     };
 
     const NOW: u64 = 1_800_000_000;
+    const PROCESS_CRASH_WORKER: &str = concat!(
+        "api::chat_anonymous_mailbox_source::tests::",
+        "source_router_process_crash_subprocess_worker"
+    );
+    const PROCESS_CRASH_MODE_ENV: &str = "AERONYX_TEST_SOURCE_PROCESS_CRASH_MODE";
+    const PROCESS_CRASH_DB_ENV: &str = "AERONYX_TEST_SOURCE_PROCESS_CRASH_DB";
+    const PROCESS_CRASH_PROXY_PORT_ENV: &str = "AERONYX_TEST_SOURCE_PROCESS_CRASH_PROXY_PORT";
+    const PROCESS_CRASH_NOW_ENV: &str = "AERONYX_TEST_SOURCE_PROCESS_CRASH_NOW";
+    const PROCESS_CRASH_DEADLINE: Duration = Duration::from_secs(20);
 
     struct TestResolver {
         descriptor: SignedNodeDescriptor,
@@ -661,6 +674,19 @@ mod tests {
         _source_store: tempfile::TempDir,
     }
 
+    struct ProcessCrashFixture {
+        target: IdentityKeyPair,
+        descriptor: SignedNodeDescriptor,
+        ticket_request: AnonymousMailboxTicketIssueV1,
+        body: Vec<u8>,
+    }
+
+    struct ProcessCrashSourceEntry {
+        coordinator: Arc<AnonymousMailboxSourceCoordinator>,
+        resolver: Arc<PinnedTargetResolver>,
+        config: AnonymousMailboxSourceConfig,
+    }
+
     fn real_source_entry(
         descriptor: SignedNodeDescriptor,
         source_seed: u8,
@@ -746,6 +772,101 @@ mod tests {
             journal_key,
             alternate_node_id,
             _source_store,
+        }
+    }
+
+    // [E7-PROCESS-CRASH-EVIDENCE 2026-09-06 by Codex] The replacement child
+    // gets only a private SQLite path, an ephemeral loopback proxy port, a
+    // clock value and a fixture mode. It reconstructs all keys and the signed
+    // source request locally; no key, route or payload crosses argv/env.
+    fn process_crash_fixture(now: u64) -> ProcessCrashFixture {
+        let target = IdentityKeyPair::from_bytes(&[0xC1; 32]).expect("process-crash target");
+        let mut descriptor = NodeDescriptor::new(
+            target.public_key_bytes(),
+            37,
+            now.saturating_sub(1),
+            now.saturating_add(60),
+            "e7-process-crash-test",
+        )
+        .with_x25519_kem(target.x25519_public_key_bytes())
+        .with_protocol_features([
+            NodeProtocolFeature::AnonymousMailboxV1,
+            NodeProtocolFeature::OnionReplyV1,
+            NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+            NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+        ]);
+        // The ordinary source client uses only the test-owned loopback proxy;
+        // this public-shaped descriptor remains unreachable from the host.
+        descriptor.public_endpoint = Some("http://8.8.8.8".into());
+        descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        let descriptor = SignedNodeDescriptor::sign(descriptor, &target).expect("descriptor");
+        let commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).expect("pin");
+        let ticket_request =
+            ticket_request_with_one_bit_proof(&target, [0xC5; 16], [0xC6; 16], [0xC7; 32], now);
+        let terminal = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::TicketIssue(ticket_request.clone()),
+        )
+        .expect("ticket terminal");
+        ProcessCrashFixture {
+            target,
+            descriptor,
+            ticket_request,
+            body: submit_body([0xC8; 16], commitment, &terminal),
+        }
+    }
+
+    fn process_crash_source_config(db_path: &Path) -> AnonymousMailboxSourceConfig {
+        AnonymousMailboxSourceConfig {
+            enabled: true,
+            db_path: db_path.to_string_lossy().into_owned(),
+            max_journal_entries: 16,
+            max_journal_bytes: 512 * 1024,
+            max_in_flight: 2,
+            request_timeout_secs: 15,
+        }
+    }
+
+    fn process_crash_source_entry(
+        db_path: &Path,
+        fixture: &ProcessCrashFixture,
+        mode: &str,
+    ) -> ProcessCrashSourceEntry {
+        let descriptor = match mode {
+            "crash" | "restored" => Some(fixture.descriptor.clone()),
+            "rotated" => {
+                let mut rotated = fixture.descriptor.descriptor.clone();
+                rotated.sequence = rotated.sequence.saturating_add(1);
+                Some(
+                    SignedNodeDescriptor::sign(rotated, &fixture.target)
+                        .expect("rotated process-crash descriptor"),
+                )
+            }
+            "missing" => None,
+            _ => panic!("unknown process-crash worker mode"),
+        };
+        let config = process_crash_source_config(db_path);
+        let resolver = Arc::new(PinnedTargetResolver {
+            exact_node_id: fixture.target.public_key_bytes(),
+            descriptor: RwLock::new(descriptor),
+            alternate_node_id: [0xC9; 32],
+            exact_calls: AtomicUsize::new(0),
+            alternate_calls: AtomicUsize::new(0),
+            unknown_calls: AtomicUsize::new(0),
+        });
+        let journal = SqliteAnonymousMailboxSourceJournal::open(config.clone(), [0xCA; 32])
+            .expect("process-crash source journal");
+        let coordinator = Arc::new(AnonymousMailboxSourceCoordinator::new(
+            Arc::new(
+                IdentityKeyPair::from_bytes(&[0xCB; 32]).expect("process-crash source identity"),
+            ),
+            resolver.clone(),
+            Arc::new(journal),
+        ));
+        ProcessCrashSourceEntry {
+            coordinator,
+            resolver,
+            config,
         }
     }
 
@@ -1306,9 +1427,16 @@ mod tests {
 
     fn loopback_proxy_client(listener: &TcpListener) -> reqwest::Client {
         let address = listener.local_addr().expect("loopback proxy address");
+        loopback_proxy_client_at(address.port())
+    }
+
+    fn loopback_proxy_client_at(port: u16) -> reqwest::Client {
         reqwest::Client::builder()
             .no_proxy()
-            .proxy(reqwest::Proxy::all(format!("http://{address}")).expect("proxy URL"))
+            .proxy(
+                reqwest::Proxy::all(format!("http://127.0.0.1:{port}"))
+                    .expect("loopback proxy URL"),
+            )
             .build()
             .expect("loopback proxy client")
     }
@@ -1320,6 +1448,251 @@ mod tests {
                 .is_err(),
             "source request unexpectedly reached the local proxy"
         );
+    }
+
+    enum ProcessCrashTerminalControl {
+        AssertQuiet(tokio::sync::oneshot::Sender<Result<(), String>>),
+        ServeRestored(tokio::sync::oneshot::Sender<Vec<u8>>),
+    }
+
+    // [E7-PROCESS-CRASH-EVIDENCE 2026-09-06 by Codex] The terminal side is
+    // parent-owned and local. It signals only after the real SQLite terminal
+    // adapter returns, then withholds the first response until the parent has
+    // reaped its own child. The control channel makes no-network assertions
+    // deterministic with try_accept rather than time-based sleeps.
+    fn process_crash_terminal_proxy(
+        listener: TcpListener,
+        inspection_listener: StdTcpListener,
+        target: IdentityKeyPair,
+        repository: Arc<dyn AnonymousMailboxCustodyRepository>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<Vec<u8>>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::mpsc::Sender<ProcessCrashTerminalControl>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(3);
+        let server = tokio::spawn(async move {
+            let (mut first_stream, _) = listener
+                .accept()
+                .await
+                .expect("process-crash first proxy connection");
+            let (_, first_body) = read_proxy_request(&mut first_stream).await;
+            let _ = real_terminal_peer_response(&first_body, &target, repository.clone());
+            committed_tx
+                .send(first_body)
+                .expect("process-crash durable terminal event");
+            release_rx.await.expect("process-crash parent release");
+            drop(first_stream);
+
+            while let Some(control) = control_rx.recv().await {
+                match control {
+                    ProcessCrashTerminalControl::AssertQuiet(reply) => {
+                        let result = match inspection_listener.accept() {
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+                            Ok((stream, _)) => {
+                                drop(stream);
+                                Err("drifted replacement unexpectedly dispatched".into())
+                            }
+                            Err(_) => Err("process-crash listener inspection failed".into()),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    ProcessCrashTerminalControl::ServeRestored(reply) => {
+                        let (mut stream, _) = listener
+                            .accept()
+                            .await
+                            .expect("restored process-crash proxy connection");
+                        let (_, body) = read_proxy_request(&mut stream).await;
+                        let response = real_terminal_peer_response(&body, &target, repository);
+                        write_peer_response(&mut stream, &response).await;
+                        let _ = reply.send(body);
+                        return;
+                    }
+                }
+            }
+            panic!("process-crash parent dropped terminal control before restore");
+        });
+        (committed_rx, release_tx, control_tx, server)
+    }
+
+    fn spawn_process_crash_child(mode: &str, db_path: &Path, proxy_port: u16, now: u64) -> Child {
+        let executable = std::env::current_exe().expect("resolve process-crash test binary");
+        let mut child = crate::isolated_child_command(executable);
+        child
+            .arg(PROCESS_CRASH_WORKER)
+            .arg("--exact")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(PROCESS_CRASH_MODE_ENV, mode)
+            .env(PROCESS_CRASH_DB_ENV, db_path)
+            .env(PROCESS_CRASH_PROXY_PORT_ENV, proxy_port.to_string())
+            .env(PROCESS_CRASH_NOW_ENV, now.to_string())
+            .env_remove("AERONYX_TEST_ANONYMOUS_MAILBOX_SOURCE_CRASH_PHASE")
+            .env_remove("AERONYX_TEST_ANONYMOUS_MAILBOX_SOURCE_CRASH_BARRIER")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        child.spawn().expect("spawn isolated process-crash child")
+    }
+
+    async fn terminate_and_reap_process_crash_child(child: &mut Child) {
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill().await;
+        }
+        let _ = tokio::time::timeout(PROCESS_CRASH_DEADLINE, child.wait()).await;
+    }
+
+    async fn require_process_crash_child_success(child: &mut Child) -> Result<(), String> {
+        match tokio::time::timeout(PROCESS_CRASH_DEADLINE, child.wait()).await {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(Ok(_)) => Err("replacement child exited unsuccessfully".into()),
+            Ok(Err(_)) => Err("replacement child could not be reaped".into()),
+            Err(_) => {
+                terminate_and_reap_process_crash_child(child).await;
+                Err("replacement child exceeded bounded deadline".into())
+            }
+        }
+    }
+
+    async fn kill_and_reap_process_crash_child(child: &mut Child) -> Result<(), String> {
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(_)) => return Err("crash child exited before parent kill".into()),
+            Err(_) => return Err("could not inspect crash child".into()),
+        }
+        if child.kill().await.is_err() {
+            terminate_and_reap_process_crash_child(child).await;
+            return Err("could not terminate owned crash child".into());
+        }
+        match tokio::time::timeout(PROCESS_CRASH_DEADLINE, child.wait()).await {
+            Ok(Ok(status)) if !status.success() => Ok(()),
+            Ok(Ok(_)) => Err("owned crash child unexpectedly exited successfully".into()),
+            Ok(Err(_)) => Err("owned crash child could not be reaped".into()),
+            Err(_) => {
+                terminate_and_reap_process_crash_child(child).await;
+                Err("owned crash child exceeded bounded reap deadline".into())
+            }
+        }
+    }
+
+    async fn abort_and_reap_process_crash_server(server: &mut Option<tokio::task::JoinHandle<()>>) {
+        if let Some(server) = server.take() {
+            server.abort();
+            let _ = tokio::time::timeout(PROCESS_CRASH_DEADLINE, server).await;
+        }
+    }
+
+    async fn require_process_crash_server_complete(
+        server: &mut Option<tokio::task::JoinHandle<()>>,
+    ) -> Result<(), String> {
+        let Some(mut server) = server.take() else {
+            return Err("process-crash server completion was consumed".into());
+        };
+        match tokio::time::timeout(PROCESS_CRASH_DEADLINE, &mut server).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err("process-crash terminal fixture failed".into()),
+            Err(_) => {
+                server.abort();
+                let _ = tokio::time::timeout(PROCESS_CRASH_DEADLINE, server).await;
+                Err("process-crash terminal fixture exceeded bounded deadline".into())
+            }
+        }
+    }
+
+    async fn request_process_crash_quiet(
+        control: &tokio::sync::mpsc::Sender<ProcessCrashTerminalControl>,
+    ) -> Result<(), String> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        control
+            .send(ProcessCrashTerminalControl::AssertQuiet(reply_tx))
+            .await
+            .map_err(|_| "process-crash terminal control unavailable".to_string())?;
+        match tokio::time::timeout(PROCESS_CRASH_DEADLINE, reply_rx).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(_))) => Err("drifted replacement dispatched to terminal".into()),
+            Ok(Err(_)) => Err("process-crash terminal dropped quiet acknowledgement".into()),
+            Err(_) => Err("process-crash terminal quiet acknowledgement timed out".into()),
+        }
+    }
+
+    #[test]
+    #[ignore = "spawned only by the bounded process-crash source acceptance"]
+    fn source_router_process_crash_subprocess_worker() {
+        let mode = std::env::var(PROCESS_CRASH_MODE_ENV).expect("process-crash worker mode");
+        let db_path = PathBuf::from(
+            std::env::var_os(PROCESS_CRASH_DB_ENV).expect("process-crash worker database"),
+        );
+        let proxy_port = std::env::var(PROCESS_CRASH_PROXY_PORT_ENV)
+            .expect("process-crash proxy port")
+            .parse::<u16>()
+            .expect("numeric process-crash proxy port");
+        let now = std::env::var(PROCESS_CRASH_NOW_ENV)
+            .expect("process-crash fixture clock")
+            .parse::<u64>()
+            .expect("numeric process-crash fixture clock");
+        let fixture = process_crash_fixture(now);
+        let entry = process_crash_source_entry(&db_path, &fixture, &mode);
+        let signer = IdentityKeyPair::from_bytes(&[0xCC; 32]).expect("process-crash signer");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("process-crash worker runtime");
+        runtime.block_on(async move {
+            let response = source_app_for(
+                source_mpi_state(),
+                Arc::clone(&entry.coordinator),
+                &entry.config,
+                loopback_proxy_client_at(proxy_port),
+            )
+            .oneshot(signed_remote_request(
+                Method::POST,
+                ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                &fixture.body,
+                fixture.body.clone(),
+                &signer,
+            ))
+            .await
+            .expect("process-crash source response");
+
+            match mode.as_str() {
+                "crash" => panic!("process-crash worker returned before parent termination"),
+                "rotated" | "missing" => {
+                    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                    assert!(matches!(
+                        entry.coordinator.result([0xC8; 16]),
+                        Ok(AnonymousMailboxSourceResult::Armed)
+                    ));
+                    assert_eq!(entry.resolver.alternate_calls.load(Ordering::Relaxed), 0);
+                    assert_eq!(entry.resolver.unknown_calls.load(Ordering::Relaxed), 0);
+                }
+                "restored" => {
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body =
+                        axum::body::to_bytes(response.into_body(), SOURCE_SUBMIT_BODY_MAX_BYTES)
+                            .await
+                            .expect("bounded restored source response");
+                    let AnonymousMailboxTerminalFrameV1::TicketIssueResponse(ticket) =
+                        completed_terminal_frame(&body)
+                    else {
+                        panic!("restored process-crash response kind");
+                    };
+                    ticket
+                        .verify_for_request(
+                            &fixture.ticket_request,
+                            &fixture.target.public_key_bytes(),
+                        )
+                        .expect("request-bound restored ticket response");
+                    assert_eq!(entry.resolver.alternate_calls.load(Ordering::Relaxed), 0);
+                    assert_eq!(entry.resolver.unknown_calls.load(Ordering::Relaxed), 0);
+                }
+                _ => panic!("unknown process-crash worker mode"),
+            }
+        });
     }
 
     #[tokio::test]
@@ -2161,6 +2534,147 @@ mod tests {
         ));
         assert_eq!(entry.resolver.alternate_calls.load(Ordering::Relaxed), 0);
         assert_eq!(entry.resolver.unknown_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn source_router_process_kill_reopens_exact_target_without_fallback() {
+        // [E7-PROCESS-CRASH-EVIDENCE 2026-09-06 by Codex] This test kills only
+        // its own libtest child after a real terminal SQLite mutation and
+        // before that child receives an HTTP response. Replacement libtest
+        // children use the same source identity/journal; no host service,
+        // fleet node, production configuration or process discovery is used.
+        let source_directory = tempfile::tempdir().expect("process-crash source directory");
+        let source_root = std::fs::canonicalize(source_directory.path())
+            .expect("canonical process-crash source directory");
+        let source_db = source_root.join("source.sqlite");
+        let target_directory = tempfile::tempdir().expect("process-crash target directory");
+        let target_root = std::fs::canonicalize(target_directory.path())
+            .expect("canonical process-crash target directory");
+        let target_db = target_root.join("terminal.sqlite");
+        let std_listener =
+            StdTcpListener::bind("127.0.0.1:0").expect("process-crash loopback listener");
+        std_listener
+            .set_nonblocking(true)
+            .expect("nonblocking process-crash listener");
+        let inspection_listener = std_listener
+            .try_clone()
+            .expect("clone process-crash inspection listener");
+        let listener =
+            TcpListener::from_std(std_listener).expect("tokio process-crash loopback listener");
+        let fixture_now = unix_now_secs();
+        let fixture = process_crash_fixture(fixture_now);
+        let store = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                AnonymousMailboxStoreConfig {
+                    enabled: true,
+                    db_path: target_db.to_string_lossy().into_owned(),
+                    max_leases_total: 4,
+                    max_items_total: 1_024,
+                    max_bytes_total: 1024 * 1024,
+                    max_in_flight: 2,
+                    cleanup_batch_size: 8,
+                    max_outstanding_tickets: 4,
+                    max_ticket_issues_per_window: 4,
+                    ticket_issuance_window_secs: 60,
+                    ticket_issue_work_bits: 1,
+                },
+                fixture.target.clone(),
+                [0xCD; 32],
+            )
+            .expect("process-crash real SQLite target store"),
+        );
+        let proxy_port = listener
+            .local_addr()
+            .expect("process-crash loopback address")
+            .port();
+        let (committed_rx, release_tx, control_tx, server) = process_crash_terminal_proxy(
+            listener,
+            inspection_listener,
+            fixture.target.clone(),
+            store.clone(),
+        );
+        let mut server = Some(server);
+
+        let scenario = async {
+            let mut crashed =
+                spawn_process_crash_child("crash", &source_db, proxy_port, fixture_now);
+            let first_peer_body =
+                match tokio::time::timeout(PROCESS_CRASH_DEADLINE, committed_rx).await {
+                    Ok(Ok(body)) => body,
+                    Ok(Err(_)) => {
+                        terminate_and_reap_process_crash_child(&mut crashed).await;
+                        return Err("terminal did not report its durable mutation".to_string());
+                    }
+                    Err(_) => {
+                        terminate_and_reap_process_crash_child(&mut crashed).await;
+                        return Err(
+                            "terminal durable-mutation event exceeded bounded deadline".to_string()
+                        );
+                    }
+                };
+            kill_and_reap_process_crash_child(&mut crashed).await?;
+            release_tx
+                .send(())
+                .map_err(|_| "process-crash terminal release failed".to_string())?;
+
+            for mode in ["rotated", "missing"] {
+                let mut replacement =
+                    spawn_process_crash_child(mode, &source_db, proxy_port, fixture_now);
+                require_process_crash_child_success(&mut replacement).await?;
+                request_process_crash_quiet(&control_tx).await?;
+            }
+
+            let mut restored =
+                spawn_process_crash_child("restored", &source_db, proxy_port, fixture_now);
+            let (restored_tx, restored_rx) = tokio::sync::oneshot::channel();
+            if control_tx
+                .send(ProcessCrashTerminalControl::ServeRestored(restored_tx))
+                .await
+                .is_err()
+            {
+                terminate_and_reap_process_crash_child(&mut restored).await;
+                return Err("process-crash terminal restore control failed".into());
+            }
+            let restored_peer_body =
+                match tokio::time::timeout(PROCESS_CRASH_DEADLINE, restored_rx).await {
+                    Ok(Ok(body)) => body,
+                    Ok(Err(_)) => {
+                        terminate_and_reap_process_crash_child(&mut restored).await;
+                        return Err("process-crash terminal dropped restored body".into());
+                    }
+                    Err(_) => {
+                        terminate_and_reap_process_crash_child(&mut restored).await;
+                        return Err("restored terminal request exceeded bounded deadline".into());
+                    }
+                };
+            require_process_crash_child_success(&mut restored).await?;
+            if restored_peer_body != first_peer_body {
+                return Err("replacement source body was not byte-identical".into());
+            }
+            if !matches!(
+                store
+                    .issue_ticket(&fixture.ticket_request, unix_now_secs())
+                    .expect("read process-crash terminal ticket"),
+                AnonymousMailboxTicketIssueOutcome::Existing(_)
+            ) {
+                return Err("restored terminal retry minted a second ticket".into());
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+
+        match scenario {
+            Ok(()) => {
+                if let Err(error) = require_process_crash_server_complete(&mut server).await {
+                    abort_and_reap_process_crash_server(&mut server).await;
+                    panic!("{error}");
+                }
+            }
+            Err(error) => {
+                abort_and_reap_process_crash_server(&mut server).await;
+                panic!("{error}");
+            }
+        }
     }
 
     #[tokio::test]
