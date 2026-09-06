@@ -2025,6 +2025,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_router_wrong_target_receipt_marks_ambiguous_without_completion_or_replay() {
+        // [R7-RECEIPT-ZERO-EFFECT 2026-09-07 by Codex] A syntactically valid
+        // terminal-shaped response signed by another key must not become a
+        // source completion.  The only socket is this test-owned loopback
+        // proxy; the response is fabricated before any custody adapter runs.
+        let fixture = source_router_fixture();
+        let state = source_mpi_state();
+        let signer = IdentityKeyPair::from_bytes(&[0xBF; 32]).expect("remote signer");
+        let body = submit_body(
+            fixture.route_id,
+            fixture.commitment,
+            &fixture.terminal_frame,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("wrong-target loopback proxy");
+        let client = loopback_proxy_client(&listener);
+        let target = fixture.target.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("one proxy connection");
+            let (_, peer_body) = read_proxy_request(&mut stream).await;
+            let request: PeerBlindRelayRequest =
+                serde_json::from_slice(&peer_body).expect("canonical peer request");
+            let (response, _) = terminal_peer_response(&peer_body, &target);
+            let mut response: PeerBlindRelayResponse =
+                serde_json::from_slice(&response).expect("canonical peer response");
+            let encoded = response
+                .opaque_terminal_response_b64
+                .as_deref()
+                .expect("sealed terminal response");
+            let wrong_target =
+                IdentityKeyPair::from_bytes(&[0xC0; 32]).expect("wrong receipt signer");
+            response.success_receipt = Some(BlindRelaySuccessReceipt::terminal(
+                &request.envelope,
+                1,
+                None,
+                None,
+                Some(encoded.as_bytes()),
+                unix_now_secs(),
+                &wrong_target,
+            ));
+            write_peer_response(
+                &mut stream,
+                &serde_json::to_vec(&response).expect("wrong-target peer response"),
+            )
+            .await;
+        });
+
+        let rejected = source_app(state.clone(), &fixture, client)
+            .oneshot(signed_remote_request(
+                Method::POST,
+                ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                &body,
+                body.clone(),
+                &signer,
+            ))
+            .await
+            .expect("wrong-target source response");
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        server.await.expect("wrong-target proxy task");
+        assert!(matches!(
+            fixture.coordinator.result(fixture.route_id),
+            Ok(AnonymousMailboxSourceResult::Ambiguous)
+        ));
+        let exact_calls_before_retry = fixture.resolver.exact_calls.load(Ordering::Relaxed);
+
+        let retry_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ambiguous retry proxy");
+        let retry = source_app(state, &fixture, loopback_proxy_client(&retry_listener))
+            .oneshot(signed_remote_request(
+                Method::POST,
+                ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH,
+                &body,
+                body.clone(),
+                &signer,
+            ))
+            .await
+            .expect("ambiguous retry response");
+        assert_eq!(retry.status(), StatusCode::CONFLICT);
+        assert_no_proxy_connection(&retry_listener).await;
+        assert_eq!(
+            fixture.resolver.exact_calls.load(Ordering::Relaxed),
+            exact_calls_before_retry,
+            "ambiguous retry must not re-resolve or replay"
+        );
+        assert_eq!(fixture.resolver.unexpected_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn source_router_real_terminal_store_survives_response_loss_and_receiver_entry() {
         // [M13J-E3 2026-09-05 by Codex] This is the source HTTP/real terminal
         // adapter acceptance boundary.  M and R are distinct source journals;
