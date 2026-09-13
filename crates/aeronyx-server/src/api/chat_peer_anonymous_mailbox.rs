@@ -362,6 +362,14 @@ mod tests {
         AnonymousMailboxPullOneV1, AnonymousMailboxPullResultV1, AnonymousMailboxPutV1,
         AnonymousMailboxSourceSealSessionV1, AnonymousMailboxTicketIssueV1,
     };
+    use aeronyx_core::protocol::anonymous_mailbox_deposit_invitation::{
+        AnonymousMailboxDepositInvitationV2, AnonymousMailboxDepositTargetPinV1,
+        DEFAULT_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_RUNWAY_SECS,
+    };
+    use aeronyx_core::protocol::anonymous_mailbox_recipient_seal::{
+        AnonymousMailboxRecipientSealKeyHandleV1, AnonymousMailboxRecipientSealPublicV1,
+    };
+    use aeronyx_core::protocol::chat::{ChatContentType, ChatEnvelope};
     use aeronyx_core::protocol::discovery::{
         DirectoryDescriptorCommitmentV1, NodeCapability, NodeDescriptor, NodeProtocolFeature,
         SignedNodeDescriptor,
@@ -369,6 +377,8 @@ mod tests {
     use aeronyx_core::protocol::memchain::encode_memchain;
     use aeronyx_core::protocol::onion::open_onion_layer;
     use rusqlite::Connection;
+    use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+    use zeroize::Zeroizing;
 
     struct TicketRepository {
         outcomes:
@@ -380,6 +390,49 @@ mod tests {
         descriptor: SignedNodeDescriptor,
         exact_calls: AtomicUsize,
         wrong_target_calls: AtomicUsize,
+    }
+
+    struct TestRecipientKeyHandle {
+        key_id: [u8; 16],
+        secret: StaticSecret,
+        public: [u8; 32],
+    }
+
+    impl TestRecipientKeyHandle {
+        fn new(key_id: [u8; 16], secret_bytes: [u8; 32]) -> Self {
+            let secret = StaticSecret::from(secret_bytes);
+            let public = X25519PublicKey::from(&secret).to_bytes();
+            Self {
+                key_id,
+                secret,
+                public,
+            }
+        }
+    }
+
+    impl AnonymousMailboxRecipientSealKeyHandleV1 for TestRecipientKeyHandle {
+        fn key_id(&self) -> [u8; 16] {
+            self.key_id
+        }
+
+        fn public_key(&self) -> [u8; 32] {
+            self.public
+        }
+
+        fn derive_shared_secret(
+            &self,
+            peer_public_key: [u8; 32],
+        ) -> Result<
+            Zeroizing<[u8; 32]>,
+            aeronyx_core::protocol::anonymous_mailbox_recipient_seal::AnonymousMailboxRecipientSealError,
+        >{
+            Ok(Zeroizing::new(
+                *self
+                    .secret
+                    .diffie_hellman(&X25519PublicKey::from(peer_public_key))
+                    .as_bytes(),
+            ))
+        }
     }
 
     impl ExactAnonymousMailboxTargetResolver for CrossEntryExactResolver {
@@ -569,6 +622,32 @@ mod tests {
             )
             .expect("issuer token count");
         (leases, outstanding, issues, consumed, issued_consumed)
+    }
+
+    fn durable_item_state(db_path: &str) -> (i64, i64, i64, Vec<Vec<u8>>) {
+        let connection = Connection::open(db_path).expect("open durable item state for audit");
+        let (total_items, total_bytes): (i64, i64) = connection
+            .query_row(
+                "SELECT total_items, total_bytes
+                 FROM anonymous_mailbox_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("durable item counters");
+        let row_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM anonymous_mailbox_items", [], |row| {
+                row.get(0)
+            })
+            .expect("durable item row count");
+        let mut statement = connection
+            .prepare("SELECT sealed_envelope FROM anonymous_mailbox_items ORDER BY sequence")
+            .expect("prepare opaque item audit");
+        let items = statement
+            .query_map([], |row| row.get(0))
+            .expect("query opaque items")
+            .collect::<Result<Vec<Vec<u8>>, _>>()
+            .expect("materialize bounded test rows");
+        (total_items, total_bytes, row_count, items)
     }
 
     fn execute_terminal_result_at(
@@ -1653,5 +1732,542 @@ mod tests {
         assert_eq!(r_resolver.wrong_target_calls.load(Ordering::Relaxed), 0);
         assert!(m_resolver.exact_calls.load(Ordering::Relaxed) >= 6);
         assert!(r_resolver.exact_calls.load(Ordering::Relaxed) >= 6);
+    }
+
+    #[test]
+    fn recipient_sealed_chat_survives_real_terminal_store_restart_and_expired_invitation() {
+        // [ANONYMOUS-MAILBOX-RECIPIENT-SEAL-VERTICAL 2026-09-08 by Codex]
+        // Exercise the production terminal adapter and SQLite custody store
+        // with opaque AMSI bytes. The in-memory key handle exists only on the
+        // simulated recipient side; T never receives a chat identity or key.
+        const NOW: u64 = 1_800_010_000;
+        const INVITATION_EXPIRES: u64 = NOW + 300;
+        const LEASE_EXPIRES: u64 = NOW + 1_800;
+        const ITEM_EXPIRES: u64 = NOW + 1_200;
+
+        let directory = tempfile::tempdir().expect("private temporary directory");
+        let private_directory = std::fs::canonicalize(directory.path()).expect("canonical path");
+        let config = AnonymousMailboxStoreConfig {
+            enabled: true,
+            db_path: private_directory
+                .join("recipient-sealed-mailbox.sqlite")
+                .display()
+                .to_string(),
+            max_leases_total: 4,
+            max_items_total: 1_024,
+            max_bytes_total: 1024 * 1024,
+            max_in_flight: 4,
+            cleanup_batch_size: 8,
+            max_outstanding_tickets: 4,
+            max_ticket_issues_per_window: 2,
+            ticket_issuance_window_secs: 60,
+            ticket_issue_work_bits: 1,
+        };
+        let target = IdentityKeyPair::from_bytes(&[0xd1; 32]).expect("target T");
+        let depositor = IdentityKeyPair::from_bytes(&[0xd2; 32]).expect("deposit capability");
+        let reader = IdentityKeyPair::from_bytes(&[0xd3; 32]).expect("mailbox reader");
+        let chat_receiver =
+            IdentityKeyPair::from_bytes(&[0xd4; 32]).expect("authenticated chat receiver");
+        let chat_sender = IdentityKeyPair::from_bytes(&[0xd5; 32]).expect("chat sender");
+        let recipient_secret = [0xd6; 32];
+        let recipient_key_id = [0xd7; 16];
+        let recipient_handle = TestRecipientKeyHandle::new(recipient_key_id, recipient_secret);
+        let recipient_public =
+            AnonymousMailboxRecipientSealPublicV1::new(recipient_key_id, recipient_handle.public)
+                .expect("recipient public seal capability");
+        assert_ne!(reader.public_key_bytes(), chat_receiver.public_key_bytes());
+        assert_ne!(reader.public_key_bytes(), recipient_handle.public);
+        assert_ne!(chat_receiver.public_key_bytes(), recipient_handle.public);
+
+        let mailbox_id = [0xd8; 32];
+        let ticket_id = [0xd9; 16];
+        let claims = AnonymousMailboxLeaseCreateV1::lease_claims_commitment(
+            &mailbox_id,
+            &depositor.public_key_bytes(),
+            &reader.public_key_bytes(),
+            4,
+            512 * 1024,
+            NOW,
+            LEASE_EXPIRES,
+        );
+        let ticket_request = (0..u64::MAX)
+            .find_map(|proof_nonce| {
+                let request = AnonymousMailboxTicketIssueV1::new(
+                    [0xda; 16],
+                    ticket_id,
+                    target.public_key_bytes(),
+                    claims,
+                    NOW,
+                    NOW + 300,
+                    proof_nonce,
+                )
+                .expect("ticket request");
+                (request.proof_digest().expect("proof digest")[0] & 0x80 == 0).then_some(request)
+            })
+            .expect("one-bit proof");
+        let cursor_secret = [0xdb; 32];
+        let store = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                config.clone(),
+                target.clone(),
+                cursor_secret,
+            )
+            .expect("open real target store"),
+        );
+        let ticket_response = execute_terminal_frame_at(
+            store.clone(),
+            &target,
+            [0xdc; 16],
+            AnonymousMailboxTerminalFrameV1::TicketIssue(ticket_request.clone()),
+            NOW,
+        );
+        let AnonymousMailboxTerminalFrameV1::TicketIssueResponse(ticket_response) = ticket_response
+        else {
+            panic!("ticket response kind");
+        };
+        ticket_response
+            .verify_for_request(&ticket_request, &target.public_key_bytes())
+            .expect("target-bound ticket response");
+        let ticket = ticket_response.ticket.expect("issued ticket");
+
+        let lease = AnonymousMailboxLeaseCreateV1::new(
+            mailbox_id,
+            depositor.public_key_bytes(),
+            4,
+            512 * 1024,
+            NOW,
+            LEASE_EXPIRES,
+            ticket,
+            &reader,
+        )
+        .expect("lease request");
+        let lease_response = execute_terminal_frame_at(
+            store.clone(),
+            &target,
+            [0xdd; 16],
+            AnonymousMailboxTerminalFrameV1::LeaseCreate(lease.clone()),
+            NOW,
+        );
+        let AnonymousMailboxTerminalFrameV1::LeaseCreateResponse(lease_response) = lease_response
+        else {
+            panic!("lease response kind");
+        };
+        assert_eq!(lease_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        let lease_frame = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::LeaseCreate(lease),
+        )
+        .expect("canonical lease request frame");
+        let lease_response_frame = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::LeaseCreateResponse(lease_response),
+        )
+        .expect("canonical lease response frame");
+        let target_pin =
+            AnonymousMailboxDepositTargetPinV1::new(target.public_key_bytes(), 17, [0xde; 32])
+                .expect("exact target pin");
+        let invitation_a = AnonymousMailboxDepositInvitationV2::issue(
+            [0xdf; 16],
+            NOW,
+            INVITATION_EXPIRES,
+            DEFAULT_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_RUNWAY_SECS,
+            target_pin,
+            depositor.to_bytes(),
+            chat_receiver.public_key_bytes(),
+            recipient_public,
+            lease_frame.clone(),
+            lease_response_frame.clone(),
+            &reader,
+        )
+        .expect("signed invitation A");
+        let invitation_b = AnonymousMailboxDepositInvitationV2::issue(
+            [0xe0; 16],
+            NOW,
+            INVITATION_EXPIRES,
+            DEFAULT_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_RUNWAY_SECS,
+            target_pin,
+            depositor.to_bytes(),
+            chat_receiver.public_key_bytes(),
+            recipient_public,
+            lease_frame,
+            lease_response_frame,
+            &reader,
+        )
+        .expect("signed invitation B");
+        let invitation_a_bytes = invitation_a.encode().expect("durable invitation A");
+        let active_a = invitation_a
+            .verify_for_new_put_at(NOW)
+            .expect("active invitation A");
+        let active_b = invitation_b
+            .verify_for_new_put_at(NOW)
+            .expect("active invitation B");
+        let mut chat = ChatEnvelope {
+            message_id: [0xe1; 16],
+            sender: chat_sender.public_key_bytes(),
+            receiver: chat_receiver.public_key_bytes(),
+            timestamp: NOW,
+            ciphertext: b"recipient-only signed chat ciphertext".to_vec(),
+            nonce: [0xe2; 24],
+            content_type: ChatContentType::Text,
+            signature: [0; 64],
+        };
+        chat.signature = chat_sender.sign(&chat.sign_data());
+
+        let sealed_for_wrong_invitation = active_a
+            .seal_chat_envelope_at(&chat, NOW)
+            .expect("A seals signed chat");
+        assert!(active_b
+            .prepare_put(
+                [0xe3; 16],
+                sealed_for_wrong_invitation,
+                NOW,
+                ITEM_EXPIRES,
+                NOW,
+            )
+            .is_err());
+        assert_eq!(durable_item_state(&config.db_path), (0, 0, 0, Vec::new()));
+
+        let sealed = active_a
+            .seal_chat_envelope_at(&chat, NOW)
+            .expect("A seals signed chat for Put");
+        let sealed_bytes = sealed.as_bytes().to_vec();
+        let put = active_a
+            .prepare_put([0xe4; 16], sealed, NOW, ITEM_EXPIRES, NOW)
+            .expect("A prepares bound Put");
+        let put_frame = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::Put(put.clone()),
+        )
+        .expect("canonical Put terminal frame");
+        let route_id = [0xe5; 16];
+        let (prepared_bytes, mut source_session) =
+            routed_terminal_frame(route_id, &target, put_frame);
+        let wrong_target =
+            IdentityKeyPair::from_bytes(&[0xe6; 32]).expect("different terminal target");
+        assert!(matches!(
+            PreparedAnonymousMailboxTerminal::decode(
+                &prepared_bytes,
+                [0xe7; 16],
+                target.public_key_bytes(),
+            ),
+            Err(AnonymousMailboxTerminalFailure::Rejected)
+        ));
+        assert!(matches!(
+            PreparedAnonymousMailboxTerminal::decode(
+                &prepared_bytes,
+                route_id,
+                wrong_target.public_key_bytes(),
+            ),
+            Err(AnonymousMailboxTerminalFailure::Rejected)
+        ));
+        assert_eq!(durable_item_state(&config.db_path), (0, 0, 0, Vec::new()));
+
+        let _lost_response = PreparedAnonymousMailboxTerminal::decode(
+            &prepared_bytes,
+            route_id,
+            target.public_key_bytes(),
+        )
+        .expect("first exact prepared request")
+        .execute(store.clone(), Arc::new(target.clone()), NOW)
+        .expect("first target Put");
+        let exact_replay_response = PreparedAnonymousMailboxTerminal::decode(
+            &prepared_bytes,
+            route_id,
+            target.public_key_bytes(),
+        )
+        .expect("byte-exact prepared retry")
+        .execute(store.clone(), Arc::new(target.clone()), NOW + 1)
+        .expect("idempotent target Put retry");
+        let exact_replay_response = BASE64
+            .decode(exact_replay_response)
+            .expect("base64 exact-retry response");
+        let exact_replay_response = decode_anonymous_mailbox_terminal_frame(
+            &source_session
+                .open(&exact_replay_response)
+                .expect("open exact-retry response once"),
+        )
+        .expect("canonical Put response");
+        let AnonymousMailboxTerminalFrameV1::PutResponse(exact_replay_response) =
+            exact_replay_response
+        else {
+            panic!("Put response kind");
+        };
+        assert_eq!(
+            exact_replay_response.outcome,
+            AnonymousMailboxOutcomeV1::Accepted
+        );
+        assert_eq!(
+            durable_item_state(&config.db_path),
+            (
+                1,
+                i64::try_from(sealed_bytes.len()).expect("opaque byte count"),
+                1,
+                vec![sealed_bytes.clone()]
+            ),
+            "T persists one opaque AMSI row for an exact prepared retry"
+        );
+
+        assert!(active_a
+            .seal_chat_envelope_at(&chat, INVITATION_EXPIRES + 1)
+            .is_err());
+        let sealed_before_expiry = active_a
+            .seal_chat_envelope_at(&chat, NOW)
+            .expect("seal while invitation is current");
+        assert!(active_a
+            .prepare_put(
+                [0xe8; 16],
+                sealed_before_expiry,
+                NOW,
+                ITEM_EXPIRES,
+                INVITATION_EXPIRES + 1,
+            )
+            .is_err());
+        drop(store);
+
+        let restarted = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                config.clone(),
+                target.clone(),
+                cursor_secret,
+            )
+            .expect("restart target store"),
+        );
+        let pull_now = INVITATION_EXPIRES + 1;
+        let pull =
+            AnonymousMailboxPullOneV1::new(mailbox_id, [0xe9; 16], Vec::new(), pull_now, &reader)
+                .expect("pull after invitation expiry");
+        let pull_response = execute_terminal_frame_at(
+            restarted.clone(),
+            &target,
+            [0xea; 16],
+            AnonymousMailboxTerminalFrameV1::PullOne(pull),
+            pull_now,
+        );
+        let AnonymousMailboxTerminalFrameV1::PullOneResponse(pull_response) = pull_response else {
+            panic!("Pull response kind");
+        };
+        assert_eq!(pull_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        let pulled = AnonymousMailboxPullResultV1::decode(&pull_response.sealed_payload)
+            .expect("canonical opaque pull result");
+        assert_eq!(pulled.item_id, put.item_id);
+        assert_eq!(pulled.sealed_commitment, put.sealed_commitment());
+        assert_eq!(pulled.sealed_item, sealed_bytes);
+
+        // Simulate recipient restart: rebuild only the native key handle and
+        // historical open context. Invitation expiry cannot revoke retained
+        // ciphertext that remains inside the lease/item lifetime.
+        let historical = AnonymousMailboxDepositInvitationV2::decode_historical_recipient_context(
+            &invitation_a_bytes,
+        )
+        .expect("historical open context");
+        let restarted_handle = TestRecipientKeyHandle::new(recipient_key_id, recipient_secret);
+        let opened = historical
+            .open_chat_envelope(&restarted_handle, &pulled.sealed_item)
+            .expect("open retained signed chat after invitation expiry");
+        assert_eq!(opened.message_id, chat.message_id);
+        assert_eq!(opened.sender, chat_sender.public_key_bytes());
+        assert_eq!(opened.receiver, chat_receiver.public_key_bytes());
+        assert_eq!(opened.timestamp, chat.timestamp);
+        assert_eq!(opened.ciphertext, chat.ciphertext);
+        assert_eq!(opened.nonce, chat.nonce);
+        assert_eq!(opened.content_type, chat.content_type);
+        assert_eq!(opened.signature, chat.signature);
+
+        // [ANONYMOUS-MAILBOX-RECIPIENT-ACK-FAULT 2026-09-08 by Codex]
+        // A canonical ACK signed by a different reader and a correctly signed
+        // ACK for a different sealed commitment must both preserve the exact
+        // opaque AMSI row and its byte counters. T never opens the item.
+        let retained_state = (
+            1,
+            i64::try_from(sealed_bytes.len()).expect("opaque retained byte count"),
+            1,
+            vec![sealed_bytes.clone()],
+        );
+        let wrong_reader = IdentityKeyPair::from_bytes(&[0xef; 32]).expect("wrong read key");
+        let wrong_reader_ack = AnonymousMailboxAckV1::new(
+            mailbox_id,
+            [0xf0; 16],
+            pulled.item_id,
+            pulled.sealed_commitment,
+            pull_now + 1,
+            &wrong_reader,
+        )
+        .expect("canonical wrong-reader Ack");
+        assert!(matches!(
+            execute_terminal_result_at(
+                restarted.clone(),
+                &target,
+                [0xf1; 16],
+                AnonymousMailboxTerminalFrameV1::Ack(wrong_reader_ack),
+                pull_now + 1,
+            ),
+            Err(AnonymousMailboxTerminalFailure::Rejected)
+        ));
+        assert_eq!(durable_item_state(&config.db_path), retained_state);
+
+        let mut wrong_commitment = pulled.sealed_commitment;
+        wrong_commitment[0] ^= 0x80;
+        let wrong_commitment_ack = AnonymousMailboxAckV1::new(
+            mailbox_id,
+            [0xf2; 16],
+            pulled.item_id,
+            wrong_commitment,
+            pull_now + 1,
+            &reader,
+        )
+        .expect("canonical wrong-commitment Ack");
+        let wrong_commitment_response = execute_terminal_frame_at(
+            restarted.clone(),
+            &target,
+            [0xf3; 16],
+            AnonymousMailboxTerminalFrameV1::Ack(wrong_commitment_ack),
+            pull_now + 1,
+        );
+        let AnonymousMailboxTerminalFrameV1::AckResponse(wrong_commitment_response) =
+            wrong_commitment_response
+        else {
+            panic!("wrong-commitment Ack response kind");
+        };
+        assert_eq!(
+            wrong_commitment_response.outcome,
+            AnonymousMailboxOutcomeV1::Conflict
+        );
+        assert_eq!(durable_item_state(&config.db_path), retained_state);
+        drop(restarted);
+
+        let restarted_after_rejection = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                config.clone(),
+                target.clone(),
+                cursor_secret,
+            )
+            .expect("restart after rejected Acks"),
+        );
+        let preserved_pull = AnonymousMailboxPullOneV1::new(
+            mailbox_id,
+            [0xf4; 16],
+            Vec::new(),
+            pull_now + 2,
+            &reader,
+        )
+        .expect("pull exact AMSI after rejected Acks");
+        let preserved_pull_response = execute_terminal_frame_at(
+            restarted_after_rejection.clone(),
+            &target,
+            [0xf5; 16],
+            AnonymousMailboxTerminalFrameV1::PullOne(preserved_pull),
+            pull_now + 2,
+        );
+        let AnonymousMailboxTerminalFrameV1::PullOneResponse(preserved_pull_response) =
+            preserved_pull_response
+        else {
+            panic!("preserved Pull response kind");
+        };
+        assert_eq!(
+            preserved_pull_response.outcome,
+            AnonymousMailboxOutcomeV1::Accepted
+        );
+        let preserved =
+            AnonymousMailboxPullResultV1::decode(&preserved_pull_response.sealed_payload)
+                .expect("preserved canonical opaque Pull result");
+        assert_eq!(preserved.item_id, pulled.item_id);
+        assert_eq!(preserved.sealed_commitment, pulled.sealed_commitment);
+        assert_eq!(preserved.sealed_item, sealed_bytes);
+
+        let ack_now = pull_now + 3;
+        let ack = AnonymousMailboxAckV1::new(
+            mailbox_id,
+            [0xeb; 16],
+            preserved.item_id,
+            preserved.sealed_commitment,
+            ack_now,
+            &reader,
+        )
+        .expect("ack retained AMSI");
+        let ack_frame = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::Ack(ack.clone()),
+        )
+        .expect("canonical Ack terminal frame");
+        let ack_route = [0xec; 16];
+        let (ack_bytes, lost_ack_session) = routed_terminal_frame(ack_route, &target, ack_frame);
+        let lost_ack_response = PreparedAnonymousMailboxTerminal::decode(
+            &ack_bytes,
+            ack_route,
+            target.public_key_bytes(),
+        )
+        .expect("canonical Ack before response loss")
+        .execute(
+            restarted_after_rejection.clone(),
+            Arc::new(target.clone()),
+            ack_now,
+        )
+        .expect("durable Ack before response loss");
+        assert!(!lost_ack_response.is_empty());
+        drop(lost_ack_session); // The sealed AMSR is intentionally never opened.
+        assert_eq!(durable_item_state(&config.db_path), (0, 0, 0, Vec::new()));
+        drop(restarted_after_rejection);
+
+        let restarted_after_lost_ack = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                config.clone(),
+                target.clone(),
+                cursor_secret,
+            )
+            .expect("restart after lost Ack response"),
+        );
+        let ack_retry_now = ack_now + 301;
+        let ack_response = execute_terminal_frame_at(
+            restarted_after_lost_ack.clone(),
+            &target,
+            [0xf6; 16],
+            AnonymousMailboxTerminalFrameV1::Ack(ack),
+            ack_retry_now,
+        );
+        let AnonymousMailboxTerminalFrameV1::AckResponse(ack_response) = ack_response else {
+            panic!("exact-retry Ack response kind");
+        };
+        assert_eq!(ack_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        assert_eq!(
+            durable_item_state(&config.db_path),
+            (0, 0, 0, Vec::new()),
+            "an exact Ack replay after restart cannot revive the item"
+        );
+        drop(restarted_after_lost_ack);
+
+        let restarted_empty = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                config,
+                target.clone(),
+                cursor_secret,
+            )
+            .expect("restart empty target store"),
+        );
+        let empty = AnonymousMailboxPullOneV1::new(
+            mailbox_id,
+            [0xed; 16],
+            Vec::new(),
+            ack_retry_now + 1,
+            &reader,
+        )
+        .expect("empty pull after Ack restart");
+        let empty_response = execute_terminal_frame_at(
+            restarted_empty,
+            &target,
+            [0xee; 16],
+            AnonymousMailboxTerminalFrameV1::PullOne(empty),
+            ack_retry_now + 1,
+        );
+        let AnonymousMailboxTerminalFrameV1::PullOneResponse(empty_response) = empty_response
+        else {
+            panic!("empty Pull response kind");
+        };
+        assert_eq!(empty_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        assert!(empty_response.sealed_payload.is_empty());
+        assert_eq!(
+            durable_item_state(
+                &private_directory
+                    .join("recipient-sealed-mailbox.sqlite")
+                    .display()
+                    .to_string()
+            ),
+            (0, 0, 0, Vec::new())
+        );
     }
 }
