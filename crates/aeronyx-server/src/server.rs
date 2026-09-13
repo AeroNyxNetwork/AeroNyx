@@ -14261,6 +14261,27 @@ impl Server {
         // rotating key bounds exposure of past routing metadata if a key leaks.
         descriptor = descriptor.with_x25519_kem(crate::services::onion_keys::current_public_key());
 
+        if anonymous_mailbox_runtime_ready {
+            // [ANONYMOUS-MAILBOX-WORK-POLICY 2026-09-07 by Codex] The same
+            // validated configuration that opened the target store is signed
+            // only after that runtime exists. Failure is coarse and prevents a
+            // ready feature token without its enforceable work policy.
+            descriptor = descriptor
+                .with_anonymous_mailbox_work_policy(
+                    config
+                        .memchain
+                        .chat_relay
+                        .anonymous_mailbox
+                        .ticket_issue_work_bits,
+                    identity,
+                )
+                .map_err(|_| {
+                    ServerError::startup_failed(
+                        "anonymous mailbox work-policy advertisement failed",
+                    )
+                })?;
+        }
+
         SignedNodeDescriptor::sign(descriptor, identity).map_err(ServerError::from)
     }
 
@@ -17138,9 +17159,9 @@ mod tests {
         encode_envelope, BlindRelayDeliveryReceipt, ChatContentType, ChatEnvelope,
     };
     use aeronyx_core::protocol::discovery::{
-        DirectoryCommitmentBlockV1, DirectoryDescriptorCommitmentV1,
-        DirectoryDescriptorInclusionProofV1, RouteDomainAttestationCertificateV1,
-        RouteDomainAttestationV1,
+        AnonymousMailboxWorkPolicyError, DirectoryCommitmentBlockV1,
+        DirectoryDescriptorCommitmentV1, DirectoryDescriptorInclusionProofV1,
+        RouteDomainAttestationCertificateV1, RouteDomainAttestationV1,
     };
     use aeronyx_core::protocol::memchain::{
         ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1, MemChainMessage,
@@ -21881,6 +21902,102 @@ mod tests {
             .descriptor
             .capabilities
             .contains(&NodeCapability::PrivacyRelay));
+    }
+
+    #[test]
+    fn self_discovery_descriptor_publishes_work_policy_only_when_mailbox_runtime_is_ready() {
+        // [ANONYMOUS-MAILBOX-WORK-POLICY 2026-09-07 by Codex] Configured work
+        // bits become public only with the live target runtime; disabled and
+        // failed-open callers retain the old descriptor representation.
+        let mut config = ServerConfig::default();
+        config
+            .memchain
+            .chat_relay
+            .anonymous_mailbox
+            .ticket_issue_work_bits = 17;
+        let identity = IdentityKeyPair::from_bytes(&[0x71; 32]).expect("identity");
+
+        let disabled = Server::build_self_discovery_descriptor_for_runtime(
+            &config,
+            &identity,
+            1_800_000_000,
+            false,
+            false,
+        )
+        .expect("disabled descriptor");
+        assert!(!disabled
+            .descriptor
+            .advertises_protocol_feature(NodeProtocolFeature::AnonymousMailboxV1));
+        assert_eq!(
+            disabled.anonymous_mailbox_work_policy_at(1_800_000_001),
+            Err(AnonymousMailboxWorkPolicyError::MissingPolicy)
+        );
+
+        let ready = Server::build_self_discovery_descriptor_for_runtime(
+            &config,
+            &identity,
+            1_800_000_000,
+            false,
+            true,
+        )
+        .expect("ready descriptor");
+        let pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&ready).expect("pin");
+        let policy = ready
+            .anonymous_mailbox_work_policy_for_pin_at(&pin, 1_800_000_001)
+            .expect("work policy");
+        assert_eq!(policy.target_node_id(), identity.public_key_bytes());
+        assert_eq!(policy.descriptor_sequence(), ready.descriptor.sequence);
+        assert_eq!(policy.issued_at(), ready.descriptor.issued_at);
+        assert_eq!(policy.expires_at(), ready.descriptor.expires_at);
+        assert_eq!(policy.work_bits(), 17);
+    }
+
+    #[test]
+    fn self_discovery_work_policy_rotation_requires_a_new_exact_pin() {
+        let mut config = ServerConfig::default();
+        config
+            .memchain
+            .chat_relay
+            .anonymous_mailbox
+            .ticket_issue_work_bits = 12;
+        let identity = IdentityKeyPair::from_bytes(&[0x72; 32]).expect("identity");
+        let first = Server::build_self_discovery_descriptor_for_runtime(
+            &config,
+            &identity,
+            1_800_000_000,
+            false,
+            true,
+        )
+        .unwrap();
+        config
+            .memchain
+            .chat_relay
+            .anonymous_mailbox
+            .ticket_issue_work_bits = 13;
+        let rotated = Server::build_self_discovery_descriptor_for_runtime(
+            &config,
+            &identity,
+            1_800_000_001,
+            false,
+            true,
+        )
+        .unwrap();
+        let first_pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&first).unwrap();
+        let rotated_pin =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&rotated).unwrap();
+
+        assert_ne!(first_pin, rotated_pin);
+        assert_eq!(
+            rotated.anonymous_mailbox_work_policy_for_pin_at(&first_pin, 1_800_000_002,),
+            Err(AnonymousMailboxWorkPolicyError::ClaimsConflict)
+        );
+        assert_eq!(
+            rotated
+                .anonymous_mailbox_work_policy_for_pin_at(&rotated_pin, 1_800_000_002,)
+                .unwrap()
+                .work_bits(),
+            13
+        );
     }
 
     #[test]
