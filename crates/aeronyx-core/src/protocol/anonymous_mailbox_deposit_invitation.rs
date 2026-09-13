@@ -13,6 +13,11 @@
 //! [M13J 2026-09-05 by Codex] AMDI v1 is a client compliance boundary, not a
 //! server-side revocation primitive. A holder that copied the deposit seed can
 //! continue attempting Put until the target enforces lease expiry and quota.
+//!
+//! [ANONYMOUS-MAILBOX-DEPOSIT-SUMMARY 2026-09-13 by Codex] A successfully
+//! admitted V2 capability exposes only its already-verified redacted summary,
+//! allowing a client to persist the exact target pin without exposing bearer
+//! or recipient private material.
 
 use std::fmt;
 
@@ -723,6 +728,7 @@ pub struct AnonymousMailboxDepositInvitationV2 {
 /// Short-lived typed authority for creating one new recipient-sealed Put.
 pub struct AnonymousMailboxDepositInvitationActiveV2<'a> {
     invitation: &'a AnonymousMailboxDepositInvitationV2,
+    summary: AnonymousMailboxDepositInvitationSummaryV2,
 }
 
 impl AnonymousMailboxDepositInvitationV2 {
@@ -823,8 +829,11 @@ impl AnonymousMailboxDepositInvitationV2 {
         now: u64,
     ) -> Result<AnonymousMailboxDepositInvitationActiveV2<'_>, AnonymousMailboxDepositInvitationError>
     {
-        self.active_lease_at(now)?;
-        Ok(AnonymousMailboxDepositInvitationActiveV2 { invitation: self })
+        let summary = self.summary_at(now)?;
+        Ok(AnonymousMailboxDepositInvitationActiveV2 {
+            invitation: self,
+            summary,
+        })
     }
 
     /// Revalidates immutable signed history and returns open-only metadata.
@@ -1124,6 +1133,15 @@ impl AnonymousMailboxDepositInvitationV2 {
 }
 
 impl AnonymousMailboxDepositInvitationActiveV2<'_> {
+    /// Returns the redacted projection verified when this authority was admitted.
+    ///
+    /// This is metadata only: it does not extend the admission window or expose
+    /// the deposit seed, recipient private key, or raw lease verifier.
+    #[must_use]
+    pub const fn summary(&self) -> AnonymousMailboxDepositInvitationSummaryV2 {
+        self.summary
+    }
+
     /// Creates canonical AMSI bytes after revalidating current authority.
     ///
     /// # Errors
@@ -1936,10 +1954,10 @@ mod tests {
     fn v2_active_put_and_expired_historical_restart_open_are_separate() {
         let (invitation, secret_bytes, chat_receiver) = invitation_v2();
         let encoded = invitation.encode().expect("encode v2");
-        let summary = invitation.summary_at(INVITATION_ISSUED).expect("summary");
         let active = invitation
             .verify_for_new_put_at(INVITATION_ISSUED)
             .expect("active");
+        let summary = active.summary();
         assert_ne!(fixture().reader.public_key_bytes(), chat_receiver);
         assert_ne!(
             RecipientKeyHandle::new([0xc2; 16], secret_bytes).public,
@@ -2030,6 +2048,60 @@ mod tests {
                 .expect_err("missing durable key"),
             AnonymousMailboxRecipientSealError::KeyUnavailable
         );
+    }
+
+    #[test]
+    fn decoded_v2_active_exposes_only_the_exact_redacted_summary() {
+        let (invitation, _, _) = invitation_v2();
+        let encoded = invitation.encode().expect("encode v2");
+        let expected_recipient = invitation.recipient_seal;
+        let expected_lease_commitment = invitation.lease_claims_commitment;
+
+        let decoded = AnonymousMailboxDepositInvitationV2::decode_at(&encoded, INVITATION_ISSUED)
+            .expect("decode admitted v2");
+        let active = decoded
+            .verify_for_new_put_at(INVITATION_ISSUED)
+            .expect("active v2");
+        let summary = active.summary();
+
+        assert_eq!(summary.invitation_id(), [0xc3; 16]);
+        assert_eq!(summary.target(), fixture().pin);
+        assert_eq!(summary.mailbox_id(), [0x44; 32]);
+        assert_eq!(summary.lease_claims_commitment(), expected_lease_commitment);
+        assert_eq!(summary.invitation_expires_at(), INVITATION_EXPIRES);
+        assert_eq!(summary.lease_expires_at(), LEASE_EXPIRES);
+        assert_eq!(
+            summary.min_remaining_lease_secs(),
+            DEFAULT_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_RUNWAY_SECS
+        );
+        assert_eq!(summary.recipient_seal(), expected_recipient);
+
+        assert!(matches!(
+            decoded.verify_for_new_put_at(INVITATION_EXPIRES + 1),
+            Err(AnonymousMailboxDepositInvitationError::Expired)
+        ));
+        let historical =
+            AnonymousMailboxDepositInvitationV2::decode_historical_recipient_context(&encoded)
+                .expect("historical open-only context");
+        assert_eq!(historical.lease_expires_at(), LEASE_EXPIRES);
+
+        let debug = format!("{summary:?}");
+        assert!(debug.contains("invitation_expires_at"));
+        for secret_or_identifier in [
+            "invitation_id",
+            "target",
+            "mailbox_id",
+            "lease_claims_commitment",
+            "recipient_seal",
+            "deposit_seed",
+            "private_key",
+            "read_verifier",
+        ] {
+            assert!(
+                !debug.contains(secret_or_identifier),
+                "redacted summary Debug leaked {secret_or_identifier}"
+            );
+        }
     }
 
     #[test]
