@@ -20953,6 +20953,9 @@ mod tests {
         let source_node = IdentityKeyPair::generate();
         let session = test_verified_submit_session(&sender, 0x96);
         let store = PeerStore::new();
+        // [VERIFIED-SUBMIT-CLOCK 2026-09-13 by Codex] Keep every boundary in
+        // this test on one clock snapshot so a wall-clock tick cannot change it.
+        let now = unix_now_secs();
 
         // The signed freshness window is symmetric. A request exactly sixty
         // seconds in the future is admitted and may create entry custody.
@@ -20962,14 +20965,14 @@ mod tests {
             &sender,
             [0x98; 16],
             [0x99; 16],
-            unix_now_secs().saturating_add(TIMESTAMP_WINDOW_SECS),
+            now.saturating_add(TIMESTAMP_WINDOW_SECS),
             0x9A,
         );
         fresh_request
             .verify_authentication()
             .expect("sixty-second boundary remains fresh");
         let fresh_option = Some(Arc::clone(&fresh_relay));
-        let fresh_response = Server::handle_verified_chat_submit(
+        let fresh_response = Server::handle_verified_chat_submit_with_clock(
             fresh_request.clone(),
             &session,
             &fresh_option,
@@ -20977,6 +20980,7 @@ mod tests {
             &source_node.public_key_bytes(),
             &source_node,
             None,
+            || now,
         )
         .await;
         assert_eq!(fresh_response.result, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1);
@@ -21000,16 +21004,16 @@ mod tests {
             &sender,
             [0x9C; 16],
             [0x9D; 16],
-            unix_now_secs().saturating_sub(TIMESTAMP_WINDOW_SECS + 1),
+            now.saturating_sub(TIMESTAMP_WINDOW_SECS + 1),
             0x9E,
         );
         let expected = {
             let relay = test_chat_relay_service(&durable_path, secret);
             seed_completed_verified_submit(&relay, &stale_request)
         };
-        let retention_boundary =
-            i64::try_from(unix_now_secs().saturating_sub(TIMESTAMP_WINDOW_SECS * 2 + 1))
-                .expect("retention boundary fits SQLite");
+        let restarted = test_chat_relay_service(&durable_path, secret);
+        let retention_boundary = i64::try_from(now.saturating_sub(TIMESTAMP_WINDOW_SECS * 2 + 1))
+            .expect("retention boundary fits SQLite");
         rusqlite::Connection::open(&durable_path)
             .expect("open retention boundary database")
             .execute(
@@ -21017,9 +21021,8 @@ mod tests {
                 rusqlite::params![retention_boundary],
             )
             .expect("age completed response to retention boundary");
-        let restarted = test_chat_relay_service(&durable_path, secret);
         let restarted_option = Some(Arc::clone(&restarted));
-        let boundary_response = Server::handle_verified_chat_submit(
+        let boundary_response = Server::handle_verified_chat_submit_with_clock(
             stale_request,
             &session,
             &restarted_option,
@@ -21027,6 +21030,7 @@ mod tests {
             &source_node.public_key_bytes(),
             &source_node,
             None,
+            || now,
         )
         .await;
         assert_eq!(boundary_response, expected);
