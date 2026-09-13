@@ -398,6 +398,21 @@ pub(crate) const AUTHENTICATED_CHAT_TERMINAL_FANOUT_LIMIT: usize = 3;
 pub(crate) const AUTHENTICATED_CHAT_MIDDLE_CANDIDATE_LIMIT: usize = 8;
 const TWO_HOP_PATH_POLICY_NETWORK_DIVERSE: &str = "distinct_node_and_network_prefix";
 const MAX_ROUTE_DOMAIN_CERTIFICATES: usize = ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES;
+/// Stage-A hard ceiling for self-signed descriptors that have not completed a
+/// separate endpoint-possession proof. This is intentionally independent of
+/// the verified-live peer capacity.
+const UNTRUSTED_DISCOVERY_CANDIDATE_CAPACITY: usize = 256;
+/// A legacy snapshot may not monopolize the candidate lane in one request.
+const UNTRUSTED_DISCOVERY_CANDIDATES_PER_MESSAGE: usize = 16;
+/// A self-signed descriptor cannot reserve candidate capacity for longer than
+/// this receiver-local horizon.
+const UNTRUSTED_DISCOVERY_MAX_LIFETIME_SECS: u64 = 7_200;
+/// Defensive bound retained explicitly even though `verify_at(now)` rejects a
+/// not-yet-valid descriptor today.
+const UNTRUSTED_DISCOVERY_MAX_FUTURE_SKEW_SECS: u64 = 300;
+/// Bounded exact-replay memory after an expired candidate releases its slot.
+const UNTRUSTED_DISCOVERY_TOMBSTONE_TTL_SECS: u64 = 900;
+const UNTRUSTED_DISCOVERY_TOMBSTONE_CAPACITY: usize = UNTRUSTED_DISCOVERY_CANDIDATE_CAPACITY;
 
 /// Privacy-safe result of applying authenticated client relay path policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1343,10 +1358,13 @@ pub struct PeerStoreStabilityStatus {
 /// Cumulative runtime counters for nodeboard and operator diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerStoreRuntimeStats {
-    /// Total descriptors seen through verified import paths.
+    /// Total descriptors processed through live or bounded-candidate import paths.
     pub total_imported: u64,
     /// Total descriptors inserted or upgraded.
     pub inserted: u64,
+    /// Total self-signed descriptors retained in the bounded, non-routeable
+    /// candidate lane. This is aggregate-only and grants no peer authority.
+    pub candidate_admitted: u64,
     /// Total descriptors ignored because sequence was unchanged.
     pub unchanged: u64,
     /// Total descriptors rejected because they were stale.
@@ -2593,6 +2611,7 @@ struct ScoredPeerRouteCandidate {
 struct PeerStoreCounters {
     total_imported: AtomicU64,
     inserted: AtomicU64,
+    candidate_admitted: AtomicU64,
     unchanged: AtomicU64,
     stale: AtomicU64,
     rejected: AtomicU64,
@@ -2644,6 +2663,7 @@ impl PeerStoreCounters {
         Self {
             total_imported: AtomicU64::new(0),
             inserted: AtomicU64::new(0),
+            candidate_admitted: AtomicU64::new(0),
             unchanged: AtomicU64::new(0),
             stale: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
@@ -2699,6 +2719,7 @@ impl PeerStoreCounters {
         PeerStoreRuntimeStats {
             total_imported: self.total_imported.load(Ordering::Relaxed),
             inserted: self.inserted.load(Ordering::Relaxed),
+            candidate_admitted: self.candidate_admitted.load(Ordering::Relaxed),
             unchanged: self.unchanged.load(Ordering::Relaxed),
             stale: self.stale.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
@@ -2780,6 +2801,10 @@ pub struct PeerStoreImportReport {
     pub total: usize,
     /// Number of descriptors inserted or upgraded.
     pub inserted: usize,
+    /// Number of self-signed descriptors retained only as non-routeable
+    /// candidates. They never grant live peer or routing authority.
+    #[serde(default)]
+    pub candidates: usize,
     /// Number of descriptors already present with the same sequence.
     pub unchanged: usize,
     /// Number of descriptors rejected because they were older than stored data.
@@ -2795,17 +2820,49 @@ impl PeerStoreImportReport {
         Self {
             total: 0,
             inserted: 0,
+            candidates: 0,
             unchanged: 0,
             stale: 0,
             rejected: 0,
         }
     }
 
-    /// Returns true when at least one peer was inserted or upgraded.
+    /// Returns true when local import state changed.
     #[must_use]
     pub const fn changed(&self) -> bool {
-        self.inserted > 0
+        self.inserted > 0 || self.candidates > 0
     }
+}
+
+/// Bounded state for an unauthenticated descriptor that passed only its own
+/// signature and local lifetime checks.
+#[derive(Debug, Clone)]
+struct UntrustedDiscoveryCandidate {
+    descriptor: SignedNodeDescriptor,
+    commitment: [u8; 32],
+}
+
+/// Exact, short-lived replay memory for an expired candidate. The map is
+/// bounded and stores no endpoint, payload, or transport identity.
+#[derive(Debug, Clone, Copy)]
+struct UntrustedDiscoveryTombstone {
+    sequence: u64,
+    commitment: [u8; 32],
+    expires_at: u64,
+}
+
+#[derive(Default)]
+struct UntrustedDiscoveryCandidateState {
+    candidates: HashMap<[u8; 32], UntrustedDiscoveryCandidate>,
+    tombstones: HashMap<[u8; 32], UntrustedDiscoveryTombstone>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateAdmissionOutcome {
+    Candidate,
+    Unchanged,
+    Stale,
+    Rejected,
 }
 
 /// Aggregate result of restoring independently signed route-domain certificates.
@@ -2845,6 +2902,13 @@ impl PeerStoreRouteDomainCertificateCacheReport {
 /// In-memory verified descriptor store for known AeroNyx nodes.
 pub struct PeerStore {
     peers: RwLock<HashMap<[u8; 32], SignedNodeDescriptor>>,
+    // [PERMISSIONLESS-DISCOVERY-CANDIDATES 2026-09-14 by Codex] A descriptor
+    // learned through legacy, unauthenticated gossip is evidence of only its
+    // own signature. Keep it outside `peers` until a later endpoint-possession
+    // protocol can promote it; candidate exhaustion must never consume live
+    // routing capacity.
+    untrusted_discovery_candidates: RwLock<UntrustedDiscoveryCandidateState>,
+    untrusted_discovery_candidate_mode: AtomicBool,
     verified_delivery_witness_requesters: RwLock<HashSet<[u8; 32]>>,
     custody_audit_witness_requesters: RwLock<HashSet<[u8; 32]>>,
     peer_runtime: RwLock<HashMap<[u8; 32], PeerRuntimeMetadata>>,
@@ -2871,6 +2935,8 @@ impl PeerStore {
     pub fn new() -> Self {
         Self {
             peers: RwLock::new(HashMap::new()),
+            untrusted_discovery_candidates: RwLock::new(UntrustedDiscoveryCandidateState::default()),
+            untrusted_discovery_candidate_mode: AtomicBool::new(false),
             verified_delivery_witness_requesters: RwLock::new(HashSet::new()),
             custody_audit_witness_requesters: RwLock::new(HashSet::new()),
             peer_runtime: RwLock::new(HashMap::new()),
@@ -2912,6 +2978,137 @@ impl PeerStore {
     #[must_use]
     pub fn max_peers(&self) -> Option<usize> {
         *self.max_peers.read()
+    }
+
+    /// Enables the Stage-A boundary for legacy unauthenticated discovery.
+    ///
+    /// Production discovery routers call this during construction. Keeping the
+    /// switch explicit preserves existing local/test-only direct imports until
+    /// their callers are migrated to a transport-authenticated admission path.
+    pub(crate) fn enable_untrusted_discovery_candidate_mode(&self) {
+        self.untrusted_discovery_candidate_mode
+            .store(true, Ordering::Release);
+    }
+
+    fn untrusted_candidate_commitment(descriptor: &SignedNodeDescriptor) -> Option<[u8; 32]> {
+        let signing_bytes = descriptor.descriptor.signing_bytes().ok()?;
+        let mut digest = Sha256::new();
+        digest.update(signing_bytes);
+        digest.update(descriptor.signature);
+        Some(digest.finalize().into())
+    }
+
+    fn untrusted_candidate_is_within_limits(descriptor: &SignedNodeDescriptor, now: u64) -> bool {
+        let issued_at = descriptor.descriptor.issued_at;
+        let expires_at = descriptor.descriptor.expires_at;
+        let Some(lifetime) = expires_at.checked_sub(issued_at) else {
+            return false;
+        };
+        descriptor.verify_at(now).is_ok()
+            && lifetime <= UNTRUSTED_DISCOVERY_MAX_LIFETIME_SECS
+            && issued_at <= now.saturating_add(UNTRUSTED_DISCOVERY_MAX_FUTURE_SKEW_SECS)
+            && expires_at
+                <= now
+                    .saturating_add(UNTRUSTED_DISCOVERY_MAX_LIFETIME_SECS)
+                    .saturating_add(UNTRUSTED_DISCOVERY_MAX_FUTURE_SKEW_SECS)
+    }
+
+    fn has_locally_established_identity(&self, node_id: &[u8; 32]) -> bool {
+        self.peers.read().contains_key(node_id)
+    }
+
+    fn prune_untrusted_candidate_state(state: &mut UntrustedDiscoveryCandidateState, now: u64) {
+        let expired = state
+            .candidates
+            .iter()
+            .filter_map(|(node_id, candidate)| {
+                (candidate.descriptor.descriptor.expires_at <= now)
+                    .then_some((*node_id, candidate.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (node_id, candidate) in expired {
+            state.candidates.remove(&node_id);
+            state.tombstones.insert(
+                node_id,
+                UntrustedDiscoveryTombstone {
+                    sequence: candidate.descriptor.sequence(),
+                    commitment: candidate.commitment,
+                    expires_at: now.saturating_add(UNTRUSTED_DISCOVERY_TOMBSTONE_TTL_SECS),
+                },
+            );
+        }
+        state
+            .tombstones
+            .retain(|_, tombstone| tombstone.expires_at > now);
+
+        while state.tombstones.len() > UNTRUSTED_DISCOVERY_TOMBSTONE_CAPACITY {
+            let Some(node_id) = state
+                .tombstones
+                .iter()
+                .min_by_key(|(node_id, tombstone)| (tombstone.expires_at, *node_id))
+                .map(|(node_id, _)| *node_id)
+            else {
+                break;
+            };
+            state.tombstones.remove(&node_id);
+        }
+    }
+
+    fn admit_untrusted_candidate(
+        &self,
+        descriptor: SignedNodeDescriptor,
+        now: u64,
+    ) -> CandidateAdmissionOutcome {
+        if !Self::untrusted_candidate_is_within_limits(&descriptor, now) {
+            return CandidateAdmissionOutcome::Rejected;
+        }
+        let Some(commitment) = Self::untrusted_candidate_commitment(&descriptor) else {
+            return CandidateAdmissionOutcome::Rejected;
+        };
+        let node_id = descriptor.node_id();
+        let sequence = descriptor.sequence();
+        let mut state = self.untrusted_discovery_candidates.write();
+        Self::prune_untrusted_candidate_state(&mut state, now);
+
+        if let Some(existing) = state.candidates.get(&node_id) {
+            if sequence < existing.descriptor.sequence() {
+                return CandidateAdmissionOutcome::Stale;
+            }
+            if sequence == existing.descriptor.sequence() {
+                return if commitment == existing.commitment {
+                    CandidateAdmissionOutcome::Unchanged
+                } else {
+                    CandidateAdmissionOutcome::Rejected
+                };
+            }
+        } else if let Some(tombstone) = state.tombstones.get(&node_id) {
+            if sequence < tombstone.sequence {
+                return CandidateAdmissionOutcome::Stale;
+            }
+            if sequence == tombstone.sequence {
+                return if commitment == tombstone.commitment {
+                    CandidateAdmissionOutcome::Unchanged
+                } else {
+                    CandidateAdmissionOutcome::Rejected
+                };
+            }
+        }
+
+        if !state.candidates.contains_key(&node_id)
+            && state.candidates.len() >= UNTRUSTED_DISCOVERY_CANDIDATE_CAPACITY
+        {
+            return CandidateAdmissionOutcome::Rejected;
+        }
+
+        state.tombstones.remove(&node_id);
+        state.candidates.insert(
+            node_id,
+            UntrustedDiscoveryCandidate {
+                descriptor,
+                commitment,
+            },
+        );
+        CandidateAdmissionOutcome::Candidate
     }
 
     /// Replaces the exact identities allowed to store a delivery-cache anchor.
@@ -4326,6 +4523,7 @@ impl PeerStore {
         let mut report = PeerStoreImportReport {
             total: snapshot.peers.len(),
             inserted: 0,
+            candidates: 0,
             unchanged: 0,
             stale: 0,
             rejected: 0,
@@ -4361,6 +4559,7 @@ impl PeerStore {
         let mut report = PeerStoreImportReport {
             total: snapshot.peers.len(),
             inserted: 0,
+            candidates: 0,
             unchanged: 0,
             stale: 0,
             rejected: 0,
@@ -4484,6 +4683,29 @@ impl PeerStore {
         message: &NodeDiscoveryMessage,
         now: u64,
     ) -> PeerStoreImportReport {
+        if self
+            .untrusted_discovery_candidate_mode
+            .load(Ordering::Acquire)
+        {
+            // [PERMISSIONLESS-DISCOVERY-CANDIDATES 2026-09-14 by Codex] An
+            // anonymous announce may refresh only an identity already held in
+            // the receiver's locally established peer cache. This preserves
+            // the pinned-witness reboot preflight without admitting a new
+            // self-signed identity to live routing. The same receiver-local
+            // lifetime limits apply before the normal verified upsert.
+            if let NodeDiscoveryMessage::DescriptorAnnounce { descriptor } = message {
+                if Self::untrusted_candidate_is_within_limits(descriptor, now)
+                    && self.has_locally_established_identity(&descriptor.node_id())
+                {
+                    return self.apply_verified_descriptor_from_source(
+                        descriptor.clone(),
+                        now,
+                        "local_identity_refresh",
+                    );
+                }
+            }
+            return self.apply_untrusted_discovery_message(message, now);
+        }
         match message {
             NodeDiscoveryMessage::SnapshotRequest { .. } => PeerStoreImportReport::empty(),
             NodeDiscoveryMessage::SnapshotResponse { snapshot } => {
@@ -4501,6 +4723,50 @@ impl PeerStore {
         }
     }
 
+    /// Admits legacy gossip as a bounded, non-routeable candidate only.
+    ///
+    /// [PERMISSIONLESS-DISCOVERY-CANDIDATES 2026-09-14 by Codex] A valid
+    /// self-signature proves control of one key, not endpoint possession,
+    /// independent operation, or routing authority. This boundary must remain
+    /// separate from `upsert_verified_from_source`, which is reserved for
+    /// self/local cache or independently anchored imports.
+    pub(crate) fn apply_untrusted_discovery_message(
+        &self,
+        message: &NodeDiscoveryMessage,
+        now: u64,
+    ) -> PeerStoreImportReport {
+        let descriptors: Vec<SignedNodeDescriptor> = match message {
+            NodeDiscoveryMessage::SnapshotRequest { .. } => return PeerStoreImportReport::empty(),
+            NodeDiscoveryMessage::DescriptorAnnounce { descriptor } => vec![descriptor.clone()],
+            NodeDiscoveryMessage::SnapshotResponse { snapshot } => snapshot.peers.clone(),
+            NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. } => {
+                return self.record_rejected_directory_proof_import(now);
+            }
+        };
+
+        let admitted_limit = descriptors
+            .len()
+            .min(UNTRUSTED_DISCOVERY_CANDIDATES_PER_MESSAGE);
+        let mut report = PeerStoreImportReport {
+            total: descriptors.len(),
+            inserted: 0,
+            candidates: 0,
+            unchanged: 0,
+            stale: 0,
+            rejected: descriptors.len().saturating_sub(admitted_limit),
+        };
+        for descriptor in descriptors.into_iter().take(admitted_limit) {
+            match self.admit_untrusted_candidate(descriptor, now) {
+                CandidateAdmissionOutcome::Candidate => report.candidates += 1,
+                CandidateAdmissionOutcome::Unchanged => report.unchanged += 1,
+                CandidateAdmissionOutcome::Stale => report.stale += 1,
+                CandidateAdmissionOutcome::Rejected => report.rejected += 1,
+            }
+        }
+        self.record_import_report(&report, now);
+        report
+    }
+
     /// Applies one descriptor through the normal verification, capacity, and
     /// anti-rollback path while producing the same aggregate import contract as
     /// snapshot and legacy gossip ingestion.
@@ -4516,6 +4782,7 @@ impl PeerStore {
         let mut report = PeerStoreImportReport {
             total: 1,
             inserted: 0,
+            candidates: 0,
             unchanged: 0,
             stale: 0,
             rejected: 0,
@@ -4536,6 +4803,7 @@ impl PeerStore {
         let report = PeerStoreImportReport {
             total: 1,
             inserted: 0,
+            candidates: 0,
             unchanged: 0,
             stale: 0,
             rejected: 1,
@@ -4556,6 +4824,9 @@ impl PeerStore {
             .inserted
             .fetch_add(report.inserted as u64, Ordering::Relaxed);
         self.counters
+            .candidate_admitted
+            .fetch_add(report.candidates as u64, Ordering::Relaxed);
+        self.counters
             .unchanged
             .fetch_add(report.unchanged as u64, Ordering::Relaxed);
         self.counters
@@ -4568,7 +4839,7 @@ impl PeerStore {
 
         let outcome = if report.rejected > 0 || report.stale > 0 {
             "warning"
-        } else if report.inserted > 0 || report.unchanged > 0 {
+        } else if report.inserted > 0 || report.candidates > 0 || report.unchanged > 0 {
             "accepted"
         } else {
             "ignored"
@@ -4578,8 +4849,13 @@ impl PeerStore {
             "descriptor_import",
             outcome,
             format!(
-                "total={} inserted={} unchanged={} stale={} rejected={}",
-                report.total, report.inserted, report.unchanged, report.stale, report.rejected
+                "total={} inserted={} candidates={} unchanged={} stale={} rejected={}",
+                report.total,
+                report.inserted,
+                report.candidates,
+                report.unchanged,
+                report.stale,
+                report.rejected
             ),
         );
     }
@@ -8235,6 +8511,12 @@ impl PeerStore {
     /// gates elsewhere (`verify_at(now)`, route candidates, gossip export)
     /// still prevent expired descriptors from being counted as live peers.
     pub fn cleanup_expired(&self, now: u64) -> usize {
+        let expired_candidates = {
+            let mut candidates = self.untrusted_discovery_candidates.write();
+            let before = candidates.candidates.len();
+            Self::prune_untrusted_candidate_state(&mut candidates, now);
+            before.saturating_sub(candidates.candidates.len())
+        };
         let expired: Vec<([u8; 32], u64)> = self
             .peers
             .read()
@@ -8265,7 +8547,7 @@ impl PeerStore {
         }
 
         let degraded_count = newly_degraded.len();
-        if degraded_count > 0 {
+        if degraded_count > 0 || expired_candidates > 0 {
             self.counters
                 .expired_degraded
                 .fetch_add(degraded_count as u64, Ordering::Relaxed);
@@ -8286,12 +8568,12 @@ impl PeerStore {
                 "expired_peer_cleanup",
                 "accepted",
                 format!(
-                    "degraded={degraded_count} retained_total={} removed=0",
+                    "degraded={degraded_count} candidate_released={expired_candidates} retained_total={} removed=0",
                     self.peers.read().len()
                 ),
             );
         }
-        degraded_count
+        degraded_count.saturating_add(expired_candidates)
     }
 
     /// Returns a monitoring snapshot.
@@ -12516,6 +12798,133 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_discovery_candidates_do_not_consume_live_routing_capacity() {
+        let now = 1_700_000_100;
+        let store = PeerStore::with_max_peers(1);
+        store.enable_untrusted_discovery_candidate_mode();
+        let candidate = signed_descriptor(1, now + 600);
+        let candidate_id = candidate.node_id();
+
+        let admitted = store.apply_discovery_message(
+            &NodeDiscoveryMessage::DescriptorAnnounce {
+                descriptor: candidate,
+            },
+            now,
+        );
+        assert_eq!(admitted.candidates, 1);
+        assert_eq!(admitted.inserted, 0);
+        assert_eq!(store.len(), 0);
+        assert!(store.get_valid(&candidate_id, now).is_none());
+        assert_eq!(store.status(now).runtime.candidate_admitted, 1);
+
+        assert!(store
+            .upsert_verified(signed_descriptor(1, now + 600), now)
+            .expect("independently anchored live import"));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn untrusted_discovery_candidate_limits_conflicts_and_expiry_release_slots() {
+        let now = 1_700_000_100;
+        let store = PeerStore::new();
+        store.enable_untrusted_discovery_candidate_mode();
+        let identity = IdentityKeyPair::generate();
+        let descriptor = signed_descriptor_for(&identity, 1, now + 1);
+
+        let first = store.apply_discovery_message(
+            &NodeDiscoveryMessage::DescriptorAnnounce {
+                descriptor: descriptor.clone(),
+            },
+            now,
+        );
+        assert_eq!(first.candidates, 1);
+        let exact = store.apply_discovery_message(
+            &NodeDiscoveryMessage::DescriptorAnnounce {
+                descriptor: descriptor.clone(),
+            },
+            now,
+        );
+        assert_eq!(exact.unchanged, 1);
+
+        let mut conflicting_body = descriptor.descriptor.clone();
+        conflicting_body.public_endpoint = Some("https://conflict.example".to_string());
+        let conflict = SignedNodeDescriptor::sign(conflicting_body, &identity).unwrap();
+        let conflicting = store.apply_discovery_message(
+            &NodeDiscoveryMessage::DescriptorAnnounce {
+                descriptor: conflict,
+            },
+            now,
+        );
+        assert_eq!(conflicting.rejected, 1);
+
+        assert_eq!(store.cleanup_expired(now + 2), 1);
+        let rolled_back_exact = store.apply_untrusted_discovery_message(
+            &NodeDiscoveryMessage::DescriptorAnnounce { descriptor },
+            now,
+        );
+        assert_eq!(rolled_back_exact.unchanged, 1);
+
+        let overlong = signed_descriptor(1, now + UNTRUSTED_DISCOVERY_MAX_LIFETIME_SECS + 2);
+        let rejected = store.apply_untrusted_discovery_message(
+            &NodeDiscoveryMessage::DescriptorAnnounce {
+                descriptor: overlong,
+            },
+            now,
+        );
+        assert_eq!(rejected.rejected, 1);
+    }
+
+    #[test]
+    fn untrusted_snapshot_is_message_bounded_before_candidate_capacity() {
+        let now = 1_700_000_100;
+        let store = PeerStore::new();
+        store.enable_untrusted_discovery_candidate_mode();
+        let descriptors = (0..=UNTRUSTED_DISCOVERY_CANDIDATES_PER_MESSAGE)
+            .map(|_| signed_descriptor(1, now + 600))
+            .collect::<Vec<_>>();
+        let report = store.apply_discovery_message(
+            &NodeDiscoveryMessage::SnapshotResponse {
+                snapshot: NodeBootstrapSnapshot::new(now, descriptors),
+            },
+            now,
+        );
+        assert_eq!(
+            report.candidates,
+            UNTRUSTED_DISCOVERY_CANDIDATES_PER_MESSAGE
+        );
+        assert_eq!(report.rejected, 1);
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn untrusted_candidate_exhaustion_cannot_starve_verified_live_capacity() {
+        let now = 1_700_000_100;
+        let store = PeerStore::with_max_peers(1);
+        store.enable_untrusted_discovery_candidate_mode();
+        for _ in 0..UNTRUSTED_DISCOVERY_CANDIDATE_CAPACITY {
+            let report = store.apply_untrusted_discovery_message(
+                &NodeDiscoveryMessage::DescriptorAnnounce {
+                    descriptor: signed_descriptor(1, now + 600),
+                },
+                now,
+            );
+            assert_eq!(report.candidates, 1);
+        }
+        let saturated = store.apply_untrusted_discovery_message(
+            &NodeDiscoveryMessage::DescriptorAnnounce {
+                descriptor: signed_descriptor(1, now + 600),
+            },
+            now,
+        );
+        assert_eq!(saturated.rejected, 1);
+        assert_eq!(store.len(), 0);
+        assert!(store
+            .upsert_verified(signed_descriptor(1, now + 600), now)
+            .expect("candidate exhaustion cannot consume live capacity"));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
     fn test_peer_cache_snapshot_retains_expired_signed_records_without_making_them_live() {
         let store = PeerStore::new();
         let expired = signed_descriptor(1, 1_700_001_000);
@@ -12529,6 +12938,7 @@ mod tests {
             PeerStoreImportReport {
                 total: 1,
                 inserted: 1,
+                candidates: 0,
                 unchanged: 0,
                 stale: 0,
                 rejected: 0,
@@ -12622,6 +13032,7 @@ mod tests {
             PeerStoreImportReport {
                 total: 2,
                 inserted: 1,
+                candidates: 0,
                 unchanged: 0,
                 stale: 0,
                 rejected: 1,
@@ -12670,6 +13081,7 @@ mod tests {
             PeerStoreImportReport {
                 total: 2,
                 inserted: 0,
+                candidates: 0,
                 unchanged: 1,
                 stale: 1,
                 rejected: 0,

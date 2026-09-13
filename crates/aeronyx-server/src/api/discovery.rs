@@ -2907,6 +2907,11 @@ fn build_discovery_router_state(
     directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
     local_node_id: Option<[u8; 32]>,
 ) -> Router {
+    // [PERMISSIONLESS-DISCOVERY-CANDIDATES 2026-09-14 by Codex] The public
+    // gossip surface has no endpoint-possession proof. Enable the PeerStore's
+    // bounded candidate mode before exposing it so legacy self-signed gossip
+    // cannot consume verified-live routing capacity.
+    peer_store.enable_untrusted_discovery_candidate_mode();
     let state = DiscoveryApiState {
         peer_store,
         local_node_id,
@@ -7007,7 +7012,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gossip_descriptor_announce_imports_peer() {
+    async fn gossip_descriptor_announce_stays_non_routeable_candidate() {
         let store = Arc::new(PeerStore::new());
         let app = build_discovery_router(Arc::clone(&store), DiscoveryApiPolicy::default());
         let body = serde_json::to_vec(&NodeDiscoveryMessage::DescriptorAnnounce {
@@ -7028,7 +7033,68 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(store.len(), 1);
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.status(now_secs()).runtime.candidate_admitted, 1);
+    }
+
+    #[tokio::test]
+    async fn gossip_descriptor_announce_refreshes_only_a_locally_established_identity() {
+        let now = now_secs();
+        let identity = IdentityKeyPair::generate();
+        let expired = SignedNodeDescriptor::sign(
+            NodeDescriptor::new(
+                identity.public_key_bytes(),
+                1,
+                now.saturating_sub(1_200),
+                now.saturating_sub(600),
+                "locally-cached-identity",
+            ),
+            &identity,
+        )
+        .unwrap();
+        let store = Arc::new(PeerStore::new());
+        let restored = store.load_peer_cache_snapshot_from_source(
+            &NodeBootstrapSnapshot::new(now, vec![expired]),
+            now,
+            "test_local_cache",
+        );
+        assert_eq!(restored.inserted, 1);
+
+        let refreshed = SignedNodeDescriptor::sign(
+            NodeDescriptor::new(
+                identity.public_key_bytes(),
+                2,
+                now.saturating_sub(1),
+                now.saturating_add(300),
+                "locally-cached-identity-refresh",
+            ),
+            &identity,
+        )
+        .unwrap();
+        let app = build_discovery_router(Arc::clone(&store), DiscoveryApiPolicy::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/discovery/gossip")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&NodeDiscoveryMessage::DescriptorAnnounce {
+                            descriptor: refreshed,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let current = store
+            .get_valid(&identity.public_key_bytes(), now)
+            .expect("only the existing locally established identity may refresh");
+        assert_eq!(current.sequence(), 2);
+        assert_eq!(store.status(now).runtime.candidate_admitted, 0);
     }
 
     #[tokio::test]
