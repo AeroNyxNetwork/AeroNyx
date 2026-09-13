@@ -11,7 +11,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::fs::File;
@@ -36,7 +36,9 @@ use sha2::{Digest, Sha256};
 
 use crate::api::chat_peer::{prepare_exact_peer_blind_relay_http_request, PeerBlindRelayRequest};
 use crate::api::{canonical_peer_http_url, peer_endpoint_is_public_ip};
-use crate::config_chat_relay::AnonymousMailboxSourceConfig;
+use crate::config_chat_relay::{
+    AnonymousMailboxSourceConfig, MAX_ANONYMOUS_MAILBOX_SOURCE_TERMINAL_RETENTION_SECS,
+};
 
 use super::chat_relay_backup_certification::verify_sqlite_physical_integrity;
 use super::chat_relay_backup_sqlite::{
@@ -67,7 +69,10 @@ const MAX_JOURNAL_PROTECTED_STATE_BYTES: usize =
 const JOURNAL_DOMAIN: &[u8] = b"aeronyx/anonymous-mailbox/source-journal/v1\0";
 const REQUEST_COMMITMENT_DOMAIN: &[u8] = b"aeronyx/anonymous-mailbox/source-request/v1\0";
 const BODY_COMMITMENT_DOMAIN: &[u8] = b"aeronyx/anonymous-mailbox/source-body/v1\0";
-const SOURCE_JOURNAL_SCHEMA_VERSION: i64 = 1;
+// [ANONYMOUS-MAILBOX-SOURCE-RETENTION 2026-09-13 by Codex] Schema v2 gives
+// terminal rows a durable replay deadline and exact aggregate accounting.
+// Unresolved phases deliberately retain NULL forever and cannot be age-cleaned.
+const SOURCE_JOURNAL_SCHEMA_VERSION: i64 = 2;
 const PEER_BLIND_RELAY_PATH: &str = "/api/chat/peer/blind-relay";
 
 #[cfg(test)]
@@ -282,7 +287,20 @@ struct SourceJournalRecord {
     descriptor_commitment: DirectoryDescriptorCommitmentV1,
     body: Vec<u8>,
     phase: AnonymousMailboxSourcePhase,
+    retain_until: Option<u64>,
     state: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AnonymousMailboxSourceCleanupReport {
+    pub(crate) rows_removed: u64,
+    pub(crate) bytes_removed: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceJournalMeta {
+    entries: u64,
+    bytes: u64,
 }
 
 struct DecodedSourceState {
@@ -300,6 +318,8 @@ pub(crate) struct SqliteAnonymousMailboxSourceJournal {
     journal_key: [u8; 32],
     max_entries: usize,
     max_bytes: u64,
+    terminal_retention_secs: u64,
+    cleanup_batch_size: usize,
     #[cfg(unix)]
     _database_parent: Option<File>,
 }
@@ -310,18 +330,26 @@ impl SqliteAnonymousMailboxSourceJournal {
         journal_key: [u8; 32],
         config: &AnonymousMailboxSourceConfig,
     ) -> Result<Self, AnonymousMailboxSourceError> {
-        if !config.enabled || config.max_journal_entries == 0 || config.max_journal_bytes == 0 {
+        if !source_config_is_valid(config) || journal_key == [0; 32] {
             return Err(AnonymousMailboxSourceError::Disabled);
         }
-        initialize_or_verify_source_schema(&mut connection)?;
-        Ok(Self {
+        initialize_or_verify_source_schema(
+            &mut connection,
+            source_now_secs()?,
+            config.terminal_retention_secs,
+        )?;
+        let journal = Self {
             connection: Mutex::new(connection),
             journal_key,
             max_entries: config.max_journal_entries,
             max_bytes: config.max_journal_bytes,
+            terminal_retention_secs: config.terminal_retention_secs,
+            cleanup_batch_size: config.cleanup_batch_size,
             #[cfg(unix)]
             _database_parent: None,
-        })
+        };
+        journal.audit_startup()?;
+        Ok(journal)
     }
 
     /// Opens the production journal only after descriptor-relative ownership,
@@ -331,13 +359,9 @@ impl SqliteAnonymousMailboxSourceJournal {
         config: AnonymousMailboxSourceConfig,
         journal_key: [u8; 32],
     ) -> Result<Self, AnonymousMailboxSourceError> {
-        if !config.enabled
+        if !source_config_is_valid(&config)
             || config.db_path.is_empty()
             || config.db_path == ":memory:"
-            || config.max_journal_entries == 0
-            || i64::try_from(config.max_journal_entries).is_err()
-            || config.max_journal_bytes == 0
-            || config.max_journal_bytes > i64::MAX as u64
             || journal_key == [0; 32]
         {
             return Err(AnonymousMailboxSourceError::Rejected);
@@ -363,15 +387,23 @@ impl SqliteAnonymousMailboxSourceJournal {
         connection
             .execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;")
             .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
-        initialize_or_verify_source_schema(&mut connection)?;
-        Ok(Self {
+        initialize_or_verify_source_schema(
+            &mut connection,
+            source_now_secs()?,
+            config.terminal_retention_secs,
+        )?;
+        let journal = Self {
             connection: Mutex::new(connection),
             journal_key,
             max_entries: config.max_journal_entries,
             max_bytes: config.max_journal_bytes,
+            terminal_retention_secs: config.terminal_retention_secs,
+            cleanup_batch_size: config.cleanup_batch_size,
             #[cfg(unix)]
             _database_parent: Some(target.parent),
-        })
+        };
+        journal.audit_startup()?;
+        Ok(journal)
     }
 
     fn load(
@@ -436,7 +468,7 @@ impl SqliteAnonymousMailboxSourceJournal {
         connection
             .query_row(
                 "SELECT request_commitment, target_node_id, descriptor_commitment, body, phase,
-                        state_nonce, protected_state
+                        retain_until, state_nonce, protected_state
                  FROM anonymous_mailbox_source_journal WHERE route_id = ?1",
                 params![route_id.as_slice()],
                 |row| {
@@ -445,14 +477,16 @@ impl SqliteAnonymousMailboxSourceJournal {
                     let descriptor: Vec<u8> = row.get(2)?;
                     let body: Vec<u8> = row.get(3)?;
                     let phase: i64 = row.get(4)?;
-                    let nonce: Vec<u8> = row.get(5)?;
-                    let protected: Vec<u8> = row.get(6)?;
+                    let retain_until: Option<i64> = row.get(5)?;
+                    let nonce: Vec<u8> = row.get(6)?;
+                    let protected: Vec<u8> = row.get(7)?;
                     Ok((
                         request_commitment,
                         target_node_id,
                         descriptor,
                         body,
                         phase,
+                        retain_until,
                         nonce,
                         protected,
                     ))
@@ -461,12 +495,14 @@ impl SqliteAnonymousMailboxSourceJournal {
             .optional()
             .map_err(|_| AnonymousMailboxSourceError::Unavailable)?
             .map(
-                |(request, target, descriptor, body, phase, nonce, protected)| {
+                |(request, target, descriptor, body, phase, retain_until, nonce, protected)| {
                     let request_commitment = fixed::<32>(&request)?;
                     let target_node_id = fixed::<32>(&target)?;
                     let descriptor_commitment = bincode::deserialize(&descriptor)
                         .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
                     let phase = AnonymousMailboxSourcePhase::decode(phase)?;
+                    let retain_until = retain_until.map(source_u64).transpose()?;
+                    validate_phase_retention(phase, retain_until)?;
                     let state = self.open_state(
                         route_id,
                         &request_commitment,
@@ -498,6 +534,7 @@ impl SqliteAnonymousMailboxSourceJournal {
                         descriptor_commitment,
                         body,
                         phase,
+                        retain_until,
                         state,
                     })
                 },
@@ -540,21 +577,7 @@ impl SqliteAnonymousMailboxSourceJournal {
             return Ok(loaded);
         }
         validate_source_record_projection(record)?;
-        let entries: i64 = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM anonymous_mailbox_source_journal",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
-        let used: i64 = transaction
-            .query_row(
-                "SELECT COALESCE(SUM(length(body) + length(protected_state)), 0)
-                 FROM anonymous_mailbox_source_journal",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+        let meta = load_source_meta(&transaction)?;
         let (nonce, protected) = self.seal_state(
             &record.route_id,
             &record.request_commitment,
@@ -569,16 +592,21 @@ impl SqliteAnonymousMailboxSourceJournal {
             .len()
             .checked_add(protected.len())
             .ok_or(AnonymousMailboxSourceError::Unavailable)?;
-        if entries < 0
-            || usize::try_from(entries).map_err(|_| AnonymousMailboxSourceError::Corrupt)?
-                >= self.max_entries
-            || u64::try_from(used)
-                .map_err(|_| AnonymousMailboxSourceError::Corrupt)?
-                .checked_add(
-                    u64::try_from(incoming).map_err(|_| AnonymousMailboxSourceError::Rejected)?,
-                )
-                .ok_or(AnonymousMailboxSourceError::Rejected)?
-                > self.max_bytes
+        let incoming =
+            u64::try_from(incoming).map_err(|_| AnonymousMailboxSourceError::Rejected)?;
+        let updated_meta = SourceJournalMeta {
+            entries: meta
+                .entries
+                .checked_add(1)
+                .ok_or(AnonymousMailboxSourceError::Rejected)?,
+            bytes: meta
+                .bytes
+                .checked_add(incoming)
+                .ok_or(AnonymousMailboxSourceError::Rejected)?,
+        };
+        if updated_meta.entries
+            > u64::try_from(self.max_entries).map_err(|_| AnonymousMailboxSourceError::Corrupt)?
+            || updated_meta.bytes > self.max_bytes
         {
             return Err(AnonymousMailboxSourceError::Rejected);
         }
@@ -591,15 +619,17 @@ impl SqliteAnonymousMailboxSourceJournal {
             .execute(
                 "INSERT INTO anonymous_mailbox_source_journal
                    (route_id, request_commitment, target_node_id, descriptor_commitment, body, phase,
-                    state_nonce, protected_state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    retain_until, state_nonce, protected_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     record.route_id.as_slice(), record.request_commitment.as_slice(),
                     record.target_node_id.as_slice(), descriptor, record.body,
-                    record.phase.code(), nonce, protected
+                    record.phase.code(), record.retain_until.map(source_i64).transpose()?, nonce,
+                    protected
                 ],
             )
             .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+        update_source_meta_exact(&transaction, meta, updated_meta)?;
         transaction
             .commit()
             .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
@@ -612,6 +642,7 @@ impl SqliteAnonymousMailboxSourceJournal {
             descriptor_commitment: record.descriptor_commitment,
             body: record.body.clone(),
             phase: record.phase,
+            retain_until: record.retain_until,
             state: record.state.clone(),
         })
     }
@@ -622,6 +653,17 @@ impl SqliteAnonymousMailboxSourceJournal {
         expected: AnonymousMailboxSourcePhase,
         phase: AnonymousMailboxSourcePhase,
         state: Vec<u8>,
+    ) -> Result<(), AnonymousMailboxSourceError> {
+        self.transition_at(record, expected, phase, state, source_now_secs()?)
+    }
+
+    fn transition_at(
+        &self,
+        record: &SourceJournalRecord,
+        expected: AnonymousMailboxSourcePhase,
+        phase: AnonymousMailboxSourcePhase,
+        state: Vec<u8>,
+        transitioned_at: u64,
     ) -> Result<(), AnonymousMailboxSourceError> {
         validate_source_record_projection(record)?;
         let desired_decoded = decode_state(&state)?;
@@ -661,9 +703,9 @@ impl SqliteAnonymousMailboxSourceJournal {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
-        let current: Option<(i64, i64, i64)> = transaction
+        let current: Option<(i64, i64, i64, Option<i64>)> = transaction
             .query_row(
-                "SELECT phase, length(body), length(protected_state)
+                "SELECT phase, length(body), length(protected_state), retain_until
                  FROM anonymous_mailbox_source_journal
                  WHERE route_id = ?1 AND request_commitment = ?2 AND target_node_id = ?3",
                 params![
@@ -671,14 +713,18 @@ impl SqliteAnonymousMailboxSourceJournal {
                     record.request_commitment.as_slice(),
                     record.target_node_id.as_slice()
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
-        let Some((current_phase, body_len, old_protected_len)) = current else {
+        let Some((current_phase, body_len, old_protected_len, current_retain_until)) = current
+        else {
             return Err(AnonymousMailboxSourceError::Ambiguous);
         };
-        if AnonymousMailboxSourcePhase::decode(current_phase)? != expected {
+        let current_phase = AnonymousMailboxSourcePhase::decode(current_phase)?;
+        let current_retain_until = current_retain_until.map(source_u64).transpose()?;
+        validate_phase_retention(current_phase, current_retain_until)?;
+        if current_phase != expected {
             return Err(AnonymousMailboxSourceError::Ambiguous);
         }
         if body_len < 1
@@ -694,15 +740,7 @@ impl SqliteAnonymousMailboxSourceJournal {
         {
             return Err(AnonymousMailboxSourceError::Corrupt);
         }
-        let used: i64 = transaction
-            .query_row(
-                "SELECT COALESCE(SUM(length(body) + length(protected_state)), 0)
-                 FROM anonymous_mailbox_source_journal",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
-        let used = u64::try_from(used).map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
+        let meta = load_source_meta(&transaction)?;
         let old_row_bytes = u64::try_from(body_len)
             .ok()
             .and_then(|body| {
@@ -711,7 +749,8 @@ impl SqliteAnonymousMailboxSourceJournal {
                     .and_then(|protected| body.checked_add(protected))
             })
             .ok_or(AnonymousMailboxSourceError::Corrupt)?;
-        let retained_without_row = used
+        let retained_without_row = meta
+            .bytes
             .checked_sub(old_row_bytes)
             .ok_or(AnonymousMailboxSourceError::Corrupt)?;
 
@@ -753,15 +792,45 @@ impl SqliteAnonymousMailboxSourceJournal {
         } else {
             return Err(AnonymousMailboxSourceError::Rejected);
         };
+        let retain_until = if matches!(
+            stored_phase,
+            AnonymousMailboxSourcePhase::Completed | AnonymousMailboxSourcePhase::Rejected
+        ) {
+            Some(
+                transitioned_at
+                    .checked_add(self.terminal_retention_secs)
+                    .filter(|value| *value <= i64::MAX as u64)
+                    .ok_or(AnonymousMailboxSourceError::Rejected)?,
+            )
+        } else {
+            None
+        };
+        validate_phase_retention(stored_phase, retain_until)?;
+        let updated_meta = SourceJournalMeta {
+            entries: meta.entries,
+            bytes: retained_without_row
+                .checked_add(
+                    u64::try_from(body_len)
+                        .ok()
+                        .and_then(|body| {
+                            u64::try_from(protected.len())
+                                .ok()
+                                .and_then(|protected| body.checked_add(protected))
+                        })
+                        .ok_or(AnonymousMailboxSourceError::Corrupt)?,
+                )
+                .ok_or(AnonymousMailboxSourceError::Corrupt)?,
+        };
 
         let updated = transaction
             .execute(
                 "UPDATE anonymous_mailbox_source_journal
-                 SET phase = ?1, state_nonce = ?2, protected_state = ?3
-                 WHERE route_id = ?4 AND request_commitment = ?5 AND target_node_id = ?6
-                       AND phase = ?7",
+                 SET phase = ?1, retain_until = ?2, state_nonce = ?3, protected_state = ?4
+                 WHERE route_id = ?5 AND request_commitment = ?6 AND target_node_id = ?7
+                       AND phase = ?8",
                 params![
                     stored_phase.code(),
+                    retain_until.map(source_i64).transpose()?,
                     nonce,
                     protected,
                     record.route_id.as_slice(),
@@ -774,6 +843,7 @@ impl SqliteAnonymousMailboxSourceJournal {
         if updated != 1 {
             return Err(AnonymousMailboxSourceError::Ambiguous);
         }
+        update_source_meta_exact(&transaction, meta, updated_meta)?;
         transaction
             .commit()
             .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
@@ -784,6 +854,140 @@ impl SqliteAnonymousMailboxSourceJournal {
         } else {
             Ok(())
         }
+    }
+
+    /// Reclaims only terminal source rows whose byte-identical replay window ended.
+    ///
+    /// Prepared, armed, and ambiguous rows are durable safety fences and are
+    /// never selected, regardless of age. The aggregate report contains no
+    /// route, target, commitment, path, or ciphertext information.
+    pub(crate) fn cleanup_terminal_records(
+        &self,
+        now: u64,
+    ) -> Result<AnonymousMailboxSourceCleanupReport, AnonymousMailboxSourceError> {
+        let now_sql = source_i64(now)?;
+        let limit = source_i64(
+            u64::try_from(self.cleanup_batch_size)
+                .map_err(|_| AnonymousMailboxSourceError::Rejected)?,
+        )?;
+        let mut connection = self.connection.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+        let before = load_source_meta(&transaction)?;
+        let rows = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT route_id, phase, retain_until, length(body), length(protected_state)
+                     FROM anonymous_mailbox_source_journal
+                     WHERE phase IN (3, 5) AND retain_until < ?1
+                     ORDER BY retain_until, route_id LIMIT ?2",
+                )
+                .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+            let mapped = statement
+                .query_map(params![now_sql, limit], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                })
+                .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| AnonymousMailboxSourceError::Unavailable)?
+        };
+        let mut report = AnonymousMailboxSourceCleanupReport::default();
+        for (route_id, phase, retain_until, body_len, protected_len) in rows {
+            let route_id = fixed::<16>(&route_id)?;
+            let phase = AnonymousMailboxSourcePhase::decode(phase)?;
+            let retain_until = retain_until.map(source_u64).transpose()?;
+            validate_phase_retention(phase, retain_until)?;
+            if !matches!(
+                phase,
+                AnonymousMailboxSourcePhase::Completed | AnonymousMailboxSourcePhase::Rejected
+            ) || retain_until.filter(|deadline| *deadline < now).is_none()
+            {
+                return Err(AnonymousMailboxSourceError::Corrupt);
+            }
+            let row_bytes = source_row_bytes(body_len, protected_len)?;
+            let removed = transaction
+                .execute(
+                    "DELETE FROM anonymous_mailbox_source_journal
+                     WHERE route_id = ?1 AND phase = ?2 AND retain_until = ?3",
+                    params![
+                        route_id.as_slice(),
+                        phase.code(),
+                        retain_until.map(source_i64).transpose()?
+                    ],
+                )
+                .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+            if removed != 1 {
+                return Err(AnonymousMailboxSourceError::Corrupt);
+            }
+            report.rows_removed = report
+                .rows_removed
+                .checked_add(1)
+                .ok_or(AnonymousMailboxSourceError::Corrupt)?;
+            report.bytes_removed = report
+                .bytes_removed
+                .checked_add(row_bytes)
+                .ok_or(AnonymousMailboxSourceError::Corrupt)?;
+        }
+        let after = SourceJournalMeta {
+            entries: before
+                .entries
+                .checked_sub(report.rows_removed)
+                .ok_or(AnonymousMailboxSourceError::Corrupt)?,
+            bytes: before
+                .bytes
+                .checked_sub(report.bytes_removed)
+                .ok_or(AnonymousMailboxSourceError::Corrupt)?,
+        };
+        if after != before {
+            update_source_meta_exact(&transaction, before, after)?;
+        }
+        if compute_source_meta(&transaction)? != after {
+            return Err(AnonymousMailboxSourceError::Corrupt);
+        }
+        transaction
+            .commit()
+            .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+        Ok(report)
+    }
+
+    fn audit_startup(&self) -> Result<(), AnonymousMailboxSourceError> {
+        let route_ids = {
+            let connection = self.connection.lock();
+            let stored = load_source_meta(&connection)?;
+            let observed = compute_source_meta(&connection)?;
+            if stored != observed
+                || stored.entries
+                    > u64::try_from(self.max_entries)
+                        .map_err(|_| AnonymousMailboxSourceError::Corrupt)?
+                || stored.bytes > self.max_bytes
+            {
+                return Err(AnonymousMailboxSourceError::Corrupt);
+            }
+            let mut statement = connection
+                .prepare("SELECT route_id FROM anonymous_mailbox_source_journal ORDER BY route_id")
+                .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
+            rows.map(|row| {
+                row.map_err(|_| AnonymousMailboxSourceError::Corrupt)
+                    .and_then(|bytes| fixed::<16>(&bytes))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        for route_id in route_ids {
+            self.load(&route_id)?
+                .ok_or(AnonymousMailboxSourceError::Corrupt)?;
+        }
+        Ok(())
     }
 
     fn seal_state(
@@ -969,6 +1173,7 @@ impl AnonymousMailboxSourceCoordinator {
             descriptor_commitment: pin.descriptor_commitment,
             body,
             phase: AnonymousMailboxSourcePhase::Prepared,
+            retain_until: None,
             state,
         };
         let record = self.journal.insert_or_exact(&record)?;
@@ -1208,6 +1413,8 @@ impl AnonymousMailboxSourceCoordinator {
 
 fn initialize_or_verify_source_schema(
     connection: &mut Connection,
+    migration_now: u64,
+    terminal_retention_secs: u64,
 ) -> Result<(), AnonymousMailboxSourceError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1215,64 +1422,278 @@ fn initialize_or_verify_source_schema(
     let version: i64 = transaction
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
-    if version == 0 {
-        let foreign: i64 = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type IN ('table', 'index', 'view', 'trigger')
-                   AND name NOT LIKE 'sqlite_%'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
-        if foreign != 0 {
-            return Err(AnonymousMailboxSourceError::Corrupt);
-        }
-        transaction
-            .execute_batch(
-                "CREATE TABLE anonymous_mailbox_source_journal (
-                    route_id BLOB PRIMARY KEY NOT NULL CHECK (length(route_id) = 16),
-                    request_commitment BLOB NOT NULL CHECK (length(request_commitment) = 32),
-                    target_node_id BLOB NOT NULL CHECK (length(target_node_id) = 32),
-                    descriptor_commitment BLOB NOT NULL CHECK (length(descriptor_commitment) > 0),
-                    body BLOB NOT NULL CHECK (length(body) > 0),
-                    phase INTEGER NOT NULL CHECK (phase BETWEEN 1 AND 5),
-                    state_nonce BLOB NOT NULL CHECK (length(state_nonce) = 24),
-                    protected_state BLOB NOT NULL CHECK (length(protected_state) >= 16)
-                 );
-                 PRAGMA user_version = 1;",
-            )
-            .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
-    } else if version != SOURCE_JOURNAL_SCHEMA_VERSION {
-        return Err(AnonymousMailboxSourceError::Corrupt);
-    }
-    let owned: i64 = transaction
+    let foreign_before: i64 = transaction
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
              WHERE type IN ('table', 'index', 'view', 'trigger')
                AND name NOT LIKE 'sqlite_%'
-               AND name != 'anonymous_mailbox_source_journal'",
+               AND name NOT IN ('anonymous_mailbox_source_journal',
+                                'anonymous_mailbox_source_meta')",
             [],
             |row| row.get(0),
         )
         .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
-    if owned != 0 {
+    if foreign_before != 0 {
         return Err(AnonymousMailboxSourceError::Corrupt);
     }
-    let table_exists: i64 = transaction
+    match version {
+        0 => {
+            let owned_before: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type IN ('table', 'index', 'view', 'trigger')
+                       AND name NOT LIKE 'sqlite_%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
+            if owned_before != 0 {
+                return Err(AnonymousMailboxSourceError::Corrupt);
+            }
+            transaction
+                .execute_batch(
+                    "CREATE TABLE anonymous_mailbox_source_journal (
+                        route_id BLOB PRIMARY KEY NOT NULL CHECK (length(route_id) = 16),
+                        request_commitment BLOB NOT NULL CHECK (length(request_commitment) = 32),
+                        target_node_id BLOB NOT NULL CHECK (length(target_node_id) = 32),
+                        descriptor_commitment BLOB NOT NULL CHECK (length(descriptor_commitment) > 0),
+                        body BLOB NOT NULL CHECK (length(body) > 0),
+                        phase INTEGER NOT NULL CHECK (phase BETWEEN 1 AND 5),
+                        retain_until INTEGER CHECK (retain_until IS NULL OR retain_until >= 0),
+                        state_nonce BLOB NOT NULL CHECK (length(state_nonce) = 24),
+                        protected_state BLOB NOT NULL CHECK (length(protected_state) >= 16)
+                     );
+                     CREATE TABLE anonymous_mailbox_source_meta (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        schema_version INTEGER NOT NULL CHECK (schema_version = 2),
+                        total_entries INTEGER NOT NULL CHECK (total_entries >= 0),
+                        total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0)
+                     );
+                     INSERT INTO anonymous_mailbox_source_meta VALUES (1, 2, 0, 0);
+                     PRAGMA user_version = 2;",
+                )
+                .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+        }
+        1 => {
+            let legacy_tables: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'anonymous_mailbox_source_journal'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
+            let unexpected_meta: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'anonymous_mailbox_source_meta'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
+            if legacy_tables != 1 || unexpected_meta != 0 {
+                return Err(AnonymousMailboxSourceError::Corrupt);
+            }
+            let retain_until = migration_now
+                .checked_add(terminal_retention_secs)
+                .filter(|value| *value <= i64::MAX as u64)
+                .ok_or(AnonymousMailboxSourceError::Rejected)?;
+            transaction
+                .execute_batch(
+                    "ALTER TABLE anonymous_mailbox_source_journal
+                         ADD COLUMN retain_until INTEGER
+                         CHECK (retain_until IS NULL OR retain_until >= 0);
+                     CREATE TABLE anonymous_mailbox_source_meta (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        schema_version INTEGER NOT NULL CHECK (schema_version = 2),
+                        total_entries INTEGER NOT NULL CHECK (total_entries >= 0),
+                        total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0)
+                     );",
+                )
+                .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+            transaction
+                .execute(
+                    "UPDATE anonymous_mailbox_source_journal SET retain_until = ?1
+                     WHERE phase IN (3, 5)",
+                    params![source_i64(retain_until)?],
+                )
+                .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+            let observed = compute_source_meta(&transaction)?;
+            transaction
+                .execute(
+                    "INSERT INTO anonymous_mailbox_source_meta
+                     (singleton, schema_version, total_entries, total_bytes)
+                     VALUES (1, 2, ?1, ?2)",
+                    params![source_i64(observed.entries)?, source_i64(observed.bytes)?],
+                )
+                .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+            transaction
+                .execute_batch("PRAGMA user_version = 2;")
+                .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+        }
+        SOURCE_JOURNAL_SCHEMA_VERSION => {}
+        _ => return Err(AnonymousMailboxSourceError::Corrupt),
+    }
+    let table_count: i64 = transaction
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
-             WHERE type = 'table' AND name = 'anonymous_mailbox_source_journal'",
+             WHERE type = 'table'
+               AND name IN ('anonymous_mailbox_source_journal',
+                            'anonymous_mailbox_source_meta')",
             [],
             |row| row.get(0),
         )
         .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
-    if table_exists != 1 {
+    let owned_after: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type IN ('table', 'index', 'view', 'trigger')
+               AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
+    if table_count != 2 || owned_after != 2 {
         return Err(AnonymousMailboxSourceError::Corrupt);
     }
+    load_source_meta(&transaction)?;
     transaction
         .commit()
         .map_err(|_| AnonymousMailboxSourceError::Unavailable)
+}
+
+fn source_config_is_valid(config: &AnonymousMailboxSourceConfig) -> bool {
+    config.enabled
+        && config.max_journal_entries > 0
+        && i64::try_from(config.max_journal_entries).is_ok()
+        && config.max_journal_bytes > 0
+        && config.max_journal_bytes <= i64::MAX as u64
+        && config.max_in_flight > 0
+        && config.request_timeout_secs > 0
+        && config.terminal_retention_secs > 0
+        && config.terminal_retention_secs <= MAX_ANONYMOUS_MAILBOX_SOURCE_TERMINAL_RETENTION_SECS
+        && config.cleanup_batch_size > 0
+        && config.cleanup_batch_size <= 4_096
+}
+
+fn source_now_secs() -> Result<u64, AnonymousMailboxSourceError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| AnonymousMailboxSourceError::Unavailable)
+}
+
+fn source_i64(value: u64) -> Result<i64, AnonymousMailboxSourceError> {
+    i64::try_from(value).map_err(|_| AnonymousMailboxSourceError::Rejected)
+}
+
+fn source_u64(value: i64) -> Result<u64, AnonymousMailboxSourceError> {
+    u64::try_from(value).map_err(|_| AnonymousMailboxSourceError::Corrupt)
+}
+
+fn source_row_bytes(body_len: i64, protected_len: i64) -> Result<u64, AnonymousMailboxSourceError> {
+    if body_len < 1
+        || usize::try_from(body_len)
+            .ok()
+            .filter(|value| *value <= MAX_JOURNAL_BODY_BYTES)
+            .is_none()
+        || protected_len < JOURNAL_AEAD_TAG_BYTES as i64
+        || usize::try_from(protected_len)
+            .ok()
+            .filter(|value| *value <= MAX_JOURNAL_PROTECTED_STATE_BYTES)
+            .is_none()
+    {
+        return Err(AnonymousMailboxSourceError::Corrupt);
+    }
+    source_u64(body_len)?
+        .checked_add(source_u64(protected_len)?)
+        .ok_or(AnonymousMailboxSourceError::Corrupt)
+}
+
+fn validate_phase_retention(
+    phase: AnonymousMailboxSourcePhase,
+    retain_until: Option<u64>,
+) -> Result<(), AnonymousMailboxSourceError> {
+    let terminal = matches!(
+        phase,
+        AnonymousMailboxSourcePhase::Completed | AnonymousMailboxSourcePhase::Rejected
+    );
+    if terminal == retain_until.is_some() {
+        Ok(())
+    } else {
+        Err(AnonymousMailboxSourceError::Corrupt)
+    }
+}
+
+fn load_source_meta(
+    connection: &Connection,
+) -> Result<SourceJournalMeta, AnonymousMailboxSourceError> {
+    connection
+        .query_row(
+            "SELECT schema_version, total_entries, total_bytes
+             FROM anonymous_mailbox_source_meta WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .map_err(|_| AnonymousMailboxSourceError::Corrupt)
+        .and_then(|(version, entries, bytes)| {
+            if version != SOURCE_JOURNAL_SCHEMA_VERSION {
+                return Err(AnonymousMailboxSourceError::Corrupt);
+            }
+            Ok(SourceJournalMeta {
+                entries: source_u64(entries)?,
+                bytes: source_u64(bytes)?,
+            })
+        })
+}
+
+fn compute_source_meta(
+    connection: &Connection,
+) -> Result<SourceJournalMeta, AnonymousMailboxSourceError> {
+    let (entries, bytes): (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(length(body) + length(protected_state)), 0)
+             FROM anonymous_mailbox_source_journal",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
+    Ok(SourceJournalMeta {
+        entries: source_u64(entries)?,
+        bytes: source_u64(bytes)?,
+    })
+}
+
+fn update_source_meta_exact(
+    transaction: &rusqlite::Transaction<'_>,
+    before: SourceJournalMeta,
+    after: SourceJournalMeta,
+) -> Result<(), AnonymousMailboxSourceError> {
+    let updated = transaction
+        .execute(
+            "UPDATE anonymous_mailbox_source_meta
+             SET total_entries = ?1, total_bytes = ?2
+             WHERE singleton = 1 AND schema_version = 2
+               AND total_entries = ?3 AND total_bytes = ?4",
+            params![
+                source_i64(after.entries)?,
+                source_i64(after.bytes)?,
+                source_i64(before.entries)?,
+                source_i64(before.bytes)?
+            ],
+        )
+        .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(AnonymousMailboxSourceError::Corrupt)
+    }
 }
 
 fn verify_source_sqlite_integrity(
@@ -1445,6 +1866,7 @@ fn source_body_commitment(body: &[u8]) -> [u8; 32] {
 fn validate_source_record_projection(
     record: &SourceJournalRecord,
 ) -> Result<(), AnonymousMailboxSourceError> {
+    validate_phase_retention(record.phase, record.retain_until)?;
     let decoded = decode_state(&record.state)?;
     if decoded.body_commitment != source_body_commitment(&record.body)
         || source_request_commitment(
@@ -1660,10 +2082,21 @@ mod tests {
     }
 
     fn journal_with_max_bytes(max_journal_bytes: u64) -> SqliteAnonymousMailboxSourceJournal {
+        journal_with_limits(4, max_journal_bytes, 7 * 24 * 60 * 60, 256)
+    }
+
+    fn journal_with_limits(
+        max_journal_entries: usize,
+        max_journal_bytes: u64,
+        terminal_retention_secs: u64,
+        cleanup_batch_size: usize,
+    ) -> SqliteAnonymousMailboxSourceJournal {
         let config = AnonymousMailboxSourceConfig {
             enabled: true,
-            max_journal_entries: 4,
+            max_journal_entries,
             max_journal_bytes,
+            terminal_retention_secs,
+            cleanup_batch_size,
             ..AnonymousMailboxSourceConfig::default()
         };
         SqliteAnonymousMailboxSourceJournal::new(
@@ -1676,6 +2109,116 @@ mod tests {
 
     fn journal() -> SqliteAnonymousMailboxSourceJournal {
         journal_with_max_bytes(4096)
+    }
+
+    fn journal_record(
+        route_byte: u8,
+        body_byte: u8,
+        phase: AnonymousMailboxSourcePhase,
+    ) -> SourceJournalRecord {
+        let target = target();
+        let terminal = ticket_request(&target);
+        let body = vec![body_byte; 64];
+        let descriptor_commitment = DirectoryDescriptorCommitmentV1 {
+            node_id: target.public_key_bytes(),
+            sequence: u64::from(route_byte),
+            descriptor_hash: [route_byte.wrapping_add(1); 32],
+        };
+        SourceJournalRecord {
+            route_id: [route_byte; 16],
+            request_commitment: source_request_commitment(
+                &[route_byte; 16],
+                &target.public_key_bytes(),
+                &descriptor_commitment,
+                &terminal,
+            ),
+            target_node_id: target.public_key_bytes(),
+            descriptor_commitment,
+            body: body.clone(),
+            phase,
+            retain_until: None,
+            state: encode_state(&body, &terminal, None, None).expect("state"),
+        }
+    }
+
+    fn retain_terminal_record(
+        journal: &SqliteAnonymousMailboxSourceJournal,
+        record: &SourceJournalRecord,
+        phase: AnonymousMailboxSourcePhase,
+        transitioned_at: u64,
+        completed: Option<&[u8]>,
+    ) -> SourceJournalRecord {
+        journal.insert_or_exact(record).expect("insert source row");
+        let terminal = decode_state(&record.state)
+            .expect("decode prepared state")
+            .terminal_frame;
+        journal
+            .transition_at(
+                record,
+                AnonymousMailboxSourcePhase::Prepared,
+                phase,
+                encode_state(&record.body, &terminal, None, completed)
+                    .expect("encode terminal state"),
+                transitioned_at,
+            )
+            .expect("terminal transition");
+        journal
+            .load(&record.route_id)
+            .expect("load terminal row")
+            .expect("terminal row")
+    }
+
+    fn create_legacy_source_schema(connection: &Connection) {
+        connection
+            .execute_batch(
+                "CREATE TABLE anonymous_mailbox_source_journal (
+                    route_id BLOB PRIMARY KEY NOT NULL CHECK (length(route_id) = 16),
+                    request_commitment BLOB NOT NULL CHECK (length(request_commitment) = 32),
+                    target_node_id BLOB NOT NULL CHECK (length(target_node_id) = 32),
+                    descriptor_commitment BLOB NOT NULL CHECK (length(descriptor_commitment) > 0),
+                    body BLOB NOT NULL CHECK (length(body) > 0),
+                    phase INTEGER NOT NULL CHECK (phase BETWEEN 1 AND 5),
+                    state_nonce BLOB NOT NULL CHECK (length(state_nonce) = 24),
+                    protected_state BLOB NOT NULL CHECK (length(protected_state) >= 16)
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .expect("legacy source schema");
+    }
+
+    fn insert_legacy_source_record(
+        connection: &Connection,
+        sealer: &SqliteAnonymousMailboxSourceJournal,
+        record: &SourceJournalRecord,
+    ) {
+        let descriptor =
+            bincode::serialize(&record.descriptor_commitment).expect("legacy descriptor");
+        let (nonce, protected) = sealer
+            .seal_state(
+                &record.route_id,
+                &record.request_commitment,
+                &record.target_node_id,
+                &record.state,
+            )
+            .expect("legacy protected state");
+        connection
+            .execute(
+                "INSERT INTO anonymous_mailbox_source_journal
+                   (route_id, request_commitment, target_node_id, descriptor_commitment, body,
+                    phase, state_nonce, protected_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    record.route_id.as_slice(),
+                    record.request_commitment.as_slice(),
+                    record.target_node_id.as_slice(),
+                    descriptor,
+                    &record.body,
+                    record.phase.code(),
+                    nonce,
+                    protected
+                ],
+            )
+            .expect("legacy source row");
     }
 
     struct ExactOnlyResolver {
@@ -1817,6 +2360,7 @@ mod tests {
             descriptor_commitment,
             body: body.clone(),
             phase: AnonymousMailboxSourcePhase::Prepared,
+            retain_until: None,
             state: encode_state(&body, &terminal, None, None).expect("state"),
         };
         let journal = journal();
@@ -1862,6 +2406,7 @@ mod tests {
             descriptor_commitment,
             body: body.clone(),
             phase: AnonymousMailboxSourcePhase::Prepared,
+            retain_until: None,
             state: encode_state(&body, &terminal, None, None).expect("state"),
         };
         let journal = journal();
@@ -1899,6 +2444,346 @@ mod tests {
                 .phase,
             AnonymousMailboxSourcePhase::Completed
         );
+    }
+
+    #[test]
+    fn terminal_retention_preserves_exact_replay_until_strict_deadline() {
+        // [ANONYMOUS-MAILBOX-SOURCE-RETENTION 2026-09-13 by Codex] A
+        // terminal row is the durable idempotency result until strictly after
+        // its deadline. Equality remains retained to avoid a clock-boundary
+        // retry racing cleanup.
+        let journal = journal_with_limits(2, 4096, 10, 2);
+        let record = journal_record(0x81, 0x82, AnonymousMailboxSourcePhase::Prepared);
+        let completed = vec![0x83; 37];
+        let retained = retain_terminal_record(
+            &journal,
+            &record,
+            AnonymousMailboxSourcePhase::Completed,
+            NOW,
+            Some(&completed),
+        );
+        assert_eq!(retained.retain_until, Some(NOW + 10));
+
+        let replay = journal.insert_or_exact(&record).expect("exact retry");
+        assert_eq!(replay.phase, AnonymousMailboxSourcePhase::Completed);
+        assert_eq!(
+            decode_state(&replay.state)
+                .expect("decode replay")
+                .completed,
+            Some(completed)
+        );
+        let mut conflict = journal_record(0x81, 0x84, AnonymousMailboxSourcePhase::Prepared);
+        conflict.request_commitment = [0x85; 32];
+        assert!(matches!(
+            journal.insert_or_exact(&conflict),
+            Err(AnonymousMailboxSourceError::Conflict)
+        ));
+
+        assert_eq!(
+            journal
+                .cleanup_terminal_records(NOW + 10)
+                .expect("deadline cleanup"),
+            AnonymousMailboxSourceCleanupReport::default()
+        );
+        assert!(journal
+            .load(&record.route_id)
+            .expect("load at deadline")
+            .is_some());
+        let reclaimed = journal
+            .cleanup_terminal_records(NOW + 11)
+            .expect("expired cleanup");
+        assert_eq!(reclaimed.rows_removed, 1);
+        assert!(reclaimed.bytes_removed > 0);
+        assert!(journal
+            .load(&record.route_id)
+            .expect("load reclaimed")
+            .is_none());
+    }
+
+    #[test]
+    fn cleanup_never_reclaims_unresolved_rows_and_releases_quota() {
+        let journal = journal_with_limits(3, 8192, 10, 3);
+        let prepared = journal_record(0x86, 0x87, AnonymousMailboxSourcePhase::Prepared);
+        let armed = journal_record(0x88, 0x89, AnonymousMailboxSourcePhase::Prepared);
+        let ambiguous = journal_record(0x8a, 0x8b, AnonymousMailboxSourcePhase::Prepared);
+        journal.insert_or_exact(&prepared).expect("prepared");
+        journal.insert_or_exact(&armed).expect("armed insert");
+        journal
+            .transition_at(
+                &armed,
+                AnonymousMailboxSourcePhase::Prepared,
+                AnonymousMailboxSourcePhase::Armed,
+                armed.state.clone(),
+                NOW,
+            )
+            .expect("arm");
+        journal
+            .insert_or_exact(&ambiguous)
+            .expect("ambiguous insert");
+        journal
+            .transition_at(
+                &ambiguous,
+                AnonymousMailboxSourcePhase::Prepared,
+                AnonymousMailboxSourcePhase::Ambiguous,
+                ambiguous.state.clone(),
+                NOW,
+            )
+            .expect("mark ambiguous");
+        assert_eq!(
+            journal
+                .cleanup_terminal_records(i64::MAX as u64)
+                .expect("unresolved cleanup"),
+            AnonymousMailboxSourceCleanupReport::default()
+        );
+        for route_id in [prepared.route_id, armed.route_id, ambiguous.route_id] {
+            let loaded = journal.load(&route_id).expect("load unresolved");
+            assert!(loaded.is_some());
+            assert_eq!(loaded.expect("unresolved row").retain_until, None);
+        }
+
+        let quota = journal_with_limits(1, 4096, 10, 1);
+        let expired = journal_record(0x8c, 0x8d, AnonymousMailboxSourcePhase::Prepared);
+        retain_terminal_record(
+            &quota,
+            &expired,
+            AnonymousMailboxSourcePhase::Rejected,
+            NOW,
+            None,
+        );
+        let replacement = journal_record(0x8e, 0x8f, AnonymousMailboxSourcePhase::Prepared);
+        assert!(matches!(
+            quota.insert_or_exact(&replacement),
+            Err(AnonymousMailboxSourceError::Rejected)
+        ));
+        assert_eq!(
+            quota
+                .cleanup_terminal_records(NOW + 11)
+                .expect("quota cleanup")
+                .rows_removed,
+            1
+        );
+        quota
+            .insert_or_exact(&replacement)
+            .expect("quota released after atomic cleanup");
+    }
+
+    #[test]
+    fn cleanup_is_bounded_and_rolls_back_row_and_meta_together() {
+        let journal = journal_with_limits(3, 8192, 10, 1);
+        let first = journal_record(0x90, 0x91, AnonymousMailboxSourcePhase::Prepared);
+        let second = journal_record(0x92, 0x93, AnonymousMailboxSourcePhase::Prepared);
+        retain_terminal_record(
+            &journal,
+            &first,
+            AnonymousMailboxSourcePhase::Completed,
+            NOW,
+            Some(&[0x94; 8]),
+        );
+        retain_terminal_record(
+            &journal,
+            &second,
+            AnonymousMailboxSourcePhase::Rejected,
+            NOW,
+            None,
+        );
+        let before = load_source_meta(&journal.connection.lock()).expect("meta before cleanup");
+        journal
+            .connection
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER abort_source_cleanup BEFORE DELETE
+                 ON anonymous_mailbox_source_journal
+                 BEGIN SELECT RAISE(ABORT, 'bounded rollback fixture'); END;",
+            )
+            .expect("install rollback trigger");
+        assert!(matches!(
+            journal.cleanup_terminal_records(NOW + 11),
+            Err(AnonymousMailboxSourceError::Unavailable)
+        ));
+        assert_eq!(
+            load_source_meta(&journal.connection.lock()).expect("meta after rollback"),
+            before
+        );
+        assert!(journal
+            .load(&first.route_id)
+            .expect("first after rollback")
+            .is_some());
+        assert!(journal
+            .load(&second.route_id)
+            .expect("second after rollback")
+            .is_some());
+        journal
+            .connection
+            .lock()
+            .execute_batch("DROP TRIGGER abort_source_cleanup;")
+            .expect("drop rollback trigger");
+
+        assert_eq!(
+            journal
+                .cleanup_terminal_records(NOW + 11)
+                .expect("first bounded batch")
+                .rows_removed,
+            1
+        );
+        assert_eq!(
+            journal
+                .cleanup_terminal_records(NOW + 11)
+                .expect("batch plus one")
+                .rows_removed,
+            1
+        );
+        assert_eq!(
+            journal
+                .cleanup_terminal_records(NOW + 11)
+                .expect("empty cleanup")
+                .rows_removed,
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_v1_migration_grants_full_window_and_preserves_unresolved_rows() {
+        let sealer = journal();
+        let mut completed = journal_record(0x95, 0x96, AnonymousMailboxSourcePhase::Completed);
+        completed.state = encode_state(
+            &completed.body,
+            &decode_state(&completed.state)
+                .expect("decode completed fixture")
+                .terminal_frame,
+            None,
+            Some(&[0x97; 19]),
+        )
+        .expect("completed fixture state");
+        let armed = journal_record(0x98, 0x99, AnonymousMailboxSourcePhase::Armed);
+        let mut connection = Connection::open_in_memory().expect("legacy sqlite");
+        create_legacy_source_schema(&connection);
+        insert_legacy_source_record(&connection, &sealer, &completed);
+        insert_legacy_source_record(&connection, &sealer, &armed);
+
+        initialize_or_verify_source_schema(&mut connection, NOW, 10).expect("migrate v1");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("schema version");
+        assert_eq!(version, SOURCE_JOURNAL_SCHEMA_VERSION);
+        let terminal_deadline: Option<i64> = connection
+            .query_row(
+                "SELECT retain_until FROM anonymous_mailbox_source_journal WHERE route_id = ?1",
+                params![completed.route_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("terminal deadline");
+        assert_eq!(
+            terminal_deadline,
+            Some(source_i64(NOW + 10).expect("deadline"))
+        );
+        let unresolved_deadline: Option<i64> = connection
+            .query_row(
+                "SELECT retain_until FROM anonymous_mailbox_source_journal WHERE route_id = ?1",
+                params![armed.route_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("unresolved deadline");
+        assert_eq!(unresolved_deadline, None);
+
+        let migrated = SqliteAnonymousMailboxSourceJournal {
+            connection: Mutex::new(connection),
+            journal_key: [0x22; 32],
+            max_entries: 4,
+            max_bytes: 4096,
+            terminal_retention_secs: 10,
+            cleanup_batch_size: 2,
+            #[cfg(unix)]
+            _database_parent: None,
+        };
+        migrated.audit_startup().expect("migrated startup audit");
+        let replay = migrated
+            .insert_or_exact(&journal_record(
+                0x95,
+                0x96,
+                AnonymousMailboxSourcePhase::Prepared,
+            ))
+            .expect("legacy exact retry");
+        assert_eq!(replay.phase, AnonymousMailboxSourcePhase::Completed);
+        assert_eq!(replay.retain_until, Some(NOW + 10));
+        assert_eq!(
+            decode_state(&replay.state)
+                .expect("legacy replay state")
+                .completed,
+            Some(vec![0x97; 19])
+        );
+        assert_eq!(
+            migrated
+                .cleanup_terminal_records(NOW + 10)
+                .expect("migration boundary")
+                .rows_removed,
+            0
+        );
+        assert_eq!(
+            migrated
+                .cleanup_terminal_records(NOW + 11)
+                .expect("migration expiry")
+                .rows_removed,
+            1
+        );
+        assert_eq!(
+            migrated
+                .load(&armed.route_id)
+                .expect("legacy unresolved load")
+                .expect("legacy unresolved row")
+                .phase,
+            AnonymousMailboxSourcePhase::Armed
+        );
+    }
+
+    #[test]
+    fn startup_audit_rejects_retention_and_meta_corruption() {
+        let journal = journal_with_limits(2, 4096, 10, 2);
+        let terminal = journal_record(0x9a, 0x9b, AnonymousMailboxSourcePhase::Prepared);
+        retain_terminal_record(
+            &journal,
+            &terminal,
+            AnonymousMailboxSourcePhase::Completed,
+            NOW,
+            Some(&[0x9c; 7]),
+        );
+        journal
+            .connection
+            .lock()
+            .execute(
+                "UPDATE anonymous_mailbox_source_journal SET retain_until = NULL
+                 WHERE route_id = ?1",
+                params![terminal.route_id.as_slice()],
+            )
+            .expect("corrupt terminal retention");
+        assert!(matches!(
+            journal.audit_startup(),
+            Err(AnonymousMailboxSourceError::Corrupt)
+        ));
+        journal
+            .connection
+            .lock()
+            .execute(
+                "UPDATE anonymous_mailbox_source_journal SET retain_until = ?1
+                 WHERE route_id = ?2",
+                params![
+                    source_i64(NOW + 10).expect("deadline"),
+                    terminal.route_id.as_slice()
+                ],
+            )
+            .expect("restore terminal retention");
+        journal
+            .connection
+            .lock()
+            .execute(
+                "UPDATE anonymous_mailbox_source_meta SET total_entries = total_entries + 1
+                 WHERE singleton = 1",
+                [],
+            )
+            .expect("corrupt source meta");
+        assert!(matches!(
+            journal.audit_startup(),
+            Err(AnonymousMailboxSourceError::Corrupt)
+        ));
     }
 
     #[test]
@@ -1958,6 +2843,7 @@ mod tests {
             descriptor_commitment,
             body: body.clone(),
             phase: AnonymousMailboxSourcePhase::Prepared,
+            retain_until: None,
             state: prepared_state.clone(),
         };
         journal.insert_or_exact(&record).expect("insert");
@@ -2171,6 +3057,7 @@ mod tests {
             descriptor_commitment,
             body: body.clone(),
             phase: AnonymousMailboxSourcePhase::Prepared,
+            retain_until: None,
             state: encode_state(&body, &terminal, None, None).expect("state"),
         };
         let journal = journal();
@@ -2452,10 +3339,14 @@ mod tests {
             run_source_crash_child("tampered", "prepared", &db_path, &tampered_barrier).await;
         assert_source_crash_child(&tampered, &tampered_barrier);
 
-        let journal = Arc::new(
-            SqliteAnonymousMailboxSourceJournal::open(source_crash_config(&db_path), [0x7b; 32])
-                .expect("reopen tampered source journal"),
-        );
+        let journal = match SqliteAnonymousMailboxSourceJournal::open(
+            source_crash_config(&db_path),
+            [0x7b; 32],
+        ) {
+            Err(AnonymousMailboxSourceError::Corrupt) => return,
+            Err(error) => panic!("tampered startup returned unexpected error: {error}"),
+            Ok(journal) => Arc::new(journal),
+        };
         let (coordinator, resolver) = source_crash_coordinator(journal);
         assert!(matches!(
             coordinator.begin_dispatch([0x7a; 16], NOW),
@@ -2499,6 +3390,7 @@ mod tests {
             descriptor_commitment,
             body: body.clone(),
             phase: AnonymousMailboxSourcePhase::Prepared,
+            retain_until: None,
             state: encode_state(&body, &terminal, None, None).expect("state"),
         };
         let journal = SqliteAnonymousMailboxSourceJournal::open(config.clone(), [0x67; 32])

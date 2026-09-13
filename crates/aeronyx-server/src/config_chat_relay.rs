@@ -35,6 +35,8 @@
 //! and recoverable SQLite WAL-backlog admission for blind-route replay state.
 //! v1.16.0-AnonymousMailboxSourceWiring — Added a default-off, independently
 //! durable source-journal and bounded VPN transport configuration.
+//! v1.17.0-AnonymousMailboxSourceRetention — Added bounded terminal-result
+//! replay retention and transactional cleanup limits for the source journal.
 //! v1.14.0-AnonymousMailboxStore — Added a default-off, node-local custody
 //! repository configuration for opaque anonymous-mailbox capabilities.
 //!
@@ -209,6 +211,12 @@ pub const DEFAULT_ANONYMOUS_MAILBOX_MAX_TICKET_ISSUES_PER_WINDOW: usize = 64;
 pub const DEFAULT_ANONYMOUS_MAILBOX_TICKET_ISSUANCE_WINDOW_SECS: u64 = 60;
 /// Default target-bound Hashcash difficulty for production mailbox ticket issue.
 pub const DEFAULT_ANONYMOUS_MAILBOX_TICKET_ISSUE_WORK_BITS: u8 = 12;
+/// Default byte-identical terminal-result replay retention for source journals.
+pub const DEFAULT_ANONYMOUS_MAILBOX_SOURCE_TERMINAL_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+/// Default maximum source-journal rows reclaimed by one transaction.
+pub const DEFAULT_ANONYMOUS_MAILBOX_SOURCE_CLEANUP_BATCH_SIZE: usize = 256;
+/// Hard ceiling for source terminal-result retention.
+pub const MAX_ANONYMOUS_MAILBOX_SOURCE_TERMINAL_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// Default-off local custody settings for anonymous mailboxes.
 ///
@@ -379,6 +387,15 @@ pub struct AnonymousMailboxSourceConfig {
     /// armed and may be retried only with its durable exact body.
     #[serde(default = "default_anonymous_mailbox_source_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    // [ANONYMOUS-MAILBOX-SOURCE-RETENTION 2026-09-13 by Codex] Terminal
+    // replay retention is explicit and bounded; unresolved effects remain
+    // durable safety fences and are never age-cleaned.
+    /// Byte-identical replay window after a source result becomes terminal.
+    #[serde(default = "default_anonymous_mailbox_source_terminal_retention_secs")]
+    pub terminal_retention_secs: u64,
+    /// Maximum terminal rows reclaimed by one source-journal transaction.
+    #[serde(default = "default_anonymous_mailbox_source_cleanup_batch_size")]
+    pub cleanup_batch_size: usize,
 }
 
 impl Default for AnonymousMailboxSourceConfig {
@@ -390,6 +407,8 @@ impl Default for AnonymousMailboxSourceConfig {
             max_journal_bytes: default_anonymous_mailbox_source_max_journal_bytes(),
             max_in_flight: default_anonymous_mailbox_source_max_in_flight(),
             request_timeout_secs: default_anonymous_mailbox_source_request_timeout_secs(),
+            terminal_retention_secs: default_anonymous_mailbox_source_terminal_retention_secs(),
+            cleanup_batch_size: default_anonymous_mailbox_source_cleanup_batch_size(),
         }
     }
 }
@@ -427,6 +446,20 @@ impl AnonymousMailboxSourceConfig {
             return Err(ServerError::config_invalid(
                 "memchain.chat_relay.anonymous_mailbox_source.request_timeout_secs",
                 "must be a non-zero bounded duration",
+            ));
+        }
+        if self.terminal_retention_secs == 0
+            || self.terminal_retention_secs > MAX_ANONYMOUS_MAILBOX_SOURCE_TERMINAL_RETENTION_SECS
+        {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox_source.terminal_retention_secs",
+                "must be between 1 second and the 30-day lease lifetime",
+            ));
+        }
+        if self.cleanup_batch_size == 0 || self.cleanup_batch_size > 4_096 {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.anonymous_mailbox_source.cleanup_batch_size",
+                "must be between 1 and 4096",
             ));
         }
         Ok(())
@@ -756,6 +789,12 @@ fn default_anonymous_mailbox_source_max_in_flight() -> usize {
 }
 fn default_anonymous_mailbox_source_request_timeout_secs() -> u64 {
     15
+}
+fn default_anonymous_mailbox_source_terminal_retention_secs() -> u64 {
+    DEFAULT_ANONYMOUS_MAILBOX_SOURCE_TERMINAL_RETENTION_SECS
+}
+fn default_anonymous_mailbox_source_cleanup_batch_size() -> usize {
+    DEFAULT_ANONYMOUS_MAILBOX_SOURCE_CLEANUP_BATCH_SIZE
 }
 fn default_max_pending_messages_total() -> usize {
     100_000
@@ -1112,6 +1151,55 @@ mod tests {
             cr.custody_backup_partial_grace_secs,
             DEFAULT_CUSTODY_BACKUP_PARTIAL_GRACE_SECS
         );
+        assert_eq!(
+            cr.anonymous_mailbox_source.terminal_retention_secs,
+            DEFAULT_ANONYMOUS_MAILBOX_SOURCE_TERMINAL_RETENTION_SECS
+        );
+        assert_eq!(
+            cr.anonymous_mailbox_source.cleanup_batch_size,
+            DEFAULT_ANONYMOUS_MAILBOX_SOURCE_CLEANUP_BATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn anonymous_mailbox_source_retention_and_cleanup_bounds_are_enforced() {
+        for terminal_retention_secs in [0, MAX_ANONYMOUS_MAILBOX_SOURCE_TERMINAL_RETENTION_SECS + 1]
+        {
+            let cr = ChatRelayConfig {
+                enabled: true,
+                anonymous_mailbox_source: AnonymousMailboxSourceConfig {
+                    enabled: true,
+                    terminal_retention_secs,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(cr.validate().is_err());
+        }
+        for cleanup_batch_size in [0, 4_097] {
+            let cr = ChatRelayConfig {
+                enabled: true,
+                anonymous_mailbox_source: AnonymousMailboxSourceConfig {
+                    enabled: true,
+                    cleanup_batch_size,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(cr.validate().is_err());
+        }
+
+        let maximum = ChatRelayConfig {
+            enabled: true,
+            anonymous_mailbox_source: AnonymousMailboxSourceConfig {
+                enabled: true,
+                terminal_retention_secs: MAX_ANONYMOUS_MAILBOX_SOURCE_TERMINAL_RETENTION_SECS,
+                cleanup_batch_size: 4_096,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(maximum.validate().is_ok());
     }
 
     #[test]

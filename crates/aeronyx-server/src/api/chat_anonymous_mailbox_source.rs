@@ -704,6 +704,7 @@ mod tests {
             max_journal_bytes: 512 * 1024,
             max_in_flight: 2,
             request_timeout_secs: 2,
+            ..AnonymousMailboxSourceConfig::default()
         };
         let resolver = Arc::new(PinnedTargetResolver {
             exact_node_id: descriptor.descriptor.node_id,
@@ -824,6 +825,7 @@ mod tests {
             max_journal_bytes: 512 * 1024,
             max_in_flight: 2,
             request_timeout_secs: 15,
+            ..AnonymousMailboxSourceConfig::default()
         }
     }
 
@@ -995,6 +997,7 @@ mod tests {
             max_journal_bytes: 512 * 1024,
             max_in_flight: 2,
             request_timeout_secs: 2,
+            ..AnonymousMailboxSourceConfig::default()
         };
         let journal = SqliteAnonymousMailboxSourceJournal::open(config.clone(), [0xB6; 32])
             .expect("private source journal");
