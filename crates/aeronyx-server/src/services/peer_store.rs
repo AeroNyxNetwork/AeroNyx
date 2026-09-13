@@ -219,6 +219,8 @@
 //!   listeners. Do not reuse that bulk reset as a runtime route-health tool.
 //!
 //! ## Last Modified
+//! v0.89.0-ExpiredCacheSequenceFencing - Rejects conflicting authentic expired
+//! cache descriptors that reuse one node identity and sequence after restart
 //! v0.88.0-BlindRelayGlobalAdmission - Broadened the existing privacy-safe
 //! rate-limit aggregate to include parser-front identity-rotation protection
 //! v0.87.0-ExternalWitnessGenerationBinding - Bound startup witness decisions
@@ -4400,7 +4402,8 @@ impl PeerStore {
         let node_id = descriptor.node_id();
         let incoming_sequence = descriptor.sequence();
         let mut peers = self.peers.write();
-        let existing_sequence = peers.get(&node_id).map(SignedNodeDescriptor::sequence);
+        let existing = peers.get(&node_id);
+        let existing_sequence = existing.map(SignedNodeDescriptor::sequence);
 
         if let Some(current) = existing_sequence {
             if incoming_sequence < current {
@@ -4408,6 +4411,24 @@ impl PeerStore {
                     current,
                     incoming: incoming_sequence,
                 });
+            }
+            // [DISCOVERY-CACHE-SEQUENCE-FENCING 2026-09-13 by Codex] Expiry
+            // changes routeability, not descriptor identity. Mirror the live
+            // upsert fence so restart recovery cannot silently treat two
+            // authentic but different descriptors at one sequence as an exact
+            // retry. The retained original remains non-routeable and unchanged.
+            if incoming_sequence == current && existing != Some(&descriptor) {
+                drop(peers);
+                self.record_peer_event(
+                    now,
+                    "peer_rejected",
+                    "rejected",
+                    source,
+                    &node_id,
+                    Some(incoming_sequence),
+                    Some("sequence_conflict"),
+                );
+                return Err(PeerStoreError::VerificationFailed);
             }
         } else if let Some(max_peers) = self.max_peers() {
             if peers.len() >= max_peers {
@@ -12533,6 +12554,58 @@ mod tests {
             "cache",
         );
         assert_eq!(rejected.rejected, 1);
+    }
+
+    #[test]
+    fn test_peer_cache_snapshot_rejects_expired_same_sequence_conflict() {
+        let now = 1_700_002_000;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut original_body = signed_descriptor_for(&peer_kp, 7, now - 1).descriptor;
+        original_body.public_endpoint = Some("https://cache-a.example".to_string());
+        let original = SignedNodeDescriptor::sign(original_body, &peer_kp).unwrap();
+        let node_id = original.node_id();
+        let store = PeerStore::new();
+
+        let inserted = store.load_peer_cache_snapshot_from_source(
+            &NodeBootstrapSnapshot::new(now, vec![original.clone()]),
+            now,
+            "cache",
+        );
+        assert_eq!(inserted.inserted, 1);
+
+        let exact_retry = store.load_peer_cache_snapshot_from_source(
+            &NodeBootstrapSnapshot::new(now + 1, vec![original.clone()]),
+            now + 1,
+            "cache",
+        );
+        assert_eq!(exact_retry.unchanged, 1);
+
+        let mut conflicting_body = original.descriptor.clone();
+        conflicting_body.public_endpoint = Some("https://cache-b.example".to_string());
+        let conflicting = SignedNodeDescriptor::sign(conflicting_body, &peer_kp).unwrap();
+        let rejected = store.load_peer_cache_snapshot_from_source(
+            &NodeBootstrapSnapshot::new(now + 2, vec![conflicting]),
+            now + 2,
+            "cache",
+        );
+
+        assert_eq!(rejected.rejected, 1);
+        assert_eq!(rejected.unchanged, 0);
+        assert_eq!(store.len(), 1);
+        assert!(store.get_valid(&node_id, now + 2).is_none());
+        assert_eq!(
+            store.export_peer_cache_snapshot(now + 2).peers,
+            vec![original]
+        );
+        assert!(store
+            .status(now + 2)
+            .recent_peer_events
+            .iter()
+            .any(|event| {
+                event.event == "peer_rejected"
+                    && event.outcome == "rejected"
+                    && event.reason.as_deref() == Some("sequence_conflict")
+            }));
     }
 
     #[test]
