@@ -60,6 +60,9 @@
 //   v2.8.26-AnonymousMailboxCanonicalOuter — New anonymous-mailbox route
 //   variants reject trailing or otherwise non-canonical outer bytes while
 //   preserving the legacy trailing-byte policy for every older variant.
+//   [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] Added signature-only
+//   verification for bounded, read-only replay of an existing durable result;
+//   callers must still enforce freshness before admitting any new effect.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -142,7 +145,7 @@
 use serde::{de, Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::crypto::IdentityKeyPair;
+use crate::crypto::{IdentityKeyPair, IdentityPublicKey};
 use crate::error::CoreError;
 #[allow(deprecated)]
 use crate::ledger::Fact;
@@ -335,6 +338,23 @@ impl ChatRelayVerifiedSubmitRequestV1 {
                 request_timestamp.as_ref(),
             ],
         )
+    }
+
+    /// Verifies both signed layers without admitting a new delivery effect.
+    ///
+    /// [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] This deliberately
+    /// does not enforce timestamp freshness. Only an authenticated session may
+    /// use it to read an unexpired matching durable completion; it is not
+    /// permission to reserve, recover pending custody, or relay.
+    pub fn verify_signatures_for_replay(&self) -> Result<(), AuthError> {
+        self.envelope
+            .verify_signature()
+            .map_err(|_| AuthError::SignatureMismatch)?;
+        let sender = IdentityPublicKey::from_bytes(&self.envelope.sender)
+            .map_err(|_| AuthError::InvalidPublicKey)?;
+        sender
+            .verify(&self.signing_digest(), &self.signature)
+            .map_err(|_| AuthError::SignatureMismatch)
     }
 
     /// Verifies request freshness, sender signature, and envelope signature.
@@ -2552,6 +2572,26 @@ mod tests {
         request
             .verify_authentication()
             .expect("verify exact submit request");
+        request
+            .verify_signatures_for_replay()
+            .expect("verify both signed layers without freshness admission");
+
+        // [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] The helper keeps
+        // the timestamp inside the sender signature while deliberately leaving
+        // new-effect freshness to the server admission boundary.
+        let mut stale_signed = request.clone();
+        stale_signed.request_timestamp = now.saturating_sub(61);
+        stale_signed.signature = sender.sign(&stale_signed.signing_digest());
+        stale_signed
+            .verify_signatures_for_replay()
+            .expect("stale exact request keeps both valid signatures");
+        assert!(stale_signed.verify_authentication().is_err());
+        let mut tampered_outer = stale_signed.clone();
+        tampered_outer.signature[0] ^= 0x01;
+        assert!(tampered_outer.verify_signatures_for_replay().is_err());
+        let mut tampered_envelope = stale_signed;
+        tampered_envelope.envelope.signature[0] ^= 0x01;
+        assert!(tampered_envelope.verify_signatures_for_replay().is_err());
 
         let encoded = encode_memchain(&MemChainMessage::ChatRelayVerifiedSubmitV1(request.clone()))
             .expect("encode verified submit");

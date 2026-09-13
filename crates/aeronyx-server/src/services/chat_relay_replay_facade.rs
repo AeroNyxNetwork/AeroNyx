@@ -9,6 +9,8 @@
 //   while preserving owner fencing, effect arming, and exact-response replay.
 //
 // Main Functionality:
+//   [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] Exposes a read-only,
+//   explicitly timed durable completion lookup, without new effect admission.
 //   - Serializes equal verified-submit requests through fixed lock lanes.
 //   - Looks up, reserves, recovers, and completes verified-submit replay state.
 //   - Reserves, arms, releases, and completes blind-route replay state.
@@ -63,6 +65,18 @@ impl ChatRelayService {
         request: &ChatRelayVerifiedSubmitRequestV1,
     ) -> ChatRelayResult<VerifiedSubmitCacheLookup> {
         self.verified_submit.lookup(&self.conn, request, now_secs())
+    }
+
+    /// After both signatures and session ownership pass, read only an unexpired
+    /// completion. This path never consults or fills the process-local cache.
+    // [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex]
+    pub(crate) fn verified_submit_completed_readonly(
+        &self,
+        request: &ChatRelayVerifiedSubmitRequestV1,
+        now: u64,
+    ) -> ChatRelayResult<Option<ChatRelayVerifiedSubmitResponseV1>> {
+        self.verified_submit
+            .lookup_completed_readonly(&self.conn, request, now)
     }
 
     /// Atomically reserves one private replay slot before any external effect.

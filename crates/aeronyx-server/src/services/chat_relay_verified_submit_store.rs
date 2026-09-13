@@ -9,6 +9,8 @@
 //   completion state machine from the oversized relay orchestration service.
 //
 // Main Functionality:
+//   [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] Read retained completed
+//   results without pruning, renewing, or touching unfinished reservations.
 //   - Defines a replaceable durable verified-submit repository capability.
 //   - Reads completed sealed responses and unfinished private reservations.
 //   - Expires stale evidence with compare-and-delete semantics.
@@ -63,6 +65,15 @@ pub(crate) enum DurableVerifiedSubmitLookup {
 
 /// Durable reservation and completion capability for verified submissions.
 pub(crate) trait VerifiedSubmitDurableRepository {
+    /// Read-only stale retry: only unexpired completed evidence is eligible.
+    fn lookup_completed_readonly(
+        &self,
+        connection: &Mutex<Connection>,
+        cache_key: &[u8; 32],
+        envelope_fingerprint: &[u8; 32],
+        now: u64,
+    ) -> ChatRelayResult<Option<DurableVerifiedSubmitResponse>>;
+
     fn lookup(
         &self,
         connection: &Mutex<Connection>,
@@ -118,6 +129,58 @@ impl SqliteVerifiedSubmitDurableStore {
 }
 
 impl VerifiedSubmitDurableRepository for SqliteVerifiedSubmitDurableStore {
+    // [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] One SELECT, no cache
+    // fill, cleanup, reservation takeover, or sliding TTL. Bounds mirror the
+    // existing v1 response schema and are checked before Rust BLOB allocation.
+    fn lookup_completed_readonly(
+        &self,
+        connection: &Mutex<Connection>,
+        cache_key: &[u8; 32],
+        envelope_fingerprint: &[u8; 32],
+        now: u64,
+    ) -> ChatRelayResult<Option<DurableVerifiedSubmitResponse>> {
+        sqlite_integer(now, "verified_submit_readonly_time")?;
+        let connection = connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT completed_at, length(envelope_fingerprint), length(response_nonce),
+                    length(response_ciphertext), envelope_fingerprint,
+                    response_nonce, response_ciphertext
+             FROM relay_verified_submit_responses WHERE cache_key = ?1",
+        )?;
+        let mut rows = statement.query(params![cache_key.as_slice()])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let completed_at = u64::try_from(row.get::<_, i64>(0)?).map_err(|_| {
+            ChatRelayError::CorruptStoredData {
+                field: "verified_submit_completed_time",
+            }
+        })?;
+        let age = now
+            .checked_sub(completed_at)
+            .ok_or(ChatRelayError::CorruptStoredData {
+                field: "verified_submit_completed_time",
+            })?;
+        if age > self.response_ttl_secs {
+            return Ok(None);
+        }
+        if row.get::<_, i64>(1)? != 32
+            || row.get::<_, i64>(2)? != 24
+            || !(17..=528).contains(&row.get::<_, i64>(3)?)
+        {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "verified_submit_readonly_shape",
+            });
+        }
+        if row.get::<_, Vec<u8>>(4)?.as_slice() != envelope_fingerprint.as_slice() {
+            return Ok(None);
+        }
+        Ok(Some(DurableVerifiedSubmitResponse {
+            nonce: row.get(5)?,
+            ciphertext: row.get(6)?,
+        }))
+    }
+
     fn lookup(
         &self,
         connection: &Mutex<Connection>,
@@ -430,4 +493,171 @@ impl VerifiedSubmitDurableRepository for SqliteVerifiedSubmitDurableStore {
 
 fn sqlite_integer(value: u64, field: &'static str) -> ChatRelayResult<i64> {
     i64::try_from(value).map_err(|_| ChatRelayError::CorruptStoredData { field })
+}
+
+#[cfg(test)]
+mod stale_replay_tests {
+    use super::*;
+
+    // [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] Real file-backed
+    // SQLite, synthetic opaque rows. No network, global time, or real identity.
+    #[test]
+    fn verified_submit_stale_completed_replay_retention_reopen_and_zero_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("completed.sqlite3");
+        let connection = Mutex::new(Connection::open(&path).unwrap());
+        connection
+            .lock()
+            .execute_batch(
+                "CREATE TABLE relay_verified_submit_responses (
+               cache_key BLOB PRIMARY KEY, envelope_fingerprint BLOB,
+               response_nonce BLOB, response_ciphertext BLOB, completed_at INTEGER);
+             CREATE TABLE relay_verified_submit_reservations (cache_key BLOB PRIMARY KEY);
+             INSERT INTO relay_verified_submit_reservations VALUES (zeroblob(32));",
+            )
+            .unwrap();
+        connection
+            .lock()
+            .execute(
+                "INSERT INTO relay_verified_submit_responses VALUES (?1, ?2, ?3, ?4, 1000)",
+                params![
+                    [1_u8; 32].as_slice(),
+                    [2_u8; 32].as_slice(),
+                    [3_u8; 24].as_slice(),
+                    vec![4_u8; 32]
+                ],
+            )
+            .unwrap();
+        let store = SqliteVerifiedSubmitDurableStore::new(121, 8, 5);
+        let before: i64 = connection
+            .lock()
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        for now in [1000, 1060, 1061, 1121] {
+            assert!(store
+                .lookup_completed_readonly(&connection, &[1; 32], &[2; 32], now)
+                .unwrap()
+                .is_some());
+        }
+        assert!(store
+            .lookup_completed_readonly(&connection, &[1; 32], &[2; 32], 1122)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .lookup_completed_readonly(&connection, &[1; 32], &[9; 32], 1061)
+            .unwrap()
+            .is_none());
+        for key in [[0; 32], [9; 32]] {
+            // Pending and miss never touch reservations.
+            assert!(store
+                .lookup_completed_readonly(&connection, &key, &[2; 32], 1061)
+                .unwrap()
+                .is_none());
+        }
+        assert!(store
+            .lookup_completed_readonly(&connection, &[1; 32], &[2; 32], 999)
+            .is_err());
+        assert!(store
+            .lookup_completed_readonly(&connection, &[1; 32], &[2; 32], u64::MAX)
+            .is_err());
+        let after: i64 = connection
+            .lock()
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            connection
+                .lock()
+                .query_row(
+                    "SELECT completed_at FROM relay_verified_submit_responses",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1000
+        );
+        drop(connection);
+        let reopened = Mutex::new(Connection::open(path).unwrap());
+        assert!(store
+            .lookup_completed_readonly(&reopened, &[1; 32], &[2; 32], 1121)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .lookup_completed_readonly(&reopened, &[1; 32], &[2; 32], 1122)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            reopened
+                .lock()
+                .query_row("SELECT total_changes()", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            reopened
+                .lock()
+                .query_row(
+                    "SELECT count(*) FROM relay_verified_submit_reservations",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn verified_submit_stale_completed_replay_rejects_corruption_before_materialization() {
+        let connection = Mutex::new(Connection::open_in_memory().unwrap());
+        connection
+            .lock()
+            .execute_batch(
+                "CREATE TABLE relay_verified_submit_responses (
+               cache_key BLOB PRIMARY KEY, envelope_fingerprint BLOB,
+               response_nonce BLOB, response_ciphertext BLOB, completed_at INTEGER);
+             INSERT INTO relay_verified_submit_responses VALUES
+               (zeroblob(32), zeroblob(32), zeroblob(24), zeroblob(32), 1000);",
+            )
+            .unwrap();
+        let store = SqliteVerifiedSubmitDurableStore::new(121, 8, 5);
+        for mutation in [
+            "completed_at = -1",
+            "completed_at = 2000",
+            "envelope_fingerprint = zeroblob(31)",
+            "response_nonce = zeroblob(25)",
+            "response_ciphertext = zeroblob(16)",
+            "response_ciphertext = zeroblob(529)",
+            "response_ciphertext = zeroblob(1048576)",
+        ] {
+            connection
+                .lock()
+                .execute_batch(
+                    "UPDATE relay_verified_submit_responses SET completed_at=1000,
+                   envelope_fingerprint=zeroblob(32), response_nonce=zeroblob(24),
+                   response_ciphertext=zeroblob(32)",
+                )
+                .unwrap();
+            connection
+                .lock()
+                .execute(
+                    &format!("UPDATE relay_verified_submit_responses SET {mutation}"),
+                    [],
+                )
+                .unwrap();
+            let before: i64 = connection
+                .lock()
+                .query_row("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap();
+            assert!(store
+                .lookup_completed_readonly(&connection, &[0; 32], &[0; 32], 1061)
+                .is_err());
+            assert_eq!(
+                connection
+                    .lock()
+                    .query_row("SELECT total_changes()", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                before
+            );
+        }
+    }
 }

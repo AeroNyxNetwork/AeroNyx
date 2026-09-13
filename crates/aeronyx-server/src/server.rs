@@ -7,6 +7,8 @@
 //   [PROTOCOL-V2-ADMISSION-HOTFIX 2026-09-13 by Codex] Removed unauthenticated
 //   identity eviction from UDP ingress and finalizes only evictions returned
 //   by the authenticated, lifecycle-fenced handshake admission transition.
+//   [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] Separates bounded,
+//   durable completed-response replay from fresh effect admission.
 //   [BLIND-VAULT-MANAGEMENT-RUNTIME 2026-08-31 by Codex] Passes the live
 //   Blind Vault service explicitly into management readiness reporting.
 //   [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Bound startup,
@@ -949,7 +951,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, trace, warn};
 
 use aeronyx_core::protocol::auth::{
-    verify_signed_message, AuthError, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_CHAT_PULL_V2,
+    verify_signed_message, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_CHAT_PULL_V2,
     DOMAIN_DEVICE_REGISTER, DOMAIN_SESSION_CLOSE_V1, DOMAIN_WALLET_PRESENCE,
 };
 use aeronyx_core::protocol::chat::{
@@ -15370,22 +15372,6 @@ impl Server {
         traffic_tracker.remove_wallet(&termination.wallet_hex);
     }
 
-    /// Verifies both signed layers without treating timestamp freshness as
-    /// authority to create a new relay or custody effect.
-    fn verified_submit_signatures_are_valid_without_freshness(
-        request: &ChatRelayVerifiedSubmitRequestV1,
-    ) -> bool {
-        if request.envelope.verify_signature().is_err() {
-            return false;
-        }
-        let Ok(sender) = IdentityPublicKey::from_bytes(&request.envelope.sender) else {
-            return false;
-        };
-        sender
-            .verify(&request.signing_digest(), &request.signature)
-            .is_ok()
-    }
-
     /// Handles one opt-in client request that requires terminal-verifiable
     /// onion delivery without changing legacy `ChatRelay` availability.
     ///
@@ -15402,6 +15388,32 @@ impl Server {
         node_identity: &IdentityKeyPair,
         chat_peer_client: Option<&reqwest::Client>,
     ) -> ChatRelayVerifiedSubmitResponseV1 {
+        Self::handle_verified_chat_submit_with_clock(
+            request,
+            session,
+            chat_relay,
+            peer_store,
+            self_node_id,
+            node_identity,
+            chat_peer_client,
+            unix_now_secs,
+        )
+        .await
+    }
+
+    // [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] Read the clock after
+    // the single-flight wait so admission cannot reuse a pre-wait timestamp.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_verified_chat_submit_with_clock(
+        request: ChatRelayVerifiedSubmitRequestV1,
+        session: &Arc<crate::services::Session>,
+        chat_relay: &Option<Arc<ChatRelayService>>,
+        peer_store: &PeerStore,
+        self_node_id: &[u8; 32],
+        node_identity: &IdentityKeyPair,
+        chat_peer_client: Option<&reqwest::Client>,
+        clock: impl Fn() -> u64 + Send + Sync,
+    ) -> ChatRelayVerifiedSubmitResponseV1 {
         let rejected = || {
             ChatRelayVerifiedSubmitResponseV1::rejected(
                 request.request_id,
@@ -15409,37 +15421,11 @@ impl Server {
             )
         };
 
-        let sender_matches_session = request
+        if !request
             .envelope
-            .sender_matches_authenticated_identity(&session.client_public_key.to_bytes());
-        // [CHAT-VERIFIED-SUBMIT-STALE-REPLAY 2026-09-02 by Codex] A stale
-        // request must still prove both signed layers and the live session
-        // identity before it may query private replay state. Freshness gates
-        // every new effect below, while an exact completed result remains
-        // replayable for its independently bounded durable lifetime.
-        let request_is_fresh = match request.verify_authentication() {
-            Ok(()) => true,
-            Err(AuthError::TimestampOutOfWindow)
-                if sender_matches_session
-                    && Self::verified_submit_signatures_are_valid_without_freshness(&request) =>
-            {
-                false
-            }
-            Err(_) => {
-                let response = rejected();
-                if let Some(relay) = chat_relay.as_ref() {
-                    // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] Count
-                    // rejected explicit submissions only as an aggregate result.
-                    relay.record_verified_submit_result(unix_now_secs(), response.result);
-                }
-                warn!(
-                    reason = "verified_submit_authentication_failed",
-                    "[CHAT_RELAY] Verified submit rejected"
-                );
-                return response;
-            }
-        };
-        if !sender_matches_session {
+            .sender_matches_authenticated_identity(&session.client_public_key.to_bytes())
+            || request.verify_signatures_for_replay().is_err()
+        {
             let response = rejected();
             if let Some(relay) = chat_relay.as_ref() {
                 // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] Count
@@ -15467,6 +15453,33 @@ impl Server {
         // onion relay or entry custody. Reuse for another envelope fails
         // closed before route, wallet-route, or durable-state mutation.
         let _single_flight = relay.lock_verified_submit(&request).await;
+        let now = clock();
+        // [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] Preserve the
+        // existing symmetric freshness window for new effects. Only too-old
+        // requests may take this durable completed-only branch; future-dated
+        // requests never gain replay authority.
+        if request.request_timestamp.abs_diff(now)
+            > aeronyx_core::protocol::auth::TIMESTAMP_WINDOW_SECS
+        {
+            if request.request_timestamp < now {
+                match relay.verified_submit_completed_readonly(&request, now) {
+                    Ok(Some(response)) => {
+                        relay.record_verified_submit_replay(now, response.result);
+                        return response;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(
+                            reason = error.reason_bucket(),
+                            "[CHAT_RELAY] Retained verified submit unavailable"
+                        );
+                    }
+                }
+            }
+            let response = rejected();
+            relay.record_verified_submit_result(now, response.result);
+            return response;
+        }
         match relay.verified_submit_cache_lookup(&request) {
             Ok(VerifiedSubmitCacheLookup::Exact(response)) => {
                 relay.record_verified_submit_replay(unix_now_secs(), response.result);
@@ -15497,16 +15510,6 @@ impl Server {
                 );
                 return response;
             }
-        }
-
-        if !request_is_fresh {
-            let response = rejected();
-            relay.record_verified_submit_result(unix_now_secs(), response.result);
-            warn!(
-                reason = "verified_submit_stale_replay_unavailable",
-                "[CHAT_RELAY] Verified submit rejected"
-            );
-            return response;
         }
 
         // [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] Reserve
@@ -16521,6 +16524,7 @@ impl Server {
                                 }
                             }
                             Err(e) => {
+                                if !retry_required_data_plane_rec           Err(e) => {
                                 if !retry_required_data_plane_receive(
                                     "tun",
                                     &e,
@@ -20873,7 +20877,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_submit_stale_exact_completed_replays_in_process_and_after_restart() {
+    async fn verified_submit_stale_completed_replay_in_process_and_after_restart() {
         // [CHAT-VERIFIED-SUBMIT-STALE-REPLAY 2026-09-02 by Codex] An exact
         // completed result remains the sole authority for a request whose
         // signed timestamp is one second outside the admission window. Both
@@ -20884,11 +20888,17 @@ mod tests {
         let secret = [0x91; 32];
         let sender = IdentityKeyPair::generate();
         let source_node = IdentityKeyPair::generate();
+        // Keep the synthetic completion inside the store's real-clock startup
+        // retention gate while driving the request clock deterministically.
+        // An epoch-era fixture would be correctly removed when the repository
+        // is reopened, masking the restart replay boundary under test.
+        let completed_at = unix_now_secs();
+        let completed_response_ttl_secs = TIMESTAMP_WINDOW_SECS * 2 + 1;
         let request = test_verified_submit_request(
             &sender,
             [0x92; 16],
             [0x93; 16],
-            unix_now_secs().saturating_sub(TIMESTAMP_WINDOW_SECS + 1),
+            completed_at.saturating_sub(TIMESTAMP_WINDOW_SECS + 1),
             0x94,
         );
         let session = test_verified_submit_session(&sender, 0x95);
@@ -20896,8 +20906,15 @@ mod tests {
         let expected = {
             let relay = test_chat_relay_service(&db_path, secret);
             let expected = seed_completed_verified_submit(&relay, &request);
+            rusqlite::Connection::open(&db_path)
+                .expect("open deterministic stale replay database")
+                .execute(
+                    "UPDATE relay_verified_submit_responses SET completed_at = ?1",
+                    rusqlite::params![completed_at],
+                )
+                .expect("set deterministic completion time");
             let relay_option = Some(Arc::clone(&relay));
-            let replayed = Server::handle_verified_chat_submit(
+            let replayed = Server::handle_verified_chat_submit_with_clock(
                 request.clone(),
                 &session,
                 &relay_option,
@@ -20905,6 +20922,7 @@ mod tests {
                 &source_node.public_key_bytes(),
                 &source_node,
                 None,
+                || completed_at,
             )
             .await;
             assert_eq!(replayed, expected);
@@ -20914,7 +20932,7 @@ mod tests {
 
         let restarted = test_chat_relay_service(&db_path, secret);
         let restarted_option = Some(Arc::clone(&restarted));
-        let replayed = Server::handle_verified_chat_submit(
+        let replayed = Server::handle_verified_chat_submit_with_clock(
             request,
             &session,
             &restarted_option,
@@ -20922,6 +20940,7 @@ mod tests {
             &source_node.public_key_bytes(),
             &source_node,
             None,
+            || completed_at.saturating_add(completed_response_ttl_secs),
         )
         .await;
         assert_eq!(replayed, expected);
@@ -20929,7 +20948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_submit_freshness_and_completed_retention_boundaries_are_closed() {
+    async fn verified_submit_stale_completed_replay_freshness_and_retention_boundaries() {
         let directory = tempfile::tempdir().expect("verified submit boundary directory");
         let sender = IdentityKeyPair::generate();
         let source_node = IdentityKeyPair::generate();
@@ -21013,10 +21032,83 @@ mod tests {
         .await;
         assert_eq!(boundary_response, expected);
         assert_no_verified_submit_delivery_effects(&restarted, &sender);
+
+        // [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] An in-memory
+        // cache entry must not extend the durable 121-second replay lifetime.
+        let expired_path = directory.path().join("expired-memory-cache.sqlite3");
+        let expired_relay = test_chat_relay_service(&expired_path, [0xB1; 32]);
+        let expired_request =
+            test_verified_submit_request(&sender, [0xB2; 16], [0xB3; 16], 1_000, 0xB4);
+        let expired_expected = seed_completed_verified_submit(&expired_relay, &expired_request);
+        rusqlite::Connection::open(&expired_path)
+            .expect("open expired replay database")
+            .execute(
+                "UPDATE relay_verified_submit_responses SET completed_at = 1000",
+                [],
+            )
+            .expect("set expired completion time");
+        let observer = rusqlite::Connection::open(&expired_path).expect("open replay observer");
+        let before_data_version: i64 = observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .expect("read replay data version");
+        let expired_option = Some(Arc::clone(&expired_relay));
+        let expired_response = Server::handle_verified_chat_submit_with_clock(
+            expired_request.clone(),
+            &session,
+            &expired_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+            || 1_122,
+        )
+        .await;
+        assert_eq!(expired_response.result, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
+        assert!(matches!(
+            expired_relay
+                .verified_submit_cache_lookup(&expired_request)
+                .expect("memory cache remains independently populated"),
+            VerifiedSubmitCacheLookup::Exact(response) if response == expired_expected
+        ));
+        assert_eq!(
+            observer
+                .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+                .expect("recheck replay data version"),
+            before_data_version
+        );
+        assert_no_verified_submit_delivery_effects(&expired_relay, &sender);
+
+        // A correctly signed request beyond the future window cannot use an
+        // existing completion as replay authority.
+        let future_path = directory.path().join("future-completion.sqlite3");
+        let future_relay = test_chat_relay_service(&future_path, [0xB5; 32]);
+        let future_request =
+            test_verified_submit_request(&sender, [0xB6; 16], [0xB7; 16], 2_000, 0xB8);
+        let future_expected = seed_completed_verified_submit(&future_relay, &future_request);
+        let future_option = Some(Arc::clone(&future_relay));
+        let future_response = Server::handle_verified_chat_submit_with_clock(
+            future_request.clone(),
+            &session,
+            &future_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+            || 1_000,
+        )
+        .await;
+        assert_eq!(future_response.result, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
+        assert!(matches!(
+            future_relay
+                .verified_submit_cache_lookup(&future_request)
+                .expect("future rejection must preserve prior completion"),
+            VerifiedSubmitCacheLookup::Exact(response) if response == future_expected
+        ));
+        assert_no_verified_submit_delivery_effects(&future_relay, &sender);
     }
 
     #[tokio::test]
-    async fn verified_submit_stale_noncompleted_states_reject_without_delivery_effects() {
+    async fn verified_submit_stale_completed_replay_rejects_noncompleted_states() {
         let directory = tempfile::tempdir().expect("stale rejection directory");
         let relay = test_chat_relay_service(
             &directory.path().join("stale-rejections.sqlite3"),
@@ -22812,8 +22904,7 @@ mod tests {
         assert_eq!(legacy_history.proof_scope, "control_plane");
         assert_eq!(legacy_history.message_delivery_successes, 0);
 
-        // Reset only the test counter. The second round below must still prove
-        // that search continues past this legacy-only route to a signed receipt.
+        // Reset only the test counter. Thenly route to a signed receipt.
         legacy_requests.store(0, AtomicOrdering::SeqCst);
 
         let store = PeerStore::new();

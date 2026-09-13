@@ -9,6 +9,8 @@
 //   orchestration service.
 //
 // Main Functionality:
+//   [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] Separates read-only
+//   completed replay from fresh effect admission and unbounded-age local cache.
 //   - Serializes equal authenticated submissions through bounded lock lanes.
 //   - Resolves process-local and durable replay state in one use-case boundary.
 //   - Authenticates recovered sealed responses against their exact request.
@@ -126,6 +128,40 @@ impl VerifiedSubmitCoordinator {
         }
     }
 
+    /// Reads a retained completion without using or populating the memory cache.
+    ///
+    /// [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] Equality remains the
+    /// existing sender/request-id plus signed-envelope fingerprint, NOT equality
+    /// of every request byte: a newly signed timestamp does not change the key.
+    /// The handler must validate session ownership and both signatures first.
+    pub(crate) fn lookup_completed_readonly(
+        &self,
+        connection: &Mutex<Connection>,
+        request: &ChatRelayVerifiedSubmitRequestV1,
+        now: u64,
+    ) -> ChatRelayResult<Option<ChatRelayVerifiedSubmitResponseV1>> {
+        let cache_key = self.replay.cache_key(request);
+        let fingerprint = self.replay.envelope_fingerprint(request);
+        let Some(durable) =
+            self.store
+                .lookup_completed_readonly(connection, &cache_key, &fingerprint, now)?
+        else {
+            return Ok(None);
+        };
+        let response = self.replay.recover_response(
+            &cache_key,
+            &fingerprint,
+            &durable.nonce,
+            &durable.ciphertext,
+        )?;
+        response
+            .validate_for_request(request)
+            .map_err(|_| ChatRelayError::CorruptStoredData {
+                field: "verified_submit_response_request_binding",
+            })?;
+        Ok(Some(response))
+    }
+
     /// Atomically reserves one private replay slot before external effects.
     pub(crate) fn reserve(
         &self,
@@ -178,5 +214,131 @@ impl VerifiedSubmitCoordinator {
         self.replay
             .remember_cached(cache_key, envelope_fingerprint, response.clone());
         durable_result
+    }
+}
+
+#[cfg(test)]
+mod stale_replay_tests {
+    use super::*;
+    use aeronyx_core::crypto::IdentityKeyPair;
+    use aeronyx_core::protocol::chat::{ChatContentType, ChatEnvelope};
+    use aeronyx_core::protocol::memchain::CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1;
+
+    // [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] Real SQLite and
+    // production AEAD; no unbounded-age cache hit or cache fill is permitted.
+    #[test]
+    fn verified_submit_stale_completed_replay_authenticates_without_memory_cache() {
+        let connection = Mutex::new(Connection::open_in_memory().unwrap());
+        connection
+            .lock()
+            .execute_batch(
+                "CREATE TABLE relay_verified_submit_responses (
+                cache_key BLOB PRIMARY KEY, envelope_fingerprint BLOB,
+                response_nonce BLOB, response_ciphertext BLOB, completed_at INTEGER);
+             CREATE TABLE relay_verified_submit_reservations (
+                cache_key BLOB PRIMARY KEY, envelope_fingerprint BLOB,
+                reserved_at INTEGER, owner_epoch BLOB, owner_acquired_at INTEGER);",
+            )
+            .unwrap();
+        let sender = IdentityKeyPair::generate();
+        let mut envelope = ChatEnvelope {
+            message_id: [2; 16],
+            sender: sender.public_key_bytes(),
+            receiver: [3; 32],
+            timestamp: 1000,
+            ciphertext: vec![4; 16],
+            nonce: [5; 24],
+            content_type: ChatContentType::Text,
+            signature: [0; 64],
+        };
+        envelope.signature = sender.sign(&envelope.sign_data());
+        let request =
+            ChatRelayVerifiedSubmitRequestV1::signed([6; 16], envelope, 1000, &sender).unwrap();
+        let response = ChatRelayVerifiedSubmitResponseV1 {
+            request_id: request.request_id,
+            message_id: request.envelope.message_id,
+            result: CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
+            terminal_receipt: None,
+        };
+        let coordinator = VerifiedSubmitCoordinator::new([1; 32], 8, 121, 5).unwrap();
+        assert_eq!(
+            coordinator
+                .reserve(&connection, &request, &[7; 16], 1000)
+                .unwrap(),
+            VerifiedSubmitAdmission::Reserved
+        );
+        coordinator
+            .remember_response(&connection, &request, &response, &[7; 16], 1000)
+            .unwrap();
+        // Memory has a result, but its expired durable counterpart must not replay.
+        assert!(coordinator
+            .lookup_completed_readonly(&connection, &request, 1122)
+            .unwrap()
+            .is_none());
+        let recovered = VerifiedSubmitCoordinator::new([1; 32], 8, 121, 5).unwrap();
+        let key = recovered.replay.cache_key(&request);
+        let fingerprint = recovered.replay.envelope_fingerprint(&request);
+        let before: i64 = connection
+            .lock()
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            recovered
+                .lookup_completed_readonly(&connection, &request, 1121)
+                .unwrap(),
+            Some(response.clone())
+        );
+        assert!(matches!(
+            recovered.replay.lookup_cached(&key, &fingerprint),
+            VerifiedSubmitCacheLookup::Miss
+        ));
+        assert_eq!(
+            connection
+                .lock()
+                .query_row("SELECT total_changes()", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            before
+        );
+        // Correct AEAD but wrong response message id still fails binding.
+        let mut wrong_response = response;
+        wrong_response.message_id = [9; 16];
+        let protected = recovered
+            .replay
+            .protect_response(&key, &fingerprint, &wrong_response)
+            .unwrap();
+        connection.lock().execute(
+            "UPDATE relay_verified_submit_responses SET response_nonce=?1, response_ciphertext=?2",
+            rusqlite::params![protected.nonce.as_slice(), protected.ciphertext],
+        ).unwrap();
+        let before: i64 = connection
+            .lock()
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        assert!(recovered
+            .lookup_completed_readonly(&connection, &request, 1061)
+            .is_err());
+        assert_eq!(
+            connection
+                .lock()
+                .query_row("SELECT total_changes()", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            before
+        );
+        // Same legal length with unauthentic ciphertext must not leak plaintext.
+        connection.lock().execute("UPDATE relay_verified_submit_responses SET response_ciphertext=zeroblob(length(response_ciphertext))", []).unwrap();
+        let before: i64 = connection
+            .lock()
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        assert!(recovered
+            .lookup_completed_readonly(&connection, &request, 1061)
+            .is_err());
+        assert_eq!(
+            connection
+                .lock()
+                .query_row("SELECT total_changes()", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            before
+        );
     }
 }
