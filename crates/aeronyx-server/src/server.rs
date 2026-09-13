@@ -4,6 +4,9 @@
 // Version: 1.0.0-Membership
 //
 // Modification Reason:
+//   [ANONYMOUS-MAILBOX-CLEANUP-RUNTIME 2026-09-13 by Codex] Runs bounded
+//   custody and source-journal retention before readiness and in one
+//   supervised, non-overlapping, aggregate-only runtime maintenance task.
 //   [PROTOCOL-V2-ADMISSION-HOTFIX 2026-09-13 by Codex] Removed unauthenticated
 //   identity eviction from UDP ingress and finalizes only evictions returned
 //   by the authenticated, lifecycle-fenced handshake admission transition.
@@ -425,6 +428,10 @@
 // 153. [CHAT-DISPATCH-STORAGE-DECOUPLING 2026-09-02 by Codex] Dispatches chat
 //      runtime frames independently from optional MemChain persistence while
 //      rejecting storage-owned frames through a typed privacy-safe gate.
+// 154. [ANONYMOUS-MAILBOX-CLEANUP-RUNTIME 2026-09-13 by Codex] Opens and
+//      cleans explicitly enabled custody storage before readiness, then
+//      supervises non-overlapping custody/source retention with typed retry
+//      and fatal failure behavior; disabled storage has no path or task effect.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -1072,10 +1079,12 @@ use crate::services::chat_relay::{
     VerifiedSubmitRecoveryOutcome, MAX_CHAT_ACK_MESSAGE_IDS,
 };
 use crate::services::chat_relay_anonymous_mailbox_source::{
-    AnonymousMailboxSourceCoordinator, SqliteAnonymousMailboxSourceJournal,
+    AnonymousMailboxSourceCleanupReport, AnonymousMailboxSourceCoordinator,
+    AnonymousMailboxSourceError, SqliteAnonymousMailboxSourceJournal,
 };
 use crate::services::chat_relay_mailbox::{
-    AnonymousMailboxCustodyRepository, SqliteAnonymousMailboxStore,
+    AnonymousMailboxCleanupReport, AnonymousMailboxCustodyRepository, AnonymousMailboxStoreError,
+    SqliteAnonymousMailboxStore,
 };
 use crate::services::memchain::derive_rawlog_key;
 use crate::services::memchain::derive_record_key;
@@ -4298,6 +4307,96 @@ impl RequiredApiListenerExit {
     }
 }
 
+// [ANONYMOUS-MAILBOX-CLEANUP-RUNTIME 2026-09-13 by Codex] Keep the source
+// coordinator and its exact journal handle in one server-local composition.
+// The coordinator remains the only API-facing value; maintenance receives no
+// route, target, request, or ciphertext projection.
+struct AnonymousMailboxSourceRuntime {
+    coordinator: Arc<AnonymousMailboxSourceCoordinator>,
+    journal: Arc<SqliteAnonymousMailboxSourceJournal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnonymousMailboxCleanupFailureDisposition {
+    Retryable,
+    Fatal,
+}
+
+#[derive(Debug)]
+struct AnonymousMailboxCleanupCycleOutcome {
+    custody: Option<std::result::Result<AnonymousMailboxCleanupReport, AnonymousMailboxStoreError>>,
+    source: Option<
+        std::result::Result<AnonymousMailboxSourceCleanupReport, AnonymousMailboxSourceError>,
+    >,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnonymousMailboxCleanupLoopDirective {
+    Continue,
+    StopFatal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnonymousMailboxCleanupLoopExit {
+    Shutdown,
+    Fatal,
+}
+
+fn anonymous_mailbox_custody_cleanup_failure_disposition(
+    error: AnonymousMailboxStoreError,
+) -> AnonymousMailboxCleanupFailureDisposition {
+    match error {
+        AnonymousMailboxStoreError::Busy | AnonymousMailboxStoreError::Unavailable => {
+            AnonymousMailboxCleanupFailureDisposition::Retryable
+        }
+        AnonymousMailboxStoreError::Corrupt
+        | AnonymousMailboxStoreError::UnsupportedSchema
+        | AnonymousMailboxStoreError::Disabled
+        | AnonymousMailboxStoreError::Rejected => AnonymousMailboxCleanupFailureDisposition::Fatal,
+    }
+}
+
+fn anonymous_mailbox_source_cleanup_failure_disposition(
+    error: AnonymousMailboxSourceError,
+) -> AnonymousMailboxCleanupFailureDisposition {
+    match error {
+        AnonymousMailboxSourceError::Unavailable => {
+            AnonymousMailboxCleanupFailureDisposition::Retryable
+        }
+        AnonymousMailboxSourceError::Corrupt
+        | AnonymousMailboxSourceError::Disabled
+        | AnonymousMailboxSourceError::Rejected
+        | AnonymousMailboxSourceError::Conflict
+        | AnonymousMailboxSourceError::Ambiguous => {
+            AnonymousMailboxCleanupFailureDisposition::Fatal
+        }
+    }
+}
+
+async fn run_anonymous_mailbox_cleanup_loop<C, F>(
+    interval: Duration,
+    mut shutdown_rx: broadcast::Receiver<()>,
+    mut cycle: C,
+) -> AnonymousMailboxCleanupLoopExit
+where
+    C: FnMut() -> F,
+    F: std::future::Future<Output = AnonymousMailboxCleanupLoopDirective>,
+{
+    let mut timer = tokio::time::interval(interval);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => return AnonymousMailboxCleanupLoopExit::Shutdown,
+            _ = timer.tick() => {
+                if cycle().await == AnonymousMailboxCleanupLoopDirective::StopFatal {
+                    return AnonymousMailboxCleanupLoopExit::Fatal;
+                }
+            }
+        }
+    }
+}
+
 pub struct Server {
     config: ServerConfig,
     identity: IdentityKeyPair,
@@ -4503,7 +4602,7 @@ impl Server {
 
         let chat_relay_enabled = self.config.memchain.is_chat_relay_enabled();
         let chat_relay = self.init_chat_relay_service()?;
-        let anonymous_mailbox = self.init_anonymous_mailbox_store()?;
+        let anonymous_mailbox = self.init_anonymous_mailbox_store().await?;
         // [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Strict mode
         // consumes only already-durable local receipts. Startup does not
         // contact witnesses or let permissionless discovery supply authority.
@@ -4571,9 +4670,14 @@ impl Server {
                 "Anonymous mailbox source requires full authenticated VPN MPI runtime",
             ));
         }
-        let anonymous_mailbox_source = self
+        let anonymous_mailbox_source_runtime = self
             .init_anonymous_mailbox_source_coordinator(Arc::clone(&peer_store))
             .await?;
+        let anonymous_mailbox_source = anonymous_mailbox_source_runtime
+            .as_ref()
+            .map(|runtime| Arc::clone(&runtime.coordinator));
+        let anonymous_mailbox_source_journal =
+            anonymous_mailbox_source_runtime.map(|runtime| runtime.journal);
         if self.config.discovery.custody_audit_witness_runtime_required {
             // [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Runtime
             // custody starts only after authenticated PeerStore bootstrap.
@@ -4874,6 +4978,21 @@ impl Server {
                 }),
             ));
             info!("[CHAT_RELAY] Wallet route cleanup task started (ttl=300s, interval=60s)");
+        }
+
+        if let Some(cleanup_task) = self.spawn_anonymous_mailbox_cleanup_task(
+            anonymous_mailbox.clone(),
+            anonymous_mailbox_source_journal,
+        ) {
+            tasks.push((
+                "anonymous-mailbox-cleanup",
+                Self::supervise_required_runtime_task(
+                    "anonymous-mailbox-cleanup",
+                    cleanup_task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
         }
 
         if let Some(ref vault) = blind_vault {
@@ -5737,11 +5856,24 @@ impl Server {
 
     /// Opens the explicitly enabled node-blind mailbox repository. Disabled
     /// configuration performs no filesystem operation and is not advertised.
-    fn init_anonymous_mailbox_store(&self) -> Result<Option<Arc<SqliteAnonymousMailboxStore>>> {
+    async fn init_anonymous_mailbox_store(
+        &self,
+    ) -> Result<Option<Arc<SqliteAnonymousMailboxStore>>> {
+        self.init_anonymous_mailbox_store_at(unix_now_secs()).await
+    }
+
+    async fn init_anonymous_mailbox_store_at(
+        &self,
+        now: u64,
+    ) -> Result<Option<Arc<SqliteAnonymousMailboxStore>>> {
         let config = self.config.memchain.chat_relay.anonymous_mailbox.clone();
         if !config.enabled {
             return Ok(None);
         }
+        // [ANONYMOUS-MAILBOX-CLEANUP-RUNTIME 2026-09-13 by Codex] Opening and
+        // the first bounded cleanup share one blocking startup job. Readiness
+        // cannot become true while expired custody rows remain unaudited, and
+        // disabled configuration returns before any key or path operation.
         // [BLIND-RELAY-ANONYMOUS-MAILBOX 2026-09-03 by Codex] The cursor MAC
         // root is stable but private, independently domain-separated from the
         // existing chat relay secret, and never logged or returned.
@@ -5749,18 +5881,34 @@ impl Server {
         hasher.update(b"AeroNyx/anonymous-mailbox/cursor-root/v1");
         hasher.update(self.identity.to_bytes());
         let cursor_secret: [u8; 32] = hasher.finalize().into();
+        let identity = self.identity.clone();
         // [BLIND-RELAY-ANONYMOUS-MAILBOX-TICKET 2026-09-03 by Codex] The
         // mailbox ticket signer is precisely this node's existing identity;
         // no global/config issuer or additional private key is introduced.
         // Construct it before readiness advertisement so an enabled mailbox
         // cannot claim availability while ticket issuance is unavailable.
-        SqliteAnonymousMailboxStore::open_with_ticket_issuer(
-            config,
-            self.identity.clone(),
-            cursor_secret,
-        )
-        .map(|store| Some(Arc::new(store)))
-        .map_err(|_| ServerError::startup_failed("Anonymous mailbox initialization failed"))
+        let (store, report) = tokio::task::spawn_blocking(move || {
+            let store = Arc::new(SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                config,
+                identity,
+                cursor_secret,
+            )?);
+            let report = store.cleanup(now)?;
+            Ok::<_, AnonymousMailboxStoreError>((store, report))
+        })
+        .await
+        .map_err(|_| ServerError::startup_failed("Anonymous mailbox initialization failed"))?
+        .map_err(|_| ServerError::startup_failed("Anonymous mailbox initialization failed"))?;
+        info!(
+            leases_removed = report.leases_removed,
+            items_removed = report.items_removed,
+            bytes_removed = report.bytes_removed,
+            acknowledgements_removed = report.acknowledgements_removed,
+            tickets_removed = report.tickets_removed,
+            issued_tickets_removed = report.issued_tickets_removed,
+            "[ANONYMOUS_MAILBOX] Bounded startup cleanup completed"
+        );
+        Ok(Some(store))
     }
 
     /// Activates the optional source only after authenticated PeerStore
@@ -5770,7 +5918,7 @@ impl Server {
     async fn init_anonymous_mailbox_source_coordinator(
         &self,
         peer_store: Arc<PeerStore>,
-    ) -> Result<Option<Arc<AnonymousMailboxSourceCoordinator>>> {
+    ) -> Result<Option<AnonymousMailboxSourceRuntime>> {
         let config = self
             .config
             .memchain
@@ -5790,14 +5938,18 @@ impl Server {
         let journal_key: [u8; 32] = hasher.finalize().into();
         let source_identity = Arc::new(self.identity.clone());
         tokio::task::spawn_blocking(move || {
-            let journal = SqliteAnonymousMailboxSourceJournal::open(config, journal_key)?;
-            Ok::<_, crate::services::chat_relay_anonymous_mailbox_source::AnonymousMailboxSourceError>(
-                Arc::new(AnonymousMailboxSourceCoordinator::new(
+            let journal = Arc::new(SqliteAnonymousMailboxSourceJournal::open(
+                config,
+                journal_key,
+            )?);
+            Ok::<_, AnonymousMailboxSourceError>(AnonymousMailboxSourceRuntime {
+                coordinator: Arc::new(AnonymousMailboxSourceCoordinator::new(
                     source_identity,
                     peer_store,
-                    Arc::new(journal),
+                    Arc::clone(&journal),
                 )),
-            )
+                journal,
+            })
         })
         .await
         .map_err(|_| ServerError::startup_failed("Anonymous mailbox source initialization failed"))?
@@ -16668,6 +16820,183 @@ impl Server {
     // Cleanup Task
     // ============================================
 
+    fn run_anonymous_mailbox_cleanup_cycle(
+        custody: Option<Arc<SqliteAnonymousMailboxStore>>,
+        source: Option<Arc<SqliteAnonymousMailboxSourceJournal>>,
+        now: u64,
+    ) -> AnonymousMailboxCleanupCycleOutcome {
+        // Each repository already bounds one IMMEDIATE transaction. Keeping
+        // both calls in this single blocking closure makes overlap impossible
+        // while allowing an independent repository to report after its peer
+        // returned a coarse error.
+        let custody = custody.map(|store| store.cleanup(now));
+        let source = source.map(|journal| journal.cleanup_terminal_records(now));
+        AnonymousMailboxCleanupCycleOutcome { custody, source }
+    }
+
+    fn custody_cleanup_reason(error: AnonymousMailboxStoreError) -> &'static str {
+        match error {
+            AnonymousMailboxStoreError::Busy => "busy",
+            AnonymousMailboxStoreError::Unavailable => "unavailable",
+            AnonymousMailboxStoreError::Corrupt => "corrupt",
+            AnonymousMailboxStoreError::UnsupportedSchema => "unsupported_schema",
+            AnonymousMailboxStoreError::Disabled => "disabled",
+            AnonymousMailboxStoreError::Rejected => "rejected",
+        }
+    }
+
+    fn source_cleanup_reason(error: AnonymousMailboxSourceError) -> &'static str {
+        match error {
+            AnonymousMailboxSourceError::Unavailable => "unavailable",
+            AnonymousMailboxSourceError::Corrupt => "corrupt",
+            AnonymousMailboxSourceError::Disabled => "disabled",
+            AnonymousMailboxSourceError::Rejected => "rejected",
+            AnonymousMailboxSourceError::Conflict => "conflict",
+            AnonymousMailboxSourceError::Ambiguous => "ambiguous",
+        }
+    }
+
+    fn observe_anonymous_mailbox_cleanup_cycle(
+        outcome: AnonymousMailboxCleanupCycleOutcome,
+    ) -> AnonymousMailboxCleanupLoopDirective {
+        let mut fatal = false;
+        if let Some(result) = outcome.custody {
+            match result {
+                Ok(report) => {
+                    if report.leases_removed > 0
+                        || report.items_removed > 0
+                        || report.bytes_removed > 0
+                        || report.acknowledgements_removed > 0
+                        || report.tickets_removed > 0
+                        || report.issued_tickets_removed > 0
+                    {
+                        info!(
+                            component = "custody",
+                            leases_removed = report.leases_removed,
+                            items_removed = report.items_removed,
+                            bytes_removed = report.bytes_removed,
+                            acknowledgements_removed = report.acknowledgements_removed,
+                            tickets_removed = report.tickets_removed,
+                            issued_tickets_removed = report.issued_tickets_removed,
+                            "[ANONYMOUS_MAILBOX] Bounded cleanup completed"
+                        );
+                    }
+                }
+                Err(error) => {
+                    let reason = Self::custody_cleanup_reason(error);
+                    match anonymous_mailbox_custody_cleanup_failure_disposition(error) {
+                        AnonymousMailboxCleanupFailureDisposition::Retryable => warn!(
+                            component = "custody",
+                            reason, "[ANONYMOUS_MAILBOX] Cleanup deferred"
+                        ),
+                        AnonymousMailboxCleanupFailureDisposition::Fatal => {
+                            fatal = true;
+                            error!(
+                                component = "custody",
+                                reason, "[ANONYMOUS_MAILBOX] Cleanup invariant failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(result) = outcome.source {
+            match result {
+                Ok(report) => {
+                    if report.rows_removed > 0 || report.bytes_removed > 0 {
+                        info!(
+                            component = "source_journal",
+                            rows_removed = report.rows_removed,
+                            bytes_removed = report.bytes_removed,
+                            "[ANONYMOUS_MAILBOX] Bounded cleanup completed"
+                        );
+                    }
+                }
+                Err(error) => {
+                    let reason = Self::source_cleanup_reason(error);
+                    match anonymous_mailbox_source_cleanup_failure_disposition(error) {
+                        AnonymousMailboxCleanupFailureDisposition::Retryable => warn!(
+                            component = "source_journal",
+                            reason, "[ANONYMOUS_MAILBOX] Cleanup deferred"
+                        ),
+                        AnonymousMailboxCleanupFailureDisposition::Fatal => {
+                            fatal = true;
+                            error!(
+                                component = "source_journal",
+                                reason, "[ANONYMOUS_MAILBOX] Cleanup invariant failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if fatal {
+            AnonymousMailboxCleanupLoopDirective::StopFatal
+        } else {
+            AnonymousMailboxCleanupLoopDirective::Continue
+        }
+    }
+
+    /// Schedules one non-overlapping cleanup cycle for both anonymous stores.
+    ///
+    /// The task is absent when both features are disabled. A shutdown received
+    /// during spawn_blocking is observed immediately after the bounded cycle,
+    /// before a further interval can begin.
+    fn spawn_anonymous_mailbox_cleanup_task(
+        &self,
+        custody: Option<Arc<SqliteAnonymousMailboxStore>>,
+        source: Option<Arc<SqliteAnonymousMailboxSourceJournal>>,
+    ) -> Option<JoinHandle<()>> {
+        if custody.is_none() && source.is_none() {
+            return None;
+        }
+        let interval_secs = self.config.memchain.chat_relay.cleanup_interval_secs;
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            info!(
+                interval_secs,
+                "[ANONYMOUS_MAILBOX] Supervised bounded cleanup task started"
+            );
+            let exit = run_anonymous_mailbox_cleanup_loop(
+                Duration::from_secs(interval_secs),
+                shutdown_rx,
+                || {
+                    let custody = custody.clone();
+                    let source = source.clone();
+                    async move {
+                        let now = unix_now_secs();
+                        match tokio::task::spawn_blocking(move || {
+                            Self::run_anonymous_mailbox_cleanup_cycle(custody, source, now)
+                        })
+                        .await
+                        {
+                            Ok(outcome) => Self::observe_anonymous_mailbox_cleanup_cycle(outcome),
+                            Err(join_error) => {
+                                let reason = if join_error.is_panic() {
+                                    "cleanup_worker_panicked"
+                                } else {
+                                    "cleanup_worker_cancelled"
+                                };
+                                error!(
+                                    component = "blocking_worker",
+                                    reason, "[ANONYMOUS_MAILBOX] Cleanup worker failed"
+                                );
+                                AnonymousMailboxCleanupLoopDirective::StopFatal
+                            }
+                        }
+                    }
+                },
+            )
+            .await;
+            if exit == AnonymousMailboxCleanupLoopExit::Fatal {
+                error!(
+                    reason = "fatal_cleanup_invariant",
+                    "[ANONYMOUS_MAILBOX] Required cleanup task stopping"
+                );
+            }
+        }))
+    }
+
     /// Schedules durable `ChatRelay` TTL cleanup without blocking Tokio workers.
     ///
     /// The first interval tick runs immediately so a restarted node enforces
@@ -16875,6 +17204,10 @@ impl Server {
             // The coordinator lease task may finish one bounded renewal and
             // one bounded release round before exit.
             "memchain-coordinator-lease" => Duration::from_secs(12),
+            // One sequential custody+source cycle may observe both stores'
+            // bounded SQLite busy timeouts before it can receive shutdown.
+            // Keep the join below the service manager's 30-second ceiling.
+            "anonymous-mailbox-cleanup" => Duration::from_secs(15),
             // [DIRECTORY-SHUTDOWN-DURABILITY 2026-08-12 by Codex] The final
             // append performs a complete signed-prefix audit in `spawn_blocking`.
             // Tokio cannot cancel a running blocking closure, so aborting its
@@ -17157,6 +17490,9 @@ mod tests {
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
     use aeronyx_core::ledger::{RecordCommitmentBlockV1, GENESIS_PREV_HASH};
+    use aeronyx_core::protocol::anonymous_mailbox::{
+        AnonymousMailboxLeaseCreateV1, AnonymousMailboxTicketIssueV1,
+    };
     use aeronyx_core::protocol::auth::TIMESTAMP_WINDOW_SECS;
     use aeronyx_core::protocol::chat::{
         encode_envelope, BlindRelayDeliveryReceipt, ChatContentType, ChatEnvelope,
@@ -17198,6 +17534,10 @@ mod tests {
 
     use crate::api::discovery::{DiscoveryLocalCapabilityStatus, GossipResponse};
     use crate::config::{DiscoveryConfig, MemChainConfig, MemChainMode, ServerConfig};
+    use crate::services::chat_relay_mailbox::{
+        AnonymousMailboxCustodyRepository, AnonymousMailboxStoreError,
+        AnonymousMailboxTicketIssueOutcome,
+    };
 
     #[test]
     fn session_close_authentication_binds_transport_identity_and_id() {
@@ -17284,6 +17624,255 @@ mod tests {
         )
     }
 
+    const ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW: u64 = 1_800_020_000;
+
+    fn test_anonymous_mailbox_custody_server(enabled: bool, db_path: &std::path::Path) -> Server {
+        let mut config = ServerConfig::default();
+        config.memchain.chat_relay.anonymous_mailbox.enabled = enabled;
+        config.memchain.chat_relay.anonymous_mailbox.db_path =
+            db_path.to_string_lossy().into_owned();
+        config
+            .memchain
+            .chat_relay
+            .anonymous_mailbox
+            .ticket_issue_work_bits = 1;
+        Server::new(
+            config,
+            IdentityKeyPair::from_bytes(&[0xc1; 32]).expect("cleanup test identity"),
+            None,
+        )
+    }
+
+    fn test_anonymous_mailbox_ticket_issue(
+        server: &Server,
+        expires_at: u64,
+    ) -> AnonymousMailboxTicketIssueV1 {
+        let depositor = IdentityKeyPair::from_bytes(&[0xc2; 32]).expect("depositor");
+        let reader = IdentityKeyPair::from_bytes(&[0xc3; 32]).expect("reader");
+        let claims = AnonymousMailboxLeaseCreateV1::lease_claims_commitment(
+            &[0xc4; 32],
+            &depositor.public_key_bytes(),
+            &reader.public_key_bytes(),
+            2,
+            32,
+            ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW,
+            ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW + 1_000,
+        );
+        for nonce in 0..u64::MAX {
+            let request = AnonymousMailboxTicketIssueV1::new(
+                [0xc5; 16],
+                [0xc6; 16],
+                server.identity.public_key_bytes(),
+                claims,
+                ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW,
+                expires_at,
+                nonce,
+            )
+            .expect("ticket issue request");
+            if request.proof_digest().expect("proof digest")[0] & 0x80 == 0 {
+                return request;
+            }
+        }
+        unreachable!("one-bit work proof is reachable")
+    }
+
+    #[tokio::test]
+    async fn anonymous_mailbox_custody_startup_cleanup_precedes_readiness() {
+        // [ANONYMOUS-MAILBOX-CLEANUP-RUNTIME 2026-09-13 by Codex] Seed one
+        // valid expired ticket through the real repository, then prove the
+        // async production initializer reclaims it before returning Some.
+        let directory = tempfile::tempdir().expect("custody cleanup directory");
+        let private_parent =
+            std::fs::canonicalize(directory.path()).expect("canonical custody directory");
+        let db_path = private_parent.join("custody.sqlite");
+        let server = test_anonymous_mailbox_custody_server(true, &db_path);
+        let store = server
+            .init_anonymous_mailbox_store_at(ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW)
+            .await
+            .expect("initial custody open")
+            .expect("enabled custody");
+        let request =
+            test_anonymous_mailbox_ticket_issue(&server, ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW + 10);
+        assert!(matches!(
+            store
+                .issue_ticket(&request, ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW)
+                .expect("issue cleanup fixture"),
+            AnonymousMailboxTicketIssueOutcome::Issued(_)
+        ));
+        drop(store);
+        let before: i64 = rusqlite::Connection::open(&db_path)
+            .expect("inspect custody before restart")
+            .query_row(
+                "SELECT COUNT(*) FROM anonymous_mailbox_issued_tickets",
+                [],
+                |row| row.get(0),
+            )
+            .expect("issued ticket count before cleanup");
+        assert_eq!(before, 1);
+
+        let reopened = server
+            .init_anonymous_mailbox_store_at(ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW + 11)
+            .await
+            .expect("custody restart cleanup")
+            .expect("custody ready after cleanup");
+        drop(reopened);
+        let after: i64 = rusqlite::Connection::open(&db_path)
+            .expect("inspect custody after restart")
+            .query_row(
+                "SELECT COUNT(*) FROM anonymous_mailbox_issued_tickets",
+                [],
+                |row| row.get(0),
+            )
+            .expect("issued ticket count after cleanup");
+        assert_eq!(after, 0);
+    }
+
+    #[tokio::test]
+    async fn anonymous_mailbox_cleanup_disabled_has_no_path_or_task() {
+        let directory = tempfile::tempdir().expect("disabled cleanup directory");
+        let missing_parent = directory.path().join("not-created");
+        let db_path = missing_parent.join("custody.sqlite");
+        let server = test_anonymous_mailbox_custody_server(false, &db_path);
+        assert!(server
+            .init_anonymous_mailbox_store_at(ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW)
+            .await
+            .expect("disabled custody")
+            .is_none());
+        assert!(server
+            .spawn_anonymous_mailbox_cleanup_task(None, None)
+            .is_none());
+        assert!(!missing_parent.exists());
+    }
+
+    #[test]
+    fn anonymous_mailbox_cleanup_errors_are_retryable_or_fatal_by_contract() {
+        use super::{
+            AnonymousMailboxCleanupCycleOutcome, AnonymousMailboxCleanupLoopDirective,
+            AnonymousMailboxSourceError,
+        };
+
+        assert_eq!(
+            Server::observe_anonymous_mailbox_cleanup_cycle(AnonymousMailboxCleanupCycleOutcome {
+                custody: Some(Err(AnonymousMailboxStoreError::Busy)),
+                source: Some(Err(AnonymousMailboxSourceError::Unavailable)),
+            }),
+            AnonymousMailboxCleanupLoopDirective::Continue
+        );
+        assert_eq!(
+            Server::observe_anonymous_mailbox_cleanup_cycle(AnonymousMailboxCleanupCycleOutcome {
+                custody: Some(Err(AnonymousMailboxStoreError::UnsupportedSchema)),
+                source: None,
+            }),
+            AnonymousMailboxCleanupLoopDirective::StopFatal
+        );
+        assert_eq!(
+            Server::observe_anonymous_mailbox_cleanup_cycle(AnonymousMailboxCleanupCycleOutcome {
+                custody: None,
+                source: Some(Err(AnonymousMailboxSourceError::Corrupt)),
+            }),
+            AnonymousMailboxCleanupLoopDirective::StopFatal
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn anonymous_mailbox_cleanup_loop_skips_overlap_and_finishes_shutdown() {
+        use super::{
+            run_anonymous_mailbox_cleanup_loop, AnonymousMailboxCleanupLoopDirective,
+            AnonymousMailboxCleanupLoopExit,
+        };
+        use tokio::sync::Notify;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum_active = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let loop_calls = Arc::clone(&calls);
+        let loop_active = Arc::clone(&active);
+        let loop_maximum = Arc::clone(&maximum_active);
+        let loop_started = Arc::clone(&started);
+        let loop_release = Arc::clone(&release);
+        let task = tokio::spawn(run_anonymous_mailbox_cleanup_loop(
+            Duration::from_secs(10),
+            shutdown_rx,
+            move || {
+                let calls = Arc::clone(&loop_calls);
+                let active = Arc::clone(&loop_active);
+                let maximum = Arc::clone(&loop_maximum);
+                let started = Arc::clone(&loop_started);
+                let release = Arc::clone(&loop_release);
+                async move {
+                    let call = calls.fetch_add(1, AtomicOrdering::SeqCst);
+                    let concurrent = active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    maximum.fetch_max(concurrent, AtomicOrdering::SeqCst);
+                    if call == 0 {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    active.fetch_sub(1, AtomicOrdering::SeqCst);
+                    AnonymousMailboxCleanupLoopDirective::Continue
+                }
+            },
+        ));
+        started.notified().await;
+        tokio::time::advance(Duration::from_secs(100)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(maximum_active.load(AtomicOrdering::SeqCst), 1);
+
+        release.notify_one();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(maximum_active.load(AtomicOrdering::SeqCst), 1);
+        shutdown_tx.send(()).expect("request cleanup shutdown");
+        assert_eq!(
+            task.await.expect("cleanup loop task"),
+            AnonymousMailboxCleanupLoopExit::Shutdown
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn anonymous_mailbox_cleanup_loop_retries_then_stops_on_fatal() {
+        use super::{
+            run_anonymous_mailbox_cleanup_loop, AnonymousMailboxCleanupLoopDirective,
+            AnonymousMailboxCleanupLoopExit,
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let loop_calls = Arc::clone(&calls);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(run_anonymous_mailbox_cleanup_loop(
+            Duration::from_secs(10),
+            shutdown_rx,
+            move || {
+                let call = loop_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                async move {
+                    if call == 0 {
+                        AnonymousMailboxCleanupLoopDirective::Continue
+                    } else {
+                        AnonymousMailboxCleanupLoopDirective::StopFatal
+                    }
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            !task.is_finished(),
+            "retryable cycle must keep supervision alive"
+        );
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(
+            task.await.expect("fatal cleanup loop"),
+            AnonymousMailboxCleanupLoopExit::Fatal
+        );
+    }
+
     // [ANONYMOUS-MAILBOX-SOURCE-STARTUP-ACCEPTANCE 2026-09-05 by Codex]
     // These fixtures call the production coordinator initializer directly, but
     // own only a synthetic temporary path and an empty in-memory peer view.
@@ -17326,8 +17915,19 @@ mod tests {
         let first = server
             .init_anonymous_mailbox_source_coordinator(Arc::new(PeerStore::new()))
             .await
-            .expect("enabled source must open a private journal");
-        assert!(first.is_some());
+            .expect("enabled source must open a private journal")
+            .expect("enabled source runtime");
+        let cleanup = Server::run_anonymous_mailbox_cleanup_cycle(
+            None,
+            Some(Arc::clone(&first.journal)),
+            ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW,
+        );
+        let report = cleanup
+            .source
+            .expect("source cleanup")
+            .expect("source report");
+        assert_eq!(report.rows_removed, 0);
+        assert_eq!(report.bytes_removed, 0);
         assert!(db_path.is_file());
         drop(first);
 
@@ -17452,7 +18052,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(source),
+                Some(source.coordinator),
                 udp,
                 &peer_http_clients,
                 None,
@@ -18715,6 +19315,10 @@ mod tests {
         assert_eq!(
             Server::runtime_task_shutdown_grace("discovery-gossip"),
             Duration::from_secs(24)
+        );
+        assert_eq!(
+            Server::runtime_task_shutdown_grace("anonymous-mailbox-cleanup"),
+            Duration::from_secs(15)
         );
         assert_eq!(
             Server::runtime_task_shutdown_grace("udp"),
