@@ -50,7 +50,7 @@
 //     heartbeat/nodeboard stability triage without logging per-session details.
 // ============================================
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -165,6 +165,16 @@ pub struct PacketDropReasonCounters {
 #[derive(Debug)]
 pub enum DecryptedPayload {
     Vpn(Vec<u8>),
+    /// [PROTOCOL-V2] Authenticated liveness probe; answer with a pong.
+    ControlPing {
+        id: [u8; 2],
+    },
+    /// [PROTOCOL-V2] The client's answer to our probe.
+    ControlPong,
+    /// [PROTOCOL-V2] Authenticated close: release the session and its IP.
+    ControlDisconnect {
+        reason: u8,
+    },
     KeepaliveAck {
         rtt_ms: f64,
     },
@@ -258,7 +268,14 @@ impl PacketHandler {
     /// Returns (session, DecryptedPayload) on success.
     /// Returns Err(SessionNotFound) when session ID is unknown —
     /// caller should send 0xFF RESET to client.
-    pub fn handle_udp_packet(&self, data: &[u8]) -> Result<(Arc<Session>, DecryptedPayload)> {
+    /// `source` is the datagram's UDP source. Once the packet has
+    /// authenticated it becomes the session's endpoint, so a client that
+    /// roamed (new NAT binding, Wi-Fi → cellular) keeps its tunnel.
+    pub fn handle_udp_packet(
+        &self,
+        data: &[u8],
+        source: SocketAddr,
+    ) -> Result<(Arc<Session>, DecryptedPayload)> {
         if data.len() < DATA_PACKET_HEADER_SIZE + ENCRYPTION_OVERHEAD {
             self.record_drop_reason(PacketDropReason::ShortPacket);
             return Err(ServerError::invalid_packet(
@@ -324,7 +341,9 @@ impl PacketHandler {
             }
         };
 
-        if !session.validate_rx_counter(packet.counter) {
+        // [2026-09-12] Read-only check first; the window is advanced only
+        // after the AEAD tag verifies (see commit_rx_counter below).
+        if !session.precheck_rx_counter(packet.counter) {
             self.record_drop_reason(PacketDropReason::Replay);
             warn!(counter = packet.counter, "Replay attack detected");
             return Err(ServerError::Core(aeronyx_core::error::CoreError::replay(
@@ -335,7 +354,7 @@ impl PacketHandler {
 
         let mut plaintext = vec![0u8; packet.encrypted_payload.len()];
         let plaintext_len = match self.crypto.decrypt(
-            &session.session_key,
+            &session.rx_key,
             packet.counter,
             &packet.session_id,
             &packet.encrypted_payload,
@@ -348,6 +367,7 @@ impl PacketHandler {
             }
         };
         plaintext.truncate(plaintext_len);
+        session.commit_rx_counter(packet.counter);
 
         session.touch();
         // Maintenance drain must be based on authenticated client liveness.
@@ -364,8 +384,34 @@ impl PacketHandler {
         // packet payloads, domains, URLs, browsing history, client public IPs,
         // voucher secrets, or wallet-level traffic.
         session.mark_client_activity();
+        if session.update_endpoint(source) {
+            debug!(session_id = %session.id, "[ROAM] Client endpoint updated");
+        }
 
         let payload = match plaintext.first().copied() {
+            // [PROTOCOL-V2] In-tunnel control frames: [0x00, op, ...].
+            Some(0x00) => {
+                let op = plaintext.get(1).copied().unwrap_or(0xFF);
+                match op {
+                    0x01 => DecryptedPayload::ControlPing {
+                        id: [
+                            plaintext.get(2).copied().unwrap_or(0),
+                            plaintext.get(3).copied().unwrap_or(0),
+                        ],
+                    },
+                    0x02 => DecryptedPayload::ControlPong,
+                    0x03 => DecryptedPayload::ControlDisconnect {
+                        reason: plaintext.get(2).copied().unwrap_or(0),
+                    },
+                    _ => {
+                        self.record_drop_reason(PacketDropReason::ProtocolInvalid);
+                        return Err(ServerError::invalid_packet(
+                            redacted_packet_addr(),
+                            "Unknown control frame",
+                        ));
+                    }
+                }
+            }
             // ── IPv4 VPN ──────────────────────────────────────────────
             Some(b) if b >> 4 == 4 => {
                 if plaintext_len < IPV4_HEADER_MIN_SIZE {
@@ -523,6 +569,20 @@ impl PacketHandler {
     }
 
     /// Processes an IP packet from the TUN device (outbound: server → client).
+    /// Wrap a control frame (or any small payload) for `session` in an
+    /// authenticated data packet: what a pong or a server-side close is.
+    pub fn seal_control(&self, session: &Session, frame: &[u8]) -> Result<Vec<u8>> {
+        let counter = session.next_tx_counter();
+        let mut encrypted = vec![0u8; frame.len() + ENCRYPTION_OVERHEAD];
+        let actual_len = self
+            .crypto
+            .encrypt(&session.session_key, counter, session.id.as_bytes(), frame, &mut encrypted)
+            .map_err(ServerError::Core)?;
+        encrypted.truncate(actual_len);
+        session.stats.record_control_tx();
+        Ok(encode_data_packet(&DataPacket::new(*session.id.as_bytes(), counter, encrypted)).to_vec())
+    }
+
     pub fn handle_tun_packet(&self, ip_packet: &[u8]) -> Result<(Vec<u8>, std::net::SocketAddr)> {
         if ip_packet.len() < IPV4_HEADER_MIN_SIZE {
             self.record_drop_reason(PacketDropReason::ShortPacket);
@@ -593,7 +653,7 @@ impl PacketHandler {
             "TUN packet encrypted and sent"
         );
 
-        Ok((output, session.client_endpoint))
+        Ok((output, session.endpoint()))
     }
 
     #[inline]
@@ -721,7 +781,7 @@ impl PacketHandler {
         let output = encode_data_packet(&data_packet).to_vec();
         session.stats.record_control_tx();
 
-        Ok((output, session.client_endpoint))
+        Ok((output, session.endpoint()))
     }
 }
 
@@ -1025,7 +1085,7 @@ mod tests {
     fn test_udp_short_packet_records_privacy_safe_drop_reason() {
         let handler = make_handler();
 
-        assert!(handler.handle_udp_packet(&[0x01, 0x02, 0x03]).is_err());
+        assert!(handler.handle_udp_packet(&[0x01, 0x02, 0x03], "127.0.0.1:40000".parse().unwrap()).is_err());
 
         let status = handler.runtime_status();
         assert_eq!(status.drop_reasons.short_packet, 1);

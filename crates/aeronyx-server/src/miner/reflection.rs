@@ -2274,7 +2274,7 @@ impl ReflectionMiner {
             enc.truncate(len);
             let pkt = DataPacket::new(*s.id.as_bytes(), ctr, enc);
             let bytes = encode_data_packet(&pkt).to_vec();
-            if self.udp.send(&bytes, &s.client_endpoint).await.is_ok() {
+            if self.udp.send(&bytes, &s.endpoint()).await.is_ok() {
                 sent += 1;
             }
         }

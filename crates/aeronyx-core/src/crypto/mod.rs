@@ -124,3 +124,17 @@ pub const HKDF_SALT: &[u8] = b"aeronyx-v1";
 
 /// HKDF info prefix for key derivation.
 pub const HKDF_INFO_PREFIX: &[u8] = b"aeronyx-session-key";
+
+// ── Protocol v0x02 (2026-09-12) ─────────────────────────────────────────────
+// v0x01 derived ONE key for both directions and built the nonce from the
+// packet counter alone; both peers counted from ~0, so client packet N and
+// server packet N shared (key, nonce) — ChaCha20-Poly1305 keystream reuse.
+// v0x02 derives one key per direction from a transcript-bound HKDF.
+/// HKDF salt for v0x02 session keys.
+pub const PROTOCOL_V2_HKDF_SALT: &[u8] = b"aeronyx-v2";
+/// HKDF info label for the client→server key (the transcript hash follows).
+pub const PROTOCOL_V2_INFO_C2S: &[u8] = b"aeronyx-v2 c2s";
+/// HKDF info label for the server→client key (the transcript hash follows).
+pub const PROTOCOL_V2_INFO_S2C: &[u8] = b"aeronyx-v2 s2c";
+/// Domain label mixed into the v0x02 transcript hash.
+pub const PROTOCOL_V2_TRANSCRIPT_LABEL: &[u8] = b"aeronyx-v2-transcript";

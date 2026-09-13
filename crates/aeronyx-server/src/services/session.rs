@@ -167,6 +167,8 @@ use tracing::{debug, info, trace};
 use aeronyx_common::time::AtomicInstant;
 use aeronyx_common::types::SessionId;
 use aeronyx_core::crypto::keys::{IdentityPublicKey, SessionKey};
+use aeronyx_core::crypto::kdf::SessionKeys;
+use aeronyx_core::protocol::{PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2};
 
 use crate::error::{Result, ServerError};
 
@@ -399,6 +401,34 @@ impl Default for ReplayWindow {
     }
 }
 
+impl ReplayWindow {
+    /// Would `counter` be accepted right now? Read-only: nothing is recorded
+    /// until [`ReplayWindow::check_and_record`] runs — which the packet path
+    /// now does only AFTER the packet authenticated.
+    ///
+    /// [2026-09-12] The window used to be advanced before decryption, so a
+    /// spoofed packet carrying the session id and a huge counter slid it
+    /// forward and every genuine packet after it was "too old".
+    #[must_use]
+    pub fn precheck(&self, counter: u64) -> ReplayCheckResult {
+        if !self.has_seen_any || counter > self.highest_seen {
+            return ReplayCheckResult::AcceptAndAdvance;
+        }
+        let window_base = if self.highest_seen >= REPLAY_WINDOW_SIZE - 1 {
+            self.highest_seen - REPLAY_WINDOW_SIZE + 1
+        } else {
+            0
+        };
+        if counter < window_base {
+            return ReplayCheckResult::TooOld;
+        }
+        if self.get_bit(counter) {
+            return ReplayCheckResult::Replay;
+        }
+        ReplayCheckResult::Accept
+    }
+}
+
 impl std::fmt::Debug for ReplayWindow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplayWindow")
@@ -620,11 +650,23 @@ pub struct Session {
     /// Client's long-term Ed25519 identity public key.
     pub client_public_key: IdentityPublicKey,
     /// Derived symmetric session key for XChaCha20-Poly1305.
+    /// Server → client key (this node encrypts with it). For a v0x01
+    /// session it is also the client → server key.
     pub session_key: SessionKey,
+    /// Client → server key (this node decrypts with it). Distinct from
+    /// `session_key` for v0x02 — that distinction is what makes the
+    /// counter-derived nonce safe across the two directions.
+    pub rx_key: SessionKey,
+    /// The hello version this session negotiated.
+    pub protocol_version: u8,
     /// Virtual IPv4 address assigned to this client inside the tunnel.
     pub virtual_ip: Ipv4Addr,
     /// Client's UDP endpoint (source address at handshake time).
+    /// The UDP source at handshake time (diagnostics). Traffic goes to
+    /// [`Session::endpoint`], which follows the client as it roams.
     pub client_endpoint: SocketAddr,
+    /// Where the client last authenticated from.
+    endpoint: RwLock<SocketAddr>,
     /// Time the session was created.
     pub created_at: std::time::Instant,
     /// Time of the most recent activity, used for idle-timeout cleanup.
@@ -676,9 +718,12 @@ impl Session {
             id,
             state: RwLock::new(SessionState::Established),
             client_public_key,
+            rx_key: session_key.clone(),
             session_key,
+            protocol_version: PROTOCOL_VERSION_V1,
             virtual_ip,
             client_endpoint,
+            endpoint: RwLock::new(client_endpoint),
             created_at: now,
             last_activity: AtomicInstant::from_instant(now),
             client_activity: AtomicInstant::from_instant(now),
@@ -860,6 +905,64 @@ impl Session {
     }
 }
 
+impl Session {
+    /// A v0x02 session: one key per direction, negotiated by the transcript-
+    /// bound handshake.
+    #[must_use]
+    pub fn new_v2(
+        id: SessionId,
+        client_public_key: IdentityPublicKey,
+        keys: SessionKeys,
+        virtual_ip: Ipv4Addr,
+        client_endpoint: SocketAddr,
+    ) -> Self {
+        let mut session = Self::new(id, client_public_key, keys.s2c, virtual_ip, client_endpoint);
+        session.rx_key = keys.c2s;
+        session.protocol_version = PROTOCOL_VERSION_V2;
+        session
+    }
+
+    /// Where the client last authenticated from — the address return
+    /// traffic goes to.
+    #[must_use]
+    pub fn endpoint(&self) -> SocketAddr {
+        *self.endpoint.read()
+    }
+
+    /// Follow the client to a new source address. Callers pass only the
+    /// source of a packet that has already authenticated, so a spoofed
+    /// datagram cannot redirect a session's return traffic.
+    /// Returns true when the endpoint actually changed.
+    pub fn update_endpoint(&self, source: SocketAddr) -> bool {
+        if *self.endpoint.read() == source {
+            return false;
+        }
+        *self.endpoint.write() = source;
+        true
+    }
+
+    /// Read-only replay check for the packet path: must precede decryption.
+    #[must_use]
+    pub fn precheck_rx_counter(&self, counter: u64) -> bool {
+        match self.replay_window.lock().precheck(counter) {
+            ReplayCheckResult::Accept | ReplayCheckResult::AcceptAndAdvance => true,
+            ReplayCheckResult::Replay => {
+                self.stats.record_replay_rejected();
+                false
+            }
+            ReplayCheckResult::TooOld => {
+                self.stats.record_too_old_rejected();
+                false
+            }
+        }
+    }
+
+    /// Record a counter whose packet has authenticated.
+    pub fn commit_rx_counter(&self, counter: u64) {
+        let _ = self.validate_rx_counter(counter);
+    }
+}
+
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (window_base, highest_seen) = self.replay_window_info();
@@ -868,6 +971,7 @@ impl std::fmt::Debug for Session {
             .field("state", &self.state())
             .field("virtual_ip", &self.virtual_ip)
             .field("client_endpoint", &self.client_endpoint)
+            .field("endpoint", &self.endpoint())
             .field("idle_time", &self.idle_time())
             .field("client_inactive_time", &self.client_inactive_time())
             .field(
@@ -1337,6 +1441,39 @@ impl std::fmt::Debug for SessionManager {
 // ============================================
 // Tests
 // ============================================
+
+impl SessionManager {
+    /// Like [`SessionManager::create`], for a v0x02 session with per-direction
+    /// keys.
+    pub fn create_v2(
+        &self,
+        session_id: SessionId,
+        client_public_key: IdentityPublicKey,
+        keys: SessionKeys,
+        virtual_ip: Ipv4Addr,
+        client_endpoint: SocketAddr,
+    ) -> Result<Arc<Session>> {
+        let _lifecycle_guard = self.lifecycle_lock.lock();
+        if self.sessions.contains_key(&session_id) {
+            return Err(ServerError::SessionExists);
+        }
+        if self.sessions.len() >= self.max_sessions {
+            return Err(ServerError::SessionLimitReached {
+                limit: self.max_sessions,
+            });
+        }
+        let session = Arc::new(Session::new_v2(
+            session_id.clone(),
+            client_public_key,
+            keys,
+            virtual_ip,
+            client_endpoint,
+        ));
+        self.sessions
+            .insert(session_id.clone(), Arc::clone(&session));
+        Ok(session)
+    }
+}
 
 #[cfg(test)]
 mod tests {

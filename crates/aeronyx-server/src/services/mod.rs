@@ -296,6 +296,7 @@ pub mod directory_chain;
 pub mod directory_replica;
 pub mod dns_proxy;
 pub mod handshake;
+pub mod handshake_limiter;
 pub mod ip_pool;
 pub mod memchain;
 pub mod node_policy;
@@ -353,6 +354,7 @@ pub use directory_replica::{
 };
 pub use dns_proxy::{spawn_dns_proxy, start_dns_proxy};
 pub use handshake::HandshakeService;
+pub use handshake_limiter::HandshakeLimiter;
 pub use ip_pool::IpPoolService;
 pub use memchain::{AofWriter, MemPool};
 pub use node_policy::{

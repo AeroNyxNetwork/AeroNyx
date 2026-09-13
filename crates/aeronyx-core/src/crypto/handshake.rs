@@ -51,10 +51,15 @@
 //! v0.1.1 - Redacted sensitive handshake material from crypto logs
 //! v0.1.0 - Initial handshake crypto implementation
 
-use crate::crypto::kdf::derive_session_key;
+use crate::crypto::kdf::{
+    derive_session_key, derive_session_keys_v2, transcript_hash_v2, SessionKeys,
+};
 use crate::crypto::keys::{EphemeralKeyPair, IdentityKeyPair, IdentityPublicKey, SessionKey};
 use crate::error::{CoreError, Result};
+use crate::protocol::messages::PROTOCOL_VERSION_V2;
 use crate::protocol::{ClientHello, ServerHello};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use aeronyx_common::time::Timestamp;
 use tracing::{debug, trace, warn};
@@ -124,6 +129,36 @@ pub trait HandshakeCrypto: Send + Sync {
         assigned_ip: [u8; 4],
         session_id: [u8; 16],
     ) -> Result<(ServerHello, SessionKey)>;
+
+    /// v0x02: like [`verify_client_hello`], but the signature also covers
+    /// `SHA-256(extension)` — the voucher bytes that trail the fixed hello —
+    /// so a voucher observed on the wire cannot be re-attached to another
+    /// client's hello.
+    ///
+    /// [`verify_client_hello`]: HandshakeCrypto::verify_client_hello
+    fn verify_client_hello_v2(&self, msg: &ClientHello, extension: &[u8]) -> Result<()> {
+        let _ = (msg, extension);
+        Err(CoreError::UnsupportedVersion {
+            got: PROTOCOL_VERSION_V2,
+            expected: 0x01,
+        })
+    }
+
+    /// v0x02: answer a verified hello with a transcript-bound ServerHello and
+    /// derive the two per-direction session keys.
+    fn process_handshake_v2(
+        &self,
+        client_hello: &ClientHello,
+        extension: &[u8],
+        assigned_ip: [u8; 4],
+        session_id: [u8; 16],
+    ) -> Result<(ServerHello, SessionKeys)> {
+        let _ = (client_hello, extension, assigned_ip, session_id);
+        Err(CoreError::UnsupportedVersion {
+            got: PROTOCOL_VERSION_V2,
+            expected: 0x01,
+        })
+    }
 }
 
 // ============================================
@@ -208,6 +243,26 @@ impl DefaultHandshakeCrypto {
     /// session_id (16 bytes) ||
     /// client_public_key (32 bytes)
     /// ```
+    /// v0x02 client signing data: the v0x01 fields followed by the SHA-256 of
+    /// the trailing extension (empty extension → hash of the empty string).
+    #[must_use]
+    pub fn client_hello_sign_data_v2(msg: &ClientHello, extension: &[u8]) -> Vec<u8> {
+        let mut data = Self::client_hello_sign_data(msg);
+        data.extend_from_slice(&Sha256::digest(extension));
+        data
+    }
+
+    /// v0x02 server signing data: the v0x01 fields followed by the client's
+    /// ephemeral key and timestamp, so this ServerHello answers exactly one
+    /// ClientHello and cannot be replayed to a later one.
+    #[must_use]
+    pub fn server_hello_sign_data_v2(msg: &ServerHello, client: &ClientHello) -> Vec<u8> {
+        let mut data = Self::server_hello_sign_data(msg, &client.client_public_key);
+        data.extend_from_slice(&client.client_ephemeral_key);
+        data.extend_from_slice(&client.timestamp.to_le_bytes());
+        data
+    }
+
     fn server_hello_sign_data(msg: &ServerHello, client_public: &[u8; 32]) -> Vec<u8> {
         let mut data = Vec::with_capacity(118);
         data.push(msg.message_type);
@@ -442,6 +497,61 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
 
         Ok((server_hello, session_key))
     }
+
+    fn verify_client_hello_v2(&self, msg: &ClientHello, extension: &[u8]) -> Result<()> {
+        if msg.version != PROTOCOL_VERSION_V2 {
+            return Err(CoreError::UnsupportedVersion {
+                got: msg.version,
+                expected: PROTOCOL_VERSION_V2,
+            });
+        }
+        let timestamp = Timestamp::from_secs(msg.timestamp);
+        if !timestamp.is_recent(self.max_timestamp_skew) {
+            return Err(CoreError::invalid_timestamp(format!(
+                "Timestamp {} is not recent (max skew: {}s)",
+                msg.timestamp, self.max_timestamp_skew
+            )));
+        }
+        let sign_data = Self::client_hello_sign_data_v2(msg, extension);
+        let client_public = IdentityPublicKey::from_bytes(&msg.client_public_key)?;
+        client_public.verify(&sign_data, &msg.signature)
+    }
+
+    fn process_handshake_v2(
+        &self,
+        client_hello: &ClientHello,
+        extension: &[u8],
+        assigned_ip: [u8; 4],
+        session_id: [u8; 16],
+    ) -> Result<(ServerHello, SessionKeys)> {
+        if client_hello.version != PROTOCOL_VERSION_V2 {
+            return Err(CoreError::UnsupportedVersion {
+                got: client_hello.version,
+                expected: PROTOCOL_VERSION_V2,
+            });
+        }
+        let ephemeral = EphemeralKeyPair::generate();
+        let server_ephemeral_public = ephemeral.public_key_bytes();
+        let mut shared_secret = ephemeral.exchange(&client_hello.client_ephemeral_key);
+
+        let mut server_hello = ServerHello {
+            message_type: crate::protocol::MessageType::ServerHello as u8,
+            version: PROTOCOL_VERSION_V2,
+            server_public_key: self.identity.public_key_bytes(),
+            server_ephemeral_key: server_ephemeral_public,
+            assigned_ip,
+            session_id,
+            signature: [0u8; 64],
+        };
+        let server_sign_data = Self::server_hello_sign_data_v2(&server_hello, client_hello);
+        server_hello.signature = self.identity.sign(&server_sign_data);
+
+        let client_sign_data = Self::client_hello_sign_data_v2(client_hello, extension);
+        let transcript = transcript_hash_v2(&client_sign_data, &server_sign_data);
+        let keys = derive_session_keys_v2(&shared_secret, &transcript);
+        shared_secret.zeroize();
+        Ok((server_hello, keys?))
+    }
 }
 
 // ============================================
@@ -587,10 +697,156 @@ pub fn create_client_hello(
 // Tests
 // ============================================
 
+// ============================================
+// Client-side v0x02 helpers (used by tests, smoke clients, and the app core's
+// reference implementation)
+// ============================================
+
+/// Build and sign a v0x02 ClientHello. `extension` is the exact trailing byte
+/// string that will follow the 138-byte hello on the wire (voucher block or
+/// empty); it is covered by the signature.
+#[must_use]
+pub fn create_client_hello_v2(
+    identity: &IdentityKeyPair,
+    ephemeral_public: [u8; 32],
+    extension: &[u8],
+) -> ClientHello {
+    let mut msg = ClientHello {
+        message_type: crate::protocol::MessageType::ClientHello as u8,
+        version: PROTOCOL_VERSION_V2,
+        client_public_key: identity.public_key_bytes(),
+        client_ephemeral_key: ephemeral_public,
+        timestamp: Timestamp::now().as_secs(),
+        signature: [0u8; 64],
+    };
+    let sign_data = DefaultHandshakeCrypto::client_hello_sign_data_v2(&msg, extension);
+    msg.signature = identity.sign(&sign_data);
+    msg
+}
+
+/// Verify a v0x02 ServerHello against the ClientHello it must answer.
+/// `expected_server_public` pins the node identity when the caller knows it
+/// (from the signed node directory); a mismatch fails before the signature
+/// is even checked.
+pub fn verify_server_hello_v2(
+    server_hello: &ServerHello,
+    client_hello: &ClientHello,
+    expected_server_public: Option<&[u8; 32]>,
+) -> Result<()> {
+    if server_hello.version != PROTOCOL_VERSION_V2 {
+        return Err(CoreError::UnsupportedVersion {
+            got: server_hello.version,
+            expected: PROTOCOL_VERSION_V2,
+        });
+    }
+    if let Some(expected) = expected_server_public {
+        if expected != &server_hello.server_public_key {
+            return Err(CoreError::SignatureVerification);
+        }
+    }
+    let sign_data = DefaultHandshakeCrypto::server_hello_sign_data_v2(server_hello, client_hello);
+    let server_public = IdentityPublicKey::from_bytes(&server_hello.server_public_key)?;
+    server_public.verify(&sign_data, &server_hello.signature)
+}
+
+/// The client's side of the v0x02 key schedule.
+pub fn derive_client_session_keys_v2(
+    shared_secret: &[u8; 32],
+    client_hello: &ClientHello,
+    extension: &[u8],
+    server_hello: &ServerHello,
+) -> Result<SessionKeys> {
+    let client_sign_data = DefaultHandshakeCrypto::client_hello_sign_data_v2(client_hello, extension);
+    let server_sign_data = DefaultHandshakeCrypto::server_hello_sign_data_v2(server_hello, client_hello);
+    let transcript = transcript_hash_v2(&client_sign_data, &server_sign_data);
+    derive_session_keys_v2(shared_secret, &transcript)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::CURRENT_PROTOCOL_VERSION;
+
+    // ── v0x02 ────────────────────────────────────────────────────────────
+
+    fn v2_pair() -> (DefaultHandshakeCrypto, IdentityKeyPair) {
+        (
+            DefaultHandshakeCrypto::new(IdentityKeyPair::generate()),
+            IdentityKeyPair::generate(),
+        )
+    }
+
+    #[test]
+    fn v2_handshake_agrees_on_two_distinct_direction_keys() {
+        let (server, client) = v2_pair();
+        let client_eph = EphemeralKeyPair::generate();
+        let extension = b"AVCH\x03\x00abc";
+        let hello = create_client_hello_v2(&client, client_eph.public_key_bytes(), extension);
+        server.verify_client_hello_v2(&hello, extension).expect("client hello verifies");
+        let (server_hello, server_keys) = server
+            .process_handshake_v2(&hello, extension, [10, 7, 0, 2], [0x33u8; 16])
+            .expect("server side");
+
+        verify_server_hello_v2(&server_hello, &hello, Some(&server.public_key().to_bytes()))
+            .expect("server hello verifies and pins");
+        let shared = client_eph.exchange(&server_hello.server_ephemeral_key);
+        let client_keys =
+            derive_client_session_keys_v2(&shared, &hello, extension, &server_hello).unwrap();
+
+        assert_eq!(client_keys.c2s, server_keys.c2s, "c2s agrees");
+        assert_eq!(client_keys.s2c, server_keys.s2c, "s2c agrees");
+        assert_ne!(server_keys.c2s, server_keys.s2c, "the two directions never share a key");
+        assert_eq!(server_hello.version, PROTOCOL_VERSION_V2);
+    }
+
+    #[test]
+    fn v2_voucher_extension_is_covered_by_the_client_signature() {
+        let (server, client) = v2_pair();
+        let eph = EphemeralKeyPair::generate();
+        let hello = create_client_hello_v2(&client, eph.public_key_bytes(), b"AVCH\x01\x00x");
+        assert!(server.verify_client_hello_v2(&hello, b"AVCH\x01\x00y").is_err(),
+            "a swapped voucher must not verify under the original signature");
+        assert!(server.verify_client_hello_v2(&hello, b"").is_err(),
+            "a stripped voucher must not verify either");
+    }
+
+    #[test]
+    fn v2_server_hello_answers_exactly_one_client_hello() {
+        let (server, client) = v2_pair();
+        let eph = EphemeralKeyPair::generate();
+        let hello = create_client_hello_v2(&client, eph.public_key_bytes(), b"");
+        let (server_hello, _) = server
+            .process_handshake_v2(&hello, b"", [10, 7, 0, 3], [0x44u8; 16])
+            .unwrap();
+        // The same client, a fresh hello: the old ServerHello no longer verifies.
+        let later = create_client_hello_v2(&client, EphemeralKeyPair::generate().public_key_bytes(), b"");
+        assert!(verify_server_hello_v2(&server_hello, &later, None).is_err());
+        // Pinning: a different expected node key fails before the signature.
+        assert!(verify_server_hello_v2(&server_hello, &hello, Some(&[0u8; 32])).is_err());
+    }
+
+    #[test]
+    fn v2_rejects_a_v1_hello_and_v1_path_rejects_nothing_it_used_to_accept() {
+        let (server, client) = v2_pair();
+        let eph = EphemeralKeyPair::generate();
+        let v1 = create_client_hello(&client, eph.public_key_bytes(), 0x01);
+        assert!(server.verify_client_hello_v2(&v1, b"").is_err());
+        assert!(server.verify_client_hello(&v1).is_ok(), "v0x01 clients keep working");
+    }
+
+    /// Interop vector shared with the app core (rust/src/udp_client.rs tests):
+    /// fixed shared secret and fixed signing bodies must yield these keys.
+    #[test]
+    fn v2_key_schedule_vector() {
+        let shared = [0x11u8; 32];
+        let client_sign_data: Vec<u8> = (0u8..74).collect();
+        let server_sign_data: Vec<u8> = (100u8..218).collect();
+        let th = transcript_hash_v2(&client_sign_data, &server_sign_data);
+        let keys = derive_session_keys_v2(&shared, &th).unwrap();
+        assert_eq!(hex::encode(th), "743d6e151ea92bb3965f9dd98d843730b64a5e4036090b62537fb5f923a4426f");
+        assert_eq!(hex::encode(keys.c2s.as_bytes()), "f8569af8dd0f13954c07be5b80a4b09efda38100c358b821c653aaecdb9e3b1a");
+        assert_eq!(hex::encode(keys.s2c.as_bytes()), "ee00bd70f541a1e05e04e6960737e4d4d41f522a7ed7bf0e2191a42b6ae047d0");
+    }
 
     #[test]
     fn test_full_handshake() {

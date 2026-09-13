@@ -1123,6 +1123,9 @@ const QUANTIZER_CAL_KEY_PREFIX: &str = "quantizer_cal";
 const POOL_EVICTION_INTERVAL_SECS: u64 = 300;
 const MINER_SCHEDULER_TICK_SECS: u64 = 60;
 const KEEPALIVE_PROBE_INTERVAL_SECS: u64 = 60;
+/// [2026-09-12] Live sessions one client identity may hold (a phone and a
+/// laptop on the same wallet). The oldest is evicted when a new hello arrives.
+const MAX_SESSIONS_PER_IDENTITY: usize = 4;
 const KEEPALIVE_ACK_TIMEOUT_SECS: u64 = 90;
 /// First delay after a required data-plane receive failure.
 const DATA_PLANE_RECV_RETRY_BASE_MILLIS: u64 = 25;
@@ -15047,6 +15050,7 @@ impl Server {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let crypto = DefaultTransportCrypto::new();
+            let handshake_limiter = crate::services::HandshakeLimiter::production();
             let mut consecutive_receive_failures = 0u32;
 
             loop {
@@ -15059,15 +15063,19 @@ impl Server {
                                 if shutdown.load(Ordering::SeqCst) { break; }
                                 let data = &buf[..len];
 
-                                match ProtocolCodec::peek_message_type(data) {
-                                    Ok(MessageType::ClientHello) => {
+                                match ProtocolCodec::classify_datagram(data) {
+                                    MessageType::ClientHello => {
+                                        // [2026-09-12] Two token buckets before any crypto.
+                                        if !handshake_limiter.allow(source.addr.ip()) {
+                                            continue;
+                                        }
                                         let extension = if data.len() > CLIENT_HELLO_SIZE {
                                             data[CLIENT_HELLO_SIZE..].to_vec()
                                         } else {
                                             Vec::new()
                                         };
                                         let verifier = Arc::clone(&voucher_verifier);
-                                        if !verifier.accept_client_hello_extension(extension).await {
+                                        if !verifier.accept_client_hello_extension(extension.clone()).await {
                                             warn!(
                                                 client = %source.addr,
                                                 "[VOUCHER] rejected ClientHello with invalid voucher"
@@ -15076,7 +15084,30 @@ impl Server {
                                         }
 
                                         if let Ok(hello) = decode_client_hello(data) {
-                                            match handshake.process(&hello, source.addr) {
+                                            // [2026-09-12] One identity keeps at most a few
+                                            // live sessions; the oldest makes room.
+                                            let mut same_identity =
+                                                sessions.get_all_by_wallet(&hello.client_public_key);
+                                            if same_identity.len() >= MAX_SESSIONS_PER_IDENTITY {
+                                                same_identity.sort_by_key(|s| s.created_at);
+                                                for stale in same_identity
+                                                    .iter()
+                                                    .take(same_identity.len() + 1 - MAX_SESSIONS_PER_IDENTITY)
+                                                {
+                                                    if let Some(termination) =
+                                                        sessions.terminate_with_cooldown(&stale.id)
+                                                    {
+                                                        Self::finalize_session_termination(
+                                                            termination,
+                                                            &routing,
+                                                            &session_events,
+                                                            chat_relay.as_deref(),
+                                                            &traffic_tracker,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            match handshake.process(&hello, &extension, source.addr) {
                                                 Ok(result) => {
                                                     let sid        = BASE64.encode(&result.response.session_id);
                                                     let wallet_hex = hex::encode(result.session.client_public_key.to_bytes());
@@ -15092,7 +15123,7 @@ impl Server {
                                             }
                                         }
                                     }
-                                    Ok(MessageType::Keepalive) => {
+                                    MessageType::Keepalive => {
                                         if len >= KEEPALIVE_PACKET_SIZE {
                                             let mut sid = [0u8; 16];
                                             sid.copy_from_slice(&data[1..17]);
@@ -15101,11 +15132,34 @@ impl Server {
                                             }
                                         }
                                     }
-                                    Ok(MessageType::Data) | Err(_) => {
-                                        match packet_handler.handle_udp_packet(data) {
+                                    MessageType::Data | MessageType::ServerHello => {
+                                        match packet_handler.handle_udp_packet(data, source.addr) {
                                             Ok((_sess, DecryptedPayload::Vpn(pkt))) => {
                                                 #[cfg(target_os = "linux")]
                                                 { let _ = tun.write(&pkt).await; }
+                                            }
+                                            // [PROTOCOL-V2] Authenticated liveness and close.
+                                            Ok((session, DecryptedPayload::ControlPing { id })) => {
+                                                if let Ok(bytes) = packet_handler
+                                                    .seal_control(&session, &[0x00, 0x02, id[0], id[1]])
+                                                {
+                                                    let _ = udp_reply.send(&bytes, &session.endpoint()).await;
+                                                }
+                                            }
+                                            Ok((_session, DecryptedPayload::ControlPong)) => {}
+                                            Ok((session, DecryptedPayload::ControlDisconnect { reason })) => {
+                                                info!(session_id = %session.id, reason, "[PROTOCOL-V2] Client closed the session");
+                                                if let Some(termination) =
+                                                    sessions.terminate_with_cooldown(&session.id)
+                                                {
+                                                    Self::finalize_session_termination(
+                                                        termination,
+                                                        &routing,
+                                                        &session_events,
+                                                        chat_relay.as_deref(),
+                                                        &traffic_tracker,
+                                                    );
+                                                }
                                             }
                                             Ok((session, DecryptedPayload::KeepaliveAck { rtt_ms })) => {
                                                 trace!(
@@ -15144,7 +15198,7 @@ impl Server {
                                                                                 encrypted.truncate(len);
                                                                                 let pkt   = aeronyx_core::protocol::DataPacket::new(*target_session.id.as_bytes(), counter, encrypted);
                                                                                 let bytes = aeronyx_core::protocol::codec::encode_data_packet(&pkt).to_vec();
-                                                                                let _ = udp_reply.send(&bytes, &target_session.client_endpoint).await;
+                                                                                let _ = udp_reply.send(&bytes, &target_session.endpoint()).await;
                                                                                 debug!(signal = signal_name, "[VOICE_SIGNAL] Forwarded");
                                                                             }
                                                                             Err(_) => { warn!(reason = "encryption_failed", signal = signal_name, "[VOICE_SIGNAL] Forward failed"); }
@@ -15166,7 +15220,7 @@ impl Server {
                                                                 encrypted.truncate(len);
                                                                 let pkt   = aeronyx_core::protocol::DataPacket::new(*target.id.as_bytes(), counter, encrypted);
                                                                 let bytes = aeronyx_core::protocol::codec::encode_data_packet(&pkt).to_vec();
-                                                                let _ = udp_reply.send(&bytes, &target.client_endpoint).await;
+                                                                let _ = udp_reply.send(&bytes, &target.endpoint()).await;
                                                                 trace!("[VOICE] Relayed voice packet");
                                                             }
                                                             Err(_) => { warn!(reason = "encryption_failed", "[VOICE] Relay failed"); }
@@ -16022,7 +16076,7 @@ impl Server {
                 }
                 relay
                     .wallet_routes
-                    .announce(&wallet, session.id.clone(), session.client_endpoint);
+                    .announce(&wallet, session.id.clone(), session.endpoint());
                 match relay.pull_pending(&wallet, after_timestamp, &cursor, limit) {
                     Ok((messages, message_has_more)) => {
                         let envelopes: Vec<_> = messages.into_iter().map(|m| m.envelope).collect();
@@ -16108,7 +16162,7 @@ impl Server {
                 }
                 relay
                     .wallet_routes
-                    .announce(&wallet, session.id.clone(), session.client_endpoint);
+                    .announce(&wallet, session.id.clone(), session.endpoint());
                 match relay.pull_pending_v2(&wallet, after_timestamp, &cursor, limit) {
                     Ok(page) => {
                         let envelopes: Vec<_> = page
@@ -16413,7 +16467,7 @@ impl Server {
         encrypted.truncate(len);
         let pkt = DataPacket::new(*session.id.as_bytes(), counter, encrypted);
         let bytes = encode_data_packet(&pkt).to_vec();
-        match udp.send(&bytes, &session.client_endpoint).await {
+        match udp.send(&bytes, &session.endpoint()).await {
             Ok(_) => true,
             Err(_) => {
                 warn!(

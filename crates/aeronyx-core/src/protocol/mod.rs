@@ -383,7 +383,9 @@ pub use memchain::{
     decode_memchain, encode_memchain, MemChainMessage, MAX_CHAT_PULL_CURSOR_V2_BYTES,
     MEMCHAIN_MAGIC,
 };
-pub use messages::{ClientHello, DataPacket, MessageType, ServerHello};
+pub use messages::{ClientHello, DataPacket, MessageType, ServerHello, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2,
+    is_supported_hello_version,
+};
 pub use onion::{
     build_onion_envelope, is_onion_blob, open_onion_layer, OnionHop, OnionPeel,
     OnionRouteFailureDisposition, OnionRoutePlanError, OnionRoutePurpose, VerifiedOnionRoute,

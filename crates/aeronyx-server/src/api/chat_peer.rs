@@ -5164,7 +5164,7 @@ async fn send_envelope_to_session(
 
     let packet = DataPacket::new(*session.id.as_bytes(), counter, encrypted);
     let bytes = encode_data_packet(&packet).to_vec();
-    udp.send(&bytes, &session.client_endpoint).await.is_ok()
+    udp.send(&bytes, &session.endpoint()).await.is_ok()
 }
 
 // ============================================

@@ -38,6 +38,19 @@ use serde::{Deserialize, Serialize};
 // ============================================
 
 /// Size of ClientHello message in bytes.
+/// Protocol v0x01: one session key for both directions (retired for new
+/// clients on 2026-09-12; still served for clients in the field).
+pub const PROTOCOL_VERSION_V1: u8 = 0x01;
+/// Protocol v0x02: per-direction keys, transcript-bound hellos, signed voucher
+/// extension, authenticated in-tunnel control frames.
+pub const PROTOCOL_VERSION_V2: u8 = 0x02;
+
+/// Whether this node serves a hello of the given version.
+#[must_use]
+pub const fn is_supported_hello_version(version: u8) -> bool {
+    matches!(version, PROTOCOL_VERSION_V1 | PROTOCOL_VERSION_V2)
+}
+
 pub const CLIENT_HELLO_SIZE: usize = 138;
 
 /// Size of ServerHello message in bytes.

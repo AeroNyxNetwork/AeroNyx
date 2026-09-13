@@ -38,11 +38,14 @@
 //! v0.1.0 - Initial KDF implementation
 
 use hkdf::Hkdf;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 use zeroize::Zeroize;
 
-use super::{CHACHA20_KEY_SIZE, ED25519_PUBLIC_KEY_SIZE, HKDF_INFO_PREFIX, HKDF_SALT};
+use super::{
+    CHACHA20_KEY_SIZE, ED25519_PUBLIC_KEY_SIZE, HKDF_INFO_PREFIX, HKDF_SALT, PROTOCOL_V2_HKDF_SALT,
+    PROTOCOL_V2_INFO_C2S, PROTOCOL_V2_INFO_S2C, PROTOCOL_V2_TRANSCRIPT_LABEL,
+};
 use crate::crypto::SessionKey;
 use crate::error::{CoreError, Result};
 
@@ -264,6 +267,78 @@ pub fn hkdf_expand(
 // ============================================
 // Tests
 // ============================================
+
+// ============================================================================
+// Protocol v0x02 key schedule
+// ============================================================================
+
+/// The two keys of a v0x02 session, one per direction.
+///
+/// The server encrypts with `s2c` and decrypts with `c2s`; the client does the
+/// opposite. Distinct keys are what make the counter-derived nonce safe: the
+/// same counter value on both sides no longer means the same keystream.
+pub struct SessionKeys {
+    /// Client → server.
+    pub c2s: SessionKey,
+    /// Server → client.
+    pub s2c: SessionKey,
+}
+
+impl SessionKeys {
+    /// The v0x01 degenerate case: one key both ways. Only for sessions that
+    /// negotiated v0x01; never derived by [`derive_session_keys_v2`].
+    #[must_use]
+    pub fn symmetric(key: SessionKey) -> Self {
+        Self {
+            c2s: key.clone(),
+            s2c: key,
+        }
+    }
+}
+
+/// `SHA-256(label ‖ len(c) ‖ c ‖ len(s) ‖ s)` over the two signed handshake
+/// bodies. Both peers can compute it, and it binds the keys to exactly this
+/// pair of hellos — including the client's ephemeral, timestamp and voucher
+/// extension, and the server's session id and assigned IP.
+#[must_use]
+pub fn transcript_hash_v2(client_sign_data: &[u8], server_sign_data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PROTOCOL_V2_TRANSCRIPT_LABEL);
+    hasher.update((client_sign_data.len() as u32).to_le_bytes());
+    hasher.update(client_sign_data);
+    hasher.update((server_sign_data.len() as u32).to_le_bytes());
+    hasher.update(server_sign_data);
+    hasher.finalize().into()
+}
+
+/// v0x02: `HKDF-SHA256(salt = "aeronyx-v2", ikm = X25519 shared secret)`
+/// expanded twice, with `"aeronyx-v2 c2s" ‖ th` and `"aeronyx-v2 s2c" ‖ th`.
+pub fn derive_session_keys_v2(
+    shared_secret: &[u8; 32],
+    transcript_hash: &[u8; 32],
+) -> Result<SessionKeys> {
+    let hk = Hkdf::<Sha256>::new(Some(PROTOCOL_V2_HKDF_SALT), shared_secret);
+    let expand = |label: &[u8]| -> Result<SessionKey> {
+        let mut info = Vec::with_capacity(label.len() + transcript_hash.len());
+        info.extend_from_slice(label);
+        info.extend_from_slice(transcript_hash);
+        let mut key = [0u8; CHACHA20_KEY_SIZE];
+        let expanded = hk.expand(&info, &mut key);
+        info.zeroize();
+        if expanded.is_err() {
+            key.zeroize();
+            return Err(CoreError::KeyDerivation {
+                reason: "HKDF v2 expansion failed".into(),
+            });
+        }
+        let session_key = SessionKey::from_bytes(key);
+        key.zeroize();
+        Ok(session_key)
+    };
+    let c2s = expand(PROTOCOL_V2_INFO_C2S)?;
+    let s2c = expand(PROTOCOL_V2_INFO_S2C)?;
+    Ok(SessionKeys { c2s, s2c })
+}
 
 #[cfg(test)]
 mod tests {

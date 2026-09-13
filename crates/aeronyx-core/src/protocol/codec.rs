@@ -182,6 +182,33 @@ impl ProtocolCodec {
     /// - `Ok(Some(len))` - Complete message of `len` bytes
     /// - `Ok(None)` - Incomplete message, need more data
     /// - `Err(_)` - Invalid/unknown message type
+    /// Classify one UDP datagram by shape, not by its first byte alone.
+    ///
+    /// [2026-09-12] `DataPacket` carries no type byte — its first byte is the
+    /// first byte of a random session id. Dispatching on `buf[0]` therefore
+    /// misrouted every session whose id began with 0x01/0x02/0x04 (≈1.2% of
+    /// connections): their uploads were parsed as hellos or keepalives and
+    /// dropped. Control frames have fixed sizes; a data packet is at least
+    /// header + tag. Length decides first, the type byte only confirms.
+    #[must_use]
+    pub fn classify_datagram(buf: &[u8]) -> MessageType {
+        const KEEPALIVE_SIZE: usize = 17;
+        const VOUCHER_MAGIC: &[u8; 4] = b"AVCH";
+        let Some(&first) = buf.first() else {
+            return MessageType::Data;
+        };
+        let looks_like_client_hello = buf.len() == CLIENT_HELLO_SIZE
+            || (buf.len() > CLIENT_HELLO_SIZE + VOUCHER_MAGIC.len()
+                && &buf[CLIENT_HELLO_SIZE..CLIENT_HELLO_SIZE + VOUCHER_MAGIC.len()]
+                    == VOUCHER_MAGIC);
+        match first {
+            0x01 if looks_like_client_hello => MessageType::ClientHello,
+            0x02 if buf.len() == SERVER_HELLO_SIZE => MessageType::ServerHello,
+            0x04 if buf.len() == KEEPALIVE_SIZE => MessageType::Keepalive,
+            _ => MessageType::Data,
+        }
+    }
+
     pub fn check_complete(buf: &[u8]) -> Result<Option<usize>> {
         if buf.is_empty() {
             return Ok(None);
@@ -530,6 +557,27 @@ mod tests {
 
         let decoded = decode_data_packet(&encoded).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn classify_datagram_goes_by_shape_not_first_byte() {
+        // A data packet whose session id happens to start with a control
+        // type byte is still data — the bug that dropped ~1.2% of sessions.
+        let mut data = vec![0x04u8; 24];
+        data.extend_from_slice(&[0u8; 16]); // tag-sized payload
+        assert_eq!(ProtocolCodec::classify_datagram(&data), MessageType::Data);
+        let mut data = vec![0x01u8; 24];
+        data.extend_from_slice(&[0u8; 16]);
+        assert_eq!(ProtocolCodec::classify_datagram(&data), MessageType::Data);
+        // Real control frames keep their meaning.
+        assert_eq!(ProtocolCodec::classify_datagram(&[0x04u8; 17]), MessageType::Keepalive);
+        assert_eq!(ProtocolCodec::classify_datagram(&[0x01u8; CLIENT_HELLO_SIZE]), MessageType::ClientHello);
+        let mut with_voucher = vec![0x01u8; CLIENT_HELLO_SIZE];
+        with_voucher.extend_from_slice(b"AVCH\x02\x00ab");
+        assert_eq!(ProtocolCodec::classify_datagram(&with_voucher), MessageType::ClientHello);
+        // A 138-byte blob that does not start with 0x01 is data, not a hello.
+        assert_eq!(ProtocolCodec::classify_datagram(&[0x09u8; CLIENT_HELLO_SIZE]), MessageType::Data);
+        assert_eq!(ProtocolCodec::classify_datagram(&[]), MessageType::Data);
     }
 
     #[test]

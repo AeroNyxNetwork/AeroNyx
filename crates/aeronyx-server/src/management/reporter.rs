@@ -737,7 +737,7 @@ impl HeartbeatReporter {
 
             // Send RESET (0xFF) — client re-handshakes immediately,
             // which will be rejected by the deny list check.
-            let _ = udp.send(&[0xFFu8], &sess.client_endpoint).await;
+            let _ = udp.send(&[0xFFu8], &sess.endpoint()).await;
 
             // Remove session — cleans up routing + wallet_index + cooldown.
             sessions.remove(&sess.id);

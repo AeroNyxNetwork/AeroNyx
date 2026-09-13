@@ -143,8 +143,18 @@ impl SessionId {
     #[must_use]
     pub fn generate() -> Self {
         let mut id = [0u8; SESSION_ID_SIZE];
-        rand::thread_rng().fill_bytes(&mut id);
-        Self(id)
+        loop {
+            rand::thread_rng().fill_bytes(&mut id);
+            // [2026-09-12] Data packets start with the session id and carry
+            // no type byte. A first byte equal to a control message type
+            // (0x01 hello, 0x02 server hello, 0x04 keepalive, 0x05/0x06
+            // legacy disconnect/error) used to get the packet misrouted by a
+            // first-byte demux. The codec now classifies by length, but no
+            // session id needs to look like a control frame either.
+            if !matches!(id[0], 0x01 | 0x02 | 0x04 | 0x05 | 0x06) {
+                return Self(id);
+            }
+        }
     }
 
     /// Returns the raw bytes of the session ID.

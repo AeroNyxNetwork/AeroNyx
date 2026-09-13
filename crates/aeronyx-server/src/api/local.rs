@@ -282,7 +282,7 @@ async fn broadcast_to_all_sessions(
         let data_packet = DataPacket::new(*session.id.as_bytes(), counter, encrypted);
         let packet_bytes = encode_data_packet(&data_packet).to_vec();
 
-        if let Err(e) = udp.send(&packet_bytes, &session.client_endpoint).await {
+        if let Err(e) = udp.send(&packet_bytes, &session.endpoint()).await {
             warn!(
                 session_id = %session.id,
                 error = %e,

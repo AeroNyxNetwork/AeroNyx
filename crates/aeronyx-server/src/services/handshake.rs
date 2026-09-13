@@ -120,11 +120,17 @@ impl HandshakeService {
     /// receive an immediate error without consuming IP or session slots.
     /// This prevents the 30-second reconnect loop for quota-exceeded and
     /// no-premium-access wallets.
+    /// `extension` is the byte string that followed the fixed hello on the
+    /// wire (the voucher block, or empty). A v0x02 signature covers it.
     pub fn process(
         &self,
         client_hello: &ClientHello,
+        extension: &[u8],
         client_addr: SocketAddr,
     ) -> Result<HandshakeResult> {
+        if client_hello.version == aeronyx_core::protocol::PROTOCOL_VERSION_V2 {
+            return self.process_v2(client_hello, extension, client_addr);
+        }
         debug!("Processing handshake");
 
         if let Err(reason) = self.policy.validate_new_session(self.sessions.count()) {
@@ -233,6 +239,70 @@ impl HandshakeService {
     }
 
     /// Cleans up resources for a failed or closed session.
+    /// v0x02: transcript-bound hellos, per-direction keys.
+    fn process_v2(
+        &self,
+        client_hello: &ClientHello,
+        extension: &[u8],
+        client_addr: SocketAddr,
+    ) -> Result<HandshakeResult> {
+        self.crypto
+            .verify_client_hello_v2(client_hello, extension)
+            .map_err(|e| {
+                warn!(client = %client_addr, error = %e, "Handshake v2 signature verification failed");
+                e
+            })?;
+        let virtual_ip = self.ip_pool.allocate().map_err(|e| {
+            warn!(client = %client_addr, "IP allocation failed: {}", e);
+            e
+        })?;
+        let session_id = aeronyx_common::SessionId::generate();
+        let (server_hello, keys) = match self.crypto.process_handshake_v2(
+            client_hello,
+            extension,
+            virtual_ip.octets(),
+            *session_id.as_bytes(),
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                self.ip_pool.release(virtual_ip);
+                warn!(client = %client_addr, error = %e, "Handshake v2 crypto failed");
+                return Err(e.into());
+            }
+        };
+        let client_public_key = aeronyx_core::crypto::keys::IdentityPublicKey::from_bytes(
+            &client_hello.client_public_key,
+        )
+        .map_err(|e| {
+            self.ip_pool.release(virtual_ip);
+            ServerError::session_creation_failed(format!("Invalid client public key: {}", e))
+        })?;
+        let session = match self.sessions.create_v2(
+            session_id.clone(),
+            client_public_key,
+            keys,
+            virtual_ip,
+            client_addr,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.ip_pool.release(virtual_ip);
+                warn!(client = %client_addr, error = %e, "Session v2 creation failed");
+                return Err(e);
+            }
+        };
+        self.routing.add_route(virtual_ip, session.id.clone());
+        info!(
+            session_id = %session.id,
+            virtual_ip = %virtual_ip,
+            "Handshake v2 completed successfully"
+        );
+        Ok(HandshakeResult {
+            session,
+            response: server_hello,
+        })
+    }
+
     pub fn cleanup(&self, session_id: &aeronyx_common::SessionId, virtual_ip: std::net::Ipv4Addr) {
         debug!("Cleaning up session resources");
         let removed_route = self
@@ -328,7 +398,7 @@ mod tests {
         );
 
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let result = service.process(&client_hello, client_addr).unwrap();
+        let result = service.process(&client_hello, &[], client_addr).unwrap();
 
         assert_eq!(
             result.session.id.as_bytes(),
@@ -336,7 +406,7 @@ mod tests {
             "Session ID mismatch between Session and ServerHello!"
         );
         assert!(result.session.is_established());
-        assert_eq!(result.session.client_endpoint, client_addr);
+        assert_eq!(result.session.endpoint(), client_addr);
         assert!(ip_pool.is_allocated(result.session.virtual_ip));
         assert!(routing.has_route(result.session.virtual_ip));
         assert_eq!(sessions.count(), 1);
@@ -362,7 +432,7 @@ mod tests {
             EphemeralKeyPair::generate().public_key_bytes(),
             CURRENT_PROTOCOL_VERSION,
         );
-        let first = service.process(&first_hello, client_addr).unwrap();
+        let first = service.process(&first_hello, &[], client_addr).unwrap();
         let old_session_id = first.session.id.clone();
         let reused_ip = first.session.virtual_ip;
 
@@ -378,7 +448,7 @@ mod tests {
             CURRENT_PROTOCOL_VERSION,
         );
         let replacement = service
-            .process(&replacement_hello, "127.0.0.1:12346".parse().unwrap())
+            .process(&replacement_hello, &[], "127.0.0.1:12346".parse().unwrap())
             .unwrap();
         assert_eq!(replacement.session.virtual_ip, reused_ip);
 
@@ -418,7 +488,7 @@ mod tests {
         client_hello.signature[0] ^= 0xFF;
 
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let result = service.process(&client_hello, client_addr);
+        let result = service.process(&client_hello, &[], client_addr);
         assert!(result.is_err());
         assert_eq!(ip_pool.allocated_count(), 0);
         assert_eq!(sessions.count(), 0);
@@ -452,7 +522,7 @@ mod tests {
         );
 
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let result = service.process(&client_hello, client_addr);
+        let result = service.process(&client_hello, &[], client_addr);
 
         assert!(result.is_err(), "Denied wallet must be rejected");
         // No resources consumed.
@@ -499,13 +569,13 @@ mod tests {
 
         // Denied.
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        assert!(service.process(&client_hello, client_addr).is_err());
+        assert!(service.process(&client_hello, &[], client_addr).is_err());
 
         // Remove from deny list (simulating tier upgrade).
         deny_list.remove(&wallet_hex);
 
         // Now allowed.
-        let result = service.process(&client_hello, client_addr);
+        let result = service.process(&client_hello, &[], client_addr);
         assert!(
             result.is_ok(),
             "Wallet removed from deny list must be allowed"
@@ -541,7 +611,7 @@ mod tests {
         );
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
-        let result = service.process(&client_hello, client_addr);
+        let result = service.process(&client_hello, &[], client_addr);
         assert!(matches!(
             result,
             Err(ServerError::NodePolicyRejected { .. })
@@ -579,7 +649,7 @@ mod tests {
                 CURRENT_PROTOCOL_VERSION,
             );
             let client_addr: SocketAddr = format!("127.0.0.1:{}", 12345 + index).parse().unwrap();
-            let result = service.process(&client_hello, client_addr);
+            let result = service.process(&client_hello, &[], client_addr);
             if index == 0 {
                 assert!(result.is_ok());
             } else {
@@ -630,7 +700,7 @@ mod tests {
                     let port = 20_000u16 + u16::try_from(index).expect("test index fits u16");
                     let client_addr = SocketAddr::from(([127, 0, 0, 1], port));
                     start.wait();
-                    service.process(&client_hello, client_addr).is_ok()
+                    service.process(&client_hello, &[], client_addr).is_ok()
                 })
             })
             .collect();
