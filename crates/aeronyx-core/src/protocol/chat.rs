@@ -127,9 +127,14 @@ use crate::protocol::onion::OnionRoutePurpose;
 // ============================================
 
 /// Maximum accepted byte size for a single `ChatEnvelope` payload.
+///
 /// Text ciphertext ≤ 64 KB + fixed fields ≤ ~1 KB overhead.
 /// Prevents bincode length-prefix OOM attacks.
-const MAX_ENVELOPE_BYTES: u64 = 128 * 1024; // 128 KB
+/// Maximum canonical bytes accepted for one signed chat envelope.
+///
+/// [ANONYMOUS-MAILBOX-RECIPIENT-SEAL 2026-09-08 by Codex] The recipient-seal
+/// codec reuses this exact ceiling instead of maintaining a second estimate.
+pub const MAX_CHAT_ENVELOPE_BYTES: u64 = 128 * 1024; // 128 KB
 const MAX_BLIND_RELAY_ENVELOPE_BYTES: u64 = 256 * 1024; // 256 KB opaque relay frame cap
 const MAX_BLIND_RELAY_BLOB_BYTES: usize = 192 * 1024; // media/file bytes must use blob storage
 const BLIND_RELAY_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-v1";
@@ -1606,19 +1611,43 @@ pub struct MediaPointer {
 /// Returns `bincode::Error` if serialisation fails or the encoded envelope
 /// exceeds the 128 KiB protocol ceiling.
 pub fn encode_envelope(envelope: &ChatEnvelope) -> Result<Vec<u8>, bincode::Error> {
-    encode_bincode_bounded(envelope, MAX_ENVELOPE_BYTES)
+    encode_bincode_bounded(envelope, MAX_CHAT_ENVELOPE_BYTES)
 }
 
 /// Decodes a `ChatEnvelope` from a bincode byte slice.
 ///
 /// # Size limit
-/// Rejects inputs that would require allocating more than `MAX_ENVELOPE_BYTES`
+/// Rejects inputs that would require allocating more than [`MAX_CHAT_ENVELOPE_BYTES`]
 /// (128 KB). Prevents a malicious length-prefix from triggering large allocations.
 ///
 /// # Errors
 /// Returns `bincode::Error` if the bytes are malformed, truncated, or too large.
 pub fn decode_envelope(bytes: &[u8]) -> Result<ChatEnvelope, bincode::Error> {
-    decode_bincode_bounded(bytes, MAX_ENVELOPE_BYTES, TrailingBytesPolicy::Allow)
+    decode_bincode_bounded(bytes, MAX_CHAT_ENVELOPE_BYTES, TrailingBytesPolicy::Allow)
+}
+
+/// Decodes one exact canonical envelope and verifies its sender signature.
+///
+/// The legacy [`decode_envelope`] intentionally keeps its historical trailing
+/// byte policy. New authenticated containers use this stricter boundary so a
+/// single byte string cannot have multiple accepted representations.
+///
+/// # Errors
+/// Returns a coarse protocol error for oversized, trailing, non-canonical, or
+/// incorrectly signed envelopes.
+pub fn decode_envelope_strict_verified(bytes: &[u8]) -> Result<ChatEnvelope, CoreError> {
+    // [ANONYMOUS-MAILBOX-RECIPIENT-SEAL 2026-09-08 by Codex] Strict decode,
+    // re-encode equality, and signature verification are one operation.
+    let envelope =
+        decode_bincode_bounded(bytes, MAX_CHAT_ENVELOPE_BYTES, TrailingBytesPolicy::Reject)
+            .map_err(|_| CoreError::malformed("chat envelope is not canonical"))?;
+    let canonical = encode_envelope(&envelope)
+        .map_err(|_| CoreError::malformed("chat envelope is not canonical"))?;
+    if canonical != bytes {
+        return Err(CoreError::malformed("chat envelope is not canonical"));
+    }
+    envelope.verify_signature()?;
+    Ok(envelope)
 }
 
 // ============================================
@@ -2017,13 +2046,22 @@ mod tests {
         let decoded = decode_envelope(&bytes).expect("decode with legacy trailing bytes");
         assert_eq!(decoded.message_id, env.message_id);
         assert_eq!(decoded.ciphertext, env.ciphertext);
+
+        assert!(decode_envelope_strict_verified(&bytes).is_err());
+        let canonical = encode_envelope(&env).expect("canonical");
+        assert!(decode_envelope_strict_verified(&canonical).is_ok());
+
+        let mut bad_signature = canonical;
+        let last = bad_signature.len() - 1;
+        bad_signature[last] ^= 1;
+        assert!(decode_envelope_strict_verified(&bad_signature).is_err());
     }
 
     #[test]
     fn test_envelope_codec_rejects_oversized_output_and_padded_input() {
         let kp = IdentityKeyPair::generate();
         let mut oversized = make_signed_envelope(&kp);
-        oversized.ciphertext = vec![0xCC; MAX_ENVELOPE_BYTES as usize];
+        oversized.ciphertext = vec![0xCC; MAX_CHAT_ENVELOPE_BYTES as usize];
         assert!(
             encode_envelope(&oversized).is_err(),
             "sender must not create an envelope that receivers reject"
@@ -2031,7 +2069,7 @@ mod tests {
 
         let env = make_signed_envelope(&kp);
         let mut padded = bincode::serialize(&env).expect("legacy wire encoding");
-        padded.resize(MAX_ENVELOPE_BYTES as usize + 1, 0);
+        padded.resize(MAX_CHAT_ENVELOPE_BYTES as usize + 1, 0);
         assert!(
             decode_envelope(&padded).is_err(),
             "ignored trailing padding must not bypass the complete input ceiling"

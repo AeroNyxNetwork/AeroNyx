@@ -28,13 +28,23 @@ use crate::protocol::anonymous_mailbox::{
     AnonymousMailboxTerminalResponseV1, MAX_ANONYMOUS_MAILBOX_ADMISSION_TTL_SECS,
     MAX_ANONYMOUS_MAILBOX_REQUEST_SKEW_SECS,
 };
+use crate::protocol::anonymous_mailbox_recipient_seal::{
+    seal_chat_envelope, AnonymousMailboxRecipientOpenContextV1,
+    AnonymousMailboxRecipientSealBindingV1, AnonymousMailboxRecipientSealError,
+    AnonymousMailboxRecipientSealPublicV1, AnonymousMailboxRecipientSealedItemV1,
+};
+use crate::protocol::chat::ChatEnvelope;
 
 const INVITATION_MAGIC: [u8; 4] = *b"AMDI";
 const INVITATION_SIGNATURE_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-DepositInvitation-v1";
 const INVITATION_COMMITMENT_DOMAIN: &[u8] =
     b"AeroNyx-AnonymousMailbox-DepositInvitationCommitment-v1";
+const INVITATION_V2_SIGNATURE_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-DepositInvitation-v2";
+const INVITATION_V2_COMMITMENT_DOMAIN: &[u8] =
+    b"AeroNyx-AnonymousMailbox-DepositInvitationCommitment-v2";
 const HEADER_BYTES: usize = 4 + 2 + 4;
 const FIXED_PREFIX_BYTES: usize = HEADER_BYTES + 16 + 8 + 8 + 4 + 32 + 8 + 32 + 32 + 32;
+const FIXED_PREFIX_BYTES_V2: usize = FIXED_PREFIX_BYTES + 32 + 1 + 16 + 32;
 const LENGTH_BYTES: usize = 2;
 const SIGNATURE_BYTES: usize = 64;
 const MAX_LEASE_CREATE_FRAME_BYTES: usize = 512;
@@ -42,6 +52,8 @@ const MAX_LEASE_RESPONSE_FRAME_BYTES: usize = 256;
 
 /// Frozen AMDI codec version.
 pub const ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_VERSION_V1: u16 = 1;
+/// Recipient-sealed AMDI codec version. V1 remains deposit-only.
+pub const ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_VERSION_V2: u16 = 2;
 /// Hard upper bound for one canonical deposit invitation.
 pub const MAX_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_BYTES: usize = 1024;
 /// Longest client-policy invitation lifetime.
@@ -88,6 +100,19 @@ impl From<AnonymousMailboxProtocolError> for AnonymousMailboxDepositInvitationEr
             AnonymousMailboxProtocolError::Malformed
             | AnonymousMailboxProtocolError::UnsupportedOperation
             | AnonymousMailboxProtocolError::ProofRejected => Self::Malformed,
+        }
+    }
+}
+
+impl From<AnonymousMailboxRecipientSealError> for AnonymousMailboxDepositInvitationError {
+    fn from(value: AnonymousMailboxRecipientSealError) -> Self {
+        match value {
+            AnonymousMailboxRecipientSealError::TooLarge => Self::TooLarge,
+            AnonymousMailboxRecipientSealError::UnsupportedVersion => Self::UnsupportedVersion,
+            AnonymousMailboxRecipientSealError::ClaimsConflict => Self::ClaimsConflict,
+            AnonymousMailboxRecipientSealError::Malformed
+            | AnonymousMailboxRecipientSealError::KeyUnavailable
+            | AnonymousMailboxRecipientSealError::Rejected => Self::Malformed,
         }
     }
 }
@@ -202,6 +227,7 @@ impl AnonymousMailboxDepositInvitationSummaryV1 {
     }
 
     /// Signed minimum remaining lease time required before a new Put.
+    /// Required lease runway for new effects.
     #[must_use]
     pub const fn min_remaining_lease_secs(&self) -> u32 {
         self.min_remaining_lease_secs
@@ -599,6 +625,606 @@ impl Drop for AnonymousMailboxDepositInvitationV1 {
     }
 }
 
+/// Redacted metadata returned after current AMDI v2 admission verification.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AnonymousMailboxDepositInvitationSummaryV2 {
+    invitation_id: [u8; 16],
+    target: AnonymousMailboxDepositTargetPinV1,
+    mailbox_id: [u8; 32],
+    lease_claims_commitment: [u8; 32],
+    invitation_expires_at: u64,
+    lease_expires_at: u64,
+    min_remaining_lease_secs: u32,
+    recipient_seal: AnonymousMailboxRecipientSealPublicV1,
+}
+
+impl AnonymousMailboxDepositInvitationSummaryV2 {
+    /// Random exact-replay identifier.
+    #[must_use]
+    pub const fn invitation_id(&self) -> [u8; 16] {
+        self.invitation_id
+    }
+
+    /// Receiver-selected exact custody target.
+    #[must_use]
+    pub const fn target(&self) -> AnonymousMailboxDepositTargetPinV1 {
+        self.target
+    }
+
+    /// Unlinkable mailbox id from the accepted lease.
+    #[must_use]
+    pub const fn mailbox_id(&self) -> [u8; 32] {
+        self.mailbox_id
+    }
+
+    /// Commitment to every immutable lease claim.
+    #[must_use]
+    pub const fn lease_claims_commitment(&self) -> [u8; 32] {
+        self.lease_claims_commitment
+    }
+
+    /// Client-policy deadline for new effects.
+    #[must_use]
+    pub const fn invitation_expires_at(&self) -> u64 {
+        self.invitation_expires_at
+    }
+
+    /// Terminal-enforced lease expiry.
+    #[must_use]
+    pub const fn lease_expires_at(&self) -> u64 {
+        self.lease_expires_at
+    }
+
+    /// Required lease runway for new effects.
+    #[must_use]
+    pub const fn min_remaining_lease_secs(&self) -> u32 {
+        self.min_remaining_lease_secs
+    }
+
+    /// Signed public recipient-seal capability.
+    #[must_use]
+    pub const fn recipient_seal(&self) -> AnonymousMailboxRecipientSealPublicV1 {
+        self.recipient_seal
+    }
+}
+
+impl fmt::Debug for AnonymousMailboxDepositInvitationSummaryV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnonymousMailboxDepositInvitationSummaryV2")
+            .field("invitation_expires_at", &self.invitation_expires_at)
+            .field("lease_expires_at", &self.lease_expires_at)
+            .field("min_remaining_lease_secs", &self.min_remaining_lease_secs)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Canonical receiver-shared recipient-sealed deposit capability.
+///
+/// [ANONYMOUS-MAILBOX-RECIPIENT-SEAL 2026-09-08 by Codex] V2 binds a native
+/// recipient encryption key to the exact signed V1 lease proof. It neither
+/// exports nor persists the recipient private key.
+pub struct AnonymousMailboxDepositInvitationV2 {
+    version: u16,
+    invitation_id: [u8; 16],
+    issued_at: u64,
+    expires_at: u64,
+    min_remaining_lease_secs: u32,
+    target: AnonymousMailboxDepositTargetPinV1,
+    lease_claims_commitment: [u8; 32],
+    deposit_seed: [u8; 32],
+    chat_receiver: [u8; 32],
+    recipient_seal: AnonymousMailboxRecipientSealPublicV1,
+    lease_create_frame: Vec<u8>,
+    lease_response_frame: Vec<u8>,
+    signature: [u8; 64],
+}
+
+/// Short-lived typed authority for creating one new recipient-sealed Put.
+pub struct AnonymousMailboxDepositInvitationActiveV2<'a> {
+    invitation: &'a AnonymousMailboxDepositInvitationV2,
+}
+
+impl AnonymousMailboxDepositInvitationV2 {
+    /// Creates and read-signs one exact recipient-sealed invitation.
+    ///
+    /// `chat_receiver` must come from authenticated local/contact context.
+    /// The `reader` signature authenticates mailbox authority and is not proof
+    /// that the same party controls the chat identity.
+    ///
+    /// # Errors
+    /// Returns a coarse invitation error when nested frames, signatures,
+    /// claims, keys, bounds, or current time policy are invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue(
+        invitation_id: [u8; 16],
+        issued_at: u64,
+        expires_at: u64,
+        min_remaining_lease_secs: u32,
+        target: AnonymousMailboxDepositTargetPinV1,
+        deposit_seed: [u8; 32],
+        chat_receiver: [u8; 32],
+        recipient_seal: AnonymousMailboxRecipientSealPublicV1,
+        lease_create_frame: Vec<u8>,
+        lease_response_frame: Vec<u8>,
+        reader: &IdentityKeyPair,
+    ) -> Result<Self, AnonymousMailboxDepositInvitationError> {
+        let (lease, responded_at) =
+            decode_accepted_lease(&target, &lease_create_frame, &lease_response_frame)?;
+        let mut value = Self {
+            version: ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_VERSION_V2,
+            invitation_id,
+            issued_at,
+            expires_at,
+            min_remaining_lease_secs,
+            target,
+            lease_claims_commitment: lease.claims_commitment(),
+            deposit_seed,
+            chat_receiver,
+            recipient_seal,
+            lease_create_frame,
+            lease_response_frame,
+            signature: [0; 64],
+        };
+        if responded_at > issued_at.saturating_add(MAX_ANONYMOUS_MAILBOX_REQUEST_SKEW_SECS) {
+            return Err(AnonymousMailboxDepositInvitationError::Expired);
+        }
+        if reader.public_key_bytes() != lease.read_verifier {
+            return Err(AnonymousMailboxDepositInvitationError::ClaimsConflict);
+        }
+        // [ANONYMOUS-MAILBOX-RECIPIENT-SEAL 2026-09-08 by Codex] The caller
+        // supplies this identity from authenticated local/contact context;
+        // the pseudonymous mailbox reader is not a chat-identity proof.
+        IdentityPublicKey::from_bytes(&value.chat_receiver)
+            .map_err(|_| AnonymousMailboxDepositInvitationError::SignatureRejected)?;
+        let mut transcript = value.signing_bytes()?;
+        value.signature = reader.sign(&transcript);
+        transcript.zeroize();
+        value.verify_for_new_put_at(issued_at)?;
+        Ok(value)
+    }
+
+    /// Decodes canonical V2 bytes and verifies current new-effect authority.
+    ///
+    /// # Errors
+    /// Returns a coarse invitation error for non-canonical, unauthenticated,
+    /// mismatched, oversized, unsupported, or expired input.
+    pub fn decode_at(
+        encoded: &[u8],
+        now: u64,
+    ) -> Result<Self, AnonymousMailboxDepositInvitationError> {
+        let value = Self::decode_static(encoded)?;
+        value.verify_for_new_put_at(now)?;
+        Ok(value)
+    }
+
+    /// Decodes a historical invitation into an open-only context.
+    ///
+    /// Current invitation expiry is intentionally not consulted. The decoded
+    /// bearer and its deposit seed are dropped and zeroized before return.
+    ///
+    /// # Errors
+    /// Returns a coarse invitation error when immutable history is invalid.
+    pub fn decode_historical_recipient_context(
+        encoded: &[u8],
+    ) -> Result<AnonymousMailboxRecipientOpenContextV1, AnonymousMailboxDepositInvitationError>
+    {
+        let value = Self::decode_static(encoded)?;
+        value.verify_historical_recipient_context()
+    }
+
+    /// Verifies current expiry/skew/runway and returns the sole new-effect type.
+    ///
+    /// # Errors
+    /// Returns a coarse invitation error when authentication, claims, or the
+    /// current effect window fail validation.
+    pub fn verify_for_new_put_at(
+        &self,
+        now: u64,
+    ) -> Result<AnonymousMailboxDepositInvitationActiveV2<'_>, AnonymousMailboxDepositInvitationError>
+    {
+        self.active_lease_at(now)?;
+        Ok(AnonymousMailboxDepositInvitationActiveV2 { invitation: self })
+    }
+
+    /// Revalidates immutable signed history and returns open-only metadata.
+    ///
+    /// # Errors
+    /// Returns a coarse invitation error when immutable history is invalid.
+    pub fn verify_historical_recipient_context(
+        &self,
+    ) -> Result<AnonymousMailboxRecipientOpenContextV1, AnonymousMailboxDepositInvitationError>
+    {
+        let lease = self.validate_static()?;
+        let binding = self.recipient_binding(lease.mailbox_id)?;
+        Ok(AnonymousMailboxRecipientOpenContextV1::new(
+            binding,
+            lease.expires_at,
+        ))
+    }
+
+    /// Returns exact signed V2 bytes.
+    ///
+    /// # Errors
+    /// Returns [`AnonymousMailboxDepositInvitationError::TooLarge`] when the
+    /// canonical frame exceeds its frozen bound.
+    pub fn encode(&self) -> Result<Vec<u8>, AnonymousMailboxDepositInvitationError> {
+        let mut encoded = self.unsigned_wire_bytes()?;
+        encoded.extend_from_slice(&self.signature);
+        if encoded.len() > MAX_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_BYTES {
+            encoded.zeroize();
+            return Err(AnonymousMailboxDepositInvitationError::TooLarge);
+        }
+        Ok(encoded)
+    }
+
+    /// Domain-separated commitment to the exact signed V2 bytes.
+    ///
+    /// # Errors
+    /// Returns a coarse invitation error when the canonical frame cannot be
+    /// represented within its frozen bound.
+    pub fn commitment(&self) -> Result<[u8; 32], AnonymousMailboxDepositInvitationError> {
+        let mut encoded = self.encode()?;
+        let mut hasher = Sha256::new();
+        hasher.update(INVITATION_V2_COMMITMENT_DOMAIN);
+        hasher.update(
+            u32::try_from(encoded.len())
+                .map_err(|_| AnonymousMailboxDepositInvitationError::TooLarge)?
+                .to_le_bytes(),
+        );
+        hasher.update(&encoded);
+        encoded.zeroize();
+        Ok(hasher.finalize().into())
+    }
+
+    fn decode_static(encoded: &[u8]) -> Result<Self, AnonymousMailboxDepositInvitationError> {
+        if encoded.len() > MAX_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_BYTES {
+            return Err(AnonymousMailboxDepositInvitationError::TooLarge);
+        }
+        if encoded.len() < FIXED_PREFIX_BYTES_V2 + (2 * LENGTH_BYTES) + SIGNATURE_BYTES
+            || encoded[..4] != INVITATION_MAGIC
+        {
+            return Err(AnonymousMailboxDepositInvitationError::Malformed);
+        }
+        let mut offset = 4;
+        let version = take_u16(encoded, &mut offset)?;
+        if version != ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_VERSION_V2 {
+            return Err(AnonymousMailboxDepositInvitationError::UnsupportedVersion);
+        }
+        let declared = usize::try_from(take_u32(encoded, &mut offset)?)
+            .map_err(|_| AnonymousMailboxDepositInvitationError::TooLarge)?;
+        if declared != encoded.len() {
+            return Err(AnonymousMailboxDepositInvitationError::Malformed);
+        }
+        let invitation_id = take::<16>(encoded, &mut offset)?;
+        let issued_at = take_u64(encoded, &mut offset)?;
+        let expires_at = take_u64(encoded, &mut offset)?;
+        let min_remaining_lease_secs = take_u32(encoded, &mut offset)?;
+        let target = AnonymousMailboxDepositTargetPinV1::new(
+            take::<32>(encoded, &mut offset)?,
+            take_u64(encoded, &mut offset)?,
+            take::<32>(encoded, &mut offset)?,
+        )?;
+        let lease_claims_commitment = take::<32>(encoded, &mut offset)?;
+        let deposit_seed = Zeroizing::new(take::<32>(encoded, &mut offset)?);
+        let chat_receiver = take::<32>(encoded, &mut offset)?;
+        let recipient_algorithm = take::<1>(encoded, &mut offset)?[0];
+        if recipient_algorithm
+            != crate::protocol::anonymous_mailbox_recipient_seal::ANONYMOUS_MAILBOX_RECIPIENT_SEAL_ALGORITHM_V1
+        {
+            return Err(AnonymousMailboxDepositInvitationError::UnsupportedVersion);
+        }
+        let recipient_seal = AnonymousMailboxRecipientSealPublicV1::new(
+            take::<16>(encoded, &mut offset)?,
+            take::<32>(encoded, &mut offset)?,
+        )?;
+        let lease_create_len = usize::from(take_u16(encoded, &mut offset)?);
+        if lease_create_len == 0 || lease_create_len > MAX_LEASE_CREATE_FRAME_BYTES {
+            return Err(AnonymousMailboxDepositInvitationError::TooLarge);
+        }
+        let lease_create_frame = take_vec(encoded, &mut offset, lease_create_len)?;
+        let lease_response_len = usize::from(take_u16(encoded, &mut offset)?);
+        if lease_response_len == 0 || lease_response_len > MAX_LEASE_RESPONSE_FRAME_BYTES {
+            return Err(AnonymousMailboxDepositInvitationError::TooLarge);
+        }
+        let lease_response_frame = take_vec(encoded, &mut offset, lease_response_len)?;
+        let signature = take::<64>(encoded, &mut offset)?;
+        if offset != encoded.len() {
+            return Err(AnonymousMailboxDepositInvitationError::Malformed);
+        }
+        let value = Self {
+            version,
+            invitation_id,
+            issued_at,
+            expires_at,
+            min_remaining_lease_secs,
+            target,
+            lease_claims_commitment,
+            deposit_seed: *deposit_seed,
+            chat_receiver,
+            recipient_seal,
+            lease_create_frame,
+            lease_response_frame,
+            signature,
+        };
+        value.validate_static()?;
+        let mut canonical = value.encode()?;
+        if canonical != encoded {
+            canonical.zeroize();
+            return Err(AnonymousMailboxDepositInvitationError::Malformed);
+        }
+        canonical.zeroize();
+        Ok(value)
+    }
+
+    fn validate_static(
+        &self,
+    ) -> Result<AnonymousMailboxLeaseCreateV1, AnonymousMailboxDepositInvitationError> {
+        if self.version != ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_VERSION_V2
+            || self.invitation_id.iter().all(|byte| *byte == 0)
+        {
+            return Err(AnonymousMailboxDepositInvitationError::Malformed);
+        }
+        let ttl = self
+            .expires_at
+            .checked_sub(self.issued_at)
+            .ok_or(AnonymousMailboxDepositInvitationError::Expired)?;
+        if ttl == 0
+            || ttl > MAX_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_TTL_SECS
+            || !(MIN_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_RUNWAY_SECS
+                ..=MAX_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_RUNWAY_SECS)
+                .contains(&self.min_remaining_lease_secs)
+        {
+            return Err(AnonymousMailboxDepositInvitationError::Expired);
+        }
+        let (lease, responded_at) = decode_accepted_lease(
+            &self.target,
+            &self.lease_create_frame,
+            &self.lease_response_frame,
+        )?;
+        if self.lease_claims_commitment != lease.claims_commitment() {
+            return Err(AnonymousMailboxDepositInvitationError::ClaimsConflict);
+        }
+        let derived = IdentityKeyPair::from_bytes(&self.deposit_seed)
+            .map_err(|_| AnonymousMailboxDepositInvitationError::SignatureRejected)?;
+        if derived.public_key_bytes() != lease.deposit_verifier {
+            return Err(AnonymousMailboxDepositInvitationError::ClaimsConflict);
+        }
+        IdentityPublicKey::from_bytes(&self.chat_receiver)
+            .map_err(|_| AnonymousMailboxDepositInvitationError::SignatureRejected)?;
+        let runway = u64::from(self.min_remaining_lease_secs);
+        let latest_expiry = lease
+            .expires_at
+            .checked_sub(runway)
+            .ok_or(AnonymousMailboxDepositInvitationError::Expired)?;
+        if self.expires_at > latest_expiry
+            || lease.issued_at
+                > self
+                    .issued_at
+                    .saturating_add(MAX_ANONYMOUS_MAILBOX_REQUEST_SKEW_SECS)
+            || responded_at
+                > self
+                    .issued_at
+                    .saturating_add(MAX_ANONYMOUS_MAILBOX_REQUEST_SKEW_SECS)
+        {
+            return Err(AnonymousMailboxDepositInvitationError::Expired);
+        }
+        let mut transcript = self.signing_bytes()?;
+        let verification = IdentityPublicKey::from_bytes(&lease.read_verifier)
+            .and_then(|key| key.verify(&transcript, &self.signature))
+            .map_err(|_| AnonymousMailboxDepositInvitationError::SignatureRejected);
+        transcript.zeroize();
+        verification?;
+        Ok(lease)
+    }
+
+    // [ANONYMOUS-MAILBOX-RECIPIENT-SEAL 2026-09-08 by Codex] Keep static
+    // authentication and current-effect time admission in one reusable gate.
+    fn active_lease_at(
+        &self,
+        now: u64,
+    ) -> Result<AnonymousMailboxLeaseCreateV1, AnonymousMailboxDepositInvitationError> {
+        let lease = self.validate_static()?;
+        if now > self.expires_at
+            || self.issued_at > now.saturating_add(MAX_ANONYMOUS_MAILBOX_REQUEST_SKEW_SECS)
+            || lease.issued_at > now.saturating_add(MAX_ANONYMOUS_MAILBOX_REQUEST_SKEW_SECS)
+            || now
+                .checked_add(u64::from(self.min_remaining_lease_secs))
+                .ok_or(AnonymousMailboxDepositInvitationError::Expired)?
+                > lease.expires_at
+        {
+            return Err(AnonymousMailboxDepositInvitationError::Expired);
+        }
+        Ok(lease)
+    }
+
+    fn recipient_binding(
+        &self,
+        mailbox_id: [u8; 32],
+    ) -> Result<AnonymousMailboxRecipientSealBindingV1, AnonymousMailboxDepositInvitationError>
+    {
+        Ok(AnonymousMailboxRecipientSealBindingV1::new(
+            self.commitment()?,
+            self.target.node_id,
+            self.target.descriptor_sequence,
+            self.target.descriptor_commitment,
+            mailbox_id,
+            self.lease_claims_commitment,
+            self.chat_receiver,
+            self.recipient_seal,
+        )?)
+    }
+
+    fn signing_bytes(&self) -> Result<Zeroizing<Vec<u8>>, AnonymousMailboxDepositInvitationError> {
+        let mut unsigned = self.unsigned_wire_bytes()?;
+        let mut transcript = Zeroizing::new(Vec::with_capacity(
+            INVITATION_V2_SIGNATURE_DOMAIN.len() + unsigned.len(),
+        ));
+        transcript.extend_from_slice(INVITATION_V2_SIGNATURE_DOMAIN);
+        transcript.extend_from_slice(&unsigned);
+        unsigned.zeroize();
+        Ok(transcript)
+    }
+
+    fn encoded_len(&self) -> Result<usize, AnonymousMailboxDepositInvitationError> {
+        FIXED_PREFIX_BYTES_V2
+            .checked_add(LENGTH_BYTES)
+            .and_then(|value| value.checked_add(self.lease_create_frame.len()))
+            .and_then(|value| value.checked_add(LENGTH_BYTES))
+            .and_then(|value| value.checked_add(self.lease_response_frame.len()))
+            .and_then(|value| value.checked_add(SIGNATURE_BYTES))
+            .filter(|value| *value <= MAX_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_BYTES)
+            .ok_or(AnonymousMailboxDepositInvitationError::TooLarge)
+    }
+
+    fn unsigned_wire_bytes(&self) -> Result<Vec<u8>, AnonymousMailboxDepositInvitationError> {
+        if self.lease_create_frame.is_empty()
+            || self.lease_create_frame.len() > MAX_LEASE_CREATE_FRAME_BYTES
+            || self.lease_response_frame.is_empty()
+            || self.lease_response_frame.len() > MAX_LEASE_RESPONSE_FRAME_BYTES
+        {
+            return Err(AnonymousMailboxDepositInvitationError::TooLarge);
+        }
+        let total_len = self.encoded_len()?;
+        let mut encoded = Vec::with_capacity(total_len - SIGNATURE_BYTES);
+        encoded.extend_from_slice(&INVITATION_MAGIC);
+        encoded.extend_from_slice(&self.version.to_le_bytes());
+        encoded.extend_from_slice(
+            &u32::try_from(total_len)
+                .map_err(|_| AnonymousMailboxDepositInvitationError::TooLarge)?
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(&self.invitation_id);
+        encoded.extend_from_slice(&self.issued_at.to_le_bytes());
+        encoded.extend_from_slice(&self.expires_at.to_le_bytes());
+        encoded.extend_from_slice(&self.min_remaining_lease_secs.to_le_bytes());
+        encoded.extend_from_slice(&self.target.node_id);
+        encoded.extend_from_slice(&self.target.descriptor_sequence.to_le_bytes());
+        encoded.extend_from_slice(&self.target.descriptor_commitment);
+        encoded.extend_from_slice(&self.lease_claims_commitment);
+        encoded.extend_from_slice(&self.deposit_seed);
+        encoded.extend_from_slice(&self.chat_receiver);
+        encoded.push(self.recipient_seal.algorithm());
+        encoded.extend_from_slice(&self.recipient_seal.key_id());
+        encoded.extend_from_slice(&self.recipient_seal.public_key());
+        encoded.extend_from_slice(
+            &u16::try_from(self.lease_create_frame.len())
+                .map_err(|_| AnonymousMailboxDepositInvitationError::TooLarge)?
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(&self.lease_create_frame);
+        encoded.extend_from_slice(
+            &u16::try_from(self.lease_response_frame.len())
+                .map_err(|_| AnonymousMailboxDepositInvitationError::TooLarge)?
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(&self.lease_response_frame);
+        Ok(encoded)
+    }
+}
+
+impl AnonymousMailboxDepositInvitationActiveV2<'_> {
+    /// Creates canonical AMSI bytes after revalidating current authority.
+    ///
+    /// # Errors
+    /// Returns a coarse seal error when authority is no longer current or the
+    /// envelope, receiver binding, key, or ciphertext is invalid.
+    pub fn seal_chat_envelope_at(
+        &self,
+        envelope: &ChatEnvelope,
+        now: u64,
+    ) -> Result<AnonymousMailboxRecipientSealedItemV1, AnonymousMailboxRecipientSealError> {
+        let lease = self
+            .invitation
+            .active_lease_at(now)
+            .map_err(|_| AnonymousMailboxRecipientSealError::Rejected)?;
+        let binding = self
+            .invitation
+            .recipient_binding(lease.mailbox_id)
+            .map_err(|_| AnonymousMailboxRecipientSealError::Rejected)?;
+        Ok(AnonymousMailboxRecipientSealedItemV1::new(
+            seal_chat_envelope(&binding, envelope)?,
+            &binding,
+        ))
+    }
+
+    /// Consumes AMSI bytes created by this typed active context into one Put.
+    ///
+    /// # Errors
+    /// Returns a coarse invitation error when time, lease, size, or signing
+    /// constraints reject the new mutation.
+    pub fn prepare_put(
+        &self,
+        item_id: [u8; 16],
+        sealed_envelope: AnonymousMailboxRecipientSealedItemV1,
+        issued_at: u64,
+        expires_at: u64,
+        now: u64,
+    ) -> Result<AnonymousMailboxPutV1, AnonymousMailboxDepositInvitationError> {
+        let summary = self.invitation.summary_at(now)?;
+        let binding = self.invitation.recipient_binding(summary.mailbox_id)?;
+        if !sealed_envelope.matches_binding(&binding) {
+            return Err(AnonymousMailboxDepositInvitationError::ClaimsConflict);
+        }
+        if issued_at > now.saturating_add(MAX_ANONYMOUS_MAILBOX_REQUEST_SKEW_SECS)
+            || expires_at > summary.lease_expires_at
+        {
+            return Err(AnonymousMailboxDepositInvitationError::Expired);
+        }
+        let depositor = IdentityKeyPair::from_bytes(&self.invitation.deposit_seed)
+            .map_err(|_| AnonymousMailboxDepositInvitationError::SignatureRejected)?;
+        let put = AnonymousMailboxPutV1::new(
+            summary.mailbox_id,
+            item_id,
+            sealed_envelope.into_bytes(),
+            issued_at,
+            expires_at,
+            &depositor,
+        )?;
+        put.verify_at(&depositor.public_key_bytes(), now)?;
+        Ok(put)
+    }
+}
+
+impl AnonymousMailboxDepositInvitationV2 {
+    fn summary_at(
+        &self,
+        now: u64,
+    ) -> Result<AnonymousMailboxDepositInvitationSummaryV2, AnonymousMailboxDepositInvitationError>
+    {
+        let lease = self.active_lease_at(now)?;
+        Ok(AnonymousMailboxDepositInvitationSummaryV2 {
+            invitation_id: self.invitation_id,
+            target: self.target,
+            mailbox_id: lease.mailbox_id,
+            lease_claims_commitment: self.lease_claims_commitment,
+            invitation_expires_at: self.expires_at,
+            lease_expires_at: lease.expires_at,
+            min_remaining_lease_secs: self.min_remaining_lease_secs,
+            recipient_seal: self.recipient_seal,
+        })
+    }
+}
+
+impl fmt::Debug for AnonymousMailboxDepositInvitationV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnonymousMailboxDepositInvitationV2")
+            .field("version", &self.version)
+            .field("encoded_bytes", &self.encoded_len())
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .field("min_remaining_lease_secs", &self.min_remaining_lease_secs)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AnonymousMailboxDepositInvitationV2 {
+    fn drop(&mut self) {
+        self.deposit_seed.zeroize();
+    }
+}
+
 fn validate_invitation_window(
     issued_at: u64,
     expires_at: u64,
@@ -772,7 +1398,10 @@ fn take_u64(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::anonymous_mailbox::AnonymousMailboxAdmissionTicketV1;
+    use crate::protocol::anonymous_mailbox::{
+        decode_anonymous_mailbox_terminal_frame, encode_anonymous_mailbox_terminal_frame,
+        AnonymousMailboxAdmissionTicketV1, AnonymousMailboxTerminalFrameV1,
+    };
 
     const LEASE_ISSUED: u64 = 1_800_000_000;
     const LEASE_EXPIRES: u64 = LEASE_ISSUED + (10 * 24 * 60 * 60);
@@ -1201,6 +1830,294 @@ mod tests {
         assert_eq!(
             hex::encode(&encoded),
             "414d444901000f030000777777777777777777777777777777772dd3496b00000000ad0d536b0000000078000000d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787372a0000000000000066666666666666666666666666666666666666666666666666666666666666663c11c4daf854f8ed57a760f84253f66928a47698e032a82faafbb48db822bfe822222222222222222222222222222222222222222222222222222222222222226401414d01015c010000014444444444444444444444444444444444444444444444444444444444444444a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f017cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce4000000040000000000000d2496b000000000001576b000000000155555555555555555555555555555555d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787373c11c4daf854f8ed57a760f84253f66928a47698e032a82faafbb48db822bfe800d2496b000000002cd3496b00000000d8f6c3792f497972956298c2d582254357548155268ece4339e5ad8f687bcc49d1245383b1f9e2f7d9e049446885bf7a458817bd58928a98b5e8ccf4e8481f04366675f5d0d3d57d0e55527114e7ddcc53632b5e5cc2741d3c96f1d4cd915bf8610d9130a4bd9ab135045997563fa00d5cb70f6677a3419a7bef693ed8724707b100414d0181a90000000100000000555555555555555555555555555555557bfeec48297740aff27cc2595ee56a261bb03ee0548f89ccba6a5f4f3874b0870000000000000000000000000ad2496b00000000d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737707cc91999bbdcfc7cb6b0d24963d2e770a2868309a5a37da3902bbf8bb4c22d6fed853c64f18f96544181e7b0d1871c9e1152e88d1f1f523fd0ee7b7fb0620058b601a968755a3f094c2a821ebf438f952922afafe38169f4c0886a7e2b181efcfe635d1249ac50f8eded7c175e772ba9a1222d8bbcfd3ea0345c08d8549907"
+        );
+    }
+
+    struct RecipientKeyHandle {
+        key_id: [u8; 16],
+        secret: x25519_dalek::StaticSecret,
+        public: [u8; 32],
+        available: bool,
+    }
+
+    impl RecipientKeyHandle {
+        fn new(key_id: [u8; 16], secret_bytes: [u8; 32]) -> Self {
+            let secret = x25519_dalek::StaticSecret::from(secret_bytes);
+            let public = x25519_dalek::PublicKey::from(&secret).to_bytes();
+            Self {
+                key_id,
+                secret,
+                public,
+                available: true,
+            }
+        }
+    }
+
+    impl crate::protocol::anonymous_mailbox_recipient_seal::AnonymousMailboxRecipientSealKeyHandleV1
+        for RecipientKeyHandle
+    {
+        fn key_id(&self) -> [u8; 16] {
+            self.key_id
+        }
+
+        fn public_key(&self) -> [u8; 32] {
+            self.public
+        }
+
+        fn derive_shared_secret(
+            &self,
+            peer_public_key: [u8; 32],
+        ) -> Result<
+            Zeroizing<[u8; 32]>,
+            crate::protocol::anonymous_mailbox_recipient_seal::AnonymousMailboxRecipientSealError,
+        > {
+            if !self.available {
+                return Err(crate::protocol::anonymous_mailbox_recipient_seal::AnonymousMailboxRecipientSealError::KeyUnavailable);
+            }
+            Ok(Zeroizing::new(
+                *self
+                    .secret
+                    .diffie_hellman(&x25519_dalek::PublicKey::from(peer_public_key))
+                    .as_bytes(),
+            ))
+        }
+    }
+
+    fn invitation_v2_with_id(
+        invitation_id: [u8; 16],
+    ) -> (AnonymousMailboxDepositInvitationV2, [u8; 32], [u8; 32]) {
+        let fixture = fixture();
+        let secret_bytes = [0xc1; 32];
+        let handle = RecipientKeyHandle::new([0xc2; 16], secret_bytes);
+        let chat_receiver = IdentityKeyPair::from_bytes(&[0xd1; 32]).expect("chat receiver");
+        let recipient = AnonymousMailboxRecipientSealPublicV1::new(handle.key_id, handle.public)
+            .expect("recipient seal");
+        (
+            AnonymousMailboxDepositInvitationV2::issue(
+                invitation_id,
+                INVITATION_ISSUED,
+                INVITATION_EXPIRES,
+                DEFAULT_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_RUNWAY_SECS,
+                fixture.pin,
+                fixture.deposit.to_bytes(),
+                chat_receiver.public_key_bytes(),
+                recipient,
+                fixture.lease_frame,
+                fixture.response_frame,
+                &fixture.reader,
+            )
+            .expect("v2 invitation"),
+            secret_bytes,
+            chat_receiver.public_key_bytes(),
+        )
+    }
+
+    fn invitation_v2() -> (AnonymousMailboxDepositInvitationV2, [u8; 32], [u8; 32]) {
+        invitation_v2_with_id([0xc3; 16])
+    }
+
+    fn signed_chat(receiver: [u8; 32]) -> ChatEnvelope {
+        let sender = IdentityKeyPair::from_bytes(&[0xc4; 32]).expect("sender");
+        let mut envelope = ChatEnvelope {
+            message_id: [0xc5; 16],
+            sender: sender.public_key_bytes(),
+            receiver,
+            timestamp: INVITATION_ISSUED,
+            ciphertext: b"opaque inner chat ciphertext".to_vec(),
+            nonce: [0xc6; 24],
+            content_type: crate::protocol::chat::ChatContentType::Text,
+            signature: [0; 64],
+        };
+        envelope.signature = sender.sign(&envelope.sign_data());
+        envelope
+    }
+
+    #[test]
+    fn v2_active_put_and_expired_historical_restart_open_are_separate() {
+        let (invitation, secret_bytes, chat_receiver) = invitation_v2();
+        let encoded = invitation.encode().expect("encode v2");
+        let summary = invitation.summary_at(INVITATION_ISSUED).expect("summary");
+        let active = invitation
+            .verify_for_new_put_at(INVITATION_ISSUED)
+            .expect("active");
+        assert_ne!(fixture().reader.public_key_bytes(), chat_receiver);
+        assert_ne!(
+            RecipientKeyHandle::new([0xc2; 16], secret_bytes).public,
+            chat_receiver
+        );
+        let envelope = signed_chat(chat_receiver);
+        let sealed = active
+            .seal_chat_envelope_at(&envelope, INVITATION_ISSUED)
+            .expect("seal");
+        let sealed_bytes = sealed.as_bytes().to_vec();
+        let put = active
+            .prepare_put(
+                [0xc7; 16],
+                sealed,
+                INVITATION_ISSUED,
+                INVITATION_ISSUED + 60,
+                INVITATION_ISSUED,
+            )
+            .expect("put");
+        assert_eq!(put.sealed_envelope, sealed_bytes);
+        assert_eq!(put.mailbox_id, summary.mailbox_id());
+
+        // The target-visible terminal projection is structurally still the
+        // legacy Put: no chat receiver was added to its decoded field set.
+        let terminal = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::Put(put.clone()),
+        )
+        .expect("terminal");
+        let AnonymousMailboxTerminalFrameV1::Put(target_visible) =
+            decode_anonymous_mailbox_terminal_frame(&terminal).expect("target-visible Put")
+        else {
+            panic!("expected Put");
+        };
+        assert_eq!(target_visible.mailbox_id, summary.mailbox_id());
+        assert_eq!(target_visible.item_id, [0xc7; 16]);
+        assert_eq!(target_visible.sealed_envelope, sealed_bytes);
+
+        assert_eq!(
+            AnonymousMailboxDepositInvitationV2::decode_at(&encoded, INVITATION_EXPIRES + 1)
+                .expect_err("expired new effect"),
+            AnonymousMailboxDepositInvitationError::Expired
+        );
+        assert!(active
+            .seal_chat_envelope_at(&envelope, INVITATION_EXPIRES + 1)
+            .is_err());
+
+        let expired_put_item = active
+            .seal_chat_envelope_at(&envelope, INVITATION_ISSUED)
+            .expect("seal before expiry");
+        assert!(matches!(
+            active.prepare_put(
+                [0xc8; 16],
+                expired_put_item,
+                INVITATION_ISSUED,
+                INVITATION_ISSUED + 60,
+                INVITATION_EXPIRES + 1,
+            ),
+            Err(AnonymousMailboxDepositInvitationError::Expired)
+        ));
+
+        let wrong_receiver = signed_chat(fixture().reader.public_key_bytes());
+        assert_eq!(
+            active
+                .seal_chat_envelope_at(&wrong_receiver, INVITATION_ISSUED)
+                .expect_err("mailbox reader is not the chat receiver"),
+            AnonymousMailboxRecipientSealError::ClaimsConflict
+        );
+
+        // Simulate a process restart: reconstruct both the authenticated
+        // historical context and the native key handle from durable material.
+        let historical =
+            AnonymousMailboxDepositInvitationV2::decode_historical_recipient_context(&encoded)
+                .expect("historical context");
+        let handle = RecipientKeyHandle::new([0xc2; 16], secret_bytes);
+        let opened = historical
+            .open_chat_envelope(&handle, &sealed_bytes)
+            .expect("open retained item after invitation expiry");
+        assert_eq!(opened.message_id, envelope.message_id);
+        assert_eq!(historical.lease_expires_at(), LEASE_EXPIRES);
+
+        let unavailable = RecipientKeyHandle {
+            available: false,
+            ..RecipientKeyHandle::new([0xc2; 16], secret_bytes)
+        };
+        assert_eq!(
+            historical
+                .open_chat_envelope(&unavailable, &sealed_bytes)
+                .expect_err("missing durable key"),
+            AnonymousMailboxRecipientSealError::KeyUnavailable
+        );
+    }
+
+    #[test]
+    fn typed_sealed_item_cannot_cross_invitation_bindings() {
+        let (invitation_a, _, chat_receiver) = invitation_v2_with_id([0xc3; 16]);
+        let (invitation_b, _, _) = invitation_v2_with_id([0xd3; 16]);
+        let active_a = invitation_a
+            .verify_for_new_put_at(INVITATION_ISSUED)
+            .expect("active A");
+        let active_b = invitation_b
+            .verify_for_new_put_at(INVITATION_ISSUED)
+            .expect("active B");
+        let envelope = signed_chat(chat_receiver);
+
+        let wrong_origin = active_a
+            .seal_chat_envelope_at(&envelope, INVITATION_ISSUED)
+            .expect("A seal");
+        assert!(matches!(
+            active_b.prepare_put(
+                [0xd4; 16],
+                wrong_origin,
+                INVITATION_ISSUED,
+                INVITATION_ISSUED + 60,
+                INVITATION_ISSUED,
+            ),
+            Err(AnonymousMailboxDepositInvitationError::ClaimsConflict)
+        ));
+
+        let same_origin = active_a
+            .seal_chat_envelope_at(&envelope, INVITATION_ISSUED)
+            .expect("second A seal");
+        assert!(active_a
+            .prepare_put(
+                [0xd5; 16],
+                same_origin,
+                INVITATION_ISSUED,
+                INVITATION_ISSUED + 60,
+                INVITATION_ISSUED,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn v2_wire_domains_and_recipient_fields_are_frozen() {
+        let (invitation, _, chat_receiver) = invitation_v2();
+        let encoded = invitation.encode().expect("encode");
+        assert_eq!(encoded.len(), 864);
+        assert_eq!(&encoded[..4], b"AMDI");
+        assert_eq!(&encoded[4..6], &2u16.to_le_bytes());
+        assert_eq!(&encoded[6..10], &864u32.to_le_bytes());
+        assert_eq!(&encoded[182..214], &chat_receiver);
+        assert_eq!(encoded[214], 1);
+        assert_eq!(&encoded[215..231], &[0xc2; 16]);
+        assert_eq!(
+            u16::from_le_bytes(encoded[263..265].try_into().expect("lease length")),
+            356
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(&encoded)),
+            "1146ce09af689a77e2b7a3143707ecb76fe86d2e1c7b90cfef0267fe7a86de10"
+        );
+        assert_eq!(
+            hex::encode(invitation.commitment().expect("commitment")),
+            "4ea25de63bef0be8e4ec4763231fc4ac138a3b43c3603718464f5df0ffe14e55"
+        );
+
+        let mut receiver_tamper = encoded.clone();
+        receiver_tamper[182] ^= 1;
+        assert_eq!(
+            AnonymousMailboxDepositInvitationV2::decode_at(&receiver_tamper, INVITATION_ISSUED,)
+                .expect_err("chat receiver is signed"),
+            AnonymousMailboxDepositInvitationError::SignatureRejected
+        );
+
+        for offset in [
+            4usize, 10, 46, 86, 118, 150, 182, 214, 215, 231, 263, 621, 800,
+        ] {
+            let mut changed = encoded.clone();
+            changed[offset] ^= 1;
+            assert!(
+                AnonymousMailboxDepositInvitationV2::decode_at(&changed, INVITATION_ISSUED)
+                    .is_err()
+            );
+        }
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(
+            AnonymousMailboxDepositInvitationV2::decode_at(&trailing, INVITATION_ISSUED).is_err()
         );
     }
 }

@@ -242,6 +242,9 @@ pub mod anonymous_mailbox;
 // [M13J 2026-09-05 by Codex] Client-shared deposit-only bearer codec; this is
 // not a server terminal operation or public mailbox locator.
 pub mod anonymous_mailbox_deposit_invitation;
+// [ANONYMOUS-MAILBOX-RECIPIENT-SEAL 2026-09-08 by Codex] Pure core codec and
+// native key-operation boundary; platform secret persistence remains external.
+pub mod anonymous_mailbox_recipient_seal;
 pub mod auth;
 pub mod blind_vault;
 pub mod blind_vault_replica_workflow;
@@ -263,14 +266,22 @@ pub use anonymous_mailbox::{
     AnonymousMailboxTerminalResponseV1,
 };
 pub use anonymous_mailbox_deposit_invitation::{
-    AnonymousMailboxDepositInvitationError, AnonymousMailboxDepositInvitationSummaryV1,
-    AnonymousMailboxDepositInvitationV1, AnonymousMailboxDepositTargetPinV1,
-    ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_VERSION_V1,
+    AnonymousMailboxDepositInvitationActiveV2, AnonymousMailboxDepositInvitationError,
+    AnonymousMailboxDepositInvitationSummaryV1, AnonymousMailboxDepositInvitationSummaryV2,
+    AnonymousMailboxDepositInvitationV1, AnonymousMailboxDepositInvitationV2,
+    AnonymousMailboxDepositTargetPinV1, ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_VERSION_V1,
+    ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_VERSION_V2,
     DEFAULT_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_RUNWAY_SECS,
     MAX_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_BYTES,
     MAX_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_RUNWAY_SECS,
     MAX_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_TTL_SECS,
     MIN_ANONYMOUS_MAILBOX_DEPOSIT_INVITATION_RUNWAY_SECS,
+};
+pub use anonymous_mailbox_recipient_seal::{
+    AnonymousMailboxRecipientOpenContextV1, AnonymousMailboxRecipientSealError,
+    AnonymousMailboxRecipientSealKeyHandleV1, AnonymousMailboxRecipientSealPublicV1,
+    AnonymousMailboxRecipientSealedItemV1, ANONYMOUS_MAILBOX_RECIPIENT_SEAL_ALGORITHM_V1,
+    ANONYMOUS_MAILBOX_RECIPIENT_SEAL_VERSION_V1, MAX_ANONYMOUS_MAILBOX_RECIPIENT_SEALED_ITEM_BYTES,
 };
 
 // Re-export primary types
@@ -383,8 +394,9 @@ pub use memchain::{
     decode_memchain, encode_memchain, MemChainMessage, MAX_CHAT_PULL_CURSOR_V2_BYTES,
     MEMCHAIN_MAGIC,
 };
-pub use messages::{ClientHello, DataPacket, MessageType, ServerHello, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2,
-    is_supported_hello_version,
+pub use messages::{
+    is_supported_hello_version, ClientHello, DataPacket, MessageType, ServerHello,
+    PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2,
 };
 pub use onion::{
     build_onion_envelope, is_onion_blob, open_onion_layer, OnionHop, OnionPeel,
