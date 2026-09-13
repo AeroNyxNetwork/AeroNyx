@@ -5919,6 +5919,15 @@ impl Server {
         &self,
         peer_store: Arc<PeerStore>,
     ) -> Result<Option<AnonymousMailboxSourceRuntime>> {
+        self.init_anonymous_mailbox_source_coordinator_at(peer_store, unix_now_secs())
+            .await
+    }
+
+    async fn init_anonymous_mailbox_source_coordinator_at(
+        &self,
+        peer_store: Arc<PeerStore>,
+        now: u64,
+    ) -> Result<Option<AnonymousMailboxSourceRuntime>> {
         let config = self
             .config
             .memchain
@@ -5937,24 +5946,37 @@ impl Server {
         hasher.update(self.identity.to_bytes());
         let journal_key: [u8; 32] = hasher.finalize().into();
         let source_identity = Arc::new(self.identity.clone());
-        tokio::task::spawn_blocking(move || {
+        let (runtime, report) = tokio::task::spawn_blocking(move || {
             let journal = Arc::new(SqliteAnonymousMailboxSourceJournal::open(
                 config,
                 journal_key,
             )?);
-            Ok::<_, AnonymousMailboxSourceError>(AnonymousMailboxSourceRuntime {
+            // [ANONYMOUS-MAILBOX-CLEANUP-RUNTIME 2026-09-13 by Codex]
+            // Cleanup must finish before the coordinator can enter API/runtime
+            // composition. Merely spawning an immediate interval tick would
+            // allow readiness to race expired terminal source state.
+            let report = journal.cleanup_terminal_records(now)?;
+            let runtime = AnonymousMailboxSourceRuntime {
                 coordinator: Arc::new(AnonymousMailboxSourceCoordinator::new(
                     source_identity,
                     peer_store,
                     Arc::clone(&journal),
                 )),
                 journal,
-            })
+            };
+            Ok::<_, AnonymousMailboxSourceError>((runtime, report))
         })
         .await
         .map_err(|_| ServerError::startup_failed("Anonymous mailbox source initialization failed"))?
-        .map(Some)
-        .map_err(|_| ServerError::startup_failed("Anonymous mailbox source initialization failed"))
+        .map_err(|_| {
+            ServerError::startup_failed("Anonymous mailbox source initialization failed")
+        })?;
+        info!(
+            rows_removed = report.rows_removed,
+            bytes_removed = report.bytes_removed,
+            "[ANONYMOUS_MAILBOX] Bounded source startup cleanup completed"
+        );
+        Ok(Some(runtime))
     }
 
     /// Enforces the current custody anchor against durable signed receipts.
@@ -17486,12 +17508,14 @@ mod tests {
         VerifiedSubmitAdmission, VerifiedSubmitCacheLookup,
         VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS,
     };
+    use crate::services::chat_relay_anonymous_mailbox_source::ExactAnonymousMailboxTargetPin;
     use aeronyx_core::crypto::transport::{DefaultTransportCrypto, TransportCrypto};
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
     use aeronyx_core::ledger::{RecordCommitmentBlockV1, GENESIS_PREV_HASH};
     use aeronyx_core::protocol::anonymous_mailbox::{
-        AnonymousMailboxLeaseCreateV1, AnonymousMailboxTicketIssueV1,
+        encode_anonymous_mailbox_terminal_frame, AnonymousMailboxLeaseCreateV1,
+        AnonymousMailboxTerminalFrameV1, AnonymousMailboxTicketIssueV1,
     };
     use aeronyx_core::protocol::auth::TIMESTAMP_WINDOW_SECS;
     use aeronyx_core::protocol::chat::{
@@ -17882,7 +17906,59 @@ mod tests {
         config.memchain.chat_relay.anonymous_mailbox_source.enabled = enabled;
         config.memchain.chat_relay.anonymous_mailbox_source.db_path =
             db_path.to_string_lossy().into_owned();
-        Server::new(config, IdentityKeyPair::generate(), None)
+        config
+            .memchain
+            .chat_relay
+            .anonymous_mailbox_source
+            .terminal_retention_secs = 10;
+        Server::new(
+            config,
+            IdentityKeyPair::from_bytes(&[0xd1; 32]).expect("source cleanup identity"),
+            None,
+        )
+    }
+
+    fn test_anonymous_mailbox_source_descriptor(
+        target: &IdentityKeyPair,
+        now: u64,
+    ) -> SignedNodeDescriptor {
+        let mut descriptor = NodeDescriptor::new(
+            target.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now + 1_000,
+            "source-cleanup-target",
+        )
+        .with_x25519_kem(target.x25519_public_key_bytes())
+        .with_protocol_features([
+            NodeProtocolFeature::AnonymousMailboxV1,
+            NodeProtocolFeature::OnionReplyV1,
+            NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+            NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+        ]);
+        descriptor.public_endpoint = Some("https://1.1.1.1:443".into());
+        descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        SignedNodeDescriptor::sign(descriptor, target).expect("source cleanup descriptor")
+    }
+
+    fn test_anonymous_mailbox_source_terminal_frame(
+        target: &IdentityKeyPair,
+        request_byte: u8,
+    ) -> Vec<u8> {
+        let request = AnonymousMailboxTicketIssueV1::new(
+            [request_byte; 16],
+            [request_byte.wrapping_add(1); 16],
+            target.public_key_bytes(),
+            [request_byte.wrapping_add(2); 32],
+            ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW,
+            ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW + 30,
+            u64::from(request_byte),
+        )
+        .expect("source cleanup request");
+        encode_anonymous_mailbox_terminal_frame(&AnonymousMailboxTerminalFrameV1::TicketIssue(
+            request,
+        ))
+        .expect("source cleanup terminal frame")
     }
 
     #[tokio::test]
@@ -17936,6 +18012,120 @@ mod tests {
             .await
             .expect("enabled source must reopen its private journal");
         assert!(reopened.is_some());
+    }
+
+    #[tokio::test]
+    async fn anonymous_mailbox_source_startup_cleanup_precedes_runtime_composition() {
+        // [ANONYMOUS-MAILBOX-CLEANUP-RUNTIME 2026-09-13 by Codex] Prepare two
+        // canonical encrypted journal rows through the real coordinator, then
+        // project crash-persisted terminal phase/deadline columns. Reopen must
+        // reclaim both before returning a coordinator/runtime handle.
+        let directory = tempfile::tempdir().expect("source cleanup directory");
+        let private_parent =
+            std::fs::canonicalize(directory.path()).expect("canonical source directory");
+        let db_path = private_parent.join("source-cleanup.sqlite");
+        let server = test_anonymous_mailbox_source_server(true, &db_path);
+        let target = IdentityKeyPair::from_bytes(&[0xd2; 32]).expect("source cleanup target");
+        let descriptor =
+            test_anonymous_mailbox_source_descriptor(&target, ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW);
+        let descriptor_commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
+                .expect("source cleanup descriptor commitment");
+        let peer_store = Arc::new(PeerStore::new());
+        assert!(peer_store
+            .upsert_verified(descriptor, ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW)
+            .expect("admit source cleanup target"));
+        let runtime = server
+            .init_anonymous_mailbox_source_coordinator_at(
+                Arc::clone(&peer_store),
+                ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW,
+            )
+            .await
+            .expect("initial source open")
+            .expect("source runtime");
+        for (route_byte, request_byte) in [(0xd3_u8, 0xd4_u8), (0xd5_u8, 0xd6_u8)] {
+            runtime
+                .coordinator
+                .prepare(
+                    ExactAnonymousMailboxTargetPin::new(
+                        target.public_key_bytes(),
+                        descriptor_commitment,
+                    ),
+                    [route_byte; 16],
+                    test_anonymous_mailbox_source_terminal_frame(&target, request_byte),
+                    ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW,
+                )
+                .expect("prepare source cleanup row");
+        }
+        drop(runtime);
+
+        let connection = rusqlite::Connection::open(&db_path).expect("open source fixture");
+        for (route_byte, phase) in [(0xd3_u8, 3_i64), (0xd5_u8, 5_i64)] {
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE anonymous_mailbox_source_journal
+                         SET phase = ?1, retain_until = ?2 WHERE route_id = ?3",
+                        rusqlite::params![
+                            phase,
+                            ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW - 1,
+                            [route_byte; 16].as_slice()
+                        ],
+                    )
+                    .expect("project terminal source row"),
+                1
+            );
+        }
+        let before: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM anonymous_mailbox_source_journal
+                 WHERE phase IN (3, 5)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("terminal source rows before restart");
+        assert_eq!(before, 2);
+        drop(connection);
+
+        let reopened = server
+            .init_anonymous_mailbox_source_coordinator_at(
+                peer_store,
+                ANONYMOUS_MAILBOX_CLEANUP_TEST_NOW,
+            )
+            .await
+            .expect("source restart cleanup")
+            .expect("source runtime after cleanup");
+        let after: i64 = rusqlite::Connection::open(&db_path)
+            .expect("inspect source cleanup result")
+            .query_row(
+                "SELECT COUNT(*) FROM anonymous_mailbox_source_journal",
+                [],
+                |row| row.get(0),
+            )
+            .expect("source rows after restart cleanup");
+        assert_eq!(after, 0);
+        drop(reopened);
+    }
+
+    #[tokio::test]
+    async fn anonymous_mailbox_source_startup_cleanup_failure_builds_no_runtime_or_task() {
+        let directory = tempfile::tempdir().expect("source cleanup failure directory");
+        let private_parent =
+            std::fs::canonicalize(directory.path()).expect("canonical source failure directory");
+        let db_path = private_parent.join("source-cleanup-failure.sqlite");
+        let server = test_anonymous_mailbox_source_server(true, &db_path);
+        let result = server
+            .init_anonymous_mailbox_source_coordinator_at(Arc::new(PeerStore::new()), u64::MAX)
+            .await;
+
+        assert!(result.is_err(), "cleanup rejection must stop startup");
+        assert!(
+            db_path.is_file(),
+            "journal open must precede cleanup failure"
+        );
+        assert!(server
+            .spawn_anonymous_mailbox_cleanup_task(None, None)
+            .is_none());
     }
 
     #[tokio::test]
