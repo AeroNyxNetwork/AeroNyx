@@ -960,6 +960,9 @@ fn build_v1_keepalive_echo_reply(packet: &[u8], virtual_ip: [u8; 4]) -> Option<V
     // [V1-COMPATIBILITY-SMOKE 2026-09-13 by Codex] Admit only the exact
     // non-fragmented IPv4/ICMP shape emitted by PacketHandler. A random VPN
     // packet cannot be reflected merely because it starts with an IPv4 nibble.
+    // [V1-KEEPALIVE-GATEWAY-BINDING 2026-09-13 by Codex] The node probe is
+    // canonical only when it originates from this session's subnet gateway.
+    let gateway_ip = [virtual_ip[0], virtual_ip[1], virtual_ip[2], 1];
     if packet.len() != V1_KEEPALIVE_PACKET_BYTES
         || packet[0] != 0x45
         || packet[1] != 0
@@ -967,6 +970,7 @@ fn build_v1_keepalive_echo_reply(packet: &[u8], virtual_ip: [u8; 4]) -> Option<V
         || packet[6..8] != [0, 0]
         || packet[8] != 64
         || packet[9] != 1
+        || packet[12..16] != gateway_ip
         || packet[16..20] != virtual_ip
         || internet_checksum_v1(&packet[..IPV4_HEADER_BYTES]) != 0
     {
@@ -1647,6 +1651,10 @@ mod tests {
         wrong_destination[16] ^= 1;
         refresh_v1_checksums(&mut wrong_destination);
         rejected.push(wrong_destination);
+        let mut wrong_source = request.clone();
+        wrong_source[15] = 99;
+        refresh_v1_checksums(&mut wrong_source);
+        rejected.push(wrong_source);
         let mut fragmented = request.clone();
         fragmented[7] = 1;
         refresh_v1_checksums(&mut fragmented);
