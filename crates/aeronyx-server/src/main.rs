@@ -36,6 +36,8 @@
 //! - [LIVE-RELAY-SMOKE 2026-08-15 by Codex] Add a host-local operator command
 //!   that proves the production authenticated UDP, E2E relay, terminal receipt,
 //!   mailbox pull, and ACK path without exposing protocol secrets.
+//! - [V1-COMPATIBILITY-SMOKE 2026-09-13 by Codex] Add a host-local frozen
+//!   v0x01 handshake/keepalive/close proof without changing protocol defaults.
 //! - [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] Add host-local custody
 //!   retention audit and confirmation-gated prune commands with aggregate-only
 //!   output; no management-plane or HTTP mutation endpoint is introduced.
@@ -273,6 +275,37 @@ enum Commands {
         /// Confirm creation of two ephemeral test sessions and one ciphertext
         #[arg(long)]
         confirm_live_relay_smoke: bool,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Prove the running node still serves the frozen v0x01 transport
+    V1CompatibilitySmoke {
+        /// Running node UDP listener; only loopback addresses are accepted
+        #[arg(long, default_value = "127.0.0.1:51820")]
+        server: std::net::SocketAddr,
+
+        /// Running node aggregate health URL; only loopback HTTP is accepted
+        #[arg(long, default_value = "http://127.0.0.1:8421/api/vpn/health")]
+        health_url: String,
+
+        /// Path to the running node configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Total bounded proof window, including the scheduled probe wait
+        #[arg(
+            long,
+            default_value_t = 90,
+            value_parser = clap::value_parser!(u64).range(65..=180)
+        )]
+        timeout_seconds: u64,
+
+        /// Confirm creation of one ephemeral frozen-v1 session
+        #[arg(long)]
+        confirm_v1_compatibility_smoke: bool,
 
         /// Emit the stable aggregate JSON contract
         #[arg(long)]
@@ -786,6 +819,24 @@ async fn main() {
             )
             .await
         }
+        Commands::V1CompatibilitySmoke {
+            server,
+            health_url,
+            config,
+            timeout_seconds,
+            confirm_v1_compatibility_smoke,
+            json,
+        } => {
+            cmd_v1_compatibility_smoke(
+                server,
+                health_url,
+                config,
+                timeout_seconds,
+                confirm_v1_compatibility_smoke,
+                json,
+            )
+            .await
+        }
     };
 
     if let Err(e) = result {
@@ -876,6 +927,79 @@ async fn cmd_relay_smoke(
         println!(
             "  Terminal replica cleanup:       {}",
             report.terminal_replica_cleanup
+        );
+        println!(
+            "  Evidence scope:                 {}",
+            report.evidence_scope
+        );
+        println!("  Elapsed:                        {} ms", report.elapsed_ms);
+        println!(
+            "  Privacy boundary:               {}",
+            report.privacy_boundary
+        );
+    }
+    Ok(())
+}
+
+/// Runs one explicit frozen-v0x01 compatibility proof against this host.
+async fn cmd_v1_compatibility_smoke(
+    server_addr: std::net::SocketAddr,
+    health_url: String,
+    config_path: PathBuf,
+    timeout_seconds: u64,
+    confirmed: bool,
+    emit_json: bool,
+) -> anyhow::Result<()> {
+    // [V1-COMPATIBILITY-SMOKE 2026-09-13 by Codex] This creates one real
+    // session and waits for the node's scheduled keepalive, so it is never
+    // implicit in status/validate and requires an operator confirmation.
+    anyhow::ensure!(
+        confirmed,
+        "v1 compatibility smoke requires --confirm-v1-compatibility-smoke"
+    );
+    let config = ServerConfig::load(&config_path)
+        .await
+        .with_context(|| format!("load node config {}", config_path.display()))?;
+    anyhow::ensure!(
+        server_addr.port() == config.listen_addr().port(),
+        "v1 compatibility smoke UDP port does not match the configured node listener"
+    );
+    let health_authority =
+        relay_smoke::RelaySmokeHealthAuthority::new(server_addr, config.memchain.api_listen_addr)?;
+    let expected_server_key =
+        relay_smoke::load_expected_server_public_key(Path::new(&config.server_key.key_file))
+            .await?;
+    let report =
+        relay_smoke::run_v1_compatibility_smoke(relay_smoke::V1CompatibilitySmokeOptions {
+            server_addr,
+            health_url,
+            health_authority,
+            expected_server_key,
+            timeout: std::time::Duration::from_secs(timeout_seconds),
+        })
+        .await?;
+
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("AeroNyx frozen v1 compatibility smoke");
+        println!("  Status:                         {}", report.status);
+        println!(
+            "  Protocol version:               0x{:02x}",
+            report.protocol_version
+        );
+        println!("  Transport:                      {}", report.transport);
+        println!(
+            "  Server keepalive observed:      {}",
+            report.server_keepalive_probe_observed
+        );
+        println!(
+            "  Canonical echo reply sent:      {}",
+            report.canonical_echo_reply_sent
+        );
+        println!(
+            "  Session cleanup:                {}",
+            report.session_cleanup
         );
         println!(
             "  Evidence scope:                 {}",
@@ -4179,6 +4303,45 @@ mod tests {
             ["aeronyx-server", "relay-smoke", "--timeout-seconds", "121",]
         )
         .is_err());
+    }
+
+    #[test]
+    fn v1_compatibility_smoke_cli_is_additive_bounded_and_explicit() {
+        let cli = Cli::try_parse_from([
+            "aeronyx-server",
+            "v1-compatibility-smoke",
+            "--confirm-v1-compatibility-smoke",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::V1CompatibilitySmoke {
+            server,
+            health_url,
+            config,
+            timeout_seconds,
+            confirm_v1_compatibility_smoke,
+            json,
+        } = cli.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(server, "127.0.0.1:51820".parse().unwrap());
+        assert_eq!(health_url, "http://127.0.0.1:8421/api/vpn/health");
+        assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
+        assert_eq!(timeout_seconds, 90);
+        assert!(confirm_v1_compatibility_smoke);
+        assert!(json);
+
+        for rejected in [64, 181] {
+            let rejected = rejected.to_string();
+            assert!(Cli::try_parse_from([
+                "aeronyx-server",
+                "v1-compatibility-smoke",
+                "--timeout-seconds",
+                rejected.as_str(),
+            ])
+            .is_err());
+        }
     }
 
     #[test]

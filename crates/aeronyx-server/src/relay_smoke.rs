@@ -56,7 +56,7 @@
 //! address for portable host-local UDP handshake behavior.
 // ============================================
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -84,7 +84,7 @@ use aeronyx_core::protocol::memchain::{
 use aeronyx_core::protocol::{
     decode_memchain, encode_memchain, ChatContentType, ChatEnvelope, DataPacket, MemChainMessage,
     CURRENT_PROTOCOL_VERSION, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL_V2, DOMAIN_SESSION_CLOSE_V1,
-    MEMCHAIN_MAGIC,
+    MEMCHAIN_MAGIC, PROTOCOL_VERSION_V1,
 };
 
 const MIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -98,6 +98,16 @@ const SMOKE_PLAINTEXT_BYTES: usize = 48;
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_CLOSE_REDUNDANCY: usize = 2;
 const HEALTH_PATH: &str = "/api/vpn/health";
+// [V1-COMPATIBILITY-SMOKE 2026-09-13 by Codex] The production keepalive task
+// warms for 30 seconds and then probes every 60 seconds. This dedicated bound
+// cannot silently shrink to the shorter chat-relay smoke window.
+const V1_COMPAT_MIN_TIMEOUT: Duration = Duration::from_secs(65);
+const V1_COMPAT_MAX_TIMEOUT: Duration = Duration::from_secs(180);
+const IPV4_HEADER_BYTES: usize = 20;
+const ICMP_HEADER_BYTES: usize = 8;
+const V1_KEEPALIVE_PAYLOAD: &[u8] = b"AERONYX-KEEPALIVE";
+const V1_KEEPALIVE_PACKET_BYTES: usize =
+    IPV4_HEADER_BYTES + ICMP_HEADER_BYTES + V1_KEEPALIVE_PAYLOAD.len();
 
 /// Config-bound authority for the host-local readiness evidence surface.
 ///
@@ -210,6 +220,45 @@ impl RelaySmokeOptions {
         self.health_authority
             .validate_url(self.server_addr, &self.health_url)
     }
+}
+
+/// Host-local options for one frozen v0x01 compatibility proof.
+#[derive(Debug, Clone)]
+pub struct V1CompatibilitySmokeOptions {
+    pub server_addr: SocketAddr,
+    pub health_url: String,
+    pub health_authority: RelaySmokeHealthAuthority,
+    pub expected_server_key: [u8; 32],
+    pub timeout: Duration,
+}
+
+impl V1CompatibilitySmokeOptions {
+    fn validate(&self) -> Result<reqwest::Url> {
+        anyhow::ensure!(
+            self.server_addr.ip().is_loopback(),
+            "v1 compatibility smoke server must use a loopback address"
+        );
+        anyhow::ensure!(
+            (V1_COMPAT_MIN_TIMEOUT..=V1_COMPAT_MAX_TIMEOUT).contains(&self.timeout),
+            "v1 compatibility smoke timeout must be between 65 and 180 seconds"
+        );
+        self.health_authority
+            .validate_url(self.server_addr, &self.health_url)
+    }
+}
+
+/// Aggregate-only result for a successful frozen v0x01 compatibility proof.
+#[derive(Debug, Serialize)]
+pub struct V1CompatibilitySmokeReport {
+    pub status: &'static str,
+    pub protocol_version: u8,
+    pub transport: &'static str,
+    pub server_keepalive_probe_observed: bool,
+    pub canonical_echo_reply_sent: bool,
+    pub session_cleanup: &'static str,
+    pub evidence_scope: &'static str,
+    pub elapsed_ms: u64,
+    pub privacy_boundary: &'static str,
 }
 
 /// Aggregate-only report emitted by a successful smoke run.
@@ -327,6 +376,22 @@ impl HealthSnapshot {
             .peer_store
             .blind_relay_quality
             .verified_client_onion_deliveries
+    }
+
+    fn ensure_idle_v1_compatible(&self) -> Result<()> {
+        // [V1-COMPATIBILITY-SMOKE 2026-09-13 by Codex] V1 transport liveness
+        // is independent of peer discovery and chat custody. Requiring only
+        // the shared node-health invariants keeps this proof narrowly scoped.
+        anyhow::ensure!(self.status == "ok", "node health is not ready");
+        anyhow::ensure!(
+            self.privacy_protocol_health.failed_checks == 0,
+            "node health has failed checks"
+        );
+        anyhow::ensure!(
+            self.active_sessions == 0,
+            "v1 compatibility smoke requires zero active sessions for attribution"
+        );
+        Ok(())
     }
 
     fn authenticated_onion_outbound_rounds(&self) -> Option<u64> {
@@ -686,6 +751,8 @@ struct RelaySmokeClient {
     identity: IdentityKeyPair,
     session_id: [u8; 16],
     session_key: SessionKey,
+    virtual_ip: [u8; 4],
+    protocol_version: u8,
     next_tx_counter: u64,
     highest_server_counter: Option<u64>,
 }
@@ -695,6 +762,7 @@ impl RelaySmokeClient {
         server_addr: SocketAddr,
         expected_server_key: &[u8; 32],
         identity: IdentityKeyPair,
+        protocol_version: u8,
         deadline: TokioInstant,
     ) -> Result<Self> {
         // [RELAY-SMOKE-LOOPBACK-SOURCE 2026-08-25 by Codex] Validation makes
@@ -713,11 +781,7 @@ impl RelaySmokeClient {
             .map_err(|_| anyhow::anyhow!("failed to connect smoke UDP socket"))?;
 
         let ephemeral = EphemeralKeyPair::generate();
-        let hello = create_client_hello(
-            &identity,
-            ephemeral.public_key_bytes(),
-            CURRENT_PROTOCOL_VERSION,
-        );
+        let hello = create_client_hello(&identity, ephemeral.public_key_bytes(), protocol_version);
         let hello_bytes = encode_client_hello(&hello);
         let sent = timeout_at(deadline, socket.send(&hello_bytes))
             .await
@@ -738,7 +802,7 @@ impl RelaySmokeClient {
             "ServerHello identity pin mismatch"
         );
         anyhow::ensure!(
-            server_hello.version == CURRENT_PROTOCOL_VERSION,
+            server_hello.version == protocol_version,
             "ServerHello protocol version mismatch"
         );
         verify_server_hello(&server_hello, &identity.public_key_bytes())
@@ -757,23 +821,20 @@ impl RelaySmokeClient {
             identity,
             session_id: server_hello.session_id,
             session_key,
+            virtual_ip: server_hello.assigned_ip,
+            protocol_version,
             next_tx_counter: 0,
             highest_server_counter: None,
         })
     }
 
-    async fn send_memchain(
-        &mut self,
-        message: &MemChainMessage,
-        deadline: TokioInstant,
-    ) -> Result<()> {
-        let plaintext = encode_memchain(message).context("MemChain encode failed")?;
+    async fn send_plaintext(&mut self, plaintext: &[u8], deadline: TokioInstant) -> Result<()> {
         let counter = self.next_tx_counter;
         self.next_tx_counter = self
             .next_tx_counter
             .checked_add(1)
             .context("client transport counter exhausted")?;
-        let encrypted = encrypt_packet(&self.session_key, counter, &self.session_id, &plaintext)
+        let encrypted = encrypt_packet(&self.session_key, counter, &self.session_id, plaintext)
             .context("client transport encryption failed")?;
         let packet = DataPacket::new(self.session_id, counter, encrypted);
         let bytes = encode_data_packet(&packet);
@@ -783,6 +844,15 @@ impl RelaySmokeClient {
             .map_err(|_| anyhow::anyhow!("encrypted frame send failed"))?;
         anyhow::ensure!(sent == bytes.len(), "encrypted frame send was incomplete");
         Ok(())
+    }
+
+    async fn send_memchain(
+        &mut self,
+        message: &MemChainMessage,
+        deadline: TokioInstant,
+    ) -> Result<()> {
+        let plaintext = encode_memchain(message).context("MemChain encode failed")?;
+        self.send_plaintext(&plaintext, deadline).await
     }
 
     async fn send_graceful_close(&mut self, deadline: TokioInstant) -> Result<()> {
@@ -832,11 +902,115 @@ impl RelaySmokeClient {
             .context("server transport decryption failed")?;
             self.highest_server_counter = Some(packet.counter);
             if plaintext.first().copied() != Some(MEMCHAIN_MAGIC) {
+                if self.protocol_version == PROTOCOL_VERSION_V1 {
+                    if let Some(reply) = build_v1_keepalive_echo_reply(&plaintext, self.virtual_ip)
+                    {
+                        self.send_plaintext(&reply, deadline).await?;
+                    }
+                }
                 continue;
             }
             return decode_memchain(&plaintext[1..]).context("server MemChain response is invalid");
         }
     }
+
+    async fn receive_and_reply_v1_keepalive(&mut self, deadline: TokioInstant) -> Result<()> {
+        anyhow::ensure!(
+            self.protocol_version == PROTOCOL_VERSION_V1,
+            "v1 keepalive proof requires a v0x01 session"
+        );
+        let mut buffer = vec![0u8; 65_535].into_boxed_slice();
+        loop {
+            let received = timeout_at(deadline, self.socket.recv(&mut buffer))
+                .await
+                .map_err(|_| anyhow::anyhow!("v1 keepalive probe timed out"))?
+                .map_err(|_| anyhow::anyhow!("v1 keepalive probe receive failed"))?;
+            anyhow::ensure!(
+                !(received == 1 && buffer[0] == 0xff),
+                "server reset the v1 smoke session"
+            );
+            let Ok(packet) = decode_data_packet(&buffer[..received]) else {
+                continue;
+            };
+            if packet.session_id != self.session_id
+                || self
+                    .highest_server_counter
+                    .is_some_and(|highest| packet.counter <= highest)
+            {
+                continue;
+            }
+            let plaintext = decrypt_packet(
+                &self.session_key,
+                packet.counter,
+                &self.session_id,
+                &packet.encrypted_payload,
+            )
+            .context("server transport decryption failed")?;
+            self.highest_server_counter = Some(packet.counter);
+            let Some(reply) = build_v1_keepalive_echo_reply(&plaintext, self.virtual_ip) else {
+                continue;
+            };
+            self.send_plaintext(&reply, deadline).await?;
+            return Ok(());
+        }
+    }
+}
+
+fn build_v1_keepalive_echo_reply(packet: &[u8], virtual_ip: [u8; 4]) -> Option<Vec<u8>> {
+    // [V1-COMPATIBILITY-SMOKE 2026-09-13 by Codex] Admit only the exact
+    // non-fragmented IPv4/ICMP shape emitted by PacketHandler. A random VPN
+    // packet cannot be reflected merely because it starts with an IPv4 nibble.
+    if packet.len() != V1_KEEPALIVE_PACKET_BYTES
+        || packet[0] != 0x45
+        || packet[1] != 0
+        || usize::from(u16::from_be_bytes([packet[2], packet[3]])) != packet.len()
+        || packet[6..8] != [0, 0]
+        || packet[8] != 64
+        || packet[9] != 1
+        || packet[16..20] != virtual_ip
+        || internet_checksum_v1(&packet[..IPV4_HEADER_BYTES]) != 0
+    {
+        return None;
+    }
+    let icmp = &packet[IPV4_HEADER_BYTES..];
+    if icmp[0] != 8
+        || icmp[1] != 0
+        || packet[4..6] != icmp[6..8]
+        || &icmp[ICMP_HEADER_BYTES..] != V1_KEEPALIVE_PAYLOAD
+        || internet_checksum_v1(icmp) != 0
+    {
+        return None;
+    }
+
+    let mut reply = packet.to_vec();
+    let mut source = [0u8; 4];
+    source.copy_from_slice(&packet[12..16]);
+    reply[12..16].copy_from_slice(&virtual_ip);
+    reply[16..20].copy_from_slice(&source);
+    reply[10..12].fill(0);
+    reply[IPV4_HEADER_BYTES] = 0;
+    reply[IPV4_HEADER_BYTES + 2..IPV4_HEADER_BYTES + 4].fill(0);
+    let icmp_sum = internet_checksum_v1(&reply[IPV4_HEADER_BYTES..]);
+    reply[IPV4_HEADER_BYTES + 2..IPV4_HEADER_BYTES + 4].copy_from_slice(&icmp_sum.to_be_bytes());
+    let ip_sum = internet_checksum_v1(&reply[..IPV4_HEADER_BYTES]);
+    reply[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+    Some(reply)
+}
+
+fn internet_checksum_v1(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum = sum.wrapping_add(u32::from(u16::from_be_bytes([chunk[0], chunk[1]])));
+    }
+    if let Some(last) = chunks.remainder().first() {
+        sum = sum.wrapping_add(u32::from(*last) << 8);
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    // The carry-folding loop above guarantees that the value fits in 16 bits.
+    !u16::try_from(sum).unwrap_or(u16::MAX)
 }
 
 fn unix_now() -> Result<u64> {
@@ -1189,6 +1363,7 @@ pub async fn run(options: RelaySmokeOptions) -> Result<RelaySmokeReport> {
                 options.server_addr,
                 &options.expected_server_key,
                 sender_identity,
+                CURRENT_PROTOCOL_VERSION,
                 deadline,
             )
             .await?,
@@ -1221,6 +1396,7 @@ pub async fn run(options: RelaySmokeOptions) -> Result<RelaySmokeReport> {
                 options.server_addr,
                 &options.expected_server_key,
                 receiver_identity,
+                CURRENT_PROTOCOL_VERSION,
                 deadline,
             )
             .await?,
@@ -1301,6 +1477,76 @@ pub async fn run(options: RelaySmokeOptions) -> Result<RelaySmokeReport> {
     })
 }
 
+/// Proves that the running node still accepts the frozen v0x01 transport and
+/// emits the canonical legacy ICMP liveness probe.
+pub async fn run_v1_compatibility_smoke(
+    options: V1CompatibilitySmokeOptions,
+) -> Result<V1CompatibilitySmokeReport> {
+    let started = Instant::now();
+    let health_url = options.validate()?;
+    let health = HealthClient::new(health_url, options.timeout)?;
+    let deadline = TokioInstant::now() + options.timeout;
+    let baseline = health.fetch_until(deadline).await?;
+    baseline.ensure_idle_v1_compatible()?;
+    let baseline_active_sessions = baseline.active_sessions;
+    let mut client = None;
+    let mut unused_second_client = None;
+
+    let transaction: Result<()> = async {
+        client = Some(
+            RelaySmokeClient::connect(
+                options.server_addr,
+                &options.expected_server_key,
+                IdentityKeyPair::generate(),
+                PROTOCOL_VERSION_V1,
+                deadline,
+            )
+            .await?,
+        );
+        health
+            .wait_for_active_sessions(baseline_active_sessions.saturating_add(1), deadline)
+            .await?;
+        client
+            .as_mut()
+            .context("v1 compatibility session was not retained")?
+            .receive_and_reply_v1_keepalive(deadline)
+            .await
+    }
+    .await;
+
+    let cleanup = cleanup_ephemeral_sessions(
+        &mut client,
+        &mut unused_second_client,
+        &health,
+        baseline_active_sessions,
+    )
+    .await;
+    match (transaction, cleanup) {
+        (Ok(()), Ok(())) => {}
+        (Err(primary), Ok(())) => return Err(primary),
+        (Ok(()), Err(cleanup_error)) => {
+            return Err(cleanup_error.context("v1 proof passed but session cleanup failed"));
+        }
+        (Err(primary), Err(cleanup_error)) => {
+            return Err(primary.context(format!(
+                "v1 smoke session cleanup also failed: {cleanup_error}"
+            )));
+        }
+    }
+
+    Ok(V1CompatibilitySmokeReport {
+        status: "passed",
+        protocol_version: PROTOCOL_VERSION_V1,
+        transport: "authenticated_udp_v1",
+        server_keepalive_probe_observed: true,
+        canonical_echo_reply_sent: true,
+        session_cleanup: "explicit_authenticated_close",
+        evidence_scope: "pinned_v1_handshake_plus_strict_node_keepalive_echo_plus_session_baseline_restore",
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        privacy_boundary: "aggregate smoke outcomes only; no identities, session ids, endpoints, virtual addresses, packet bytes, or keys",
+    })
+}
+
 #[derive(Deserialize)]
 struct PublicKeyFile {
     public_key: String,
@@ -1327,11 +1573,125 @@ pub async fn load_expected_server_public_key(path: &Path) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    use aeronyx_common::types::SessionId;
     use aeronyx_core::crypto::handshake::DefaultHandshakeCrypto;
-    use aeronyx_core::crypto::HandshakeCrypto;
+    use aeronyx_core::crypto::{HandshakeCrypto, IdentityPublicKey};
     use aeronyx_core::protocol::chat::BlindRelayDeliveryReceipt;
     use aeronyx_core::protocol::codec::decode_client_hello;
     use aeronyx_core::protocol::{encode_envelope, OnionRoutePurpose};
+    use aeronyx_server::handlers::packet::DecryptedPayload;
+    use aeronyx_server::handlers::PacketHandler;
+    use aeronyx_server::services::traffic_tracker::TrafficTracker;
+    use aeronyx_server::services::{NodePolicyRuntime, RoutingService, SessionManager};
+
+    fn canonical_v1_keepalive_request(
+        source: [u8; 4],
+        destination: [u8; 4],
+        identifier: u16,
+        sequence: u16,
+    ) -> Vec<u8> {
+        let mut packet = vec![0u8; V1_KEEPALIVE_PACKET_BYTES];
+        packet[0] = 0x45;
+        let packet_len = u16::try_from(V1_KEEPALIVE_PACKET_BYTES).unwrap_or(u16::MAX);
+        packet[2..4].copy_from_slice(&packet_len.to_be_bytes());
+        packet[4..6].copy_from_slice(&sequence.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 1;
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        packet[IPV4_HEADER_BYTES] = 8;
+        packet[IPV4_HEADER_BYTES + 4..IPV4_HEADER_BYTES + 6]
+            .copy_from_slice(&identifier.to_be_bytes());
+        packet[IPV4_HEADER_BYTES + 6..IPV4_HEADER_BYTES + 8]
+            .copy_from_slice(&sequence.to_be_bytes());
+        packet[IPV4_HEADER_BYTES + ICMP_HEADER_BYTES..].copy_from_slice(V1_KEEPALIVE_PAYLOAD);
+        refresh_v1_checksums(&mut packet);
+        packet
+    }
+
+    fn refresh_v1_checksums(packet: &mut [u8]) {
+        packet[10..12].fill(0);
+        packet[IPV4_HEADER_BYTES + 2..IPV4_HEADER_BYTES + 4].fill(0);
+        let icmp = internet_checksum_v1(&packet[IPV4_HEADER_BYTES..]);
+        packet[IPV4_HEADER_BYTES + 2..IPV4_HEADER_BYTES + 4].copy_from_slice(&icmp.to_be_bytes());
+        let ip = internet_checksum_v1(&packet[..IPV4_HEADER_BYTES]);
+        packet[10..12].copy_from_slice(&ip.to_be_bytes());
+    }
+
+    #[test]
+    fn v1_keepalive_parser_is_canonical_and_non_reflective() {
+        let gateway = [100, 64, 0, 1];
+        let virtual_ip = [100, 64, 0, 2];
+        let request = canonical_v1_keepalive_request(gateway, virtual_ip, 0x3344, 0x5566);
+        let reply = build_v1_keepalive_echo_reply(&request, virtual_ip)
+            .expect("canonical node probe must produce one echo reply");
+        assert_eq!(reply.len(), V1_KEEPALIVE_PACKET_BYTES);
+        assert_eq!(&reply[12..16], &virtual_ip);
+        assert_eq!(&reply[16..20], &gateway);
+        assert_eq!(reply[IPV4_HEADER_BYTES], 0);
+        assert_eq!(
+            &reply[IPV4_HEADER_BYTES + 4..],
+            &request[IPV4_HEADER_BYTES + 4..]
+        );
+        assert_eq!(internet_checksum_v1(&reply[..IPV4_HEADER_BYTES]), 0);
+        assert_eq!(internet_checksum_v1(&reply[IPV4_HEADER_BYTES..]), 0);
+
+        let mut rejected = Vec::new();
+        let mut trailing = request.clone();
+        trailing.push(0);
+        rejected.push(trailing);
+        let mut wrong_destination = request.clone();
+        wrong_destination[16] ^= 1;
+        refresh_v1_checksums(&mut wrong_destination);
+        rejected.push(wrong_destination);
+        let mut fragmented = request.clone();
+        fragmented[7] = 1;
+        refresh_v1_checksums(&mut fragmented);
+        rejected.push(fragmented);
+        let mut wrong_type = request.clone();
+        wrong_type[IPV4_HEADER_BYTES] = 0;
+        refresh_v1_checksums(&mut wrong_type);
+        rejected.push(wrong_type);
+        let mut wrong_payload = request.clone();
+        wrong_payload[IPV4_HEADER_BYTES + ICMP_HEADER_BYTES] ^= 1;
+        refresh_v1_checksums(&mut wrong_payload);
+        rejected.push(wrong_payload);
+        let mut mismatched_sequence = request.clone();
+        mismatched_sequence[4] ^= 1;
+        refresh_v1_checksums(&mut mismatched_sequence);
+        rejected.push(mismatched_sequence);
+        let mut corrupt_checksum = request;
+        corrupt_checksum[10] ^= 1;
+        rejected.push(corrupt_checksum);
+
+        for packet in rejected {
+            assert!(
+                build_v1_keepalive_echo_reply(&packet, virtual_ip).is_none(),
+                "noncanonical packet must not be reflected"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_compatibility_options_are_host_local_and_probe_bounded() {
+        let server_addr: SocketAddr = "127.0.0.1:51820".parse().unwrap();
+        let authority =
+            RelaySmokeHealthAuthority::new(server_addr, "127.0.0.1:8421".parse().unwrap()).unwrap();
+        let options = |timeout| V1CompatibilitySmokeOptions {
+            server_addr,
+            health_url: "http://127.0.0.1:8421/api/vpn/health".to_string(),
+            health_authority: authority,
+            expected_server_key: [1; 32],
+            timeout,
+        };
+        assert!(options(Duration::from_secs(65)).validate().is_ok());
+        assert!(options(Duration::from_secs(180)).validate().is_ok());
+        assert!(options(Duration::from_secs(64)).validate().is_err());
+        assert!(options(Duration::from_secs(181)).validate().is_err());
+    }
 
     #[test]
     fn health_authority_accepts_only_the_configured_loopback_surface() {
@@ -2049,6 +2409,7 @@ mod tests {
             server_addr,
             &expected_server_key,
             IdentityKeyPair::generate(),
+            CURRENT_PROTOCOL_VERSION,
             TokioInstant::now() + Duration::from_secs(2),
         )
         .await
@@ -2057,5 +2418,119 @@ mod tests {
 
         assert_eq!(client.session_key.as_bytes(), server_session_key.as_bytes());
         assert_eq!(client.session_id, [0x41; 16]);
+    }
+
+    #[tokio::test]
+    async fn v1_smoke_reply_is_recognized_by_production_packet_handler() {
+        // [V1-COMPATIBILITY-SMOKE 2026-09-13 by Codex] This no-socket-external
+        // fixture joins the actual handshake crypto, DataPacket codec, smoke
+        // client, and production PacketHandler keepalive matcher.
+        let server_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind server socket");
+        let server_addr = server_socket.local_addr().expect("server address");
+        let server_identity = IdentityKeyPair::generate();
+        let expected_server_key = server_identity.public_key_bytes();
+        let session_id_bytes = [0x51; 16];
+        let virtual_ip = [100, 64, 0, 3];
+        let gateway_ip = Ipv4Addr::new(100, 64, 0, 1);
+
+        let server_task = tokio::spawn(async move {
+            let mut buffer = vec![0u8; 65_535];
+            let (received, peer) = server_socket
+                .recv_from(&mut buffer)
+                .await
+                .expect("receive ClientHello");
+            let hello = decode_client_hello(&buffer[..received]).expect("decode ClientHello");
+            assert_eq!(hello.version, PROTOCOL_VERSION_V1);
+            let client_key =
+                IdentityPublicKey::from_bytes(&hello.client_public_key).expect("client key");
+            let crypto = DefaultHandshakeCrypto::new(server_identity);
+            crypto
+                .verify_client_hello(&hello)
+                .expect("verify ClientHello");
+            let (response, session_key) = crypto
+                .process_handshake(&hello, virtual_ip, session_id_bytes)
+                .expect("process handshake");
+            let bytes = aeronyx_core::protocol::codec::encode_server_hello(&response);
+            server_socket
+                .send_to(&bytes, peer)
+                .await
+                .expect("send ServerHello");
+
+            let sessions = Arc::new(SessionManager::new(4, Duration::from_secs(60)));
+            let session_id = SessionId::from_bytes(&session_id_bytes).expect("session id");
+            let session = sessions
+                .create(
+                    session_id.clone(),
+                    client_key,
+                    session_key,
+                    Ipv4Addr::from(virtual_ip),
+                    peer,
+                )
+                .expect("create production session");
+            let handler = PacketHandler::new(
+                Arc::clone(&sessions),
+                Arc::new(RoutingService::new()),
+                Arc::new(TrafficTracker::new()),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(NodePolicyRuntime::default()),
+            );
+            let (probe, endpoint) = handler
+                .build_keepalive_probe(&session, gateway_ip, Duration::from_secs(2))
+                .expect("build production keepalive probe");
+            assert_eq!(endpoint, peer);
+            server_socket
+                .send_to(&probe, endpoint)
+                .await
+                .expect("send keepalive probe");
+
+            let (received, source) = server_socket
+                .recv_from(&mut buffer)
+                .await
+                .expect("receive keepalive reply");
+            let (_, payload) = handler
+                .handle_udp_packet(&buffer[..received], source)
+                .expect("production handler accepts reply");
+            assert!(matches!(payload, DecryptedPayload::KeepaliveAck { .. }));
+            assert_eq!(session.stats.snapshot().keepalive_acks, 1);
+
+            let (received, source) = server_socket
+                .recv_from(&mut buffer)
+                .await
+                .expect("receive authenticated close");
+            let (_, payload) = handler
+                .handle_udp_packet(&buffer[..received], source)
+                .expect("production handler decrypts close");
+            assert!(matches!(
+                payload,
+                DecryptedPayload::MemChain(MemChainMessage::SessionCloseV1 {
+                    session_id,
+                    ..
+                }) if session_id == session_id_bytes
+            ));
+            sessions.remove(&session_id);
+            assert_eq!(sessions.count(), 0);
+        });
+
+        let mut client = RelaySmokeClient::connect(
+            server_addr,
+            &expected_server_key,
+            IdentityKeyPair::generate(),
+            PROTOCOL_VERSION_V1,
+            TokioInstant::now() + Duration::from_secs(3),
+        )
+        .await
+        .expect("connect frozen v1 client");
+        assert_eq!(client.virtual_ip, virtual_ip);
+        client
+            .receive_and_reply_v1_keepalive(TokioInstant::now() + Duration::from_secs(3))
+            .await
+            .expect("reply to production v1 keepalive");
+        client
+            .send_graceful_close(TokioInstant::now() + Duration::from_secs(3))
+            .await
+            .expect("send authenticated close");
+        server_task.await.expect("join production fixture");
     }
 }
