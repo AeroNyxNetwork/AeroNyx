@@ -3218,7 +3218,11 @@ async fn onion_candidates_handler(
     // builders inject an id and fail multi-hop readiness closed until its
     // signed descriptor can be resolved and used for entry anti-affinity.
     let local_entry_context_ready = state.local_node_id.is_none() || local_descriptor.is_some();
-    let local_path_protocol_ready = state.local_node_id.is_none()
+    // [ONION-PURPOSE-COMPATIBILITY 2026-09-13 by Codex] Generic purposes
+    // with no path-feature contract do not require a local descriptor. New
+    // specialized purposes still fail closed on their signed feature set.
+    let local_path_protocol_ready = path_protocol_features.is_empty()
+        || state.local_node_id.is_none()
         || local_descriptor.as_ref().is_some_and(|descriptor| {
             path_protocol_features
                 .iter()
@@ -7414,7 +7418,14 @@ mod tests {
                 "message_relay",
                 "blind_vault_put",
                 "blind_vault_pull",
-                "blind_vault_delete"
+                "blind_vault_delete",
+                "blind_vault_lease_admission",
+                "blind_vault_put_receipt",
+                "blind_vault_lease_retire",
+                "blind_vault_lease_renewal",
+                "blind_vault_lease_status",
+                "blind_vault_lease_inventory",
+                "anonymous_mailbox_v1"
             ])
         );
         assert_eq!(

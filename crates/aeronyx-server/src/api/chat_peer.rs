@@ -3754,7 +3754,24 @@ async fn process_onion_blind_relay(
             // mutation recovery is armed. Read-only vault observations stay
             // unarmed, so cancellation can release and safely retry the route.
             let prepared =
-                prepare_onion_terminal_payload(&state, envelope.route_id, peel.inner, now).await?;
+                match prepare_onion_terminal_payload(&state, envelope.route_id, peel.inner, now)
+                    .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        // [ONION-TERMINAL-PREPARATION-HEALTH 2026-09-13 by Codex]
+                        // Preparation failures happen after authenticated route
+                        // admission and must reach the aggregate relay health
+                        // surface just like execution failures.
+                        reject_blind_relay_previous_hop(
+                            &state,
+                            previous_hop_node_id,
+                            now,
+                            error.reason_bucket(),
+                        );
+                        return Err(error);
+                    }
+                };
             let PreparedOnionTerminalWork {
                 proof_payload,
                 operation,

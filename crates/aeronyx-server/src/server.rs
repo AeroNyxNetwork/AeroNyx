@@ -19896,16 +19896,18 @@ mod tests {
         let source = IdentityKeyPair::generate();
         let self_node_id = source.public_key_bytes();
         let now = 1_800_000_000;
+        // [PROBE-DESCRIPTOR-FIXTURE 2026-09-13 by Codex] Sequence orders
+        // descriptors; it must not accidentally make issued_at future-dated.
         let middle = signed_probe_peer_descriptor(
             "http://198.51.100.10:8422".to_string(),
-            now,
+            1,
             now + 300,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x21; 32],
         );
         let terminal = signed_probe_peer_descriptor(
             "http://198.51.100.11:8422".to_string(),
-            now + 1,
+            2,
             now + 300,
             vec![NodeCapability::ChatRelay],
             [0x22; 32],
@@ -19964,14 +19966,14 @@ mod tests {
         let now = 1_800_000_000;
         let middle = signed_probe_peer_descriptor(
             "http://198.51.100.10:8422".to_string(),
-            now,
+            1,
             now + 300,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0u8; 32],
         );
         let terminal = signed_probe_peer_descriptor(
             "http://198.51.100.11:8422".to_string(),
-            now + 1,
+            2,
             now + 300,
             vec![NodeCapability::ChatRelay],
             [0x22; 32],
@@ -20030,21 +20032,21 @@ mod tests {
         let now = 1_800_000_050;
         let first_middle = signed_probe_peer_descriptor(
             "http://198.51.100.10:8422".to_string(),
-            now,
+            1,
             now + 300,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x31; 32],
         );
         let second_middle = signed_probe_peer_descriptor(
             "http://203.0.113.20:8422".to_string(),
-            now + 1,
+            2,
             now + 300,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x32; 32],
         );
         let terminal = signed_probe_peer_descriptor(
             "http://192.0.2.30:8422".to_string(),
-            now + 2,
+            3,
             now + 300,
             vec![NodeCapability::ChatRelay],
             [0x33; 32],
@@ -20166,13 +20168,13 @@ mod tests {
         let first_middle = signed_descriptor(
             &first_middle_identity,
             format!("http://{first_middle_host}:{relay_port}"),
-            vec![NodeCapability::OnionMiddle],
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
             "three-hop-first",
         );
         let second_middle = signed_descriptor(
             &second_middle_identity,
             format!("http://{second_middle_host}:{relay_port}"),
-            vec![NodeCapability::OnionMiddle],
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
             "three-hop-second",
         );
         let terminal = signed_descriptor(
@@ -20262,14 +20264,19 @@ mod tests {
                 8,
                 &[self_node_id],
             );
+        assert_eq!(proven_middles.len(), 2);
+        let terminal_exclusions = [
+            self_node_id,
+            proven_middles[0].node_id(),
+            proven_middles[1].node_id(),
+        ];
         let proven_terminals = store
             .multi_hop_delivery_receipt_route_candidates_with_capability_excluding(
                 NodeCapability::ChatRelay,
                 now,
                 8,
-                &[self_node_id],
+                &terminal_exclusions,
             );
-        assert_eq!(proven_middles.len(), 2);
         assert_eq!(proven_terminals.len(), 1);
         assert!(PeerStore::route_endpoints_are_network_diverse(
             &proven_middles[0],
@@ -21290,7 +21297,8 @@ mod tests {
             NodeDescriptor::new(middle_node_id, now, now, now + 300, "test-receipt-middle")
                 .with_x25519_kem(middle_identity.x25519_public_key_bytes());
         middle_descriptor.public_endpoint = Some(middle_endpoint);
-        middle_descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        middle_descriptor.capabilities =
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
         let middle_descriptor =
             SignedNodeDescriptor::sign(middle_descriptor, &middle_identity).unwrap();
 
@@ -21474,7 +21482,7 @@ mod tests {
         )
         .with_x25519_kem(middle_identity.x25519_public_key_bytes());
         middle.public_endpoint = Some(middle_endpoint);
-        middle.capabilities = vec![NodeCapability::OnionMiddle];
+        middle.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
         let middle = SignedNodeDescriptor::sign(middle, &middle_identity).unwrap();
 
         let mut terminal = NodeDescriptor::new(
@@ -21618,7 +21626,8 @@ mod tests {
             NodeDescriptor::new(middle_node_id, now, now, now + 300, "test-receipt-middle")
                 .with_x25519_kem(middle_identity.x25519_public_key_bytes());
         middle_descriptor.public_endpoint = Some(middle_endpoint);
-        middle_descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        middle_descriptor.capabilities =
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
         let middle_descriptor =
             SignedNodeDescriptor::sign(middle_descriptor, &middle_identity).unwrap();
         store
@@ -22748,20 +22757,20 @@ mod tests {
 
         let signed_descriptor = |identity: &IdentityKeyPair,
                                  endpoint: String,
-                                 capability: NodeCapability,
+                                 capabilities: Vec<NodeCapability>,
                                  name: &str| {
             let mut descriptor =
                 NodeDescriptor::new(identity.public_key_bytes(), now, now, now + 300, name)
                     .with_x25519_kem(identity.x25519_public_key_bytes());
             descriptor.public_endpoint = Some(endpoint);
-            descriptor.capabilities = vec![capability];
+            descriptor.capabilities = capabilities;
             SignedNodeDescriptor::sign(descriptor, identity).unwrap()
         };
 
         let terminal = signed_descriptor(
             &terminal_identity,
             "https://terminal.test".to_string(),
-            NodeCapability::ChatRelay,
+            vec![NodeCapability::ChatRelay],
             "receipt-terminal",
         );
         let self_node_id = source_identity.public_key_bytes();
@@ -22871,13 +22880,13 @@ mod tests {
         let legacy_middle = signed_descriptor(
             &legacy_middle_identity,
             format!("http://{legacy_address}"),
-            NodeCapability::OnionMiddle,
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
             "legacy-middle",
         );
         let receipt_middle = signed_descriptor(
             &receipt_middle_identity,
             format!("http://{receipt_address}"),
-            NodeCapability::OnionMiddle,
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
             "receipt-middle",
         );
         let receipt_middle_id = receipt_middle.node_id();
