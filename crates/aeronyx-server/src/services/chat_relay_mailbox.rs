@@ -16,6 +16,8 @@
 //! the future composition root.
 //!
 //! ## Last modified
+//! v1.1.2-OwnerStorageRestartGuard — Cover capacity release through
+//! receiver-bound ACK and bounded expiry cleanup across durable reopen.
 //! v1.1.1-LeaseReplayContract — Document and test durable exact replay before
 //! admission-ticket freshness.
 //! v1.1.0-AnonymousMailboxTicketIssuer — Added durable, target-identity
@@ -2865,6 +2867,47 @@ mod tests {
             .unwrap()
     }
 
+    // [ANONYMOUS-MAILBOX-OWNER-RESTART-RECOVERY 2026-09-14 by Codex]
+    // Tie restart assertions to both durable counters and their backing rows.
+    // A stale aggregate must never make released quota appear reusable.
+    fn assert_item_accounting(
+        store: &SqliteAnonymousMailboxStore,
+        mailbox_id: &[u8; 32],
+        expected_items: u64,
+        expected_bytes: u64,
+    ) {
+        let connection = store.connection.lock();
+        let totals: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT total_leases, total_items, total_bytes
+                 FROM anonymous_mailbox_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let lease: (i64, i64) = connection
+            .query_row(
+                "SELECT current_items, current_bytes
+                 FROM anonymous_mailbox_leases WHERE mailbox_id = ?1",
+                params![&mailbox_id[..]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let rows: (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(sealed_envelope)), 0)
+                 FROM anonymous_mailbox_items WHERE mailbox_id = ?1",
+                params![&mailbox_id[..]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let expected_items = as_i64(expected_items).unwrap();
+        let expected_bytes = as_i64(expected_bytes).unwrap();
+        assert_eq!(totals, (1, expected_items, expected_bytes));
+        assert_eq!(lease, (expected_items, expected_bytes));
+        assert_eq!(rows, (expected_items, expected_bytes));
+    }
+
     #[test]
     fn disabled_open_has_no_filesystem_side_effect() {
         let directory = tempfile::tempdir().unwrap();
@@ -3625,6 +3668,174 @@ mod tests {
                 CURSOR_SECRET,
             ),
             Err(AnonymousMailboxStoreError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn full_owner_storage_reopens_and_releases_capacity_without_counter_drift() {
+        let mut context = TestContext::new();
+        let item_cap = u64::from(MAX_ANONYMOUS_MAILBOX_ITEMS_PER_LEASE);
+        context.config.max_items_total = usize::from(MAX_ANONYMOUS_MAILBOX_ITEMS_PER_LEASE);
+        context.config.max_bytes_total = item_cap;
+        context.config.cleanup_batch_size = 1;
+
+        let mailbox = [0xB1; 32];
+        let lease = context.lease(
+            mailbox,
+            [0xB2; 16],
+            MAX_ANONYMOUS_MAILBOX_ITEMS_PER_LEASE,
+            item_cap,
+            NOW + 1_000,
+        );
+        let store = context.open();
+        assert!(matches!(
+            store.create(&lease, NOW).unwrap(),
+            AnonymousMailboxCreateOutcome::Created(_)
+        ));
+        let exact = context.put(mailbox, [0xB3; 16], b"x", NOW + 100);
+        assert!(matches!(
+            store.put(&exact, NOW).unwrap(),
+            AnonymousMailboxPutOutcome::Stored(_)
+        ));
+
+        // Production Put establishes the lease and first opaque row. Populate
+        // the remaining one-byte rows in one transaction so this bounded
+        // restart regression does not perform 1,023 FULL fsyncs.
+        let sealed_commitment: [u8; 32] = Sha256::digest(b"x").into();
+        let mut connection = store.connection.lock();
+        let transaction = connection.transaction().unwrap();
+        for sequence in 2..=item_cap {
+            let mut item_id = [0_u8; 16];
+            item_id[..8].copy_from_slice(&sequence.to_le_bytes());
+            let expires_at = if sequence == 2 { NOW + 2 } else { NOW + 100 };
+            transaction
+                .execute(
+                    "INSERT INTO anonymous_mailbox_items
+                     (mailbox_id, item_id, sequence, put_commitment, sealed_commitment,
+                      sealed_envelope, stored_at, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        &mailbox[..],
+                        &item_id[..],
+                        as_i64(sequence).unwrap(),
+                        &[0_u8; 32][..],
+                        &sealed_commitment[..],
+                        &b"x"[..],
+                        as_i64(NOW).unwrap(),
+                        as_i64(expires_at).unwrap(),
+                    ],
+                )
+                .unwrap();
+        }
+        transaction
+            .execute(
+                "UPDATE anonymous_mailbox_leases
+                 SET current_items = ?1, current_bytes = ?1, next_sequence = ?2
+                 WHERE mailbox_id = ?3",
+                params![
+                    as_i64(item_cap).unwrap(),
+                    as_i64(item_cap + 1).unwrap(),
+                    &mailbox[..],
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE anonymous_mailbox_meta SET total_items = ?1, total_bytes = ?1",
+                params![as_i64(item_cap).unwrap()],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        assert_item_accounting(&store, &mailbox, item_cap, item_cap);
+        drop(store);
+
+        let reopened = context.open();
+        assert_item_accounting(&reopened, &mailbox, item_cap, item_cap);
+        assert!(matches!(
+            reopened.put(&exact, NOW + 1).unwrap(),
+            AnonymousMailboxPutOutcome::Existing(_)
+        ));
+        let changed = context.put(mailbox, exact.item_id, b"y", exact.expires_at);
+        assert_eq!(
+            reopened.put(&changed, NOW + 1).unwrap(),
+            AnonymousMailboxPutOutcome::Conflict
+        );
+        let blocked = context.put(mailbox, [0xB4; 16], b"z", NOW + 100);
+        assert_eq!(
+            reopened.put(&blocked, NOW + 1).unwrap(),
+            AnonymousMailboxPutOutcome::AtCapacity
+        );
+        assert_item_accounting(&reopened, &mailbox, item_cap, item_cap);
+
+        let wrong_reader = IdentityKeyPair::generate();
+        let wrong_ack = AnonymousMailboxAckV1::new(
+            mailbox,
+            [0xB5; 16],
+            exact.item_id,
+            exact.sealed_commitment(),
+            NOW + 1,
+            &wrong_reader,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.ack(&wrong_ack, NOW + 1),
+            Err(AnonymousMailboxStoreError::Rejected)
+        );
+        assert_item_accounting(&reopened, &mailbox, item_cap, item_cap);
+
+        let ack = AnonymousMailboxAckV1::new(
+            mailbox,
+            [0xB6; 16],
+            exact.item_id,
+            exact.sealed_commitment(),
+            NOW + 1,
+            &context.reader,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.ack(&ack, NOW + 1).unwrap(),
+            AnonymousMailboxAckOutcome::Acknowledged
+        );
+        assert_item_accounting(&reopened, &mailbox, item_cap - 1, item_cap - 1);
+        assert!(matches!(
+            reopened.put(&blocked, NOW + 1).unwrap(),
+            AnonymousMailboxPutOutcome::Stored(_)
+        ));
+        assert_item_accounting(&reopened, &mailbox, item_cap, item_cap);
+        drop(reopened);
+
+        let after_ack_restart = context.open();
+        assert_item_accounting(&after_ack_restart, &mailbox, item_cap, item_cap);
+        let first_visible = after_ack_restart
+            .pull_one(&context.pull(mailbox, Vec::new(), NOW + 3), NOW + 3)
+            .unwrap();
+        let mut first_unexpired_item_id = [0_u8; 16];
+        first_unexpired_item_id[..8].copy_from_slice(&3_u64.to_le_bytes());
+        assert!(matches!(
+            first_visible,
+            AnonymousMailboxPullOutcome::Item(ref item)
+                if item.item_id == first_unexpired_item_id
+        ));
+        let cleanup = after_ack_restart.cleanup(NOW + 3).unwrap();
+        assert_eq!(cleanup.items_removed, 1);
+        assert_eq!(cleanup.bytes_removed, 1);
+        assert_eq!(cleanup.acknowledgements_removed, 0);
+        assert_item_accounting(&after_ack_restart, &mailbox, item_cap - 1, item_cap - 1);
+
+        let after_expiry = context.put(mailbox, [0xB7; 16], b"q", NOW + 100);
+        assert!(matches!(
+            after_ack_restart.put(&after_expiry, NOW + 3).unwrap(),
+            AnonymousMailboxPutOutcome::Stored(_)
+        ));
+        assert_item_accounting(&after_ack_restart, &mailbox, item_cap, item_cap);
+        drop(after_ack_restart);
+
+        let final_reopen = context.open();
+        assert_item_accounting(&final_reopen, &mailbox, item_cap, item_cap);
+        assert!(matches!(
+            final_reopen.put(&after_expiry, NOW + 4).unwrap(),
+            AnonymousMailboxPutOutcome::Existing(_)
         ));
     }
 
