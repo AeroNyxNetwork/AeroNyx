@@ -93,6 +93,11 @@
 //!   comparison because any real counter value can be a valid "first packet".
 //!
 //! ## Last Modified
+//! v2.11.0-AuthenticatedAdmission
+//!   - [PROTOCOL-V2-ADMISSION-HOTFIX 2026-09-13 by Codex] Added one
+//!     lifecycle-fenced authenticated admission transition that computes
+//!     deterministic same-identity eviction before mutating the primary map.
+//!
 //! v2.10.0-ExplicitTermination
 //!   - [SESSION-TERMINATION 2026-08-15 by Codex] Added one atomic termination
 //!     result used by expiry and authenticated graceful close. Removal from the
@@ -166,8 +171,8 @@ use tracing::{debug, info, trace};
 
 use aeronyx_common::time::AtomicInstant;
 use aeronyx_common::types::SessionId;
-use aeronyx_core::crypto::keys::{IdentityPublicKey, SessionKey};
 use aeronyx_core::crypto::kdf::SessionKeys;
+use aeronyx_core::crypto::keys::{IdentityPublicKey, SessionKey};
 use aeronyx_core::protocol::{PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2};
 
 use crate::error::{Result, ServerError};
@@ -630,6 +635,19 @@ pub struct SessionTermination {
     pub stats: StatsSnapshot,
 }
 
+/// Result of one authenticated, identity-bounded session admission.
+///
+/// The primary session map transition is complete before this value is
+/// returned. Callers must finalize each eviction against external routing,
+/// event, relay, and accounting state exactly once.
+// [PROTOCOL-V2-ADMISSION-HOTFIX 2026-09-13 by Codex] Keep identity-cap
+// replacement inside the existing lifecycle fence instead of trusting the
+// independently registered wallet secondary index.
+pub(crate) struct AuthenticatedSessionAdmission {
+    pub(crate) session: Arc<Session>,
+    pub(crate) evicted: Vec<SessionTermination>,
+}
+
 fn unix_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -688,6 +706,9 @@ pub struct Session {
     pub rx_counter: AtomicU64,
     /// Per-session traffic and rejection statistics.
     pub stats: SessionStats,
+    /// Same-identity sessions atomically replaced when this session was
+    /// admitted. The server drains these once for external finalization.
+    admission_evictions: Mutex<Vec<SessionTermination>>,
     /// In-tunnel ICMP keepalive state for RTT measurement.
     keepalive: Mutex<KeepaliveState>,
     // ── v1.0.0-Membership ────────────────────────────────────────────────
@@ -731,6 +752,7 @@ impl Session {
             replay_window: Mutex::new(ReplayWindow::new()),
             rx_counter: AtomicU64::new(0),
             stats: SessionStats::default(),
+            admission_evictions: Mutex::new(Vec::new()),
             keepalive: Mutex::new(KeepaliveState::default()),
             wallet_hex,
         }
@@ -941,6 +963,16 @@ impl Session {
         true
     }
 
+    pub(crate) fn stage_admission_evictions(&self, evicted: Vec<SessionTermination>) {
+        let mut pending = self.admission_evictions.lock();
+        debug_assert!(pending.is_empty());
+        *pending = evicted;
+    }
+
+    pub(crate) fn take_admission_evictions(&self) -> Vec<SessionTermination> {
+        std::mem::take(&mut *self.admission_evictions.lock())
+    }
+
     /// Read-only replay check for the packet path: must precede decryption.
     #[must_use]
     pub fn precheck_rx_counter(&self, counter: u64) -> bool {
@@ -1104,6 +1136,104 @@ impl SessionManager {
         Ok(session)
     }
 
+    /// Atomically admits one authenticated v0x01 session under an identity cap.
+    pub(crate) fn create_authenticated(
+        &self,
+        session_id: SessionId,
+        client_public_key: IdentityPublicKey,
+        session_key: SessionKey,
+        virtual_ip: Ipv4Addr,
+        client_endpoint: SocketAddr,
+        max_sessions_per_identity: usize,
+    ) -> Result<AuthenticatedSessionAdmission> {
+        let session = Arc::new(Session::new(
+            session_id,
+            client_public_key,
+            session_key,
+            virtual_ip,
+            client_endpoint,
+        ));
+        self.admit_authenticated(session, max_sessions_per_identity)
+    }
+
+    /// Atomically admits one authenticated v0x02 session under an identity cap.
+    pub(crate) fn create_v2_authenticated(
+        &self,
+        session_id: SessionId,
+        client_public_key: IdentityPublicKey,
+        keys: SessionKeys,
+        virtual_ip: Ipv4Addr,
+        client_endpoint: SocketAddr,
+        max_sessions_per_identity: usize,
+    ) -> Result<AuthenticatedSessionAdmission> {
+        let session = Arc::new(Session::new_v2(
+            session_id,
+            client_public_key,
+            keys,
+            virtual_ip,
+            client_endpoint,
+        ));
+        self.admit_authenticated(session, max_sessions_per_identity)
+    }
+
+    fn admit_authenticated(
+        &self,
+        session: Arc<Session>,
+        max_sessions_per_identity: usize,
+    ) -> Result<AuthenticatedSessionAdmission> {
+        debug_assert!(max_sessions_per_identity > 0);
+        if max_sessions_per_identity == 0 {
+            return Err(ServerError::SessionLimitReached { limit: 0 });
+        }
+
+        let _lifecycle_guard = self.lifecycle_lock.lock();
+        if self.sessions.contains_key(&session.id) {
+            return Err(ServerError::SessionExists);
+        }
+
+        let identity = session.client_public_key.to_bytes();
+        let mut same_identity = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.value().client_public_key.to_bytes() == identity)
+            .map(|entry| Arc::clone(entry.value()))
+            .collect::<Vec<_>>();
+        same_identity.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
+        });
+        let evict_count = same_identity
+            .len()
+            .saturating_add(1)
+            .saturating_sub(max_sessions_per_identity);
+        let post_eviction_len = self.sessions.len().saturating_sub(evict_count);
+        if post_eviction_len >= self.max_sessions {
+            return Err(ServerError::SessionLimitReached {
+                limit: self.max_sessions,
+            });
+        }
+
+        // [PROTOCOL-V2-ADMISSION-HOTFIX 2026-09-13 by Codex] All fallible
+        // admission checks precede mutation. Under lifecycle_lock, remove the
+        // deterministic oldest identities and insert the authenticated
+        // replacement as one primary-map transition.
+        let mut evicted = Vec::with_capacity(evict_count);
+        for stale in same_identity.iter().take(evict_count) {
+            if let Some(termination) = self.terminate_locked(&stale.id) {
+                evicted.push(termination);
+            }
+        }
+        self.sessions
+            .insert(session.id.clone(), Arc::clone(&session));
+        info!(
+            evicted = evicted.len(),
+            "Authenticated session admitted under identity cap"
+        );
+
+        Ok(AuthenticatedSessionAdmission { session, evicted })
+    }
+
     /// 🌟 v1.2.0-MultiDevice: Register a device under its wallet.
     ///
     /// Called when the node receives a `DeviceRegister` message from the client.
@@ -1262,6 +1392,10 @@ impl SessionManager {
         // insertion under one lock. This closes the race where expiry and an
         // explicit close could both emit termination side effects for one ID.
         let _lifecycle_guard = self.lifecycle_lock.lock();
+        self.terminate_locked(id)
+    }
+
+    fn terminate_locked(&self, id: &SessionId) -> Option<SessionTermination> {
         let session = self
             .sessions
             .get(id)

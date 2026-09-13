@@ -23,6 +23,9 @@
 //   - [POLICY-ADMISSION 2026-07-29 by Codex] Final policy validation and
 //     session resource admission are serialized so concurrent handshakes
 //     cannot exceed the operator's dynamic max_sessions limit.
+//   - [PROTOCOL-V2-ADMISSION-HOTFIX 2026-09-13 by Codex] V1 and V2 now share
+//     deny/policy admission and the same mutation fence; identity eviction is
+//     performed only after the claimed client key authenticates successfully.
 //
 // Main Logical Flow:
 //   0. Check deny list → if denied, return WalletDenied immediately
@@ -53,6 +56,7 @@
 //   v1.0.1-PrivacyLogs - Redacted handshake/session correlation metadata
 //   v1.1.0-OwnershipCleanup - Conditional route removal and IP release
 //   v1.2.0-Admission - Made dynamic policy admission atomic across handshakes
+//   v1.3.0-AuthenticatedAdmission - Unified V1/V2 gates and post-auth eviction
 // ============================================
 
 use std::net::SocketAddr;
@@ -68,6 +72,9 @@ use aeronyx_core::protocol::{ClientHello, ServerHello};
 use crate::error::{Result, ServerError};
 use crate::services::deny_list::DenyList;
 use crate::services::{IpPoolService, NodePolicyRuntime, RoutingService, Session, SessionManager};
+
+/// Maximum live transport sessions admitted for one authenticated identity.
+const MAX_AUTHENTICATED_SESSIONS_PER_IDENTITY: usize = 4;
 
 /// Result of a successful handshake.
 pub struct HandshakeResult {
@@ -128,32 +135,11 @@ impl HandshakeService {
         extension: &[u8],
         client_addr: SocketAddr,
     ) -> Result<HandshakeResult> {
+        self.validate_candidate(client_hello)?;
         if client_hello.version == aeronyx_core::protocol::PROTOCOL_VERSION_V2 {
             return self.process_v2(client_hello, extension, client_addr);
         }
         debug!("Processing handshake");
-
-        if let Err(reason) = self.policy.validate_new_session(self.sessions.count()) {
-            warn!(reason = reason, "[NODE_POLICY] Handshake rejected");
-            return Err(ServerError::node_policy_rejected(reason));
-        }
-
-        // ── Step 0: Deny list check (v1.0.0-Membership) ──────────────────
-        // Derive wallet hex from the public key in the ClientHello.
-        // O(1) DashMap lookup — cheaper than Ed25519 verify below.
-        let wallet_hex = hex::encode(&client_hello.client_public_key);
-        if self.deny_list.is_denied(&wallet_hex) {
-            let reason = self
-                .deny_list
-                .deny_reason(&wallet_hex)
-                .map(|r| r.to_string())
-                .unwrap_or_else(|| "denied".to_string());
-            warn!(
-                reason = %reason,
-                "[HANDSHAKE] Wallet on deny list — rejected"
-            );
-            return Err(ServerError::WalletDenied { reason });
-        }
 
         // ── Step 1: Verify ClientHello signature ──────────────────────────
         self.crypto.verify_client_hello(client_hello).map_err(|e| {
@@ -168,13 +154,7 @@ impl HandshakeService {
         // multiple valid handshakes cannot all observe the same free slot and
         // overshoot nodeboard's dynamic max_sessions policy.
         let _admission_guard = self.admission_lock.lock();
-        if let Err(reason) = self.policy.validate_new_session(self.sessions.count()) {
-            warn!(
-                reason = reason,
-                "[NODE_POLICY] Handshake admission rejected"
-            );
-            return Err(ServerError::node_policy_rejected(reason));
-        }
+        self.validate_candidate(client_hello)?;
 
         // ── Step 2: Allocate virtual IP ───────────────────────────────────
         let virtual_ip = self.ip_pool.allocate().map_err(|e| {
@@ -212,14 +192,15 @@ impl HandshakeService {
             ServerError::session_creation_failed(format!("Invalid client public key: {}", e))
         })?;
 
-        let session = match self.sessions.create(
+        let admission = match self.sessions.create_authenticated(
             session_id.clone(),
             client_public_key,
             session_key,
             virtual_ip,
             client_addr,
+            MAX_AUTHENTICATED_SESSIONS_PER_IDENTITY,
         ) {
-            Ok(s) => s,
+            Ok(admission) => admission,
             Err(e) => {
                 self.ip_pool.release(virtual_ip);
                 warn!(error = %e, "Session creation failed");
@@ -228,14 +209,46 @@ impl HandshakeService {
         };
 
         // ── Step 6: Register route ────────────────────────────────────────
-        self.routing.add_route(virtual_ip, session.id.clone());
+        for termination in &admission.evicted {
+            self.routing
+                .remove_route_for_session(termination.virtual_ip, &termination.session_id);
+        }
+        self.routing
+            .add_route(virtual_ip, admission.session.id.clone());
+        admission
+            .session
+            .stage_admission_evictions(admission.evicted);
 
         info!("Handshake completed successfully");
 
         Ok(HandshakeResult {
-            session,
+            session: admission.session,
             response: server_hello,
         })
+    }
+
+    /// Shared, coarse admission gate used before signature work and again
+    /// under `admission_lock` immediately before resource mutation.
+    fn validate_candidate(&self, client_hello: &ClientHello) -> Result<()> {
+        // [PROTOCOL-V2-ADMISSION-HOTFIX 2026-09-13 by Codex] Version dispatch
+        // must not bypass operator policy or membership denial. Keeping this
+        // helper common also preserves v0x01 behavior during mixed rollout.
+        if let Err(reason) = self.policy.validate_new_session(self.sessions.count()) {
+            warn!(reason = reason, "[NODE_POLICY] Handshake rejected");
+            return Err(ServerError::node_policy_rejected(reason));
+        }
+
+        let wallet_hex = hex::encode(client_hello.client_public_key);
+        if self.deny_list.is_denied(&wallet_hex) {
+            let reason = self
+                .deny_list
+                .deny_reason(&wallet_hex)
+                .map(|reason| reason.to_string())
+                .unwrap_or_else(|| "denied".to_string());
+            warn!(reason = %reason, "[HANDSHAKE] Wallet on deny list — rejected");
+            return Err(ServerError::WalletDenied { reason });
+        }
+        Ok(())
     }
 
     /// Cleans up resources for a failed or closed session.
@@ -252,6 +265,8 @@ impl HandshakeService {
                 warn!(client = %client_addr, error = %e, "Handshake v2 signature verification failed");
                 e
             })?;
+        let _admission_guard = self.admission_lock.lock();
+        self.validate_candidate(client_hello)?;
         let virtual_ip = self.ip_pool.allocate().map_err(|e| {
             warn!(client = %client_addr, "IP allocation failed: {}", e);
             e
@@ -277,28 +292,37 @@ impl HandshakeService {
             self.ip_pool.release(virtual_ip);
             ServerError::session_creation_failed(format!("Invalid client public key: {}", e))
         })?;
-        let session = match self.sessions.create_v2(
+        let admission = match self.sessions.create_v2_authenticated(
             session_id.clone(),
             client_public_key,
             keys,
             virtual_ip,
             client_addr,
+            MAX_AUTHENTICATED_SESSIONS_PER_IDENTITY,
         ) {
-            Ok(s) => s,
+            Ok(admission) => admission,
             Err(e) => {
                 self.ip_pool.release(virtual_ip);
                 warn!(client = %client_addr, error = %e, "Session v2 creation failed");
                 return Err(e);
             }
         };
-        self.routing.add_route(virtual_ip, session.id.clone());
+        for termination in &admission.evicted {
+            self.routing
+                .remove_route_for_session(termination.virtual_ip, &termination.session_id);
+        }
+        self.routing
+            .add_route(virtual_ip, admission.session.id.clone());
+        admission
+            .session
+            .stage_admission_evictions(admission.evicted);
         info!(
-            session_id = %session.id,
+            session_id = %admission.session.id,
             virtual_ip = %virtual_ip,
             "Handshake v2 completed successfully"
         );
         Ok(HandshakeResult {
-            session,
+            session: admission.session,
             response: server_hello,
         })
     }
@@ -347,7 +371,7 @@ mod tests {
     use super::*;
     use crate::services::deny_list::DenyReason;
     use crate::services::NodePolicySnapshot;
-    use aeronyx_core::crypto::handshake::create_client_hello;
+    use aeronyx_core::crypto::handshake::{create_client_hello, create_client_hello_v2};
     use aeronyx_core::crypto::EphemeralKeyPair;
     use aeronyx_core::protocol::CURRENT_PROTOCOL_VERSION;
     use std::net::Ipv4Addr;
@@ -373,6 +397,14 @@ mod tests {
         let routing = Arc::new(RoutingService::new());
         let deny_list = Arc::new(DenyList::new());
         (ip_pool, sessions, routing, deny_list)
+    }
+
+    fn create_v2_hello(identity: &IdentityKeyPair) -> ClientHello {
+        create_client_hello_v2(
+            identity,
+            EphemeralKeyPair::generate().public_key_bytes(),
+            &[],
+        )
     }
 
     #[test]
@@ -496,6 +528,94 @@ mod tests {
     }
 
     #[test]
+    fn invalid_v2_signature_cannot_evict_claimed_identity_sessions() {
+        // [PROTOCOL-V2-ADMISSION-HOTFIX 2026-09-13 by Codex] The identity cap
+        // is downstream of signature verification and reads the authenticated
+        // primary session map, never the untrusted hello or wallet index.
+        let (ip_pool, sessions, routing, deny_list) = create_test_services();
+        let service = HandshakeService::new(
+            IdentityKeyPair::generate(),
+            Arc::clone(&ip_pool),
+            Arc::clone(&sessions),
+            Arc::clone(&routing),
+            deny_list,
+            Arc::new(NodePolicyRuntime::default()),
+        );
+        let victim = IdentityKeyPair::generate();
+        let mut retained = Vec::new();
+        for offset in 0..MAX_AUTHENTICATED_SESSIONS_PER_IDENTITY {
+            let result = service
+                .process(
+                    &create_v2_hello(&victim),
+                    &[],
+                    SocketAddr::from(([127, 0, 0, 1], 24_000 + offset as u16)),
+                )
+                .expect("seed authenticated victim session");
+            retained.push(result.session.id.clone());
+        }
+
+        let attacker = IdentityKeyPair::generate();
+        let mut forged = create_v2_hello(&attacker);
+        forged.client_public_key = victim.public_key_bytes();
+        let before_allocated = ip_pool.allocated_count();
+        let rejected = service.process(
+            &forged,
+            &[],
+            "127.0.0.1:24999".parse().expect("forged endpoint"),
+        );
+
+        assert!(rejected.is_err());
+        assert_eq!(sessions.count(), retained.len());
+        assert_eq!(routing.count(), retained.len());
+        assert_eq!(ip_pool.allocated_count(), before_allocated);
+        assert!(retained.iter().all(|id| sessions.get(id).is_some()));
+    }
+
+    #[test]
+    fn fifth_authenticated_v2_session_atomically_replaces_oldest_identity_session() {
+        let (ip_pool, sessions, routing, deny_list) = create_test_services();
+        let service = HandshakeService::new(
+            IdentityKeyPair::generate(),
+            ip_pool,
+            Arc::clone(&sessions),
+            Arc::clone(&routing),
+            deny_list,
+            Arc::new(NodePolicyRuntime::default()),
+        );
+        let identity = IdentityKeyPair::generate();
+        let mut admitted = Vec::new();
+        for offset in 0..MAX_AUTHENTICATED_SESSIONS_PER_IDENTITY {
+            admitted.push(
+                service
+                    .process(
+                        &create_v2_hello(&identity),
+                        &[],
+                        SocketAddr::from(([127, 0, 0, 1], 25_000 + offset as u16)),
+                    )
+                    .expect("seed identity session"),
+            );
+        }
+        let oldest = admitted[0].session.id.clone();
+
+        let replacement = service
+            .process(
+                &create_v2_hello(&identity),
+                &[],
+                "127.0.0.1:25999".parse().expect("replacement endpoint"),
+            )
+            .expect("admit authenticated replacement");
+
+        let evicted = replacement.session.take_admission_evictions();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].session_id, oldest);
+        assert!(sessions.get(&oldest).is_none());
+        assert!(sessions.get(&replacement.session.id).is_some());
+        assert_eq!(sessions.count(), MAX_AUTHENTICATED_SESSIONS_PER_IDENTITY);
+        assert_eq!(routing.count(), MAX_AUTHENTICATED_SESSIONS_PER_IDENTITY);
+        assert!(routing.lookup(evicted[0].virtual_ip).is_none());
+    }
+
+    #[test]
     fn test_denied_wallet_rejected_before_ip_alloc() {
         let server_identity = IdentityKeyPair::generate();
         let (ip_pool, sessions, routing, deny_list) = create_test_services();
@@ -540,6 +660,35 @@ mod tests {
             routing.is_empty(),
             "Route must not be registered for denied wallet"
         );
+    }
+
+    #[test]
+    fn denied_v2_identity_is_rejected_before_resource_allocation() {
+        let (ip_pool, sessions, routing, deny_list) = create_test_services();
+        let identity = IdentityKeyPair::generate();
+        deny_list.add(
+            &hex::encode(identity.public_key_bytes()),
+            DenyReason::QuotaExceeded,
+        );
+        let service = HandshakeService::new(
+            IdentityKeyPair::generate(),
+            Arc::clone(&ip_pool),
+            Arc::clone(&sessions),
+            Arc::clone(&routing),
+            deny_list,
+            Arc::new(NodePolicyRuntime::default()),
+        );
+
+        let result = service.process(
+            &create_v2_hello(&identity),
+            &[],
+            "127.0.0.1:26000".parse().expect("client endpoint"),
+        );
+
+        assert!(matches!(result, Err(ServerError::WalletDenied { .. })));
+        assert_eq!(ip_pool.allocated_count(), 0);
+        assert_eq!(sessions.count(), 0);
+        assert!(routing.is_empty());
     }
 
     #[test]
@@ -661,6 +810,48 @@ mod tests {
         }
 
         assert_eq!(sessions.count(), 1);
+    }
+
+    #[test]
+    fn v2_respects_dynamic_policy_capacity_without_partial_allocation() {
+        let (ip_pool, sessions, routing, deny_list) = create_test_services();
+        let policy = Arc::new(NodePolicyRuntime::default());
+        policy.update(NodePolicySnapshot {
+            max_sessions: 1,
+            ..NodePolicySnapshot::default()
+        });
+        let service = HandshakeService::new(
+            IdentityKeyPair::generate(),
+            Arc::clone(&ip_pool),
+            Arc::clone(&sessions),
+            Arc::clone(&routing),
+            deny_list,
+            policy,
+        );
+        let first = IdentityKeyPair::generate();
+        service
+            .process(
+                &create_v2_hello(&first),
+                &[],
+                "127.0.0.1:27000".parse().expect("first endpoint"),
+            )
+            .expect("first v2 admission");
+        let allocated = ip_pool.allocated_count();
+        let second = IdentityKeyPair::generate();
+
+        let rejected = service.process(
+            &create_v2_hello(&second),
+            &[],
+            "127.0.0.1:27001".parse().expect("second endpoint"),
+        );
+
+        assert!(matches!(
+            rejected,
+            Err(ServerError::NodePolicyRejected { .. })
+        ));
+        assert_eq!(ip_pool.allocated_count(), allocated);
+        assert_eq!(sessions.count(), 1);
+        assert_eq!(routing.count(), 1);
     }
 
     #[test]

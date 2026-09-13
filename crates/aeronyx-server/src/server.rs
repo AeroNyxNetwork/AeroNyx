@@ -4,6 +4,9 @@
 // Version: 1.0.0-Membership
 //
 // Modification Reason:
+//   [PROTOCOL-V2-ADMISSION-HOTFIX 2026-09-13 by Codex] Removed unauthenticated
+//   identity eviction from UDP ingress and finalizes only evictions returned
+//   by the authenticated, lifecycle-fenced handshake admission transition.
 //   [BLIND-VAULT-MANAGEMENT-RUNTIME 2026-08-31 by Codex] Passes the live
 //   Blind Vault service explicitly into management readiness reporting.
 //   [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Bound startup,
@@ -1123,9 +1126,6 @@ const QUANTIZER_CAL_KEY_PREFIX: &str = "quantizer_cal";
 const POOL_EVICTION_INTERVAL_SECS: u64 = 300;
 const MINER_SCHEDULER_TICK_SECS: u64 = 60;
 const KEEPALIVE_PROBE_INTERVAL_SECS: u64 = 60;
-/// [2026-09-12] Live sessions one client identity may hold (a phone and a
-/// laptop on the same wallet). The oldest is evicted when a new hello arrives.
-const MAX_SESSIONS_PER_IDENTITY: usize = 4;
 const KEEPALIVE_ACK_TIMEOUT_SECS: u64 = 90;
 /// First delay after a required data-plane receive failure.
 const DATA_PLANE_RECV_RETRY_BASE_MILLIS: u64 = 25;
@@ -15084,18 +15084,14 @@ impl Server {
                                         }
 
                                         if let Ok(hello) = decode_client_hello(data) {
-                                            // [2026-09-12] One identity keeps at most a few
-                                            // live sessions; the oldest makes room.
-                                            let mut same_identity =
-                                                sessions.get_all_by_wallet(&hello.client_public_key);
-                                            if same_identity.len() >= MAX_SESSIONS_PER_IDENTITY {
-                                                same_identity.sort_by_key(|s| s.created_at);
-                                                for stale in same_identity
-                                                    .iter()
-                                                    .take(same_identity.len() + 1 - MAX_SESSIONS_PER_IDENTITY)
-                                                {
-                                                    if let Some(termination) =
-                                                        sessions.terminate_with_cooldown(&stale.id)
+                                            match handshake.process(&hello, &extension, source.addr) {
+                                                Ok(result) => {
+                                                    // [PROTOCOL-V2-ADMISSION-HOTFIX 2026-09-13 by Codex]
+                                                    // The handshake service returns evictions only
+                                                    // after authenticating the claimed identity and
+                                                    // atomically admitting its replacement session.
+                                                    for termination in
+                                                        result.session.take_admission_evictions()
                                                     {
                                                         Self::finalize_session_termination(
                                                             termination,
@@ -15105,10 +15101,6 @@ impl Server {
                                                             &traffic_tracker,
                                                         );
                                                     }
-                                                }
-                                            }
-                                            match handshake.process(&hello, &extension, source.addr) {
-                                                Ok(result) => {
                                                     let sid        = BASE64.encode(&result.response.session_id);
                                                     let wallet_hex = hex::encode(result.session.client_public_key.to_bytes());
                                                     session_events.session_created(
