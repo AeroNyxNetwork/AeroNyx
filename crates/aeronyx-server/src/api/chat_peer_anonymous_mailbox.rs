@@ -8,6 +8,7 @@
 //! content-key, or plaintext fields.
 //!
 //! ## Last Modified
+//! v1.0.4-NoSocketSmtr — Prove exact pinned-target S/M/T/R retries and restart.
 //! v1.0.3-LeaseReplay — Preserve durable exact lease-create replay after
 //! admission-ticket freshness expires.
 //! v1.0.2-CrossEntryVertical — M13G source-to-custody cross-entry proof.
@@ -350,7 +351,8 @@ mod tests {
     use super::*;
     use crate::config_chat_relay::{AnonymousMailboxSourceConfig, AnonymousMailboxStoreConfig};
     use crate::services::chat_relay_anonymous_mailbox_source::{
-        AnonymousMailboxSourceCoordinator, AnonymousMailboxSourceResult,
+        AnonymousMailboxSourceCoordinator, AnonymousMailboxSourceError,
+        AnonymousMailboxSourceOutbound, AnonymousMailboxSourceResult,
         ExactAnonymousMailboxTargetPin, ExactAnonymousMailboxTargetResolver,
         SqliteAnonymousMailboxSourceJournal,
     };
@@ -390,6 +392,55 @@ mod tests {
         descriptor: SignedNodeDescriptor,
         exact_calls: AtomicUsize,
         wrong_target_calls: AtomicUsize,
+    }
+
+    // [ANONYMOUS-MAILBOX-SMTR-HARNESS 2026-09-14 by Codex] A deterministic
+    // no-socket transport accepts exactly one pinned terminal. Counters prove
+    // the harness neither fans out nor attempts an alternate on rejected
+    // descriptor, target, commitment, or carrier inputs.
+    struct CrossEntryNoSocketTransport {
+        target: IdentityKeyPair,
+        exact_calls: AtomicUsize,
+        alternate_calls: AtomicUsize,
+    }
+
+    impl CrossEntryNoSocketTransport {
+        fn new(target: &IdentityKeyPair) -> Self {
+            Self {
+                target: target.clone(),
+                exact_calls: AtomicUsize::new(0),
+                alternate_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn deliver(
+            &self,
+            outbound: &AnonymousMailboxSourceOutbound,
+            repository: Arc<dyn AnonymousMailboxCustodyRepository>,
+            now: u64,
+        ) -> Vec<u8> {
+            if outbound.target_node_id() != &self.target.public_key_bytes() {
+                self.alternate_calls.fetch_add(1, Ordering::Relaxed);
+                panic!("no-socket transport received a non-pinned terminal");
+            }
+            self.exact_calls.fetch_add(1, Ordering::Relaxed);
+            let (target_kem_secret, _) = self.target.to_x25519();
+            let peel = open_onion_layer(
+                &outbound.request().envelope.encrypted_blob,
+                &target_kem_secret,
+            )
+            .expect("target peels one-hop source route");
+            assert!(peel.next_hop.is_none());
+            let sealed = PreparedAnonymousMailboxTerminal::decode(
+                &peel.inner,
+                outbound.route_id(),
+                self.target.public_key_bytes(),
+            )
+            .expect("target decodes source carrier")
+            .execute(repository, Arc::new(self.target.clone()), now)
+            .expect("target executes terminal request");
+            BASE64.decode(sealed).expect("source-sealed response")
+        }
     }
 
     struct TestRecipientKeyHandle {
@@ -736,6 +787,7 @@ mod tests {
 
     fn dispatch_cross_entry_terminal(
         coordinator: &AnonymousMailboxSourceCoordinator,
+        transport: &CrossEntryNoSocketTransport,
         repository: Arc<dyn AnonymousMailboxCustodyRepository>,
         target: &IdentityKeyPair,
         descriptor_commitment: DirectoryDescriptorCommitmentV1,
@@ -760,26 +812,8 @@ mod tests {
             .expect("source exact-target dispatch");
         assert_eq!(prepared.body(), outbound.body());
         assert_eq!(outbound.target_node_id(), &target.public_key_bytes());
-
-        let (target_kem_secret, _) = target.to_x25519();
-        let peel = open_onion_layer(
-            &outbound.request().envelope.encrypted_blob,
-            &target_kem_secret,
-        )
-        .expect("target peels one-hop source route");
-        assert!(peel.next_hop.is_none());
-        let sealed = PreparedAnonymousMailboxTerminal::decode(
-            &peel.inner,
-            route_id,
-            target.public_key_bytes(),
-        )
-        .expect("target decodes source carrier")
-        .execute(repository, Arc::new(target.clone()), 1_800_000_000)
-        .expect("target executes terminal request");
-        (
-            outbound.body().to_vec(),
-            BASE64.decode(sealed).expect("source-sealed response"),
-        )
+        let sealed = transport.deliver(&outbound, repository, 1_800_000_000);
+        (outbound.body().to_vec(), sealed)
     }
 
     fn complete_cross_entry_response(
@@ -1510,6 +1544,7 @@ mod tests {
             ticket_issue_work_bits: 1,
         };
         let target = IdentityKeyPair::from_bytes(&[0xb1; 32]).expect("target T");
+        let transport = CrossEntryNoSocketTransport::new(&target);
         let descriptor = cross_entry_descriptor(&target);
         let descriptor_commitment =
             DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
@@ -1565,9 +1600,68 @@ mod tests {
             .expect("open target store"),
         );
 
+        let empty_admission_state = durable_admission_state(&store_config.db_path);
+        let empty_item_state = durable_item_state(&store_config.db_path);
+        let ticket_frame = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::TicketIssue(ticket_request.clone()),
+        )
+        .expect("canonical ticket terminal frame");
+        let mut wrong_descriptor = descriptor_commitment;
+        wrong_descriptor.descriptor_hash[0] ^= 0x80;
+        assert!(matches!(
+            entry_m.prepare(
+                ExactAnonymousMailboxTargetPin::new(target.public_key_bytes(), wrong_descriptor,),
+                [0x21; 16],
+                ticket_frame.clone(),
+                1_800_000_000,
+            ),
+            Err(AnonymousMailboxSourceError::Rejected)
+        ));
+        let foreign_target = IdentityKeyPair::from_bytes(&[0x22; 32]).expect("non-pinned terminal");
+        assert!(matches!(
+            entry_m.prepare(
+                ExactAnonymousMailboxTargetPin::new(
+                    foreign_target.public_key_bytes(),
+                    descriptor_commitment,
+                ),
+                [0x23; 16],
+                ticket_frame.clone(),
+                1_800_000_000,
+            ),
+            Err(AnonymousMailboxSourceError::Rejected)
+        ));
+        let (canonical_ticket_route, _unused_session) =
+            routed_terminal_frame([0x24; 16], &target, ticket_frame);
+        assert!(matches!(
+            PreparedAnonymousMailboxTerminal::decode(
+                &canonical_ticket_route,
+                [0x24; 16],
+                foreign_target.public_key_bytes(),
+            ),
+            Err(AnonymousMailboxTerminalFailure::Rejected)
+        ));
+        let mut tampered_ticket_route = canonical_ticket_route;
+        tampered_ticket_route.push(0xff);
+        assert!(matches!(
+            PreparedAnonymousMailboxTerminal::decode(
+                &tampered_ticket_route,
+                [0x24; 16],
+                target.public_key_bytes(),
+            ),
+            Err(AnonymousMailboxTerminalFailure::Rejected)
+        ));
+        assert_eq!(
+            durable_admission_state(&store_config.db_path),
+            empty_admission_state
+        );
+        assert_eq!(durable_item_state(&store_config.db_path), empty_item_state);
+        assert_eq!(transport.exact_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(transport.alternate_calls.load(Ordering::Relaxed), 0);
+
         let ticket_route = [0xbc; 16];
         let (_, sealed_ticket) = dispatch_cross_entry_terminal(
             &entry_m,
+            &transport,
             store.clone(),
             &target,
             descriptor_commitment,
@@ -1598,6 +1692,7 @@ mod tests {
         let lease_route = [0xbd; 16];
         let (_, sealed_lease) = dispatch_cross_entry_terminal(
             &entry_m,
+            &transport,
             store.clone(),
             &target,
             descriptor_commitment,
@@ -1622,8 +1717,9 @@ mod tests {
         )
         .expect("put request");
         let put_route = [0xc0; 16];
-        let (put_body, sealed_put) = dispatch_cross_entry_terminal(
+        let (put_body, _lost_sealed_put) = dispatch_cross_entry_terminal(
             &entry_m,
+            &transport,
             store.clone(),
             &target,
             descriptor_commitment,
@@ -1634,17 +1730,77 @@ mod tests {
             .begin_dispatch(put_route, 1_800_000_001)
             .expect("exact armed replay");
         assert_eq!(replay.body(), put_body, "lost response replays exact bytes");
+        let sealed_put = transport.deliver(&replay, store.clone(), 1_800_000_001);
         let AnonymousMailboxTerminalFrameV1::PutResponse(put_response) =
             complete_cross_entry_response(&entry_m, put_route, &sealed_put)
         else {
             panic!("put response kind");
         };
         assert_eq!(put_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        let stored_once = (
+            1,
+            i64::try_from(opaque_item.len()).expect("opaque item length"),
+            1,
+            vec![opaque_item.clone()],
+        );
+        assert_eq!(durable_item_state(&store_config.db_path), stored_once);
+
+        let changed_put = AnonymousMailboxPutV1::new(
+            mailbox_id,
+            put.item_id,
+            vec![0x25; 4096],
+            1_800_000_000,
+            1_800_000_600,
+            &depositor,
+        )
+        .expect("same-id different-content Put");
+        let conflict_route = [0x26; 16];
+        let (_, sealed_conflict) = dispatch_cross_entry_terminal(
+            &entry_m,
+            &transport,
+            store.clone(),
+            &target,
+            descriptor_commitment,
+            conflict_route,
+            AnonymousMailboxTerminalFrameV1::Put(changed_put.clone()),
+        );
+        let AnonymousMailboxTerminalFrameV1::PutResponse(conflict_response) =
+            complete_cross_entry_response(&entry_m, conflict_route, &sealed_conflict)
+        else {
+            panic!("conflict response kind");
+        };
+        assert_eq!(
+            conflict_response.outcome,
+            AnonymousMailboxOutcomeV1::Conflict
+        );
+        let changed_frame = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::Put(changed_put),
+        )
+        .expect("changed Put terminal frame");
+        let deliveries_before_commitment_conflict = transport.exact_calls.load(Ordering::Relaxed);
+        assert!(matches!(
+            entry_m.prepare(
+                ExactAnonymousMailboxTargetPin::new(
+                    target.public_key_bytes(),
+                    descriptor_commitment,
+                ),
+                put_route,
+                changed_frame,
+                1_800_000_001,
+            ),
+            Err(AnonymousMailboxSourceError::Conflict)
+        ));
+        assert_eq!(
+            transport.exact_calls.load(Ordering::Relaxed),
+            deliveries_before_commitment_conflict,
+            "source commitment conflict cannot reach transport"
+        );
+        assert_eq!(durable_item_state(&store_config.db_path), stored_once);
         drop(store);
 
         let restarted = Arc::new(
             SqliteAnonymousMailboxStore::open_with_ticket_issuer(
-                store_config,
+                store_config.clone(),
                 target.clone(),
                 cursor_secret,
             )
@@ -1661,6 +1817,7 @@ mod tests {
         let pull_route = [0xc2; 16];
         let (_, sealed_pull) = dispatch_cross_entry_terminal(
             &entry_r,
+            &transport,
             restarted.clone(),
             &target,
             descriptor_commitment,
@@ -1688,20 +1845,43 @@ mod tests {
         )
         .expect("ack request");
         let ack_route = [0xc4; 16];
-        let (_, sealed_ack) = dispatch_cross_entry_terminal(
+        let (_, _lost_sealed_ack) = dispatch_cross_entry_terminal(
             &entry_r,
+            &transport,
             restarted.clone(),
             &target,
             descriptor_commitment,
             ack_route,
-            AnonymousMailboxTerminalFrameV1::Ack(ack),
+            AnonymousMailboxTerminalFrameV1::Ack(ack.clone()),
         );
+        assert_eq!(
+            durable_item_state(&store_config.db_path),
+            (0, 0, 0, Vec::new())
+        );
+        let ack_replay = entry_r
+            .begin_dispatch(ack_route, 1_800_000_003)
+            .expect("exact Ack replay after lost response");
+        let sealed_ack = transport.deliver(&ack_replay, restarted.clone(), 1_800_000_003);
         let AnonymousMailboxTerminalFrameV1::AckResponse(ack_response) =
             complete_cross_entry_response(&entry_r, ack_route, &sealed_ack)
         else {
             panic!("ack response kind");
         };
         assert_eq!(ack_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        assert_eq!(
+            durable_item_state(&store_config.db_path),
+            (0, 0, 0, Vec::new())
+        );
+        drop(restarted);
+
+        let restarted_after_ack = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                store_config.clone(),
+                target.clone(),
+                cursor_secret,
+            )
+            .expect("restart target after exact Ack replay"),
+        );
 
         let empty_pull = AnonymousMailboxPullOneV1::new(
             mailbox_id,
@@ -1714,7 +1894,8 @@ mod tests {
         let empty_route = [0xc6; 16];
         let (_, sealed_empty) = dispatch_cross_entry_terminal(
             &entry_r,
-            restarted,
+            &transport,
+            restarted_after_ack,
             &target,
             descriptor_commitment,
             empty_route,
@@ -1727,11 +1908,17 @@ mod tests {
         };
         assert_eq!(empty_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
         assert!(empty_response.sealed_payload.is_empty());
+        assert_eq!(
+            durable_item_state(&store_config.db_path),
+            (0, 0, 0, Vec::new())
+        );
 
-        assert_eq!(m_resolver.wrong_target_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(m_resolver.wrong_target_calls.load(Ordering::Relaxed), 1);
         assert_eq!(r_resolver.wrong_target_calls.load(Ordering::Relaxed), 0);
-        assert!(m_resolver.exact_calls.load(Ordering::Relaxed) >= 6);
-        assert!(r_resolver.exact_calls.load(Ordering::Relaxed) >= 6);
+        assert_eq!(transport.exact_calls.load(Ordering::Relaxed), 9);
+        assert_eq!(transport.alternate_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(m_resolver.exact_calls.load(Ordering::Relaxed), 10);
+        assert_eq!(r_resolver.exact_calls.load(Ordering::Relaxed), 7);
     }
 
     #[test]
