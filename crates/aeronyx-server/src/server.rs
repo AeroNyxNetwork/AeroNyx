@@ -19868,6 +19868,7 @@ mod tests {
     fn signed_probe_peer_descriptor(
         endpoint: String,
         sequence: u64,
+        issued_at: u64,
         expires_at: u64,
         capabilities: Vec<NodeCapability>,
         kem_public: [u8; 32],
@@ -19876,7 +19877,7 @@ mod tests {
         let mut descriptor = NodeDescriptor::new(
             peer_identity.public_key_bytes(),
             sequence,
-            sequence,
+            issued_at,
             expires_at,
             "test-onion-peer",
         )
@@ -19901,6 +19902,7 @@ mod tests {
         let middle = signed_probe_peer_descriptor(
             "http://198.51.100.10:8422".to_string(),
             1,
+            now,
             now + 300,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x21; 32],
@@ -19908,6 +19910,7 @@ mod tests {
         let terminal = signed_probe_peer_descriptor(
             "http://198.51.100.11:8422".to_string(),
             2,
+            now,
             now + 300,
             vec![NodeCapability::ChatRelay],
             [0x22; 32],
@@ -19967,6 +19970,7 @@ mod tests {
         let middle = signed_probe_peer_descriptor(
             "http://198.51.100.10:8422".to_string(),
             1,
+            now,
             now + 300,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0u8; 32],
@@ -19974,6 +19978,7 @@ mod tests {
         let terminal = signed_probe_peer_descriptor(
             "http://198.51.100.11:8422".to_string(),
             2,
+            now,
             now + 300,
             vec![NodeCapability::ChatRelay],
             [0x22; 32],
@@ -20033,6 +20038,7 @@ mod tests {
         let first_middle = signed_probe_peer_descriptor(
             "http://198.51.100.10:8422".to_string(),
             1,
+            now,
             now + 300,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x31; 32],
@@ -20040,6 +20046,7 @@ mod tests {
         let second_middle = signed_probe_peer_descriptor(
             "http://203.0.113.20:8422".to_string(),
             2,
+            now,
             now + 300,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x32; 32],
@@ -20047,6 +20054,7 @@ mod tests {
         let terminal = signed_probe_peer_descriptor(
             "http://192.0.2.30:8422".to_string(),
             3,
+            now,
             now + 300,
             vec![NodeCapability::ChatRelay],
             [0x33; 32],
@@ -20098,9 +20106,10 @@ mod tests {
         let self_node_id = source.public_key_bytes();
         let middle = signed_probe_peer_descriptor(
             "http://198.51.100.10:8422".to_string(),
+            1,
             now,
             now + 300,
-            vec![NodeCapability::OnionMiddle],
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
             [0x31; 32],
         );
         let store = PeerStore::new();
@@ -22619,6 +22628,7 @@ mod tests {
         let proven = signed_probe_peer_descriptor(
             "https://proven.example".to_string(),
             1,
+            now,
             now + 300,
             vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
             [0x31; 32],
@@ -22626,6 +22636,7 @@ mod tests {
         let unproven = signed_probe_peer_descriptor(
             "https://unproven.example".to_string(),
             2,
+            now,
             now + 300,
             vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
             [0x32; 32],
@@ -22633,6 +22644,7 @@ mod tests {
         let quarantined = signed_probe_peer_descriptor(
             "https://quarantined.example".to_string(),
             3,
+            now,
             now + 300,
             vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
             [0x33; 32],
@@ -25720,6 +25732,7 @@ mod tests {
         let middle = signed_probe_peer_descriptor(
             "https://legacy-middle.example".to_string(),
             1,
+            now,
             now + 4_000,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x31; 32],
@@ -25727,6 +25740,7 @@ mod tests {
         let terminal = signed_probe_peer_descriptor(
             "https://legacy-terminal.example".to_string(),
             2,
+            now,
             now + 4_000,
             vec![NodeCapability::ChatRelay],
             [0x32; 32],
@@ -25970,6 +25984,7 @@ mod tests {
         let middle = signed_probe_peer_descriptor(
             "https://middle-cache.example".to_string(),
             1,
+            now,
             now + 4_000,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x41; 32],
@@ -25977,6 +25992,7 @@ mod tests {
         let terminal = signed_probe_peer_descriptor(
             "https://terminal-cache.example".to_string(),
             2,
+            now,
             now + 4_000,
             vec![NodeCapability::ChatRelay],
             [0x42; 32],
@@ -25984,6 +26000,7 @@ mod tests {
         let second_middle = signed_probe_peer_descriptor(
             "https://second-middle-cache.example".to_string(),
             3,
+            now,
             now + 4_000,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x43; 32],
@@ -26343,6 +26360,7 @@ mod tests {
         let middle = signed_probe_peer_descriptor(
             "https://proof-rollback-middle-a.example".to_string(),
             1,
+            now,
             now + 4_000,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x71; 32],
@@ -26350,6 +26368,7 @@ mod tests {
         let second_middle = signed_probe_peer_descriptor(
             "https://proof-rollback-middle-b.example".to_string(),
             2,
+            now,
             now + 4_000,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x72; 32],
@@ -26357,6 +26376,7 @@ mod tests {
         let terminal = signed_probe_peer_descriptor(
             "https://proof-rollback-terminal.example".to_string(),
             3,
+            now,
             now + 4_000,
             vec![NodeCapability::ChatRelay],
             [0x73; 32],
@@ -26480,6 +26500,7 @@ mod tests {
         let middle = signed_probe_peer_descriptor(
             "https://rollback-middle.example".to_string(),
             1,
+            now,
             now + 4_000,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x43; 32],
@@ -26487,6 +26508,7 @@ mod tests {
         let terminal = signed_probe_peer_descriptor(
             "https://rollback-terminal.example".to_string(),
             2,
+            now,
             now + 4_000,
             vec![NodeCapability::ChatRelay],
             [0x44; 32],
@@ -26603,6 +26625,7 @@ mod tests {
         let middle = signed_probe_peer_descriptor(
             "https://cache-ahead-middle.example".to_string(),
             1,
+            now,
             now + 4_000,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x45; 32],
@@ -26610,6 +26633,7 @@ mod tests {
         let terminal = signed_probe_peer_descriptor(
             "https://cache-ahead-terminal.example".to_string(),
             2,
+            now,
             now + 4_000,
             vec![NodeCapability::ChatRelay],
             [0x46; 32],
@@ -26710,6 +26734,7 @@ mod tests {
         let middle = signed_probe_peer_descriptor(
             "https://middle-tamper.example".to_string(),
             1,
+            now,
             now + 4_000,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x51; 32],
@@ -26717,6 +26742,7 @@ mod tests {
         let terminal = signed_probe_peer_descriptor(
             "https://terminal-tamper.example".to_string(),
             2,
+            now,
             now + 4_000,
             vec![NodeCapability::ChatRelay],
             [0x52; 32],
@@ -26724,6 +26750,7 @@ mod tests {
         let second_middle = signed_probe_peer_descriptor(
             "https://second-middle-tamper.example".to_string(),
             3,
+            now,
             now + 4_000,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x53; 32],
@@ -26850,6 +26877,7 @@ mod tests {
         let middle = signed_probe_peer_descriptor(
             "https://middle-client-tamper.example".to_string(),
             1,
+            now,
             now + 4_000,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x61; 32],
@@ -26857,6 +26885,7 @@ mod tests {
         let terminal = signed_probe_peer_descriptor(
             "https://terminal-client-tamper.example".to_string(),
             2,
+            now,
             now + 4_000,
             vec![NodeCapability::ChatRelay],
             [0x62; 32],
@@ -26961,6 +26990,7 @@ mod tests {
         let middle = signed_probe_peer_descriptor(
             "https://middle-client-expired.example".to_string(),
             1,
+            now,
             now + 4_000,
             vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x63; 32],
@@ -26968,6 +26998,7 @@ mod tests {
         let terminal = signed_probe_peer_descriptor(
             "https://terminal-client-expired.example".to_string(),
             2,
+            now,
             now + 4_000,
             vec![NodeCapability::ChatRelay],
             [0x64; 32],
