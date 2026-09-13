@@ -2179,15 +2179,21 @@ fn ensure_commitment_witness_lease_clock(
     database_path: Option<&Path>,
     database_identity: Option<StorageDatabaseFileIdentity>,
 ) -> Result<(), String> {
-    if runtime.handle.is_some() || database_path.is_none() {
+    let Some(database_path) = database_path else {
         return Ok(());
-    }
+    };
     let identity =
         database_identity.ok_or_else(|| "witness lease database identity is unsafe".to_string())?;
-    if probe_storage_database_file_identity(database_path.expect("checked database path"))
-        != Ok(Some(identity))
-    {
+    // [MEMCHAIN-WITNESS-DB-REVALIDATION 2026-09-13 by Codex] A retained
+    // advisory-lock handle proves only that the original inode remains locked.
+    // Re-probe the configured name before every lease mutation: an atomic
+    // replacement otherwise lets the old SQLite handle renew an unlinked
+    // database while a new handle acquires a separate inode-derived lock.
+    if probe_storage_database_file_identity(database_path) != Ok(Some(identity)) {
         return Err("witness lease database identity is unsafe".to_string());
+    }
+    if runtime.handle.is_some() {
+        return Ok(());
     }
     runtime.handle = Some(
         acquire_commitment_witness_lease_clock(identity)
@@ -11831,25 +11837,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_witness_lease_database_replacement_before_authority_is_fail_closed() {
+    async fn test_witness_lease_database_replacement_after_authority_is_fail_closed() {
         let directory = TempDir::new().unwrap();
         let active_path = directory.path().join("witness-replaced-active.db");
         let displaced_path = directory.path().join("witness-replaced-displaced.db");
         let replacement_path = directory.path().join("witness-replacement.db");
         let storage = MemoryStorage::open(&active_path, None).unwrap();
+        let coordinator = [0x4e; 32];
+        let instance = [0x4f; 32];
+
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                    &coordinator,
+                    &instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    3_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted {
+                lease_epoch: 1,
+                lease_expires_at: 3_060,
+            }
+        );
+
+        // Control: before replacement a second handle to this exact inode
+        // remains fenced by the original identity-derived advisory lock.
+        let same_inode_handle = MemoryStorage::open(&active_path, None).unwrap();
+        assert_eq!(
+            same_inode_handle
+                .grant_record_commitment_coordinator_lease(
+                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                    &coordinator,
+                    &[0x50; 32],
+                    0,
+                    &GENESIS_PREV_HASH,
+                    3_001,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap_err(),
+            "witness lease clock is held by another database handle"
+        );
+        drop(same_inode_handle);
+
         drop(MemoryStorage::open(&replacement_path, None).unwrap());
         std::fs::rename(&active_path, &displaced_path).unwrap();
+
+        // A missing configured path is as unsafe as a replacement.  The
+        // retained connection must not renew its lease through the unlinked
+        // SQLite handle while the configured pathname is absent.
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                    &coordinator,
+                    &instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    3_002,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap_err(),
+            "witness lease database identity is unsafe"
+        );
         std::fs::rename(&replacement_path, &active_path).unwrap();
 
         assert_eq!(
             storage
                 .grant_record_commitment_coordinator_lease(
                     &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
-                    &[0x4e; 32],
-                    &[0x4f; 32],
+                    &coordinator,
+                    &instance,
                     0,
                     &GENESIS_PREV_HASH,
-                    3_000,
+                    3_003,
                     MIN_COORDINATOR_LEASE_TTL_SECS_V1,
                 )
                 .await
@@ -11860,9 +11927,9 @@ mod tests {
             storage
                 .release_record_commitment_coordinator_lease(
                     &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
-                    &[0x4e; 32],
-                    &[0x4f; 32],
-                    3_001,
+                    &coordinator,
+                    &instance,
+                    3_004,
                 )
                 .await
                 .unwrap_err(),
@@ -11879,7 +11946,32 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            0
+            1,
+            "path revalidation must reject before the displaced SQLite handle mutates"
+        );
+
+        // The process-local witness lock remains conservative after the old
+        // handle is dropped, preventing a replacement inode from becoming a
+        // second authority in this process.
+        drop(storage);
+
+        // A replacement database identity cannot bypass that process-local
+        // fence merely because it has a distinct inode-derived lock name.
+        let replacement = MemoryStorage::open(&active_path, None).unwrap();
+        assert_eq!(
+            replacement
+                .grant_record_commitment_coordinator_lease(
+                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                    &[0x51; 32],
+                    &[0x52; 32],
+                    0,
+                    &GENESIS_PREV_HASH,
+                    3_005,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Contended
         );
     }
 
