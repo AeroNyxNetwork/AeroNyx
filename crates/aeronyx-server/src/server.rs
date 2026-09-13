@@ -1057,7 +1057,9 @@ use crate::api::mpi::{
 };
 use crate::api::voice::build_voice_router;
 use crate::api::vpn_health::{
-    build_vpn_health_router, collect_node_operator_status_value, collect_vpn_health_value,
+    build_vpn_health_router_with_anonymous_mailbox_readiness,
+    collect_node_operator_status_value_with_anonymous_mailbox_readiness,
+    collect_vpn_health_value_with_anonymous_mailbox_readiness, AnonymousMailboxReadinessProjection,
 };
 use crate::api::{
     canonical_peer_http_url, decode_bounded_json_response, peer_endpoint_is_public_ip,
@@ -4462,6 +4464,12 @@ impl Server {
             .map(|runtime| Arc::clone(&runtime.coordinator));
         let anonymous_mailbox_source_journal =
             anonymous_mailbox_source_runtime.map(|runtime| runtime.journal);
+        // [ANONYMOUS-MAILBOX-READINESS-PROJECTION 2026-09-14 by Codex]
+        // Health remains unreported until the same composition root has both
+        // registered cleanup supervision and built the actual terminal/source
+        // routers. Earlier management snapshots must not infer readiness from
+        // configuration or successfully opened storage alone.
+        let anonymous_mailbox_readiness = AnonymousMailboxReadinessProjection::default();
         if self.config.discovery.custody_audit_witness_runtime_required {
             // [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Runtime
             // custody starts only after authenticated PeerStore bootstrap.
@@ -4649,6 +4657,7 @@ impl Server {
                 chat_relay.clone(),
                 blind_vault.clone(),
                 chat_relay_enabled,
+                anonymous_mailbox_readiness.clone(),
             )
             .await?;
         for (name, task) in management_tasks {
@@ -4764,10 +4773,11 @@ impl Server {
             info!("[CHAT_RELAY] Wallet route cleanup task started (ttl=300s, interval=60s)");
         }
 
-        if let Some(cleanup_task) = self.spawn_anonymous_mailbox_cleanup_task(
-            anonymous_mailbox.clone(),
-            anonymous_mailbox_source_journal,
-        ) {
+        let anonymous_mailbox_cleanup_runtime_supervised = if let Some(cleanup_task) = self
+            .spawn_anonymous_mailbox_cleanup_task(
+                anonymous_mailbox.clone(),
+                anonymous_mailbox_source_journal,
+            ) {
             tasks.push((
                 "anonymous-mailbox-cleanup",
                 Self::supervise_required_runtime_task(
@@ -4777,7 +4787,10 @@ impl Server {
                     critical_failure_tx.clone(),
                 ),
             ));
-        }
+            true
+        } else {
+            false
+        };
 
         if let Some(ref vault) = blind_vault {
             let cleanup_task = self.spawn_blind_vault_cleanup_task(Arc::clone(vault));
@@ -4974,6 +4987,8 @@ impl Server {
                     Arc::clone(&udp),
                     &peer_http_clients,
                     commitment_sync_tip_notifier,
+                    anonymous_mailbox_cleanup_runtime_supervised,
+                    anonymous_mailbox_readiness.clone(),
                     critical_failure_tx.clone(),
                 )
                 .await?;
@@ -5215,6 +5230,8 @@ impl Server {
                     Arc::clone(&udp),
                     &peer_http_clients,
                     None,
+                    anonymous_mailbox_cleanup_runtime_supervised,
+                    anonymous_mailbox_readiness.clone(),
                     critical_failure_tx.clone(),
                 )
                 .await?;
@@ -6509,6 +6526,8 @@ impl Server {
         udp: Arc<UdpTransport>,
         peer_http_clients: &PeerHttpClients,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
+        anonymous_mailbox_cleanup_runtime_supervised: bool,
+        anonymous_mailbox_readiness: AnonymousMailboxReadinessProjection,
         critical_failure_tx: mpsc::Sender<CriticalRuntimeFailure>,
     ) -> Result<JoinHandle<()>> {
         if anonymous_mailbox_source.is_some() && mpi_state.is_none() {
@@ -6534,6 +6553,14 @@ impl Server {
             None => None,
         };
         let vpn_health_config = self.config.clone();
+        let anonymous_mailbox_configured =
+            self.config.memchain.chat_relay.anonymous_mailbox.enabled
+                || self
+                    .config
+                    .memchain
+                    .chat_relay
+                    .anonymous_mailbox_source
+                    .enabled;
         let discovery_api_policy = DiscoveryApiPolicy::from_config(&self.config.discovery);
         let chat_relay_runtime_ready = chat_relay.is_some();
         let local_capability_status = Self::discovery_local_capability_status_for_runtime(
@@ -6676,11 +6703,26 @@ impl Server {
             // route, so service activity cannot be inferred from storage alone.
             let witness_carrier_route_enabled =
                 directory_chain_store.is_some() && directory_replica_store.is_some();
+            let custody_store_opened = local_anonymous_mailbox.is_some();
+            let ticket_terminal_router = build_chat_peer_router_with_anonymous_mailbox(
+                chat_relay.clone(),
+                Arc::clone(&sessions),
+                udp,
+                Arc::clone(&peer_store),
+                Arc::clone(&node_identity),
+                Arc::clone(&peer_http_client),
+                blind_vault_public_api_enabled
+                    .then(|| blind_vault.clone())
+                    .flatten(),
+                local_anonymous_mailbox
+                    .map(|store| store as Arc<dyn AnonymousMailboxCustodyRepository>),
+            );
+            let ticket_terminal_wired = custody_store_opened;
             let app = axum::Router::new()
                 .merge(build_voice_router(Arc::clone(&sessions)))
                 .merge(chat_blob_router)
                 .merge(blind_vault_router)
-                .merge(build_vpn_health_router(
+                .merge(build_vpn_health_router_with_anonymous_mailbox_readiness(
                     vpn_health_config,
                     Arc::clone(&ip_pool),
                     Arc::clone(&sessions),
@@ -6690,21 +6732,9 @@ impl Server {
                     packet_handler,
                     Arc::clone(&peer_store),
                     chat_relay.clone(),
+                    anonymous_mailbox_readiness.clone(),
                 ))
-                .merge(build_chat_peer_router_with_anonymous_mailbox(
-                    chat_relay,
-                    Arc::clone(&sessions),
-                    udp,
-                    Arc::clone(&peer_store),
-                    Arc::clone(&node_identity),
-                    Arc::clone(&peer_http_client),
-                    blind_vault_public_api_enabled
-                        .then(|| blind_vault.clone())
-                        .flatten(),
-                    local_anonymous_mailbox.map(|store| {
-                        store as Arc<dyn AnonymousMailboxCustodyRepository>
-                    }),
-                ))
+                .merge(ticket_terminal_router)
                 // Local/VPN-only operator smoke trigger. The public discovery API
                 // intentionally does not expose this route; it actively sends a
                 // synthetic two-hop onion delivery probe and returns aggregate
@@ -6962,22 +6992,39 @@ impl Server {
             // composition surface. Node-peer, public discovery, ordinary
             // ChatRelay and verified-submit routers retain their exact
             // pre-source route set.
-            let (app, vpn_app) = if let Some(mpi_state) = mpi_state {
+            let source_coordinator_enabled = vpn_anonymous_mailbox_source.is_some();
+            let (app, vpn_app, dispatcher_admitted) = if let Some(mpi_state) = mpi_state {
                 let node_mpi = build_mpi_router(Arc::clone(&mpi_state));
-                let vpn_mpi = if let Some(source) = vpn_anonymous_mailbox_source {
-                    let vpn_source_router = build_chat_anonymous_mailbox_source_router(
-                        source,
-                        Arc::clone(&peer_http_client),
-                        &anonymous_mailbox_source_config,
-                    );
-                    build_mpi_router_with_source(mpi_state, vpn_source_router)
-                } else {
-                    build_mpi_router(mpi_state)
-                };
-                (app.clone().merge(node_mpi), app.merge(vpn_mpi))
+                let (vpn_mpi, dispatcher_admitted) =
+                    if let Some(source) = vpn_anonymous_mailbox_source {
+                        let vpn_source_router = build_chat_anonymous_mailbox_source_router(
+                            source,
+                            Arc::clone(&peer_http_client),
+                            &anonymous_mailbox_source_config,
+                        );
+                        (
+                            build_mpi_router_with_source(mpi_state, vpn_source_router),
+                            true,
+                        )
+                    } else {
+                        (build_mpi_router(mpi_state), false)
+                    };
+                (
+                    app.clone().merge(node_mpi),
+                    app.merge(vpn_mpi),
+                    dispatcher_admitted,
+                )
             } else {
-                (app.clone(), app)
+                (app.clone(), app, false)
             };
+            anonymous_mailbox_readiness.publish_local_composition(
+                anonymous_mailbox_configured,
+                custody_store_opened,
+                ticket_terminal_wired,
+                source_coordinator_enabled,
+                dispatcher_admitted,
+                anonymous_mailbox_cleanup_runtime_supervised,
+            );
             listener_tasks.spawn(Self::serve_required_api_listener(
                 "vpn_client_api",
                 vpn_listen_addr,
@@ -7214,6 +7261,7 @@ impl Server {
         chat_relay: Option<Arc<ChatRelayService>>,
         blind_vault: Option<Arc<BlindVaultService>>,
         chat_relay_enabled: bool,
+        anonymous_mailbox_readiness: AnonymousMailboxReadinessProjection,
     ) -> Result<ManagementRuntime> {
         info!("Initializing management reporting...");
 
@@ -7552,6 +7600,7 @@ impl Server {
         let vpn_health_packet_handler = Arc::clone(&packet_handler);
         let vpn_health_peer_store = Arc::clone(&peer_store);
         let vpn_health_chat_relay = chat_relay.clone();
+        let vpn_health_anonymous_mailbox_readiness = anonymous_mailbox_readiness.clone();
         heartbeat = heartbeat.with_vpn_health_status(Box::new(move || {
             let config = vpn_health_config.clone();
             let ip_pool = Arc::clone(&vpn_health_ip_pool);
@@ -7562,9 +7611,10 @@ impl Server {
             let packet_handler = Arc::clone(&vpn_health_packet_handler);
             let peer_store = Arc::clone(&vpn_health_peer_store);
             let chat_relay = vpn_health_chat_relay.clone();
+            let anonymous_mailbox_readiness = vpn_health_anonymous_mailbox_readiness.clone();
             Box::pin(async move {
                 Some(
-                    collect_vpn_health_value(
+                    collect_vpn_health_value_with_anonymous_mailbox_readiness(
                         config,
                         ip_pool,
                         sessions,
@@ -7574,6 +7624,7 @@ impl Server {
                         packet_handler,
                         peer_store,
                         chat_relay,
+                        anonymous_mailbox_readiness,
                     )
                     .await,
                 )
@@ -7589,6 +7640,7 @@ impl Server {
         let operator_status_packet_handler = Arc::clone(&packet_handler);
         let operator_status_peer_store = Arc::clone(&peer_store);
         let operator_status_chat_relay = chat_relay.clone();
+        let operator_status_anonymous_mailbox_readiness = anonymous_mailbox_readiness.clone();
         heartbeat = heartbeat.with_operator_status(Box::new(move || {
             let config = operator_status_config.clone();
             let ip_pool = Arc::clone(&operator_status_ip_pool);
@@ -7599,9 +7651,10 @@ impl Server {
             let packet_handler = Arc::clone(&operator_status_packet_handler);
             let peer_store = Arc::clone(&operator_status_peer_store);
             let chat_relay = operator_status_chat_relay.clone();
+            let anonymous_mailbox_readiness = operator_status_anonymous_mailbox_readiness.clone();
             Box::pin(async move {
                 Some(
-                    collect_node_operator_status_value(
+                    collect_node_operator_status_value_with_anonymous_mailbox_readiness(
                         config,
                         ip_pool,
                         sessions,
@@ -7611,6 +7664,7 @@ impl Server {
                         packet_handler,
                         peer_store,
                         chat_relay,
+                        anonymous_mailbox_readiness,
                     )
                     .await,
                 )
@@ -7656,16 +7710,21 @@ impl Server {
         if let Some(relay) = chat_relay.as_ref() {
             let chat_relay_status: Arc<ChatRelayService> = Arc::clone(relay);
             let custody_witness_runtime = Arc::clone(&self.custody_witness_runtime);
+            let chat_relay_anonymous_mailbox_readiness = anonymous_mailbox_readiness.clone();
             heartbeat = heartbeat.with_chat_relay_status(Box::new(move || {
                 let relay = Arc::clone(&chat_relay_status);
                 let custody_witness_runtime = Arc::clone(&custody_witness_runtime);
+                let anonymous_mailbox_readiness =
+                    chat_relay_anonymous_mailbox_readiness.clone();
                 Box::pin(async move {
                     let now = unix_now_secs();
                     let storage_usage = relay.storage_usage().ok();
                     let config = relay.config();
+                    let mut peer_relay = relay.peer_status();
+                    anonymous_mailbox_readiness.apply_to(&mut peer_relay);
                     Some(serde_json::json!({
                         "generated_at": now,
-                        "peer_relay": relay.peer_status(),
+                        "peer_relay": peer_relay,
                         // [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex]
                         // This process-lifetime snapshot exposes only fixed
                         // reasons, timestamps and node-wide aggregate counts.
@@ -7685,16 +7744,21 @@ impl Server {
             }));
         } else if !chat_relay_enabled {
             let custody_witness_runtime = Arc::clone(&self.custody_witness_runtime);
+            let chat_relay_anonymous_mailbox_readiness = anonymous_mailbox_readiness.clone();
             heartbeat = heartbeat.with_chat_relay_status(Box::new(move || {
                 let custody_witness_runtime = Arc::clone(&custody_witness_runtime);
+                let anonymous_mailbox_readiness =
+                    chat_relay_anonymous_mailbox_readiness.clone();
                 Box::pin(async move {
                     let now = unix_now_secs();
+                    let mut peer_relay = ChatRelayPeerStatus::new(false);
+                    anonymous_mailbox_readiness.apply_to(&mut peer_relay);
                     Some(serde_json::json!({
                         "generated_at": now,
                         // [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex]
                         // Reuse the typed schema so disabled heartbeats cannot
                         // silently omit newly added aggregate health fields.
-                        "peer_relay": ChatRelayPeerStatus::new(false),
+                        "peer_relay": peer_relay,
                         "custody_witness": custody_witness_runtime.snapshot(),
                         "maintenance": null,
                         "storage_usage": null,
@@ -17730,6 +17794,8 @@ mod tests {
                 udp,
                 &peer_http_clients,
                 None,
+                false,
+                super::AnonymousMailboxReadinessProjection::default(),
                 critical_failure_tx,
             )
             .await

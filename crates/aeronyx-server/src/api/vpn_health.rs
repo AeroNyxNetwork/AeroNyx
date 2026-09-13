@@ -80,6 +80,9 @@
 //! self-check now consume the shared recovery-anchor projection. A deployment
 //! that explicitly requires an exact-generation external witness cannot report
 //! startup readiness while that witness is absent or generation-mismatched.
+//! [ANONYMOUS-MAILBOX-READINESS-PROJECTION 2026-09-14 by Codex] Optional
+//! mailbox readiness is copied only from a composition-root projection. Legacy
+//! constructors retain an empty projection and therefore omit unverified data.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -131,6 +134,46 @@ pub struct VpnHealthState {
     packet_handler: Arc<PacketHandler>,
     peer_store: Arc<PeerStore>,
     chat_relay: Option<Arc<ChatRelayService>>,
+    anonymous_mailbox_readiness: AnonymousMailboxReadinessProjection,
+}
+
+/// Shared, aggregate-only anonymous mailbox readiness projection.
+///
+/// The empty state is deliberately serialized as no field. Only the server
+/// composition root may publish an observed local-runtime snapshot.
+#[derive(Clone, Default)]
+pub(crate) struct AnonymousMailboxReadinessProjection {
+    snapshot: Arc<parking_lot::RwLock<Option<ChatRelayPeerStatus>>>,
+}
+
+impl AnonymousMailboxReadinessProjection {
+    /// Publishes one snapshot after actual terminal and dispatcher composition.
+    pub(crate) fn publish_local_composition(
+        &self,
+        configured: bool,
+        custody_store_opened: bool,
+        ticket_terminal_wired: bool,
+        source_coordinator_enabled: bool,
+        dispatcher_admitted: bool,
+        cleanup_runtime_supervised: bool,
+    ) {
+        let snapshot = ChatRelayPeerStatus::new(false)
+            .with_anonymous_mailbox_readiness_from_local_composition(
+                configured,
+                custody_store_opened,
+                ticket_terminal_wired,
+                source_coordinator_enabled,
+                dispatcher_admitted,
+                cleanup_runtime_supervised,
+            );
+        *self.snapshot.write() = Some(snapshot);
+    }
+
+    pub(crate) fn apply_to(&self, target: &mut ChatRelayPeerStatus) {
+        if let Some(source) = self.snapshot.read().as_ref() {
+            target.apply_anonymous_mailbox_readiness_from(source);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -494,6 +537,33 @@ pub fn build_vpn_health_router(
     peer_store: Arc<PeerStore>,
     chat_relay: Option<Arc<ChatRelayService>>,
 ) -> Router {
+    build_vpn_health_router_with_anonymous_mailbox_readiness(
+        config,
+        ip_pool,
+        sessions,
+        node_policy,
+        voucher_verifier,
+        encrypted_message_counter,
+        packet_handler,
+        peer_store,
+        chat_relay,
+        AnonymousMailboxReadinessProjection::default(),
+    )
+}
+
+/// Builds health routes with an observed composition-root mailbox projection.
+pub(crate) fn build_vpn_health_router_with_anonymous_mailbox_readiness(
+    config: ServerConfig,
+    ip_pool: Arc<IpPoolService>,
+    sessions: Arc<SessionManager>,
+    node_policy: Arc<NodePolicyRuntime>,
+    voucher_verifier: Arc<VoucherVerifier>,
+    encrypted_message_counter: Arc<AtomicU64>,
+    packet_handler: Arc<PacketHandler>,
+    peer_store: Arc<PeerStore>,
+    chat_relay: Option<Arc<ChatRelayService>>,
+    anonymous_mailbox_readiness: AnonymousMailboxReadinessProjection,
+) -> Router {
     Router::new()
         .route("/api/vpn/health", get(vpn_health_handler))
         .route(
@@ -511,6 +581,7 @@ pub fn build_vpn_health_router(
             packet_handler,
             peer_store,
             chat_relay,
+            anonymous_mailbox_readiness,
         })
 }
 
@@ -542,6 +613,34 @@ pub async fn collect_vpn_health_value(
     peer_store: Arc<PeerStore>,
     chat_relay: Option<Arc<ChatRelayService>>,
 ) -> Value {
+    collect_vpn_health_value_with_anonymous_mailbox_readiness(
+        config,
+        ip_pool,
+        sessions,
+        node_policy,
+        voucher_verifier,
+        encrypted_message_counter,
+        packet_handler,
+        peer_store,
+        chat_relay,
+        AnonymousMailboxReadinessProjection::default(),
+    )
+    .await
+}
+
+/// Collects health with an observed composition-root mailbox projection.
+pub(crate) async fn collect_vpn_health_value_with_anonymous_mailbox_readiness(
+    config: ServerConfig,
+    ip_pool: Arc<IpPoolService>,
+    sessions: Arc<SessionManager>,
+    node_policy: Arc<NodePolicyRuntime>,
+    voucher_verifier: Arc<VoucherVerifier>,
+    encrypted_message_counter: Arc<AtomicU64>,
+    packet_handler: Arc<PacketHandler>,
+    peer_store: Arc<PeerStore>,
+    chat_relay: Option<Arc<ChatRelayService>>,
+    anonymous_mailbox_readiness: AnonymousMailboxReadinessProjection,
+) -> Value {
     let state = VpnHealthState {
         config,
         ip_pool,
@@ -552,6 +651,7 @@ pub async fn collect_vpn_health_value(
         packet_handler,
         peer_store,
         chat_relay,
+        anonymous_mailbox_readiness,
     };
     serde_json::to_value(collect_vpn_health_response(state).await).unwrap_or_else(|e| {
         serde_json::json!({
@@ -584,6 +684,34 @@ pub async fn collect_node_operator_status_value(
     peer_store: Arc<PeerStore>,
     chat_relay: Option<Arc<ChatRelayService>>,
 ) -> Value {
+    collect_node_operator_status_value_with_anonymous_mailbox_readiness(
+        config,
+        ip_pool,
+        sessions,
+        node_policy,
+        voucher_verifier,
+        encrypted_message_counter,
+        packet_handler,
+        peer_store,
+        chat_relay,
+        AnonymousMailboxReadinessProjection::default(),
+    )
+    .await
+}
+
+/// Collects operator status with an observed local mailbox projection.
+pub(crate) async fn collect_node_operator_status_value_with_anonymous_mailbox_readiness(
+    config: ServerConfig,
+    ip_pool: Arc<IpPoolService>,
+    sessions: Arc<SessionManager>,
+    node_policy: Arc<NodePolicyRuntime>,
+    voucher_verifier: Arc<VoucherVerifier>,
+    encrypted_message_counter: Arc<AtomicU64>,
+    packet_handler: Arc<PacketHandler>,
+    peer_store: Arc<PeerStore>,
+    chat_relay: Option<Arc<ChatRelayService>>,
+    anonymous_mailbox_readiness: AnonymousMailboxReadinessProjection,
+) -> Value {
     let state = VpnHealthState {
         config,
         ip_pool,
@@ -594,6 +722,7 @@ pub async fn collect_node_operator_status_value(
         packet_handler,
         peer_store,
         chat_relay,
+        anonymous_mailbox_readiness,
     };
     serde_json::to_value(collect_node_operator_status_response(state).await).unwrap_or_else(|e| {
         serde_json::json!({
@@ -689,13 +818,16 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     );
     let packet_runtime = state.packet_handler.runtime_status();
     let discovery_status = collect_discovery_status_value(&state.peer_store);
-    let chat_relay_status = collect_chat_relay_health_status(
+    let mut chat_relay_status = collect_chat_relay_health_status(
         config.memchain.is_chat_relay_enabled(),
         state
             .chat_relay
             .as_deref()
             .map(ChatRelayService::peer_status),
     );
+    state
+        .anonymous_mailbox_readiness
+        .apply_to(&mut chat_relay_status.peer_relay);
     let startup_self_check = collect_startup_self_check(
         &config,
         &checks,
@@ -3206,6 +3338,37 @@ mod tests {
         );
         assert_eq!(status.peer_relay.custody_durability.synchronous_level, None);
         assert_eq!(status.source, "rust_chat_relay_runtime_unavailable");
+        let encoded = serde_json::to_value(status).expect("serialize legacy health");
+        assert!(encoded["peer_relay"]
+            .get("anonymous_mailbox_readiness")
+            .is_none());
+    }
+
+    #[test]
+    fn anonymous_mailbox_readiness_is_applied_only_after_explicit_publish() {
+        let projection = AnonymousMailboxReadinessProjection::default();
+        let mut before = collect_chat_relay_health_status(false, None);
+        projection.apply_to(&mut before.peer_relay);
+        let before = serde_json::to_value(before).expect("serialize unpublished readiness");
+        assert!(before["peer_relay"]
+            .get("anonymous_mailbox_readiness")
+            .is_none());
+
+        projection.publish_local_composition(true, true, true, true, true, true);
+        let mut after = collect_chat_relay_health_status(false, None);
+        projection.apply_to(&mut after.peer_relay);
+        let after = serde_json::to_value(after).expect("serialize published readiness");
+        let readiness = &after["peer_relay"]["anonymous_mailbox_readiness"];
+        assert_eq!(readiness["version"], 1);
+        assert_eq!(readiness["configured"], true);
+        assert_eq!(readiness["custody_store_opened"], true);
+        assert_eq!(readiness["ticket_terminal_wired"], true);
+        assert_eq!(readiness["source_coordinator_enabled"], true);
+        assert_eq!(readiness["dispatcher_admitted"], true);
+        assert_eq!(readiness["cleanup_runtime_supervised"], true);
+        assert_eq!(readiness["scope"], "local_node_runtime_only");
+        assert!(readiness.get("e2e_ready").is_none());
+        assert!(readiness.get("live").is_none());
     }
 
     #[test]

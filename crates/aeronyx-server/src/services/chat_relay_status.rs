@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_status.rs
 // ============================================
-// Version: 1.0.0-RelayStatusContractDomain
+// Version: 1.1.0-AnonymousMailboxReadinessProjection
 //
 // Creation Reason:
 //   [CHAT-RELAY-STATUS-CONTRACT-DOMAIN 2026-08-27 by Codex] Extract the
@@ -31,6 +31,8 @@
 //   - Keep this module free of filesystem, SQLite, network, and clock I/O.
 //
 // Last Modified:
+//   v1.1.0-AnonymousMailboxReadinessProjection - Add a versioned, local-only
+//   composition outcome without claiming end-to-end mailbox availability.
 //   v1.0.0-RelayStatusContractDomain - Initial status contract extraction
 // ============================================
 
@@ -352,6 +354,60 @@ impl ChatRelayCustodyDurabilityStatus {
     }
 }
 
+/// Local composition evidence for the anonymous mailbox runtime.
+///
+/// [ANONYMOUS-MAILBOX-READINESS-PROJECTION 2026-09-14 by Codex] This status
+/// records only booleans observed by the current process. It is not evidence
+/// that a remote source, recipient, route, or client is live, reachable, or
+/// end-to-end ready. In particular, `cleanup_runtime_supervised` means that the
+/// required task was registered under process supervision; it does not claim
+/// that the task will remain healthy forever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AnonymousMailboxReadinessStatusV1 {
+    /// Version of this aggregate-only status contract.
+    pub version: u8,
+    /// Whether either custody or authenticated source operation was configured.
+    pub configured: bool,
+    /// Whether the local opaque custody SQLite store opened successfully.
+    pub custody_store_opened: bool,
+    /// Whether the ticket-aware terminal adapter was mounted with that store.
+    pub ticket_terminal_wired: bool,
+    /// Whether the authenticated source coordinator opened successfully.
+    pub source_coordinator_enabled: bool,
+    /// Whether the source dispatcher was admitted to the authenticated router.
+    pub dispatcher_admitted: bool,
+    /// Whether bounded cleanup was registered as a required supervised task.
+    pub cleanup_runtime_supervised: bool,
+    /// Fixed evidence boundary; never an end-to-end readiness claim.
+    pub scope: String,
+}
+
+impl AnonymousMailboxReadinessStatusV1 {
+    pub(crate) const VERSION: u8 = 1;
+    pub(crate) const LOCAL_NODE_RUNTIME_ONLY_SCOPE: &'static str = "local_node_runtime_only";
+
+    /// Constructs one snapshot exclusively from composition-root outcomes.
+    pub(crate) fn from_local_composition(
+        configured: bool,
+        custody_store_opened: bool,
+        ticket_terminal_wired: bool,
+        source_coordinator_enabled: bool,
+        dispatcher_admitted: bool,
+        cleanup_runtime_supervised: bool,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            configured,
+            custody_store_opened,
+            ticket_terminal_wired,
+            source_coordinator_enabled,
+            dispatcher_admitted,
+            cleanup_runtime_supervised,
+            scope: Self::LOCAL_NODE_RUNTIME_ONLY_SCOPE.to_string(),
+        }
+    }
+}
+
 /// Aggregate evidence for restart reconciliation of armed blind routes.
 ///
 /// [BLIND-ROUTE-RECOVERY-STATUS 2026-08-25 by Codex] These process-lifetime
@@ -424,6 +480,9 @@ pub struct ChatRelayPeerStatus {
     /// Restart reconciliation outcomes for armed blind-route claims.
     #[serde(default)]
     pub blind_route_recovery: ChatRelayBlindRouteRecoveryStatus,
+    /// Optional local composition evidence for anonymous mailbox operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anonymous_mailbox_readiness: Option<AnonymousMailboxReadinessStatusV1>,
     /// Total inbound peer relay envelopes accepted for local processing.
     pub inbound_accepted_total: u64,
     /// Total inbound duplicate envelopes ignored idempotently.
@@ -470,6 +529,7 @@ impl ChatRelayPeerStatus {
             direct_peer_retry: ChatRelayDirectPeerRetryStatus::default(),
             verified_submit: ChatRelayVerifiedSubmitStatus::default(),
             blind_route_recovery: ChatRelayBlindRouteRecoveryStatus::default(),
+            anonymous_mailbox_readiness: None,
             inbound_accepted_total: 0,
             inbound_duplicate_total: 0,
             inbound_delivered_online_total: 0,
@@ -479,5 +539,62 @@ impl ChatRelayPeerStatus {
             last_inbound_failure_reason: None,
             last_inbound_at: None,
         }
+    }
+
+    /// Attaches evidence observed by the current composition root.
+    pub(crate) fn with_anonymous_mailbox_readiness_from_local_composition(
+        mut self,
+        configured: bool,
+        custody_store_opened: bool,
+        ticket_terminal_wired: bool,
+        source_coordinator_enabled: bool,
+        dispatcher_admitted: bool,
+        cleanup_runtime_supervised: bool,
+    ) -> Self {
+        self.anonymous_mailbox_readiness =
+            Some(AnonymousMailboxReadinessStatusV1::from_local_composition(
+                configured,
+                custody_store_opened,
+                ticket_terminal_wired,
+                source_coordinator_enabled,
+                dispatcher_admitted,
+                cleanup_runtime_supervised,
+            ));
+        self
+    }
+
+    /// Copies only the anonymous mailbox projection into a live relay status.
+    pub(crate) fn apply_anonymous_mailbox_readiness_from(&mut self, source: &Self) {
+        self.anonymous_mailbox_readiness = source.anonymous_mailbox_readiness.clone();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatRelayPeerStatus;
+
+    #[test]
+    fn anonymous_mailbox_readiness_is_versioned_and_local_only() {
+        let status = ChatRelayPeerStatus::new(true)
+            .with_anonymous_mailbox_readiness_from_local_composition(
+                true, true, true, true, true, true,
+            );
+        let encoded = serde_json::to_value(status).expect("serialize readiness");
+        let readiness = &encoded["anonymous_mailbox_readiness"];
+
+        assert_eq!(readiness["version"], 1);
+        assert_eq!(readiness["scope"], "local_node_runtime_only");
+        assert!(readiness.get("e2e_ready").is_none());
+        assert!(readiness.get("live").is_none());
+        for forbidden in ["identity", "endpoint", "route", "key", "path", "commitment"] {
+            assert!(
+                !readiness.to_string().contains(forbidden),
+                "readiness must not serialize sensitive dimensions"
+            );
+        }
+
+        let legacy = serde_json::to_value(ChatRelayPeerStatus::new(true))
+            .expect("serialize legacy readiness path");
+        assert!(legacy.get("anonymous_mailbox_readiness").is_none());
     }
 }
