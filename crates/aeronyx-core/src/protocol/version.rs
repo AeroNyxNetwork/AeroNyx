@@ -22,6 +22,7 @@
 //! | Version | Description |
 //! |---------|-------------|
 //! | 0x01    | Initial protocol (MVP) |
+//! | 0x02    | Directional session keys and transcript-bound handshake |
 //!
 //! ## ⚠️ Important Note for Next Developer
 //! - ALWAYS increment version for wire format changes
@@ -41,13 +42,17 @@ use serde::{Deserialize, Serialize};
 
 /// Current protocol version.
 ///
-/// # Version 0x01 (Initial)
-/// - ClientHello: 138 bytes
-/// - ServerHello: 150 bytes
+/// # Version 0x02
+/// - `ClientHello`: 138 bytes
+/// - `ServerHello`: 150 bytes
 /// - Ed25519 signatures
 /// - X25519 key exchange
 /// - ChaCha20-Poly1305 transport
-pub const CURRENT_PROTOCOL_VERSION: u8 = 0x01;
+/// - Directional session keys and transcript-bound hellos
+///
+/// [PROTOCOL-V2-DEFAULT-ACTIVATION 2026-09-20 by Codex] New handshakes default
+/// to v2 while the supported range remains additive for deployed v1 clients.
+pub const CURRENT_PROTOCOL_VERSION: u8 = 0x02;
 
 /// Minimum supported protocol version.
 ///
@@ -57,7 +62,7 @@ pub const MIN_SUPPORTED_VERSION: u8 = 0x01;
 /// Maximum supported protocol version.
 ///
 /// Servers will reject clients with versions above this.
-pub const MAX_SUPPORTED_VERSION: u8 = 0x01;
+pub const MAX_SUPPORTED_VERSION: u8 = 0x02;
 
 // ============================================
 // ProtocolVersion
@@ -194,27 +199,114 @@ impl ProtocolVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        crypto::{handshake::DefaultHandshakeCrypto, keys::IdentityKeyPair},
+        protocol::{
+            is_supported_hello_version, ClientHello, MessageType, PROTOCOL_VERSION_V1,
+            PROTOCOL_VERSION_V2,
+        },
+    };
+
+    const SIGNED_HELLO_TIMESTAMP: i64 = 1_700_000_000;
+    const V2_EXTENSION: &[u8] = b"deterministic-v2-extension";
+
+    fn deterministic_identity() -> IdentityKeyPair {
+        IdentityKeyPair::from_bytes(&[0x42; 32])
+            .unwrap_or_else(|_| unreachable!("fixed Ed25519 seed must be valid"))
+    }
+
+    fn client_hello_sign_data_v1(hello: &ClientHello) -> Vec<u8> {
+        let mut transcript = Vec::with_capacity(74);
+        transcript.push(hello.message_type);
+        transcript.push(hello.version);
+        transcript.extend_from_slice(&hello.client_public_key);
+        transcript.extend_from_slice(&hello.client_ephemeral_key);
+        transcript.extend_from_slice(&hello.timestamp.to_le_bytes());
+        transcript
+    }
+
+    fn signed_hello(version: u8, v2_transcript: bool) -> ClientHello {
+        let identity = deterministic_identity();
+        let mut hello = ClientHello {
+            message_type: MessageType::ClientHello as u8,
+            version,
+            client_public_key: identity.public_key_bytes(),
+            client_ephemeral_key: [0x24; 32],
+            timestamp: SIGNED_HELLO_TIMESTAMP,
+            signature: [0; 64],
+        };
+        let transcript = if v2_transcript {
+            DefaultHandshakeCrypto::client_hello_sign_data_v2(&hello, V2_EXTENSION)
+        } else {
+            client_hello_sign_data_v1(&hello)
+        };
+        hello.signature = identity.sign(&transcript);
+        hello
+    }
+
+    fn signature_matches(hello: &ClientHello, v2_transcript: bool) -> bool {
+        let transcript = if v2_transcript {
+            DefaultHandshakeCrypto::client_hello_sign_data_v2(hello, V2_EXTENSION)
+        } else {
+            client_hello_sign_data_v1(hello)
+        };
+        deterministic_identity()
+            .public_key()
+            .verify(&transcript, &hello.signature)
+            .is_ok()
+    }
 
     #[test]
     fn test_current_version() {
         let version = ProtocolVersion::current();
         assert_eq!(version.as_u8(), CURRENT_PROTOCOL_VERSION);
+        assert_eq!(version.as_u8(), PROTOCOL_VERSION_V2);
+        assert_eq!(ProtocolVersion::default(), version);
         assert!(version.is_supported());
     }
 
     #[test]
     fn test_version_support_check() {
-        // Current version should be supported
-        let current = ProtocolVersion::new(CURRENT_PROTOCOL_VERSION);
-        assert!(current.is_supported());
+        assert!(ProtocolVersion::new(PROTOCOL_VERSION_V1).is_supported());
+        assert!(ProtocolVersion::new(PROTOCOL_VERSION_V2).is_supported());
+        assert!(!ProtocolVersion::new(0).is_supported());
+        assert!(!ProtocolVersion::new(3).is_supported());
+        assert!(!ProtocolVersion::new(0xFF).is_supported());
+    }
 
-        // Version 0 should not be supported
-        let zero = ProtocolVersion::new(0);
-        assert!(!zero.is_supported());
+    #[test]
+    fn signed_hello_admission_accepts_v1_and_v2_but_rejects_adjacent_versions() {
+        // [PROTOCOL-V2-DEFAULT-ACTIVATION 2026-09-20 by Codex] A valid
+        // signature never expands the frozen supported-version range.
+        let signed_v1 = signed_hello(PROTOCOL_VERSION_V1, false);
+        assert!(signature_matches(&signed_v1, false));
+        assert!(is_supported_hello_version(signed_v1.version));
+        assert!(ProtocolVersion::new(signed_v1.version).is_supported());
 
-        // Future versions should not be supported
-        let future = ProtocolVersion::new(0xFF);
-        assert!(!future.is_supported());
+        let signed_v2 = signed_hello(PROTOCOL_VERSION_V2, true);
+        assert!(signature_matches(&signed_v2, true));
+        assert!(is_supported_hello_version(signed_v2.version));
+        assert!(ProtocolVersion::new(signed_v2.version).is_supported());
+
+        for rejected in [0, 3] {
+            let signed = signed_hello(rejected, false);
+            assert!(signature_matches(&signed, false));
+            assert!(!is_supported_hello_version(signed.version));
+            assert!(!ProtocolVersion::new(signed.version).is_supported());
+        }
+    }
+
+    #[test]
+    fn signed_transcript_rejects_post_signature_version_substitution() {
+        let signed_v1 = signed_hello(PROTOCOL_VERSION_V1, false);
+        let mut substituted_v1 = signed_v1;
+        substituted_v1.version = PROTOCOL_VERSION_V2;
+        assert!(!signature_matches(&substituted_v1, false));
+
+        let signed_v2 = signed_hello(PROTOCOL_VERSION_V2, true);
+        let mut substituted_v2 = signed_v2;
+        substituted_v2.version = PROTOCOL_VERSION_V1;
+        assert!(!signature_matches(&substituted_v2, true));
     }
 
     #[test]
