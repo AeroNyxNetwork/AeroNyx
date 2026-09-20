@@ -1314,6 +1314,62 @@ impl TargetBoundPeerRelayDeliveryOutcome {
             .is_some_and(TargetBoundPeerRelayFailure::is_local_runtime_failure)
     }
 }
+
+/// Closed, privacy-safe reason vocabulary for handshake admission failures.
+///
+/// [V2-HANDSHAKE-LOG-PRIVACY 2026-09-20 by Codex] The UDP dispatcher must not
+/// re-expand the service's typed failure into endpoint or attacker-controlled
+/// error text. Unknown/new errors deliberately collapse to `internal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandshakeRejectionClass {
+    Policy,
+    Capacity,
+    Authentication,
+    SessionAdmission,
+    Internal,
+}
+
+impl HandshakeRejectionClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Policy => "policy",
+            Self::Capacity => "capacity",
+            Self::Authentication => "authentication",
+            Self::SessionAdmission => "session_admission",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+const fn handshake_rejection_class(error: &ServerError) -> HandshakeRejectionClass {
+    match error {
+        ServerError::WalletDenied { .. } | ServerError::NodePolicyRejected { .. } => {
+            HandshakeRejectionClass::Policy
+        }
+        ServerError::IpPoolExhausted
+        | ServerError::IpAlreadyAssigned(_)
+        | ServerError::SessionLimitReached { .. } => HandshakeRejectionClass::Capacity,
+        ServerError::Core(_) => HandshakeRejectionClass::Authentication,
+        ServerError::SessionCreationFailed { .. } | ServerError::SessionExists => {
+            HandshakeRejectionClass::SessionAdmission
+        }
+        _ => HandshakeRejectionClass::Internal,
+    }
+}
+
+fn log_handshake_rejection_class(reason: HandshakeRejectionClass, active_sessions: usize) {
+    warn!(
+        event = "handshake_rejected",
+        reason = reason.as_str(),
+        active_sessions,
+        "Handshake rejected"
+    );
+}
+
+fn log_handshake_rejection(error: &ServerError, active_sessions: usize) {
+    log_handshake_rejection_class(handshake_rejection_class(error), active_sessions);
+}
+
 const ONION_ROUTE_SELECTION_CANDIDATE_LIMIT: usize = 8;
 const TWO_HOP_PROBE_REQUEST_LIMIT: usize = 8;
 const THREE_HOP_PROBE_REQUEST_LIMIT: usize = 4;
@@ -15063,9 +15119,12 @@ impl Server {
                                         };
                                         let verifier = Arc::clone(&voucher_verifier);
                                         if !verifier.accept_client_hello_extension(extension.clone()).await {
-                                            warn!(
-                                                client = %source.addr,
-                                                "[VOUCHER] rejected ClientHello with invalid voucher"
+                                            // [V2-HANDSHAKE-LOG-PRIVACY 2026-09-20 by Codex]
+                                            // Voucher failure is part of the same v1/v2 admission
+                                            // boundary and must not expose the source endpoint.
+                                            log_handshake_rejection_class(
+                                                HandshakeRejectionClass::Authentication,
+                                                sessions.count(),
                                             );
                                             continue;
                                         }
@@ -15098,7 +15157,16 @@ impl Server {
                                                     let resp = encode_server_hello(&result.response);
                                                     let _ = udp.send(&resp, &source.addr).await;
                                                 }
-                                                Err(e) => warn!("[HANDSHAKE] Failed {}: {}", source.addr, e),
+                                                Err(error) => {
+                                                    // [V2-HANDSHAKE-LOG-PRIVACY 2026-09-20 by Codex]
+                                                    // Do not reintroduce the peer endpoint or raw
+                                                    // typed error after the service has rejected a
+                                                    // v1/v2 handshake.
+                                                    log_handshake_rejection(
+                                                        &error,
+                                                        sessions.count(),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -16998,8 +17066,8 @@ mod tests {
         custody_witness_readiness_decision, custody_witness_renewal_status,
         custody_witness_renewal_warning_window_secs, custody_witness_runtime_audit_interval_secs,
         custody_witness_runtime_failure, data_plane_receive_failure_action,
-        discovery_heartbeat_status_value, memchain_index_rejection_reason,
-        peer_store_heartbeat_status_value, prefix_to_netmask,
+        discovery_heartbeat_status_value, handshake_rejection_class, log_handshake_rejection,
+        memchain_index_rejection_reason, peer_store_heartbeat_status_value, prefix_to_netmask,
         required_runtime_supervisor_channel_closed, retry_required_data_plane_receive,
         take_pre_ready_runtime_failure, unix_now_secs, CommitmentCoordinatorLeaseRound,
         CommitmentFollowerRoundOutcome, CommitmentSyncTaskLivenessGuard,
@@ -17013,8 +17081,8 @@ mod tests {
         DirectoryProofGossipPeerState, DirectoryProofGossipResult, DiscoveryGossipExecution,
         DiscoveryGossipFailure, DiscoveryGossipFailureKind, DiscoveryGossipPhase,
         DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport, DiscoveryPeerIdentityHints,
-        MemChainDispatchGateError, MemChainStorageRequirement, PeerHttpClients,
-        PeerStoreCacheDocument, PeerStoreCachePersistOutcome,
+        HandshakeRejectionClass, MemChainDispatchGateError, MemChainStorageRequirement,
+        PeerHttpClients, PeerStoreCacheDocument, PeerStoreCachePersistOutcome,
         PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryAnchorState,
         PeerStoreVerifiedClientDeliveryCacheEvidence,
         PeerStoreVerifiedClientDeliveryExternalWitnessDecision, RequiredApiListenerExit,
@@ -17047,7 +17115,7 @@ mod tests {
         PEER_ACK_RESPONSE_MAX_BYTES,
     };
     use crate::config_chat_relay::ChatRelayConfig;
-    use crate::error::RuntimeTaskJoinFailureKind;
+    use crate::error::{RuntimeTaskJoinFailureKind, ServerError};
     use crate::services::chat_relay::{
         VerifiedSubmitAdmission, VerifiedSubmitCacheLookup,
         VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS,
@@ -17091,11 +17159,13 @@ mod tests {
         Json, Router,
     };
     use sha2::{Digest, Sha256};
+    use std::io::{self, Write};
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
+    use tracing_subscriber::{fmt::MakeWriter, prelude::*};
 
     #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixDatagram;
@@ -17167,6 +17237,122 @@ mod tests {
         DirectoryReplicaSyncRuntime, MemPool, PeerStore, PeerStoreImportReport, SessionManager,
     };
     use tokio::sync::Mutex as TokioMutex;
+
+    #[derive(Clone, Default)]
+    struct CapturedServerLogs(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedServerLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedServerLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured server log mutex")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for CapturedServerLogs {
+        type Writer = CapturedServerLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedServerLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_server_info_logs(operation: impl FnOnce()) -> String {
+        let captured = CapturedServerLogs::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(captured.clone())
+            .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.level() <= &tracing::Level::INFO && metadata.target().ends_with("server")
+            }));
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, operation);
+        let bytes = captured
+            .0
+            .lock()
+            .expect("captured server log mutex")
+            .clone();
+        String::from_utf8(bytes).expect("captured server logs are UTF-8")
+    }
+
+    #[test]
+    fn handshake_rejection_logging_uses_closed_privacy_safe_classes() {
+        // [V2-HANDSHAKE-LOG-PRIVACY 2026-09-20 by Codex] Exercise every
+        // allowlisted bucket plus the fail-closed unknown bucket without a
+        // socket fixture; the logger never receives the peer endpoint.
+        let policy = ServerError::WalletDenied {
+            reason: "SENSITIVE_POLICY_SENTINEL".to_string(),
+        };
+        let capacity = ServerError::IpAlreadyAssigned(Ipv4Addr::new(198, 51, 100, 247));
+        let authentication = ServerError::Core(aeronyx_core::CoreError::SignatureVerification);
+        let admission = ServerError::session_creation_failed("SENSITIVE_SESSION_SENTINEL");
+        let unknown = ServerError::InvalidPacket {
+            from_addr: "203.0.113.248:42424".to_string(),
+            reason: "SENSITIVE_INTERNAL_SENTINEL".to_string(),
+        };
+
+        assert_eq!(
+            handshake_rejection_class(&policy),
+            HandshakeRejectionClass::Policy
+        );
+        assert_eq!(
+            handshake_rejection_class(&capacity),
+            HandshakeRejectionClass::Capacity
+        );
+        assert_eq!(
+            handshake_rejection_class(&authentication),
+            HandshakeRejectionClass::Authentication
+        );
+        assert_eq!(
+            handshake_rejection_class(&admission),
+            HandshakeRejectionClass::SessionAdmission
+        );
+        assert_eq!(
+            handshake_rejection_class(&unknown),
+            HandshakeRejectionClass::Internal
+        );
+
+        let logs = capture_server_info_logs(|| {
+            for error in [&policy, &capacity, &authentication, &admission, &unknown] {
+                log_handshake_rejection(error, 7);
+            }
+        });
+
+        for reason in [
+            "policy",
+            "capacity",
+            "authentication",
+            "session_admission",
+            "internal",
+        ] {
+            assert!(logs.contains(&format!("reason=\"{reason}\"")), "{logs}");
+        }
+        assert!(logs.contains("event=\"handshake_rejected\""), "{logs}");
+        assert!(logs.contains("active_sessions=7"), "{logs}");
+        for forbidden in [
+            "198.51.100.247",
+            "203.0.113.248:42424",
+            "SENSITIVE_POLICY_SENTINEL",
+            "SENSITIVE_SESSION_SENTINEL",
+            "SENSITIVE_INTERNAL_SENTINEL",
+            "client=",
+            "endpoint=",
+            "session_id=",
+            "virtual_ip=",
+            "error=",
+        ] {
+            assert!(!logs.contains(forbidden), "leaked {forbidden}: {logs}");
+        }
+    }
 
     fn test_peer_http_client() -> Arc<reqwest::Client> {
         // [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Exercise the same

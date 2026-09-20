@@ -26,6 +26,9 @@
 //   - [PROTOCOL-V2-ADMISSION-HOTFIX 2026-09-13 by Codex] V1 and V2 now share
 //     deny/policy admission and the same mutation fence; identity eviction is
 //     performed only after the claimed client key authenticates successfully.
+//   - [V2-HANDSHAKE-LOG-PRIVACY 2026-09-20 by Codex] V2 diagnostics expose
+//     only fixed outcome classes and aggregate counters, never client/socket,
+//     key, signature, session, or virtual-address metadata.
 //
 // Main Logical Flow:
 //   0. Check deny list → if denied, return WalletDenied immediately
@@ -57,6 +60,7 @@
 //   v1.1.0-OwnershipCleanup - Conditional route removal and IP release
 //   v1.2.0-Admission - Made dynamic policy admission atomic across handshakes
 //   v1.3.0-AuthenticatedAdmission - Unified V1/V2 gates and post-auth eviction
+//   v1.3.1-V2LogPrivacy - Redacted V2 handshake correlation metadata
 // ============================================
 
 use std::net::SocketAddr;
@@ -84,7 +88,11 @@ pub struct HandshakeResult {
 
 /// High-level handshake orchestration service.
 pub struct HandshakeService {
-    crypto: DefaultHandshakeCrypto,
+    // [V2-HANDSHAKE-LOG-PRIVACY 2026-09-20 by Codex] Keep the cryptographic
+    // boundary replaceable in same-module tests so every otherwise-unreachable
+    // fail-closed diagnostic branch can be exercised without weakening the
+    // production implementation.
+    crypto: Box<dyn HandshakeCrypto>,
     ip_pool: Arc<IpPoolService>,
     sessions: Arc<SessionManager>,
     routing: Arc<RoutingService>,
@@ -108,7 +116,27 @@ impl HandshakeService {
         deny_list: Arc<DenyList>,
         policy: Arc<NodePolicyRuntime>,
     ) -> Self {
-        let crypto = DefaultHandshakeCrypto::new(server_identity);
+        let crypto = Box::new(DefaultHandshakeCrypto::new(server_identity));
+        Self {
+            crypto,
+            ip_pool,
+            sessions,
+            routing,
+            deny_list,
+            policy,
+            admission_lock: Mutex::new(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_crypto(
+        crypto: Box<dyn HandshakeCrypto>,
+        ip_pool: Arc<IpPoolService>,
+        sessions: Arc<SessionManager>,
+        routing: Arc<RoutingService>,
+        deny_list: Arc<DenyList>,
+        policy: Arc<NodePolicyRuntime>,
+    ) -> Self {
         Self {
             crypto,
             ip_pool,
@@ -262,13 +290,25 @@ impl HandshakeService {
         self.crypto
             .verify_client_hello_v2(client_hello, extension)
             .map_err(|e| {
-                warn!(client = %client_addr, error = %e, "Handshake v2 signature verification failed");
+                // [V2-HANDSHAKE-LOG-PRIVACY 2026-09-20 by Codex] The returned
+                // typed error remains intact, but an attacker-controlled hello
+                // must not turn socket, key, signature, or timestamp material
+                // into persistent diagnostics.
+                warn!(
+                    event = "handshake_v2_rejected",
+                    reason = "authentication",
+                    "Handshake v2 rejected"
+                );
                 e
             })?;
         let _admission_guard = self.admission_lock.lock();
         self.validate_candidate(client_hello)?;
         let virtual_ip = self.ip_pool.allocate().map_err(|e| {
-            warn!(client = %client_addr, "IP allocation failed: {}", e);
+            warn!(
+                event = "handshake_v2_rejected",
+                reason = "ip_capacity",
+                "Handshake v2 rejected"
+            );
             e
         })?;
         let session_id = aeronyx_common::SessionId::generate();
@@ -281,7 +321,11 @@ impl HandshakeService {
             Ok(result) => result,
             Err(e) => {
                 self.ip_pool.release(virtual_ip);
-                warn!(client = %client_addr, error = %e, "Handshake v2 crypto failed");
+                warn!(
+                    event = "handshake_v2_rejected",
+                    reason = "crypto_state",
+                    "Handshake v2 rejected"
+                );
                 return Err(e.into());
             }
         };
@@ -303,10 +347,15 @@ impl HandshakeService {
             Ok(admission) => admission,
             Err(e) => {
                 self.ip_pool.release(virtual_ip);
-                warn!(client = %client_addr, error = %e, "Session v2 creation failed");
+                warn!(
+                    event = "handshake_v2_rejected",
+                    reason = "session_admission",
+                    "Handshake v2 rejected"
+                );
                 return Err(e);
             }
         };
+        let evicted_sessions = admission.evicted.len();
         for termination in &admission.evicted {
             self.routing
                 .remove_route_for_session(termination.virtual_ip, &termination.session_id);
@@ -317,8 +366,10 @@ impl HandshakeService {
             .session
             .stage_admission_evictions(admission.evicted);
         info!(
-            session_id = %admission.session.id,
-            virtual_ip = %virtual_ip,
+            event = "handshake_v2_accepted",
+            protocol_version = aeronyx_core::protocol::PROTOCOL_VERSION_V2,
+            active_sessions = self.sessions.count(),
+            evicted_sessions,
             "Handshake v2 completed successfully"
         );
         Ok(HandshakeResult {
@@ -372,12 +423,139 @@ mod tests {
     use crate::services::deny_list::DenyReason;
     use crate::services::NodePolicySnapshot;
     use aeronyx_core::crypto::handshake::{create_client_hello, create_client_hello_v2};
+    use aeronyx_core::crypto::kdf::SessionKeys;
+    use aeronyx_core::crypto::keys::{IdentityPublicKey, SessionKey};
     use aeronyx_core::crypto::EphemeralKeyPair;
-    use aeronyx_core::protocol::CURRENT_PROTOCOL_VERSION;
+    // [V2-HANDSHAKE-LOG-PRIVACY 2026-09-20 by Codex] These legacy fixtures
+    // exercise the signed v1 control path even after v2 becomes the default.
+    use aeronyx_core::protocol::PROTOCOL_VERSION_V1;
+    use aeronyx_core::CoreError;
+    use std::io::{self, Write};
     use std::net::Ipv4Addr;
-    use std::sync::Barrier;
+    use std::sync::{Barrier, Mutex as StdMutex};
     use std::thread;
     use std::time::Duration;
+    use tracing_subscriber::{fmt::MakeWriter, prelude::*};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<StdMutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured log mutex")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_info_logs<T>(operation: impl FnOnce() -> T) -> (T, String) {
+        let captured = CapturedLogs::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(captured.clone())
+            .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.level() <= &tracing::Level::INFO
+                    && metadata.target().ends_with("services::handshake")
+            }));
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let result = tracing::subscriber::with_default(subscriber, operation);
+        let logs = String::from_utf8(captured.0.lock().expect("captured log mutex").clone())
+            .expect("captured logs are UTF-8");
+        (result, logs)
+    }
+
+    fn assert_log_omits(logs: &str, forbidden: &[String]) {
+        for value in forbidden {
+            assert!(
+                !value.is_empty() && !logs.contains(value),
+                "sensitive value leaked into logs: {value} in {logs}"
+            );
+        }
+    }
+
+    fn assert_v2_log_schema_is_coarse(logs: &str) {
+        for forbidden_field in [
+            "client=",
+            "client_addr",
+            "endpoint",
+            "session_id",
+            "virtual_ip",
+            "public_key",
+            "signature",
+            "route_id",
+            "message_id",
+            "payload",
+            "nonce",
+            "key=",
+            "error=",
+        ] {
+            assert!(
+                !logs.contains(forbidden_field),
+                "forbidden diagnostic field {forbidden_field} in {logs}"
+            );
+        }
+    }
+
+    struct FailingV2Crypto {
+        inner: DefaultHandshakeCrypto,
+    }
+
+    impl HandshakeCrypto for FailingV2Crypto {
+        fn public_key(&self) -> IdentityPublicKey {
+            self.inner.public_key()
+        }
+
+        fn verify_client_hello(&self, message: &ClientHello) -> aeronyx_core::Result<()> {
+            self.inner.verify_client_hello(message)
+        }
+
+        fn process_handshake(
+            &self,
+            client_hello: &ClientHello,
+            assigned_ip: [u8; 4],
+            session_id: [u8; 16],
+        ) -> aeronyx_core::Result<(ServerHello, SessionKey)> {
+            self.inner
+                .process_handshake(client_hello, assigned_ip, session_id)
+        }
+
+        fn verify_client_hello_v2(
+            &self,
+            message: &ClientHello,
+            extension: &[u8],
+        ) -> aeronyx_core::Result<()> {
+            self.inner.verify_client_hello_v2(message, extension)
+        }
+
+        fn process_handshake_v2(
+            &self,
+            _client_hello: &ClientHello,
+            _extension: &[u8],
+            _assigned_ip: [u8; 4],
+            _session_id: [u8; 16],
+        ) -> aeronyx_core::Result<(ServerHello, SessionKeys)> {
+            Err(CoreError::KeyDerivation {
+                reason: "SENSITIVE_CRYPTO_SENTINEL".to_string(),
+            })
+        }
+    }
 
     fn create_test_services() -> (
         Arc<IpPoolService>,
@@ -408,6 +586,267 @@ mod tests {
     }
 
     #[test]
+    fn v2_success_logs_only_fixed_classes_and_aggregate_counters() {
+        // [V2-HANDSHAKE-LOG-PRIVACY 2026-09-20 by Codex] Capture a real signed
+        // v2 success and prove that every correlation value stays out of the
+        // formatted event while coarse operational counters remain available.
+        let server_identity = IdentityKeyPair::generate();
+        let server_public = server_identity.public_key_bytes();
+        let (ip_pool, sessions, routing, deny_list) = create_test_services();
+        let service = HandshakeService::new(
+            server_identity,
+            ip_pool,
+            sessions,
+            routing,
+            deny_list,
+            Arc::new(NodePolicyRuntime::default()),
+        );
+        let client_identity = IdentityKeyPair::generate();
+        let hello = create_v2_hello(&client_identity);
+        let client_addr: SocketAddr = "198.51.100.77:45678".parse().unwrap();
+
+        let (result, logs) = capture_info_logs(|| {
+            service
+                .process(&hello, &[], client_addr)
+                .expect("signed v2 handshake")
+        });
+
+        assert!(logs.contains("handshake_v2_accepted"));
+        assert!(logs.contains("protocol_version=2"));
+        assert!(logs.contains("active_sessions=1"));
+        assert!(logs.contains("evicted_sessions=0"));
+        assert_v2_log_schema_is_coarse(&logs);
+        assert_log_omits(
+            &logs,
+            &[
+                client_addr.to_string(),
+                hex::encode(client_identity.public_key_bytes()),
+                hex::encode(server_public),
+                hex::encode(hello.signature),
+                result.session.id.to_string(),
+                result.session.virtual_ip.to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn v2_rejection_logs_only_fixed_authentication_class() {
+        let (ip_pool, sessions, routing, deny_list) = create_test_services();
+        let service = HandshakeService::new(
+            IdentityKeyPair::generate(),
+            Arc::clone(&ip_pool),
+            Arc::clone(&sessions),
+            Arc::clone(&routing),
+            deny_list,
+            Arc::new(NodePolicyRuntime::default()),
+        );
+        let client_identity = IdentityKeyPair::generate();
+        let mut forged = create_v2_hello(&client_identity);
+        forged.signature = [0xA5; 64];
+        let client_addr: SocketAddr = "203.0.113.91:54321".parse().unwrap();
+
+        let (result, logs) = capture_info_logs(|| service.process(&forged, &[], client_addr));
+
+        assert!(result.is_err());
+        assert!(logs.contains("handshake_v2_rejected"));
+        assert!(logs.contains("reason=\"authentication\""));
+        assert_v2_log_schema_is_coarse(&logs);
+        assert_log_omits(
+            &logs,
+            &[
+                client_addr.to_string(),
+                hex::encode(client_identity.public_key_bytes()),
+                hex::encode(forged.signature),
+                forged.timestamp.to_string(),
+            ],
+        );
+        assert_eq!(ip_pool.allocated_count(), 0);
+        assert_eq!(sessions.count(), 0);
+        assert!(routing.is_empty());
+    }
+
+    #[test]
+    fn v2_allocation_failure_logs_only_capacity_class() {
+        let ip_pool = Arc::new(
+            IpPoolService::new(
+                Ipv4Addr::new(100, 64, 0, 0),
+                30,
+                Ipv4Addr::new(100, 64, 0, 1),
+            )
+            .unwrap(),
+        );
+        assert_eq!(ip_pool.allocate().unwrap(), Ipv4Addr::new(100, 64, 0, 2));
+        let sessions = Arc::new(SessionManager::new(4, Duration::from_secs(300)));
+        let routing = Arc::new(RoutingService::new());
+        let service = HandshakeService::new(
+            IdentityKeyPair::generate(),
+            Arc::clone(&ip_pool),
+            Arc::clone(&sessions),
+            Arc::clone(&routing),
+            Arc::new(DenyList::new()),
+            Arc::new(NodePolicyRuntime::default()),
+        );
+        let identity = IdentityKeyPair::generate();
+        let hello = create_v2_hello(&identity);
+        let client_addr: SocketAddr = "198.51.100.88:46000".parse().unwrap();
+
+        let (result, logs) = capture_info_logs(|| service.process(&hello, &[], client_addr));
+
+        assert!(matches!(result, Err(ServerError::IpPoolExhausted)));
+        assert!(logs.contains("handshake_v2_rejected"));
+        assert!(logs.contains("reason=\"ip_capacity\""));
+        assert!(!logs.contains("IP pool exhausted"));
+        assert_v2_log_schema_is_coarse(&logs);
+        assert_log_omits(
+            &logs,
+            &[
+                client_addr.to_string(),
+                hex::encode(identity.public_key_bytes()),
+                hex::encode(hello.signature),
+            ],
+        );
+        assert_eq!(ip_pool.allocated_count(), 1);
+        assert_eq!(sessions.count(), 0);
+        assert!(routing.is_empty());
+    }
+
+    #[test]
+    fn v2_crypto_failure_logs_only_crypto_state_class() {
+        let (ip_pool, sessions, routing, deny_list) = create_test_services();
+        let service = HandshakeService::new_with_crypto(
+            Box::new(FailingV2Crypto {
+                inner: DefaultHandshakeCrypto::new(IdentityKeyPair::generate()),
+            }),
+            Arc::clone(&ip_pool),
+            Arc::clone(&sessions),
+            Arc::clone(&routing),
+            deny_list,
+            Arc::new(NodePolicyRuntime::default()),
+        );
+        let identity = IdentityKeyPair::generate();
+        let hello = create_v2_hello(&identity);
+        let client_addr: SocketAddr = "203.0.113.92:47000".parse().unwrap();
+
+        let (result, logs) = capture_info_logs(|| service.process(&hello, &[], client_addr));
+
+        assert!(result.is_err());
+        assert!(logs.contains("handshake_v2_rejected"));
+        assert!(logs.contains("reason=\"crypto_state\""));
+        assert!(!logs.contains("SENSITIVE_CRYPTO_SENTINEL"));
+        assert_v2_log_schema_is_coarse(&logs);
+        assert_log_omits(
+            &logs,
+            &[
+                client_addr.to_string(),
+                hex::encode(identity.public_key_bytes()),
+                hex::encode(hello.signature),
+                Ipv4Addr::new(100, 64, 0, 2).to_string(),
+            ],
+        );
+        assert_eq!(ip_pool.allocated_count(), 0);
+        assert_eq!(sessions.count(), 0);
+        assert!(routing.is_empty());
+    }
+
+    #[test]
+    fn v2_session_rejection_logs_only_admission_class() {
+        let ip_pool = Arc::new(
+            IpPoolService::new(
+                Ipv4Addr::new(100, 64, 0, 0),
+                24,
+                Ipv4Addr::new(100, 64, 0, 1),
+            )
+            .unwrap(),
+        );
+        let sessions = Arc::new(SessionManager::new(0, Duration::from_secs(300)));
+        let routing = Arc::new(RoutingService::new());
+        let service = HandshakeService::new(
+            IdentityKeyPair::generate(),
+            Arc::clone(&ip_pool),
+            Arc::clone(&sessions),
+            Arc::clone(&routing),
+            Arc::new(DenyList::new()),
+            Arc::new(NodePolicyRuntime::default()),
+        );
+        let identity = IdentityKeyPair::generate();
+        let hello = create_v2_hello(&identity);
+        let client_addr: SocketAddr = "192.0.2.93:48000".parse().unwrap();
+
+        let (result, logs) = capture_info_logs(|| service.process(&hello, &[], client_addr));
+
+        assert!(matches!(
+            result,
+            Err(ServerError::SessionLimitReached { limit: 0 })
+        ));
+        assert!(logs.contains("handshake_v2_rejected"));
+        assert!(logs.contains("reason=\"session_admission\""));
+        assert!(!logs.contains("Session limit reached"));
+        assert_v2_log_schema_is_coarse(&logs);
+        assert_log_omits(
+            &logs,
+            &[
+                client_addr.to_string(),
+                hex::encode(identity.public_key_bytes()),
+                hex::encode(hello.signature),
+                Ipv4Addr::new(100, 64, 0, 2).to_string(),
+            ],
+        );
+        assert_eq!(ip_pool.allocated_count(), 0);
+        assert_eq!(sessions.count(), 0);
+        assert!(routing.is_empty());
+    }
+
+    #[test]
+    fn legacy_success_and_rejection_keep_privacy_safe_diagnostics() {
+        let (ip_pool, sessions, routing, deny_list) = create_test_services();
+        let service = HandshakeService::new(
+            IdentityKeyPair::generate(),
+            ip_pool,
+            sessions,
+            routing,
+            deny_list,
+            Arc::new(NodePolicyRuntime::default()),
+        );
+        let client_identity = IdentityKeyPair::generate();
+        let client_addr: SocketAddr = "192.0.2.44:40404".parse().unwrap();
+        let hello = create_client_hello(
+            &client_identity,
+            EphemeralKeyPair::generate().public_key_bytes(),
+            PROTOCOL_VERSION_V1,
+        );
+        let (accepted, accepted_logs) =
+            capture_info_logs(|| service.process(&hello, &[], client_addr));
+        let accepted = accepted.expect("signed v1 handshake");
+        assert!(accepted_logs.contains("Handshake completed successfully"));
+        assert_log_omits(
+            &accepted_logs,
+            &[
+                client_addr.to_string(),
+                hex::encode(client_identity.public_key_bytes()),
+                hex::encode(hello.signature),
+                accepted.session.id.to_string(),
+                accepted.session.virtual_ip.to_string(),
+            ],
+        );
+
+        let mut forged = hello;
+        forged.signature = [0x5A; 64];
+        let rejected_addr: SocketAddr = "192.0.2.45:40405".parse().unwrap();
+        let (rejected, rejected_logs) =
+            capture_info_logs(|| service.process(&forged, &[], rejected_addr));
+        assert!(rejected.is_err());
+        assert!(rejected_logs.contains("Handshake signature verification failed"));
+        assert_log_omits(
+            &rejected_logs,
+            &[
+                rejected_addr.to_string(),
+                hex::encode(client_identity.public_key_bytes()),
+                hex::encode(forged.signature),
+            ],
+        );
+    }
+
+    #[test]
     fn test_successful_handshake() {
         let server_identity = IdentityKeyPair::generate();
         let (ip_pool, sessions, routing, deny_list) = create_test_services();
@@ -426,7 +865,7 @@ mod tests {
         let client_hello = create_client_hello(
             &client_identity,
             client_ephemeral.public_key_bytes(),
-            CURRENT_PROTOCOL_VERSION,
+            PROTOCOL_VERSION_V1,
         );
 
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
@@ -462,7 +901,7 @@ mod tests {
         let first_hello = create_client_hello(
             &first_identity,
             EphemeralKeyPair::generate().public_key_bytes(),
-            CURRENT_PROTOCOL_VERSION,
+            PROTOCOL_VERSION_V1,
         );
         let first = service.process(&first_hello, &[], client_addr).unwrap();
         let old_session_id = first.session.id.clone();
@@ -477,7 +916,7 @@ mod tests {
         let replacement_hello = create_client_hello(
             &replacement_identity,
             EphemeralKeyPair::generate().public_key_bytes(),
-            CURRENT_PROTOCOL_VERSION,
+            PROTOCOL_VERSION_V1,
         );
         let replacement = service
             .process(&replacement_hello, &[], "127.0.0.1:12346".parse().unwrap())
@@ -515,7 +954,7 @@ mod tests {
         let mut client_hello = create_client_hello(
             &client_identity,
             client_ephemeral.public_key_bytes(),
-            CURRENT_PROTOCOL_VERSION,
+            PROTOCOL_VERSION_V1,
         );
         client_hello.signature[0] ^= 0xFF;
 
@@ -625,7 +1064,7 @@ mod tests {
         let client_hello = create_client_hello(
             &client_identity,
             client_ephemeral.public_key_bytes(),
-            CURRENT_PROTOCOL_VERSION,
+            PROTOCOL_VERSION_V1,
         );
 
         // Add wallet to deny list before handshake.
@@ -701,7 +1140,7 @@ mod tests {
         let client_hello = create_client_hello(
             &client_identity,
             client_ephemeral.public_key_bytes(),
-            CURRENT_PROTOCOL_VERSION,
+            PROTOCOL_VERSION_V1,
         );
 
         let wallet_hex = hex::encode(client_identity.public_key_bytes());
@@ -756,7 +1195,7 @@ mod tests {
         let client_hello = create_client_hello(
             &client_identity,
             client_ephemeral.public_key_bytes(),
-            CURRENT_PROTOCOL_VERSION,
+            PROTOCOL_VERSION_V1,
         );
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
@@ -795,7 +1234,7 @@ mod tests {
             let client_hello = create_client_hello(
                 &client_identity,
                 client_ephemeral.public_key_bytes(),
-                CURRENT_PROTOCOL_VERSION,
+                PROTOCOL_VERSION_V1,
             );
             let client_addr: SocketAddr = format!("127.0.0.1:{}", 12345 + index).parse().unwrap();
             let result = service.process(&client_hello, &[], client_addr);
@@ -886,7 +1325,7 @@ mod tests {
                     let client_hello = create_client_hello(
                         &client_identity,
                         client_ephemeral.public_key_bytes(),
-                        CURRENT_PROTOCOL_VERSION,
+                        PROTOCOL_VERSION_V1,
                     );
                     let port = 20_000u16 + u16::try_from(index).expect("test index fits u16");
                     let client_addr = SocketAddr::from(([127, 0, 0, 1], port));
