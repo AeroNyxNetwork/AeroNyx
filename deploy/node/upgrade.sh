@@ -48,6 +48,9 @@
 #   cold starts before declaring a restart
 #   unhealthy, preserve the actual running executable when the on-disk binary
 #   was already replaced, and perform rollback replacement atomically.
+# - [DEPLOY-MANIFEST-AUTHORITY 2026-09-21 by Codex] Bind an opt-in release
+#   upgrade to one exact source tree, manifest digest, candidate binary, and
+#   host-local readiness authority without changing legacy operator commands.
 #
 # Main Functionality:
 # - Pulls the configured branch.
@@ -125,6 +128,9 @@
 #   not prove that promotion is safe afterward.
 #
 # Last Modified:
+# v1.22.0-node-deploy - Adds opt-in manifest-bound source/binary/runtime proof,
+#                       config-derived local health authority, and no-clobber
+#                       rollback backup allocation.
 # v1.21.0-node-deploy - Moved active-session protection ahead of binary/unit
 #                       promotion and added no-restart staged rollback.
 # v1.20.0-node-deploy - Added live-safe Cargo job limits and reduced CPU/I/O
@@ -212,6 +218,15 @@ BUILD_TARGET_DIR=""
 BUILD_BINARY=""
 BUILD_GIT_COMMIT=""
 BUILD_BINARY_SHA256=""
+RELEASE_MANIFEST=""
+RELEASE_MANIFEST_SHA256=""
+EXPECTED_MANIFEST_TREE=""
+EXPECTED_BINARY_SHA256=""
+HEALTH_URL=""
+# [DEPLOY-GIT-SSH-AUTHORITY 2026-09-22 by Codex] Keep the SSH transport
+# authority separate from Git's origin URL so a root-owned isolated clone can
+# receive the operator-approved deploy key without ever logging its command.
+GIT_SSH_AUTHORITY="${AERONYX_GIT_SSH_COMMAND:-${GIT_SSH_COMMAND:-}}"
 BUILD_PRIORITY="${AERONYX_BUILD_PRIORITY:-live}"
 BUILD_JOBS_REQUESTED="${AERONYX_BUILD_JOBS:-auto}"
 BUILD_JOBS=""
@@ -242,6 +257,14 @@ Options:
   --branch NAME       Branch/ref to pull. Default: main
   --commit SHA        Build this exact 40-hex commit from an isolated checkout.
                       The commit must be reachable from origin/--branch.
+  --release-manifest PATH
+                      Opt in to a strict v1 release manifest. Requires
+                      --commit and --release-manifest-sha256 together.
+  --release-manifest-sha256 SHA
+                      Exact 64-hex SHA-256 of the strict release manifest.
+  --git-ssh-command COMMAND
+                      SSH authority for an SSH Git origin. The command is
+                      never logged; HTTPS origins retain their legacy mode.
   --config PATH       Config path. Default: /etc/aeronyx/server.toml
   --service NAME      systemd service name. Default: aeronyx-server
   --force             Restart even when active VPN sessions exist.
@@ -357,6 +380,9 @@ while [ "$#" -gt 0 ]; do
         --repo-dir) REPO_DIR="${2:?missing value}"; shift 2 ;;
         --branch) BRANCH="${2:?missing value}"; shift 2 ;;
         --commit) SOURCE_COMMIT="${2:?missing value}"; shift 2 ;;
+        --release-manifest) RELEASE_MANIFEST="${2:?missing value}"; shift 2 ;;
+        --release-manifest-sha256) RELEASE_MANIFEST_SHA256="${2:?missing value}"; shift 2 ;;
+        --git-ssh-command) GIT_SSH_AUTHORITY="${2:?missing value}"; shift 2 ;;
         --config) CONFIG_FILE="${2:?missing value}"; shift 2 ;;
         --service) SERVICE_NAME="${2:?missing value}"; SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"; LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"; shift 2 ;;
         --force) FORCE=1; shift ;;
@@ -439,6 +465,159 @@ validate_source_commit() {
         || die "--branch is not a valid Git branch name: ${BRANCH}"
     SOURCE_COMMIT="$(printf '%s' "${SOURCE_COMMIT}" | tr 'A-F' 'a-f')"
     SOURCE_MODE="commit_pinned"
+}
+
+# [DEPLOY-GIT-SSH-AUTHORITY 2026-09-22 by Codex] An SSH origin cannot rely on
+# an interactive credential prompt in the locked deployment path. Accept only
+# an explicit SSH invocation without control characters; Git receives it as a
+# single environment value, never through eval, and logs only its use.
+is_ssh_git_remote() {
+    local remote="$1" authority
+    case "${remote}" in
+        ssh://*) return 0 ;;
+        *://*) return 1 ;;
+        *:*)
+            authority="${remote%%:*}"
+            case "${authority}" in
+                ""|*/*|*[!A-Za-z0-9.@_-]*) return 1 ;;
+                *) return 0 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+validate_git_ssh_authority() {
+    local authority="$1"
+    [ -n "${authority}" ] \
+        || die "SSH Git origin requires --git-ssh-command or GIT_SSH_COMMAND."
+    case "${authority}" in
+        *$'\n'*|*$'\r'*|*$'\t'*)
+            die "Git SSH authority contains an unsafe control character."
+            ;;
+    esac
+    case "${authority}" in
+        ssh|ssh\ *|*/ssh|*/ssh\ *) ;;
+        *) die "Git SSH authority must invoke ssh directly." ;;
+    esac
+}
+
+run_git_for_origin() {
+    local origin="$1"
+    shift
+
+    if is_ssh_git_remote "${origin}"; then
+        validate_git_ssh_authority "${GIT_SSH_AUTHORITY}"
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            printf '[DRY-RUN] Git network operation through configured SSH authority\n'
+            return 0
+        fi
+        GIT_SSH_COMMAND="${GIT_SSH_AUTHORITY}" git "$@"
+        return
+    fi
+
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] Git network operation through origin transport\n'
+        return 0
+    fi
+    git "$@"
+}
+
+# [DEPLOY-MANIFEST-AUTHORITY 2026-09-21 by Codex] The manifest is opt-in so
+# existing operators retain their legacy workflow, but strict mode never
+# accepts a partial identity, a mutable source selection, or an unbound hash.
+validate_release_manifest_options() {
+    if [ -z "${RELEASE_MANIFEST}" ] && [ -z "${RELEASE_MANIFEST_SHA256}" ]; then
+        return 0
+    fi
+    [ -n "${RELEASE_MANIFEST}" ] && [ -n "${RELEASE_MANIFEST_SHA256}" ] \
+        || die "--release-manifest and --release-manifest-sha256 are required together."
+    [ -n "${SOURCE_COMMIT}" ] \
+        || die "--release-manifest requires one exact --commit."
+    printf '%s' "${RELEASE_MANIFEST_SHA256}" | grep -Eq '^[0-9a-f]{64}$' \
+        || die "--release-manifest-sha256 must be one lowercase 64-hex SHA-256."
+}
+
+load_release_manifest() {
+    [ -n "${RELEASE_MANIFEST}" ] || return 0
+    command -v python3 >/dev/null 2>&1 \
+        || die "python3 is required for manifest-bound upgrades."
+
+    EXPECTED_BINARY_SHA256="$(python3 - "${RELEASE_MANIFEST}" "${RELEASE_MANIFEST_SHA256}" "${SOURCE_COMMIT}" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+path, expected_manifest_sha256, expected_commit = sys.argv[1:]
+try:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or info.st_size > 4096:
+            raise ValueError("manifest must be a bounded regular file")
+        body = os.read(fd, info.st_size + 1)
+        if len(body) != info.st_size:
+            raise ValueError("manifest changed while being read")
+    finally:
+        os.close(fd)
+    if hashlib.sha256(body).hexdigest() != expected_manifest_sha256:
+        raise ValueError("manifest digest mismatch")
+    text = body.decode("utf-8")
+    lines = text.splitlines(keepends=True)
+    if len(lines) != 4 or any(not line.endswith("\n") for line in lines):
+        raise ValueError("manifest grammar mismatch")
+    if lines[0] != "aeronyx-release-manifest-v1\n":
+        raise ValueError("manifest version mismatch")
+    fields = {}
+    for line in lines[1:]:
+        if line.count("=") != 1:
+            raise ValueError("manifest field grammar mismatch")
+        key, value = line[:-1].split("=", 1)
+        if key not in {"commit", "tree", "binary_sha256"} or key in fields:
+            raise ValueError("manifest field set mismatch")
+        fields[key] = value
+    if set(fields) != {"commit", "tree", "binary_sha256"}:
+        raise ValueError("manifest required fields missing")
+    if fields["commit"] != expected_commit:
+        raise ValueError("manifest commit mismatch")
+    if any(not all(ch in "0123456789abcdef" for ch in fields[key]) for key in ("commit", "tree")) \
+            or len(fields["commit"]) != 40 or len(fields["tree"]) != 40:
+        raise ValueError("manifest Git identity is not canonical")
+    if len(fields["binary_sha256"]) != 64 or not all(ch in "0123456789abcdef" for ch in fields["binary_sha256"]):
+        raise ValueError("manifest binary SHA-256 is not canonical")
+    print(f"{fields['tree']} {fields['binary_sha256']}")
+except Exception:
+    sys.exit(1)
+PY
+)" || die "Release manifest failed closed."
+
+    EXPECTED_MANIFEST_TREE="${EXPECTED_BINARY_SHA256%% *}"
+    EXPECTED_BINARY_SHA256="${EXPECTED_BINARY_SHA256#* }"
+    printf '%s' "${EXPECTED_MANIFEST_TREE}" | grep -Eq '^[0-9a-f]{40}$' \
+        || die "Release manifest tree identity could not be established."
+    printf '%s' "${EXPECTED_BINARY_SHA256}" | grep -Eq '^[0-9a-f]{64}$' \
+        || die "Release manifest binary identity could not be established."
+    ok "Strict release manifest verified"
+}
+
+verify_isolated_source_manifest_tree() {
+    local actual_tree
+    [ -n "${RELEASE_MANIFEST}" ] || return 0
+    [ "${SOURCE_MODE}" = "commit_pinned" ] \
+        || die "Strict release manifest requires a commit-pinned isolated source."
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] verify isolated source tree against strict release manifest\n'
+        return
+    fi
+    actual_tree="$(git -C "${SOURCE_DIR}" rev-parse "${SOURCE_COMMIT}^{tree}" 2>/dev/null)" \
+        || die "Isolated source tree could not be established."
+    [ "${actual_tree}" = "${EXPECTED_MANIFEST_TREE}" ] \
+        || die "Isolated source tree does not match the release manifest."
+    ok "Isolated source tree matches strict release manifest"
 }
 
 validate_option_combinations() {
@@ -672,12 +851,12 @@ run_pinned_cargo_with_build_policy() {
 }
 
 active_sessions() {
-    if ! command -v curl >/dev/null 2>&1; then
+    if ! command -v curl >/dev/null 2>&1 || [ -z "${HEALTH_URL}" ]; then
         printf 'unknown'
         return
     fi
 
-    curl -fsS --max-time 5 http://127.0.0.1:8421/api/vpn/health 2>/dev/null \
+    curl -fsS --max-time 5 "${HEALTH_URL}" 2>/dev/null \
         | python3 -c 'import json,sys; print(json.load(sys.stdin).get("active_sessions", "unknown"))' 2>/dev/null \
         || printf 'unknown'
 }
@@ -735,8 +914,21 @@ is_git_worktree() {
         && git -C "${REPO_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1
 }
 
+allocate_backup_path() {
+    local prefix="$1"
+    local stamp
+    stamp="$(date -u +%Y%m%d_%H%M%S)"
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '%s/%s.%s.<unique>\n' "${RELEASE_DIR}" "${prefix}" "${stamp}"
+        return
+    fi
+    # `mktemp` creates the target before copying, so an existing second-level
+    # name can never be silently reused by a later short maintenance run.
+    mktemp "${RELEASE_DIR}/${prefix}.${stamp}.XXXXXX"
+}
+
 backup_current_binary() {
-    local backup_source binary main_pid running_executable stamp
+    local backup_source binary main_pid running_executable
     binary="${REPO_DIR}/target/release/aeronyx-server"
     backup_source=""
 
@@ -764,14 +956,15 @@ backup_current_binary() {
         return 0
     fi
 
-    stamp="$(date -u +%Y%m%d_%H%M%S)"
-    BACKUP_BINARY="${RELEASE_DIR}/aeronyx-server.${stamp}"
     run mkdir -p "${RELEASE_DIR}"
-    run cp --dereference "${backup_source}" "${BACKUP_BINARY}"
+    BACKUP_BINARY="$(allocate_backup_path "aeronyx-server.binary")" \
+        || die "Could not allocate a unique binary rollback backup."
+    run cp -L "${backup_source}" "${BACKUP_BINARY}"
     ok "Current binary backed up to ${BACKUP_BINARY}"
 }
 
 update_source() {
+    local source_remote
     [ "${SKIP_PULL}" -eq 0 ] || { ok "Git pull skipped"; return; }
 
     if [ -n "${SOURCE_COMMIT}" ]; then
@@ -779,10 +972,13 @@ update_source() {
         return
     fi
 
+    source_remote="$(git -C "${REPO_DIR}" remote get-url origin 2>/dev/null)" \
+        || die "Cannot resolve origin remote from runtime repository: ${REPO_DIR}"
+    [ -n "${source_remote}" ] || die "Runtime repository origin remote is empty."
     log "Updating source from origin/${BRANCH}"
-    run git -C "${REPO_DIR}" fetch origin "${BRANCH}"
+    run_git_for_origin "${source_remote}" -C "${REPO_DIR}" fetch origin "${BRANCH}"
     run git -C "${REPO_DIR}" checkout "${BRANCH}"
-    run git -C "${REPO_DIR}" pull --ff-only origin "${BRANCH}"
+    run_git_for_origin "${source_remote}" -C "${REPO_DIR}" pull --ff-only origin "${BRANCH}"
     SOURCE_DIR="${REPO_DIR}"
 }
 
@@ -798,14 +994,17 @@ prepare_isolated_source() {
     log "Preparing isolated source for ${SOURCE_COMMIT} from origin/${BRANCH}"
 
     if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] clone origin/%s into %s and detach exact commit %s\n' \
-            "${BRANCH}" "${ISOLATED_SOURCE_DIR}" "${SOURCE_COMMIT}"
-        BUILD_GIT_COMMIT="${SOURCE_COMMIT:0:12}"
+        if is_ssh_git_remote "${source_remote}"; then
+            validate_git_ssh_authority "${GIT_SSH_AUTHORITY}"
+        fi
+        printf '[DRY-RUN] clone verified origin/%s into isolated checkout and detach exact commit\n' \
+            "${BRANCH}"
+        BUILD_GIT_COMMIT="${SOURCE_COMMIT}"
         return
     fi
 
     mkdir -p "${SOURCE_ROOT}"
-    git clone --filter=blob:none --no-checkout --single-branch \
+    run_git_for_origin "${source_remote}" clone --filter=blob:none --no-checkout --single-branch \
         --branch "${BRANCH}" -- "${source_remote}" "${ISOLATED_SOURCE_DIR}"
     git -C "${ISOLATED_SOURCE_DIR}" merge-base --is-ancestor \
         "${SOURCE_COMMIT}" "refs/remotes/origin/${BRANCH}" \
@@ -823,10 +1022,11 @@ prepare_isolated_source() {
 
 resolve_build_git_commit() {
     if [ -n "${SOURCE_COMMIT}" ]; then
-        printf '%s\n' "${SOURCE_COMMIT:0:12}"
+        printf '%s\n' "${SOURCE_COMMIT}"
         return
     fi
-    git -C "${SOURCE_DIR}" rev-parse --short=12 HEAD 2>/dev/null || printf 'unknown'
+    git -C "${SOURCE_DIR}" rev-parse HEAD 2>/dev/null \
+        || die "Build source commit could not be established."
 }
 
 build_release() {
@@ -866,6 +1066,17 @@ build_release() {
     fi
 }
 
+verify_manifest_candidate_binary() {
+    [ -n "${RELEASE_MANIFEST}" ] || return 0
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] verify candidate binary SHA-256 against strict release manifest\n'
+        return
+    fi
+    [ "${BUILD_BINARY_SHA256}" = "${EXPECTED_BINARY_SHA256}" ] \
+        || die "Candidate binary does not match the strict release manifest."
+    ok "Candidate binary matches strict release manifest"
+}
+
 validate_config() {
     local binary
     binary="${BUILD_BINARY}"
@@ -873,6 +1084,106 @@ validate_config() {
 
     log "Validating config: ${CONFIG_FILE}"
     run "${binary}" validate -c "${CONFIG_FILE}"
+}
+
+# [DEPLOY-MANIFEST-AUTHORITY 2026-09-21 by Codex] Health is evidence for the
+# service being upgraded only when its authority is reconstructed from the
+# validated node config. A fixed historical port could be served by another
+# local process and must not decide session safety or release success.
+derive_health_authority() {
+    local derived_url
+    [ -f "${CONFIG_FILE}" ] || die "Config file not found for health authority."
+    command -v python3 >/dev/null 2>&1 \
+        || die "python3 is required to derive health authority."
+
+    derived_url="$(python3 - "${CONFIG_FILE}" <<'PY'
+import ipaddress
+import re
+import sys
+
+try:
+    raw = open(sys.argv[1], "rb").read()
+    text = raw.decode("utf-8")
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        tomllib = None
+    if tomllib is not None:
+        data = tomllib.loads(text)
+        memchain = data.get("memchain", {})
+        if not isinstance(memchain, dict):
+            raise ValueError("memchain section is not a table")
+        address = memchain.get("api_listen_addr", "127.0.0.1:8421")
+    else:
+        # The candidate binary has already validated full TOML syntax. On
+        # older Python, accept only the narrow unescaped string grammar needed
+        # for this safety authority; ambiguity fails closed rather than using a
+        # permissive parser or a historic hard-coded port.
+        in_memchain = False
+        address = None
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            header = re.fullmatch(r"\[([^\]]+)\](?:\s*#.*)?", line)
+            if header:
+                in_memchain = header.group(1).strip() == "memchain"
+                continue
+            if not in_memchain or not re.match(r"api_listen_addr\s*=", line):
+                continue
+            match = re.fullmatch(r"api_listen_addr\s*=\s*(['\"])([^'\"\\\\]*)\1(?:\s*#.*)?", line)
+            if match is None or address is not None:
+                raise ValueError("ambiguous API address")
+            address = match.group(2)
+        if address is None:
+            address = "127.0.0.1:8421"
+    if not isinstance(address, str):
+        raise ValueError("API address is not a string")
+    if address.startswith("["):
+        host, separator, port = address[1:].partition("]:")
+        if not separator:
+            raise ValueError("invalid IPv6 address")
+    else:
+        host, separator, port = address.rpartition(":")
+        if not separator or ":" in host:
+            raise ValueError("invalid IPv4 address")
+    parsed_port = int(port)
+    if not 1 <= parsed_port <= 65535:
+        raise ValueError("invalid API port")
+    ip = ipaddress.ip_address(host)
+    if ip.is_loopback:
+        local = ip
+    elif ip.is_unspecified:
+        local = ipaddress.ip_address("::1" if ip.version == 6 else "127.0.0.1")
+    else:
+        raise ValueError("health API is not loopback or wildcard")
+    rendered_host = f"[{local.compressed}]" if local.version == 6 else local.compressed
+    print(f"http://{rendered_host}:{parsed_port}/api/vpn/health")
+except Exception:
+    sys.exit(1)
+PY
+)" || die "Validated config does not provide a safe host-local health authority."
+    [ -n "${derived_url}" ] || die "Validated config did not provide a health authority."
+    HEALTH_URL="${derived_url}"
+    ok "Host-local health authority derived from validated config"
+}
+
+health_payload_is_acceptable() {
+    local expected_commit="${1:-}"
+    python3 -c '
+import json
+import sys
+
+expected = sys.argv[1]
+try:
+    body = json.load(sys.stdin)
+    if body.get("status") != "ok":
+        raise ValueError("health status")
+    if expected and (body.get("runtime") or {}).get("git_commit") != expected:
+        raise ValueError("runtime commit")
+except Exception:
+    sys.exit(1)
+' "${expected_commit}" 2>/dev/null
 }
 
 promote_built_binary() {
@@ -889,14 +1200,13 @@ promote_built_binary() {
 }
 
 backup_current_service_unit() {
-    local stamp
     # [UPGRADE-OPTIONAL-BACKUP 2026-08-02 by Codex] A missing prior unit is a
     # valid first-install state, not a failed backup operation under `set -e`.
     [ -f "${SERVICE_FILE}" ] || return 0
 
-    stamp="$(date -u +%Y%m%d_%H%M%S)"
-    BACKUP_SERVICE_FILE="${RELEASE_DIR}/${SERVICE_NAME}.service.${stamp}"
     run mkdir -p "${RELEASE_DIR}"
+    BACKUP_SERVICE_FILE="$(allocate_backup_path "${SERVICE_NAME}.service")" \
+        || die "Could not allocate a unique systemd-unit rollback backup."
     run cp "${SERVICE_FILE}" "${BACKUP_SERVICE_FILE}"
     ok "Current systemd unit backed up to ${BACKUP_SERVICE_FILE}"
 }
@@ -949,14 +1259,13 @@ rollback_service_unit() {
 }
 
 backup_current_network_restore_unit() {
-    local stamp
     # [UPGRADE-OPTIONAL-BACKUP 2026-08-02 by Codex] Preserve success when an
     # older deployment has no network-restore unit to back up yet.
     [ -f "${NETWORK_RESTORE_FILE}" ] || return 0
 
-    stamp="$(date -u +%Y%m%d_%H%M%S)"
-    BACKUP_NETWORK_RESTORE_FILE="${RELEASE_DIR}/${NETWORK_RESTORE_SERVICE}.${stamp}"
     run mkdir -p "${RELEASE_DIR}"
+    BACKUP_NETWORK_RESTORE_FILE="$(allocate_backup_path "${NETWORK_RESTORE_SERVICE}")" \
+        || die "Could not allocate a unique network-restore rollback backup."
     run cp "${NETWORK_RESTORE_FILE}" "${BACKUP_NETWORK_RESTORE_FILE}"
     ok "Current network restore unit backed up to ${BACKUP_NETWORK_RESTORE_FILE}"
 }
@@ -1049,24 +1358,27 @@ rollback_network_restore_unit() {
 }
 
 health_endpoint_ok() {
+    local expected_commit="${1:-}"
     command -v curl >/dev/null 2>&1 || return 1
-    curl -fsS --max-time 5 http://127.0.0.1:8421/api/vpn/health 2>/dev/null \
-        | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("status") == "ok" else 1)' 2>/dev/null
+    [ -n "${HEALTH_URL}" ] || return 1
+    curl -fsS --max-time 5 "${HEALTH_URL}" 2>/dev/null \
+        | health_payload_is_acceptable "${expected_commit}"
 }
 
 wait_for_health() {
+    local expected_commit="${1:-}"
     local attempt max_wait_seconds
     max_wait_seconds=$((HEALTH_RETRIES * HEALTH_DELAY))
 
     if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] poll http://127.0.0.1:8421/api/vpn/health up to %s times (%ss)\n' \
+        printf '[DRY-RUN] poll config-derived host-local VPN health up to %s times (%ss)\n' \
             "${HEALTH_RETRIES}" "${max_wait_seconds}"
         return 0
     fi
 
     attempt=1
     while [ "${attempt}" -le "${HEALTH_RETRIES}" ]; do
-        if health_endpoint_ok; then
+        if health_endpoint_ok "${expected_commit}"; then
             ok "Post-restart VPN health endpoint is ok"
             return 0
         fi
@@ -1076,6 +1388,31 @@ wait_for_health() {
     done
 
     return 1
+}
+
+sha256_file_matches() {
+    local path="$1"
+    local expected_sha256="$2"
+    local actual_sha256
+    [ -r "${path}" ] || return 1
+    actual_sha256="$(sha256sum "${path}" 2>/dev/null | awk '{print $1}')" || return 1
+    [ "${actual_sha256}" = "${expected_sha256}" ]
+}
+
+mapped_executable_path() {
+    printf '/proc/%s/exe\n' "$1"
+}
+
+verify_promoted_runtime() {
+    local binary main_pid mapped_executable
+    [ -n "${RELEASE_MANIFEST}" ] || return 0
+    binary="${REPO_DIR}/target/release/aeronyx-server"
+    sha256_file_matches "${binary}" "${EXPECTED_BINARY_SHA256}" \
+        || return 1
+    main_pid="$(systemctl show "${SERVICE_NAME}" --property=MainPID --value 2>/dev/null || true)"
+    printf '%s' "${main_pid}" | grep -Eq '^[1-9][0-9]*$' || return 1
+    mapped_executable="$(mapped_executable_path "${main_pid}")"
+    sha256_file_matches "${mapped_executable}" "${EXPECTED_BINARY_SHA256}"
 }
 
 rollback_binary() {
@@ -1101,7 +1438,7 @@ rollback_binary() {
     run systemctl daemon-reload
     run systemctl restart "${SERVICE_NAME}"
     run systemctl is-active "${SERVICE_NAME}"
-    if ! wait_for_health; then
+    if ! wait_for_health ""; then
         warn "Rollback service started but did not become healthy within the configured window."
         return 1
     fi
@@ -1161,10 +1498,15 @@ restart_service() {
         rollback_binary
         die "Upgrade failed because service did not become active."
     fi
-    if ! wait_for_health; then
+    if ! wait_for_health "${BUILD_GIT_COMMIT}"; then
         warn "Health endpoint failed after restart; attempting rollback."
         rollback_binary
         die "Upgrade failed because post-restart health check did not pass."
+    fi
+    if ! verify_promoted_runtime; then
+        warn "Promoted runtime identity did not match the strict release manifest; attempting rollback."
+        rollback_binary
+        die "Upgrade failed because post-restart runtime identity did not match the release manifest."
     fi
 }
 
@@ -1185,6 +1527,7 @@ run_healthcheck() {
 prune_backup_pattern() {
     local pattern="$1"
     local label="$2"
+    local protected_path="${3:-}"
     local file
     local files=()
 
@@ -1197,10 +1540,13 @@ prune_backup_pattern() {
     [ -d "${RELEASE_DIR}" ] || { ok "Release backup directory absent: ${RELEASE_DIR}"; return; }
 
     while IFS= read -r file; do
+        # A just-created rollback artifact is a capability for the current
+        # upgrade. It must survive even a filesystem timestamp tie.
+        [ "${file}" = "${protected_path}" ] && continue
         files+=("${file}")
     done < <(
         find "${RELEASE_DIR}" -maxdepth 1 -type f -name "${pattern}" -printf '%T@ %p\n' 2>/dev/null \
-            | sort -rn \
+            | LC_ALL=C sort -k1,1nr -k2,2r \
             | awk -v keep="${KEEP_RELEASES}" 'NR > keep { $1=""; sub(/^ /, ""); print }'
     )
 
@@ -1217,9 +1563,13 @@ prune_backup_pattern() {
 
 prune_release_backups() {
     log "Pruning release backups; keeping latest ${KEEP_RELEASES} per backup type"
-    prune_backup_pattern "aeronyx-server.*" "binary"
-    prune_backup_pattern "${SERVICE_NAME}.service.*" "systemd unit"
-    prune_backup_pattern "${NETWORK_RESTORE_SERVICE}.*" "network restore unit"
+    # New binary backups have a dedicated namespace. Retain the numeric-only
+    # legacy pattern separately so unit backups cannot be mistaken for binary
+    # backups merely because both begin with the service name.
+    prune_backup_pattern "aeronyx-server.binary.*" "binary" "${BACKUP_BINARY}"
+    prune_backup_pattern "aeronyx-server.[0-9]*" "legacy binary" "${BACKUP_BINARY}"
+    prune_backup_pattern "${SERVICE_NAME}.service.*" "systemd unit" "${BACKUP_SERVICE_FILE}"
+    prune_backup_pattern "${NETWORK_RESTORE_SERVICE}.*" "network restore unit" "${BACKUP_NETWORK_RESTORE_FILE}"
 }
 
 main() {
@@ -1228,6 +1578,7 @@ main() {
     validate_health_polling
     validate_build_resource_options
     validate_source_commit
+    validate_release_manifest_options
     SOURCE_DIR="${REPO_DIR}"
     validate_option_combinations
     require_root
@@ -1235,6 +1586,10 @@ main() {
     set_upgrade_step "preflight" "Acquiring deployment lock and validating upgrade options."
     acquire_lock
     trap cleanup_upgrade EXIT
+    if [ -n "${RELEASE_MANIFEST}" ]; then
+        set_upgrade_step "manifest" "Verifying strict release manifest authority."
+        load_release_manifest
+    fi
     if [ "${SERVICE_UNIT_ONLY}" -eq 1 ]; then
         set_upgrade_step "service_unit" "Syncing AeroNyx systemd service unit only."
         if ! render_service_unit; then
@@ -1269,18 +1624,21 @@ main() {
     # `.git` is a directory; linked production worktrees use a pointer file.
     is_git_worktree || die "Git worktree not found: ${REPO_DIR}"
     ensure_tracked_worktree_clean
-    set_upgrade_step "build_policy" "Selecting a resource policy that protects the running node during compilation."
-    configure_build_resource_policy
-    set_upgrade_step "backup" "Backing up current release binary before upgrade."
-    backup_current_binary
     set_upgrade_step "repository" "Preparing verified AeroNyx source from Git."
     update_source
+    verify_isolated_source_manifest_tree
+    set_upgrade_step "build_policy" "Selecting a resource policy that protects the running node during compilation."
+    configure_build_resource_policy
     set_upgrade_step "toolchain" "Selecting the repository-pinned Rust toolchain and isolated target."
     configure_pinned_rust_build
     set_upgrade_step "build" "Building AeroNyx Rust release binary."
     build_release
     set_upgrade_step "validate" "Validating AeroNyx server configuration."
     validate_config
+    derive_health_authority
+    verify_manifest_candidate_binary
+    set_upgrade_step "backup" "Backing up current release binary before upgrade."
+    backup_current_binary
     if [ "${NO_RESTART}" -eq 0 ]; then
         set_upgrade_step "session_gate" "Rechecking active sessions after compilation and before deployment mutation."
         restart_session_gate_passes \
@@ -1318,4 +1676,6 @@ main() {
     write_upgrade_status "completed" "completed" "Upgrade workflow completed."
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi
