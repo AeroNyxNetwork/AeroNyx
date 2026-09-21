@@ -1132,6 +1132,20 @@ use crate::services::session::StatsSnapshot;
 use crate::services::traffic_tracker::TrafficTracker;
 use crate::voucher_verifier::VoucherVerifier;
 
+// [SERVER-DECOMPOSITION-PHASE12A 2026-09-21 by Codex] Pure persistence
+// outcomes and signed recovery-anchor validation remain independent from I/O.
+mod peer_cache_recovery;
+use peer_cache_recovery::{
+    PeerStoreCachePersistOutcome, PeerStoreCachePersistReport,
+    PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryAnchorState,
+    PeerStoreVerifiedClientDeliveryExternalWitnessDecision,
+    VERIFIED_CLIENT_DELIVERY_ANCHOR_MAX_BYTES,
+};
+#[cfg(test)]
+use peer_cache_recovery::{
+    VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT,
+    VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT,
+};
 // [SERVER-DECOMPOSITION-PHASE1 2026-09-14 by Codex] Keep the public server
 // composition stable while runtime supervision lives in a focused child module.
 mod runtime_supervision;
@@ -1409,12 +1423,6 @@ const PEER_CACHE_PERSIST_RETRY_BASE_MILLIS: u64 = 1_000;
 const PEER_CACHE_PERSIST_RETRY_MAX_MILLIS: u64 = 60_000;
 /// Previous signed aggregate delivery schema accepted during rolling upgrades.
 const VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION: u16 = 1;
-/// Signed rollback anchors are intentionally tiny aggregate-only documents.
-const VERIFIED_CLIENT_DELIVERY_ANCHOR_MAX_BYTES: usize = 4 * 1024;
-const VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT: &str =
-    "peer_store_verified_client_delivery_anchor.v1";
-const VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT: &str = "peer_store_recovery_anchor.v2";
-const VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT: &str = "peer_store_recovery_anchor.v3";
 /// Direct startup probes are bounded independently of untrusted peer count.
 const BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES: usize = 3;
 
@@ -2017,34 +2025,6 @@ struct PeerStoreCacheDocument {
     route_domain_certificates: Vec<RouteDomainAttestationCertificateV1>,
 }
 
-/// Aggregate result of one durable peer-cache write.
-///
-/// [THREE-HOP-SIGNED-RECOVERY 2026-08-02 by Codex] A named report replaces the
-/// positional tuple so adding independently signed recovery sections cannot
-/// silently swap counters at call sites.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PeerStoreCachePersistReport {
-    two_hop_events: usize,
-    two_hop_stability_ready: bool,
-    three_hop_events: usize,
-    three_hop_stability_ready: bool,
-    route_domain_certificates: usize,
-    client_deliveries: u64,
-    client_delivery_generation: u64,
-}
-
-/// Durable state reached by one peer-cache persistence attempt.
-///
-/// [PEER-CACHE-RETRY-STATE 2026-08-12 by Codex] `Deferred` is not an error: it
-/// means the generation intentionally remained pending because its configured
-/// external delivery witness was not yet protected. Callers must not log it as
-/// persisted or clear retry state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerStoreCachePersistOutcome {
-    Persisted,
-    Deferred,
-}
-
 impl PeerStoreCacheDocument {
     fn new(
         descriptor_snapshot: NodeBootstrapSnapshot,
@@ -2452,380 +2432,6 @@ impl PeerStoreCacheDocument {
             )));
         }
         Ok(bytes)
-    }
-}
-
-/// Independent signed local high-water mark for aggregate delivery evidence.
-///
-/// The anchor intentionally repeats only the cache generation, cache time,
-/// aggregate count, and latest verification time. It contains no route,
-/// endpoint, peer pair, sender, receiver, message id, payload commitment, or
-/// ciphertext. Because it is host-local, it detects single-file rollback but
-/// cannot detect a whole-host snapshot rollback that also replaces the anchor.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct PeerStoreVerifiedClientDeliveryAnchor {
-    contract_version: String,
-    cache_generation: u64,
-    cache_generated_at: u64,
-    evidence: Option<PeerStoreVerifiedClientDeliveryCacheEvidence>,
-    /// Opaque digest of signed routeability plus active quarantine state.
-    #[serde(default)]
-    route_state_digest: Option<String>,
-    /// Opaque digest of the independently signed two-hop proof section.
-    #[serde(default)]
-    two_hop_path_proof_digest: Option<String>,
-    /// Opaque digest of the independently signed three-hop proof section.
-    #[serde(default)]
-    three_hop_path_proof_digest: Option<String>,
-    signer_node_id: String,
-    signature_ed25519: String,
-}
-
-impl PeerStoreVerifiedClientDeliveryAnchor {
-    fn new(document: &PeerStoreCacheDocument, identity: &IdentityKeyPair) -> Result<Self> {
-        let mut anchor = Self {
-            contract_version: VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT.to_string(),
-            cache_generation: document.verified_client_delivery_generation,
-            cache_generated_at: document.descriptor_snapshot.generated_at,
-            evidence: document.verified_client_delivery_evidence,
-            route_state_digest: Some(
-                document
-                    .route_state_digest()
-                    .map_err(ServerError::internal)?,
-            ),
-            two_hop_path_proof_digest: Some(
-                document
-                    .two_hop_path_proof_digest()
-                    .map_err(ServerError::internal)?,
-            ),
-            three_hop_path_proof_digest: Some(
-                document
-                    .three_hop_path_proof_digest()
-                    .map_err(ServerError::internal)?,
-            ),
-            signer_node_id: hex::encode(identity.public_key_bytes()),
-            signature_ed25519: String::new(),
-        };
-        if anchor.cache_generation == 0 {
-            return Err(ServerError::internal(
-                "verified client delivery anchor generation must be positive",
-            ));
-        }
-        anchor.signature_ed25519 =
-            hex::encode(identity.sign(&anchor.signing_bytes().map_err(ServerError::internal)?));
-        Ok(anchor)
-    }
-
-    fn from_json_bytes(bytes: &[u8]) -> std::result::Result<Self, String> {
-        if bytes.len() > VERIFIED_CLIENT_DELIVERY_ANCHOR_MAX_BYTES {
-            return Err(format!(
-                "verified client delivery anchor exceeds {} bytes",
-                VERIFIED_CLIENT_DELIVERY_ANCHOR_MAX_BYTES
-            ));
-        }
-        let anchor: Self = serde_json::from_slice(bytes)
-            .map_err(|error| format!("verified client delivery anchor json: {error}"))?;
-        if !matches!(
-            anchor.contract_version.as_str(),
-            VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT
-                | VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT
-                | VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
-        ) {
-            return Err("verified client delivery anchor contract unsupported".to_string());
-        }
-        if anchor.cache_generation == 0 {
-            return Err("verified client delivery anchor generation invalid".to_string());
-        }
-        if matches!(
-            anchor.contract_version.as_str(),
-            VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT
-                | VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
-        ) {
-            for digest in [
-                anchor.two_hop_path_proof_digest.as_deref(),
-                anchor.three_hop_path_proof_digest.as_deref(),
-            ] {
-                let digest =
-                    digest.ok_or_else(|| "recovery anchor proof digest missing".to_string())?;
-                let mut decoded = [0u8; 32];
-                hex::decode_to_slice(digest, &mut decoded)
-                    .map_err(|_| "recovery anchor proof digest encoding invalid".to_string())?;
-            }
-        }
-        match anchor.contract_version.as_str() {
-            VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT => {
-                if anchor.route_state_digest.is_some()
-                    || anchor.two_hop_path_proof_digest.is_some()
-                    || anchor.three_hop_path_proof_digest.is_some()
-                {
-                    return Err("legacy recovery anchor contains unsupported digest".to_string());
-                }
-            }
-            VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT => {
-                if anchor.route_state_digest.is_some() {
-                    return Err("v2 recovery anchor contains route-state digest".to_string());
-                }
-            }
-            VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT => {
-                let digest = anchor
-                    .route_state_digest
-                    .as_deref()
-                    .ok_or_else(|| "recovery anchor route-state digest missing".to_string())?;
-                let mut decoded = [0u8; 32];
-                hex::decode_to_slice(digest, &mut decoded).map_err(|_| {
-                    "recovery anchor route-state digest encoding invalid".to_string()
-                })?;
-            }
-            _ => unreachable!("anchor contract checked above"),
-        }
-        Ok(anchor)
-    }
-
-    fn signing_bytes(&self) -> std::result::Result<Vec<u8>, String> {
-        match self.contract_version.as_str() {
-            VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT => bincode::serialize(&(
-                "aeronyx-peer-cache-verified-client-delivery-anchor-v1",
-                self.contract_version.as_str(),
-                self.cache_generation,
-                self.cache_generated_at,
-                self.evidence,
-            )),
-            VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT => bincode::serialize(&(
-                "aeronyx-peer-cache-recovery-anchor-v2",
-                self.contract_version.as_str(),
-                self.cache_generation,
-                self.cache_generated_at,
-                self.evidence,
-                self.two_hop_path_proof_digest.as_deref(),
-                self.three_hop_path_proof_digest.as_deref(),
-            )),
-            VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT => bincode::serialize(&(
-                "aeronyx-peer-cache-recovery-anchor-v3",
-                self.contract_version.as_str(),
-                self.cache_generation,
-                self.cache_generated_at,
-                self.evidence,
-                self.route_state_digest.as_deref(),
-                self.two_hop_path_proof_digest.as_deref(),
-                self.three_hop_path_proof_digest.as_deref(),
-            )),
-            _ => return Err("recovery anchor contract unsupported".to_string()),
-        }
-        .map_err(|error| format!("verified client delivery anchor signing bytes: {error}"))
-    }
-
-    fn verify(&self, identity: &IdentityKeyPair) -> std::result::Result<(), String> {
-        let expected_signer = hex::encode(identity.public_key_bytes());
-        if self.signer_node_id != expected_signer {
-            return Err("verified client delivery anchor signer mismatch".to_string());
-        }
-        let mut signature = [0u8; 64];
-        hex::decode_to_slice(&self.signature_ed25519, &mut signature).map_err(|_| {
-            "verified client delivery anchor signature encoding invalid".to_string()
-        })?;
-        let public_key = IdentityPublicKey::from_bytes(&identity.public_key_bytes())
-            .map_err(|_| "verified client delivery anchor signer key invalid".to_string())?;
-        public_key
-            .verify(&self.signing_bytes()?, &signature)
-            .map_err(|_| "verified client delivery anchor signature invalid".to_string())
-    }
-
-    fn matches_document(&self, document: &PeerStoreCacheDocument) -> bool {
-        self.cache_generation == document.verified_client_delivery_generation
-            && self.cache_generated_at == document.descriptor_snapshot.generated_at
-            && self.evidence == document.verified_client_delivery_evidence
-    }
-
-    fn matches_two_hop_path_proof_section(&self, document: &PeerStoreCacheDocument) -> bool {
-        matches!(
-            self.contract_version.as_str(),
-            VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT
-                | VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
-        ) && self.cache_generation == document.verified_client_delivery_generation
-            && self.cache_generated_at == document.descriptor_snapshot.generated_at
-            && document.two_hop_path_proof_digest().is_ok_and(|digest| {
-                self.two_hop_path_proof_digest.as_deref() == Some(digest.as_str())
-            })
-    }
-
-    fn matches_three_hop_path_proof_section(&self, document: &PeerStoreCacheDocument) -> bool {
-        matches!(
-            self.contract_version.as_str(),
-            VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT
-                | VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
-        ) && self.cache_generation == document.verified_client_delivery_generation
-            && self.cache_generated_at == document.descriptor_snapshot.generated_at
-            && document.three_hop_path_proof_digest().is_ok_and(|digest| {
-                self.three_hop_path_proof_digest.as_deref() == Some(digest.as_str())
-            })
-    }
-
-    fn matches_route_state_section(&self, document: &PeerStoreCacheDocument) -> bool {
-        self.contract_version == VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
-            && self.cache_generation == document.verified_client_delivery_generation
-            && self.cache_generated_at == document.descriptor_snapshot.generated_at
-            && document
-                .route_state_digest()
-                .is_ok_and(|digest| self.route_state_digest.as_deref() == Some(digest.as_str()))
-    }
-
-    /// Returns a domain-separated opaque digest of the exact signed anchor.
-    ///
-    /// External witnesses receive this digest, never the embedded aggregate
-    /// delivery count or verification time. Binding the signer and signature
-    /// prevents two differently signed anchor documents from sharing witness
-    /// state even if their canonical fields were otherwise equal.
-    fn witness_digest(&self) -> std::result::Result<[u8; 32], String> {
-        let mut signer = [0u8; 32];
-        hex::decode_to_slice(&self.signer_node_id, &mut signer)
-            .map_err(|_| "verified client delivery anchor signer encoding invalid".to_string())?;
-        let mut signature = [0u8; 64];
-        hex::decode_to_slice(&self.signature_ed25519, &mut signature).map_err(|_| {
-            "verified client delivery anchor signature encoding invalid".to_string()
-        })?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"AeroNyx-VerifiedDeliveryAnchorWitnessDigest-v1");
-        hasher.update(self.signing_bytes()?);
-        hasher.update(signer);
-        hasher.update(signature);
-        Ok(hasher.finalize().into())
-    }
-
-    fn to_json_pretty(&self) -> Result<Vec<u8>> {
-        let bytes = serde_json::to_vec_pretty(self).map_err(|error| {
-            ServerError::internal(format!("verified client delivery anchor json: {error}"))
-        })?;
-        if bytes.len() > VERIFIED_CLIENT_DELIVERY_ANCHOR_MAX_BYTES {
-            return Err(ServerError::internal(format!(
-                "verified client delivery anchor exceeds {} bytes",
-                VERIFIED_CLIENT_DELIVERY_ANCHOR_MAX_BYTES
-            )));
-        }
-        Ok(bytes)
-    }
-}
-
-#[derive(Debug, Clone)]
-enum PeerStoreVerifiedClientDeliveryAnchorState {
-    /// Compatibility path for direct parser callers and non-cache sources.
-    NotChecked,
-    Missing,
-    Invalid,
-    Verified(PeerStoreVerifiedClientDeliveryAnchor),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerStoreVerifiedClientDeliveryExternalWitnessDecision {
-    /// No external witness policy is configured; local anchor behavior remains unchanged.
-    Disabled,
-    /// No local anchor exists yet. Only a genuinely fresh cache may bootstrap.
-    Missing,
-    /// The exact local anchor reached the configured accepted-response threshold.
-    Protected,
-    /// The local anchor was unavailable, adverse, or below threshold.
-    Unprotected(&'static str),
-}
-
-impl PeerStoreVerifiedClientDeliveryAnchorState {
-    fn protection_for(&self, document: &PeerStoreCacheDocument) -> &'static str {
-        if document.verified_client_delivery_schema_version
-            == VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION
-        {
-            return match self {
-                Self::NotChecked | Self::Missing => "legacy_unanchored",
-                Self::Invalid => "anchor_invalid",
-                Self::Verified(_) => "rollback_detected",
-            };
-        }
-        if document.verified_client_delivery_schema_version == 0 {
-            return "not_checked";
-        }
-        match self {
-            Self::NotChecked => "not_checked",
-            Self::Missing => "anchor_missing",
-            Self::Invalid => "anchor_invalid",
-            Self::Verified(anchor) => {
-                if document.verified_client_delivery_generation < anchor.cache_generation {
-                    "rollback_detected"
-                } else if document.verified_client_delivery_generation > anchor.cache_generation {
-                    "cache_ahead"
-                } else if anchor.matches_document(document) {
-                    "anchored"
-                } else {
-                    "anchor_conflict"
-                }
-            }
-        }
-    }
-
-    fn two_hop_path_proof_protection_for(&self, document: &PeerStoreCacheDocument) -> &'static str {
-        self.path_proof_protection_for(document, |anchor, document| {
-            anchor.matches_two_hop_path_proof_section(document)
-        })
-    }
-
-    fn three_hop_path_proof_protection_for(
-        &self,
-        document: &PeerStoreCacheDocument,
-    ) -> &'static str {
-        self.path_proof_protection_for(document, |anchor, document| {
-            anchor.matches_three_hop_path_proof_section(document)
-        })
-    }
-
-    /// Evaluates the signed routeability/quarantine snapshot against the
-    /// monotonic local generation without exposing its digest.
-    fn route_state_protection_for(&self, document: &PeerStoreCacheDocument) -> &'static str {
-        match self {
-            Self::NotChecked => "not_checked",
-            Self::Missing => "anchor_missing",
-            Self::Invalid => "anchor_invalid",
-            Self::Verified(anchor) => {
-                if document.verified_client_delivery_generation < anchor.cache_generation {
-                    "rollback_detected"
-                } else if document.verified_client_delivery_generation > anchor.cache_generation {
-                    "cache_ahead"
-                } else if anchor.contract_version != VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT {
-                    "legacy_unanchored"
-                } else if anchor.matches_route_state_section(document) {
-                    "anchored"
-                } else {
-                    "anchor_conflict"
-                }
-            }
-        }
-    }
-
-    /// Evaluates rollback protection independently from aggregate delivery
-    /// evidence so one proof-anchor mismatch cannot discard the other proof
-    /// section or valid descriptors.
-    fn path_proof_protection_for(
-        &self,
-        document: &PeerStoreCacheDocument,
-        matches_section: impl FnOnce(
-            &PeerStoreVerifiedClientDeliveryAnchor,
-            &PeerStoreCacheDocument,
-        ) -> bool,
-    ) -> &'static str {
-        match self {
-            Self::NotChecked => "not_checked",
-            Self::Missing => "anchor_missing",
-            Self::Invalid => "anchor_invalid",
-            Self::Verified(anchor) => {
-                if document.verified_client_delivery_generation < anchor.cache_generation {
-                    "rollback_detected"
-                } else if document.verified_client_delivery_generation > anchor.cache_generation {
-                    "cache_ahead"
-                } else if anchor.contract_version == VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT
-                {
-                    "legacy_unanchored"
-                } else if matches_section(anchor, document) {
-                    "anchored"
-                } else {
-                    "anchor_conflict"
-                }
-            }
-        }
     }
 }
 
@@ -25236,6 +24842,61 @@ mod tests {
         );
         assert_eq!(peer_store.status(now + 1).runtime.last_gossip_at, Some(now));
         mock_peer.abort();
+    }
+
+    #[test]
+    fn peer_cache_recovery_anchor_golden_bytes_remain_stable() {
+        // [SERVER-DECOMPOSITION-PHASE12A 2026-09-21 by Codex] Freeze the exact
+        // legacy/current signing transcripts and pretty-JSON projection across
+        // the pure-domain extraction.
+        let template = PeerStoreVerifiedClientDeliveryAnchor {
+            contract_version: VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT.to_string(),
+            cache_generation: 7,
+            cache_generated_at: 9,
+            evidence: None,
+            route_state_digest: None,
+            two_hop_path_proof_digest: None,
+            three_hop_path_proof_digest: None,
+            signer_node_id: "22".repeat(32),
+            signature_ed25519: "33".repeat(64),
+        };
+        let v1 = template.clone();
+        let mut v2 = template.clone();
+        v2.contract_version = VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT.to_string();
+        v2.two_hop_path_proof_digest = Some("44".repeat(32));
+        v2.three_hop_path_proof_digest = Some("55".repeat(32));
+        let mut v3 = v2.clone();
+        v3.contract_version = "peer_store_recovery_anchor.v3".to_string();
+        v3.route_state_digest = Some("66".repeat(32));
+
+        assert_eq!(
+            hex::encode(v1.signing_bytes().unwrap()),
+            "35000000000000006165726f6e79782d706565722d63616368652d76657269666965642d636c69656e742d64656c69766572792d616e63686f722d76312d00000000000000706565725f73746f72655f76657269666965645f636c69656e745f64656c69766572795f616e63686f722e76310700000000000000090000000000000000"
+        );
+        assert_eq!(
+            hex::encode(v2.signing_bytes().unwrap()),
+            "25000000000000006165726f6e79782d706565722d63616368652d7265636f766572792d616e63686f722d76321d00000000000000706565725f73746f72655f7265636f766572795f616e63686f722e763207000000000000000900000000000000000140000000000000003434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343401400000000000000035353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535"
+        );
+        assert_eq!(
+            hex::encode(v3.signing_bytes().unwrap()),
+            "25000000000000006165726f6e79782d706565722d63616368652d7265636f766572792d616e63686f722d76331d00000000000000706565725f73746f72655f7265636f766572795f616e63686f722e76330700000000000000090000000000000000014000000000000000363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636360140000000000000003434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343434343401400000000000000035353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535353535"
+        );
+        assert_eq!(
+            String::from_utf8(v3.to_json_pretty().unwrap()).unwrap(),
+            concat!(
+                "{\n",
+                "  \"contract_version\": \"peer_store_recovery_anchor.v3\",\n",
+                "  \"cache_generation\": 7,\n",
+                "  \"cache_generated_at\": 9,\n",
+                "  \"evidence\": null,\n",
+                "  \"route_state_digest\": \"6666666666666666666666666666666666666666666666666666666666666666\",\n",
+                "  \"two_hop_path_proof_digest\": \"4444444444444444444444444444444444444444444444444444444444444444\",\n",
+                "  \"three_hop_path_proof_digest\": \"5555555555555555555555555555555555555555555555555555555555555555\",\n",
+                "  \"signer_node_id\": \"2222222222222222222222222222222222222222222222222222222222222222\",\n",
+                "  \"signature_ed25519\": \"33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333\"\n",
+                "}"
+            )
+        );
     }
 
     #[tokio::test]
