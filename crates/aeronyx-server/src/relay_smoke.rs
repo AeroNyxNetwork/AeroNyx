@@ -44,9 +44,14 @@
 //! - [RELAY-SMOKE-HEALTH-AUTHORITY 2026-09-01 by Codex] The health surface is
 //!   pinned to the configured API authority, matching loopback family, and exact
 //!   `/api/vpn/health` path before any smoke traffic is created.
+//! - [V2-RELAY-SMOKE-EXACT-HANDSHAKE 2026-09-21 by Codex] V2 uses the bound
+//!   transcript and directional keys; version dispatch is closed and V1 remains.
 //!
-//! Last Modified: v1.4.0-HealthAuthority - Pins readiness evidence to the
-//! configured host-local API authority instead of trusting any loopback URL.
+//! Last Modified: v1.5.0-ExactV2Handshake - Uses real V2 transcript verification
+//! and directional transport keys without a legacy fallback.
+//!
+//! Previous: v1.4.0-HealthAuthority - Pins readiness evidence to the configured
+//! host-local API authority instead of trusting any loopback URL.
 //!
 //! Previous: v1.3.0-RequestBoundTerminalProof - Requires the encrypted
 //! verified-submit response and exact terminal receipt before aggregate health
@@ -56,7 +61,7 @@
 //! address for portable host-local UDP handshake behavior.
 // ============================================
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -68,8 +73,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout_at, Instant as TokioInstant};
+use zeroize::Zeroize;
 
-use aeronyx_core::crypto::handshake::{create_client_hello, verify_server_hello};
+use aeronyx_core::crypto::handshake::{
+    create_client_hello, create_client_hello_v2, derive_client_session_keys_v2,
+    verify_server_hello, verify_server_hello_v2,
+};
 use aeronyx_core::crypto::kdf::derive_session_key;
 use aeronyx_core::crypto::transport::{decrypt_packet, encrypt_packet};
 use aeronyx_core::crypto::{E2eSession, EphemeralKeyPair, IdentityKeyPair, SessionKey};
@@ -84,7 +93,7 @@ use aeronyx_core::protocol::memchain::{
 use aeronyx_core::protocol::{
     decode_memchain, encode_memchain, ChatContentType, ChatEnvelope, DataPacket, MemChainMessage,
     CURRENT_PROTOCOL_VERSION, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL_V2, DOMAIN_SESSION_CLOSE_V1,
-    MEMCHAIN_MAGIC, PROTOCOL_VERSION_V1,
+    MEMCHAIN_MAGIC, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2,
 };
 
 const MIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -750,7 +759,8 @@ struct RelaySmokeClient {
     socket: UdpSocket,
     identity: IdentityKeyPair,
     session_id: [u8; 16],
-    session_key: SessionKey,
+    tx_key: SessionKey,
+    rx_key: SessionKey,
     virtual_ip: [u8; 4],
     protocol_version: u8,
     next_tx_counter: u64,
@@ -765,6 +775,22 @@ impl RelaySmokeClient {
         protocol_version: u8,
         deadline: TokioInstant,
     ) -> Result<Self> {
+        // [V2-RELAY-SMOKE-EXACT-HANDSHAKE 2026-09-21 by Codex] Never infer a
+        // legacy transcript from an unknown version and never advertise v2
+        // while signing the v1 transcript. The extension is exactly empty for
+        // this host-local operator client and is therefore still committed by
+        // the v2 signature and key transcript.
+        let ephemeral = EphemeralKeyPair::generate();
+        let hello = match protocol_version {
+            PROTOCOL_VERSION_V1 => {
+                create_client_hello(&identity, ephemeral.public_key_bytes(), PROTOCOL_VERSION_V1)
+            }
+            PROTOCOL_VERSION_V2 => {
+                create_client_hello_v2(&identity, ephemeral.public_key_bytes(), &[])
+            }
+            _ => anyhow::bail!("unsupported smoke protocol version"),
+        };
+
         // [RELAY-SMOKE-LOOPBACK-SOURCE 2026-08-25 by Codex] Validation makes
         // the smoke path host-local. Bind the same address family explicitly;
         // wildcard UDP sources can fail loopback route selection on macOS.
@@ -780,8 +806,6 @@ impl RelaySmokeClient {
             .await
             .map_err(|_| anyhow::anyhow!("failed to connect smoke UDP socket"))?;
 
-        let ephemeral = EphemeralKeyPair::generate();
-        let hello = create_client_hello(&identity, ephemeral.public_key_bytes(), protocol_version);
         let hello_bytes = encode_client_hello(&hello);
         let sent = timeout_at(deadline, socket.send(&hello_bytes))
             .await
@@ -805,22 +829,43 @@ impl RelaySmokeClient {
             server_hello.version == protocol_version,
             "ServerHello protocol version mismatch"
         );
-        verify_server_hello(&server_hello, &identity.public_key_bytes())
-            .context("ServerHello signature verification failed")?;
+        match protocol_version {
+            PROTOCOL_VERSION_V1 => {
+                verify_server_hello(&server_hello, &identity.public_key_bytes())
+                    .context("ServerHello signature verification failed")?;
+            }
+            PROTOCOL_VERSION_V2 => {
+                verify_server_hello_v2(&server_hello, &hello, Some(expected_server_key))
+                    .context("ServerHello signature verification failed")?;
+            }
+            _ => unreachable!("protocol version was closed before socket creation"),
+        }
 
-        let shared_secret = ephemeral.exchange(&server_hello.server_ephemeral_key);
-        let session_key = derive_session_key(
-            &shared_secret,
-            &identity.public_key_bytes(),
-            &server_hello.server_public_key,
-        )
-        .context("session key derivation failed")?;
+        let mut shared_secret = ephemeral.exchange(&server_hello.server_ephemeral_key);
+        let derived: Result<(SessionKey, SessionKey)> = match protocol_version {
+            PROTOCOL_VERSION_V1 => derive_session_key(
+                &shared_secret,
+                &identity.public_key_bytes(),
+                &server_hello.server_public_key,
+            )
+            .map(|key| (key.clone(), key))
+            .context("session key derivation failed"),
+            PROTOCOL_VERSION_V2 => {
+                derive_client_session_keys_v2(&shared_secret, &hello, &[], &server_hello)
+                    .map(|keys| (keys.c2s, keys.s2c))
+                    .context("session key derivation failed")
+            }
+            _ => unreachable!("protocol version was closed before socket creation"),
+        };
+        shared_secret.zeroize();
+        let (tx_key, rx_key) = derived?;
 
         Ok(Self {
             socket,
             identity,
             session_id: server_hello.session_id,
-            session_key,
+            tx_key,
+            rx_key,
             virtual_ip: server_hello.assigned_ip,
             protocol_version,
             next_tx_counter: 0,
@@ -834,7 +879,7 @@ impl RelaySmokeClient {
             .next_tx_counter
             .checked_add(1)
             .context("client transport counter exhausted")?;
-        let encrypted = encrypt_packet(&self.session_key, counter, &self.session_id, plaintext)
+        let encrypted = encrypt_packet(&self.tx_key, counter, &self.session_id, plaintext)
             .context("client transport encryption failed")?;
         let packet = DataPacket::new(self.session_id, counter, encrypted);
         let bytes = encode_data_packet(&packet);
@@ -894,7 +939,7 @@ impl RelaySmokeClient {
                 continue;
             }
             let plaintext = decrypt_packet(
-                &self.session_key,
+                &self.rx_key,
                 packet.counter,
                 &self.session_id,
                 &packet.encrypted_payload,
@@ -940,7 +985,7 @@ impl RelaySmokeClient {
                 continue;
             }
             let plaintext = decrypt_packet(
-                &self.session_key,
+                &self.rx_key,
                 packet.counter,
                 &self.session_id,
                 &packet.encrypted_payload,
@@ -1577,6 +1622,7 @@ pub async fn load_expected_server_public_key(path: &Path) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
@@ -1589,7 +1635,10 @@ mod tests {
     use aeronyx_server::handlers::packet::DecryptedPayload;
     use aeronyx_server::handlers::PacketHandler;
     use aeronyx_server::services::traffic_tracker::TrafficTracker;
-    use aeronyx_server::services::{NodePolicyRuntime, RoutingService, SessionManager};
+    use aeronyx_server::services::{
+        DenyList, HandshakeService, IpPoolService, NodePolicyRuntime, RoutingService,
+        SessionManager,
+    };
 
     fn canonical_v1_keepalive_request(
         source: [u8; 4],
@@ -2384,36 +2433,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_handshake_pins_server_and_derives_same_session_key() {
+    async fn current_v2_smoke_uses_real_handshake_and_directional_packet_path() {
+        // [V2-RELAY-SMOKE-EXACT-HANDSHAKE 2026-09-21 by Codex] Unlike the
+        // former self-consistent v1 fixture carrying a version-2 byte, this
+        // joins the production version dispatcher, session admission, and
+        // packet handler in both directions.
         let server_socket = UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("bind server socket");
         let server_addr = server_socket.local_addr().expect("server address");
         let server_identity = IdentityKeyPair::generate();
         let expected_server_key = server_identity.public_key_bytes();
+        let ip_pool = Arc::new(
+            IpPoolService::new(
+                Ipv4Addr::new(100, 64, 0, 0),
+                24,
+                Ipv4Addr::new(100, 64, 0, 1),
+            )
+            .expect("IP pool"),
+        );
+        let sessions = Arc::new(SessionManager::new(4, Duration::from_secs(60)));
+        let routing = Arc::new(RoutingService::new());
+        let handshake = HandshakeService::new(
+            server_identity,
+            Arc::clone(&ip_pool),
+            Arc::clone(&sessions),
+            Arc::clone(&routing),
+            Arc::new(DenyList::new()),
+            Arc::new(NodePolicyRuntime::default()),
+        );
+        let handler = PacketHandler::new(
+            Arc::clone(&sessions),
+            routing,
+            Arc::new(TrafficTracker::new()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(NodePolicyRuntime::default()),
+        );
         let server_task = tokio::spawn(async move {
-            let mut buffer = [0u8; 256];
+            let mut buffer = vec![0u8; 65_535];
             let (received, peer) = server_socket
                 .recv_from(&mut buffer)
                 .await
                 .expect("receive ClientHello");
             let hello = decode_client_hello(&buffer[..received]).expect("decode ClientHello");
-            let crypto = DefaultHandshakeCrypto::new(server_identity);
-            crypto
-                .verify_client_hello(&hello)
-                .expect("verify ClientHello");
-            let (response, session_key) = crypto
-                .process_handshake(&hello, [100, 64, 0, 2], [0x41; 16])
-                .expect("process handshake");
-            let bytes = aeronyx_core::protocol::codec::encode_server_hello(&response);
+            assert_eq!(hello.version, PROTOCOL_VERSION_V2);
+            let result = handshake
+                .process(&hello, &[], peer)
+                .expect("production v2 handshake");
+            assert_eq!(result.session.protocol_version, PROTOCOL_VERSION_V2);
+            let bytes = aeronyx_core::protocol::codec::encode_server_hello(&result.response);
             server_socket
                 .send_to(&bytes, peer)
                 .await
                 .expect("send ServerHello");
-            session_key
+
+            let (received, source) = server_socket
+                .recv_from(&mut buffer)
+                .await
+                .expect("receive client control ping");
+            let (session, payload) = handler
+                .handle_udp_packet(&buffer[..received], source)
+                .expect("production handler decrypts c2s");
+            assert!(matches!(
+                payload,
+                DecryptedPayload::ControlPing { id: [0x12, 0x34] }
+            ));
+            let pong = handler
+                .seal_control(&session, &[0x00, 0x02, 0x12, 0x34])
+                .expect("seal s2c pong");
+            server_socket
+                .send_to(&pong, session.endpoint())
+                .await
+                .expect("send s2c pong");
+            session
         });
 
-        let client = RelaySmokeClient::connect(
+        let mut client = RelaySmokeClient::connect(
             server_addr,
             &expected_server_key,
             IdentityKeyPair::generate(),
@@ -2422,10 +2517,38 @@ mod tests {
         )
         .await
         .expect("connect smoke client");
-        let server_session_key = server_task.await.expect("join server task");
+        client
+            .send_plaintext(
+                &[0x00, 0x01, 0x12, 0x34],
+                TokioInstant::now() + Duration::from_secs(2),
+            )
+            .await
+            .expect("send c2s control ping");
+        let mut packet_bytes = [0u8; 256];
+        let received = timeout_at(
+            TokioInstant::now() + Duration::from_secs(2),
+            client.socket.recv(&mut packet_bytes),
+        )
+        .await
+        .expect("s2c pong timeout")
+        .expect("receive s2c pong");
+        let packet = decode_data_packet(&packet_bytes[..received]).expect("decode s2c packet");
+        let plaintext = decrypt_packet(
+            &client.rx_key,
+            packet.counter,
+            &packet.session_id,
+            &packet.encrypted_payload,
+        )
+        .expect("client decrypts s2c");
+        assert_eq!(plaintext, [0x00, 0x02, 0x12, 0x34]);
 
-        assert_eq!(client.session_key.as_bytes(), server_session_key.as_bytes());
-        assert_eq!(client.session_id, [0x41; 16]);
+        let server_session = server_task.await.expect("join server task");
+        assert_eq!(client.session_id, *server_session.id.as_bytes());
+        assert_eq!(client.tx_key.as_bytes(), server_session.rx_key.as_bytes());
+        assert_eq!(
+            client.rx_key.as_bytes(),
+            server_session.session_key.as_bytes()
+        );
     }
 
     #[tokio::test]

@@ -29,6 +29,8 @@
 //   - [V2-HANDSHAKE-LOG-PRIVACY 2026-09-20 by Codex] V2 diagnostics expose
 //     only fixed outcome classes and aggregate counters, never client/socket,
 //     key, signature, session, or virtual-address metadata.
+//   - [V2-HANDSHAKE-CLOSED-VERSION-ADMISSION 2026-09-21 by Codex] Reject
+//     unknown protocol versions before policy, cryptography, or resource state.
 //
 // Main Logical Flow:
 //   0. Check deny list → if denied, return WalletDenied immediately
@@ -61,6 +63,7 @@
 //   v1.2.0-Admission - Made dynamic policy admission atomic across handshakes
 //   v1.3.0-AuthenticatedAdmission - Unified V1/V2 gates and post-auth eviction
 //   v1.3.1-V2LogPrivacy - Redacted V2 handshake correlation metadata
+//   v1.3.2-ClosedVersionAdmission - Fail closed on every non-V1/V2 hello
 // ============================================
 
 use std::net::SocketAddr;
@@ -71,7 +74,10 @@ use tracing::{debug, info, warn};
 
 use aeronyx_core::crypto::handshake::{DefaultHandshakeCrypto, HandshakeCrypto};
 use aeronyx_core::crypto::IdentityKeyPair;
-use aeronyx_core::protocol::{ClientHello, ServerHello};
+use aeronyx_core::error::CoreError;
+use aeronyx_core::protocol::{
+    ClientHello, ServerHello, CURRENT_PROTOCOL_VERSION, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2,
+};
 
 use crate::error::{Result, ServerError};
 use crate::services::deny_list::DenyList;
@@ -163,8 +169,23 @@ impl HandshakeService {
         extension: &[u8],
         client_addr: SocketAddr,
     ) -> Result<HandshakeResult> {
+        // [V2-HANDSHAKE-CLOSED-VERSION-ADMISSION 2026-09-21 by Codex]
+        // Version dispatch is a closed set. In particular, a future or
+        // malformed version must never inherit the legacy symmetric-key path.
+        // Keep this before policy, signature work, and every durable/resource
+        // mutation so unsupported input has no admission side effect.
+        match client_hello.version {
+            PROTOCOL_VERSION_V1 | PROTOCOL_VERSION_V2 => {}
+            got => {
+                return Err(CoreError::UnsupportedVersion {
+                    got,
+                    expected: CURRENT_PROTOCOL_VERSION,
+                }
+                .into());
+            }
+        }
         self.validate_candidate(client_hello)?;
-        if client_hello.version == aeronyx_core::protocol::PROTOCOL_VERSION_V2 {
+        if client_hello.version == PROTOCOL_VERSION_V2 {
             return self.process_v2(client_hello, extension, client_addr);
         }
         debug!("Processing handshake");
@@ -844,6 +865,44 @@ mod tests {
                 hex::encode(forged.signature),
             ],
         );
+    }
+
+    #[test]
+    fn unsupported_signed_versions_fail_before_every_admission_mutation() {
+        // [V2-HANDSHAKE-CLOSED-VERSION-ADMISSION 2026-09-21 by Codex]
+        // A valid signature over an unknown version used to fall through to
+        // v1. Exercise values on both sides of the frozen {1,2} set and prove
+        // the rejection neither reserves an IP nor creates a session/route.
+        for version in [0, 3, u8::MAX] {
+            let (ip_pool, sessions, routing, deny_list) = create_test_services();
+            let service = HandshakeService::new(
+                IdentityKeyPair::generate(),
+                Arc::clone(&ip_pool),
+                Arc::clone(&sessions),
+                Arc::clone(&routing),
+                deny_list,
+                Arc::new(NodePolicyRuntime::default()),
+            );
+            let identity = IdentityKeyPair::generate();
+            let hello = create_client_hello(
+                &identity,
+                EphemeralKeyPair::generate().public_key_bytes(),
+                version,
+            );
+            let client_addr: SocketAddr = "192.0.2.99:40999".parse().unwrap();
+
+            let result = service.process(&hello, &[], client_addr);
+            assert!(matches!(
+                result,
+                Err(ServerError::Core(CoreError::UnsupportedVersion {
+                    got,
+                    expected: CURRENT_PROTOCOL_VERSION,
+                })) if got == version
+            ));
+            assert_eq!(ip_pool.allocated_count(), 0);
+            assert_eq!(sessions.count(), 0);
+            assert_eq!(routing.count(), 0);
+        }
     }
 
     #[test]
