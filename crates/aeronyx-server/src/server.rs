@@ -1132,6 +1132,10 @@ use crate::services::session::StatsSnapshot;
 use crate::services::traffic_tracker::TrafficTracker;
 use crate::voucher_verifier::VoucherVerifier;
 
+// [PEER-CACHE-BACKUP-DURABILITY 2026-09-21 by Codex] Keep the bounded backup
+// rotation and primary publication in one blocking filesystem transaction.
+mod peer_cache_backup_io;
+use peer_cache_backup_io::publish_peer_cache_snapshot;
 // [SERVER-DECOMPOSITION-PHASE12A 2026-09-21 by Codex] Pure persistence
 // outcomes and signed recovery-anchor validation remain independent from I/O.
 mod peer_cache_recovery;
@@ -13485,12 +13489,6 @@ impl Server {
         now: u64,
     ) -> Result<PeerStoreCachePersistReport> {
         let path = PathBuf::from(path);
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-        }
-
         let descriptor_snapshot = peer_store.export_peer_cache_snapshot(now);
         let routeability_evidence = peer_store.export_routeability_cache_evidence(now);
         let route_quarantine_evidence = peer_store.export_route_quarantine_cache_evidence(now);
@@ -13533,27 +13531,14 @@ impl Server {
         let client_delivery_anchor =
             PeerStoreVerifiedClientDeliveryAnchor::new(&document, identity)?;
         let bytes = document.to_json_pretty()?;
-        let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
-        let backup_path = Self::peer_cache_backup_path(path.to_string_lossy().as_ref());
-
-        let mut tmp_file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .await?;
-        tmp_file.write_all(&bytes).await?;
-        tmp_file.flush().await?;
-        tmp_file.sync_all().await?;
-        drop(tmp_file);
-
-        if tokio::fs::metadata(&path).await.is_ok() {
-            if tokio::fs::copy(&path, &backup_path).await.is_ok() {
-                let _ = Self::sync_file_for_durability(&backup_path).await;
-            }
-        }
-        tokio::fs::rename(&tmp_path, &path).await?;
-        Self::sync_parent_dir_for_durability(&path).await?;
+        // [PEER-CACHE-BACKUP-DURABILITY 2026-09-21 by Codex] A single
+        // spawn_blocking transaction now syncs the new temp, preserves the
+        // pinned old primary as an atomically replaced durable backup, and
+        // only then publishes the new primary. Any typed failure prevents the
+        // dependent recovery anchor from advancing.
+        publish_peer_cache_snapshot(path.clone(), bytes)
+            .await
+            .map_err(|error| ServerError::internal(error.to_string()))?;
         Self::write_peer_cache_client_delivery_anchor(
             path.to_string_lossy().as_ref(),
             &client_delivery_anchor,
@@ -13623,12 +13608,6 @@ impl Server {
         drop(tmp_file);
         tokio::fs::rename(&tmp_path, &anchor_path).await?;
         Self::sync_parent_dir_for_durability(&anchor_path).await
-    }
-
-    async fn sync_file_for_durability(path: &PathBuf) -> Result<()> {
-        let file = tokio::fs::OpenOptions::new().read(true).open(path).await?;
-        file.sync_all().await?;
-        Ok(())
     }
 
     async fn sync_parent_dir_for_durability(path: &PathBuf) -> Result<()> {
@@ -26837,19 +26816,34 @@ mod tests {
         Server::save_peer_store_cache_snapshot(&server.identity, &original_store, &path_str, now)
             .await
             .unwrap();
-        tokio::fs::copy(&path, &backup_path).await.unwrap();
+        let first_generation = tokio::fs::read(&path).await.unwrap();
+        // [PEER-CACHE-BACKUP-DURABILITY 2026-09-21 by Codex] Exercise the
+        // production rotation rather than manufacturing a backup in the test.
+        // The second publish must preserve the first complete signed primary.
+        Server::save_peer_store_cache_snapshot(
+            &server.identity,
+            &original_store,
+            &path_str,
+            now + 1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read(&backup_path).await.unwrap(),
+            first_generation
+        );
         tokio::fs::write(&path, b"{not-json").await.unwrap();
 
         let restored_store = PeerStore::new();
         server
-            .load_peer_cache(&restored_store, &path_str, now + 1)
+            .load_peer_cache(&restored_store, &path_str, now + 2)
             .await;
 
         assert!(restored_store
-            .get_valid(&signed.node_id(), now + 1)
+            .get_valid(&signed.node_id(), now + 2)
             .is_some());
 
-        let status = restored_store.status(now + 1);
+        let status = restored_store.status(now + 2);
         assert_eq!(status.snapshot.valid_peers, 1);
         assert_eq!(
             status.bootstrap.last_source_kind.as_deref(),
@@ -26857,7 +26851,10 @@ mod tests {
         );
         assert_eq!(
             status.bootstrap.last_source_status.as_deref(),
-            Some("success")
+            // The complete prior generation restores descriptors, while the
+            // newer anchor correctly keeps rollback-sensitive readiness in a
+            // warning state rather than blessing older evidence.
+            Some("warning")
         );
         assert_eq!(
             status.bootstrap.last_cache_load_source.as_deref(),
@@ -26865,12 +26862,14 @@ mod tests {
         );
         assert_eq!(
             status.bootstrap.last_cache_load_status.as_deref(),
-            Some("success")
+            Some("warning")
         );
-        assert_eq!(status.bootstrap.last_cache_load_at, Some(now + 1));
+        assert_eq!(status.bootstrap.last_cache_load_at, Some(now + 2));
 
         let _ = tokio::fs::remove_file(path).await;
         let _ = tokio::fs::remove_file(backup_path).await;
+        let _ =
+            tokio::fs::remove_file(Server::peer_cache_client_delivery_anchor_path(&path_str)).await;
     }
 
     #[tokio::test]

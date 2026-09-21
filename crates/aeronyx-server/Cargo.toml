@@ -188,6 +188,12 @@ x25519-dalek = { workspace = true }
 base64 = { workspace = true }
 blind-rsa-signatures = "0.17.2"
 
+# [PEER-CACHE-BACKUP-DURABILITY 2026-09-21 by Codex] Windows lacks Unix
+# rename/fsync semantics. Use the OS atomic replacement APIs with write-through
+# flags instead of a delete-then-rename gap.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = "3.12"
 tower = { version = "0.5", features = ["util"] }
