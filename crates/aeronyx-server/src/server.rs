@@ -4,6 +4,8 @@
 // Version: 1.0.0-Membership
 //
 // Modification Reason:
+//   [HANDSHAKE-PRE-ADMISSION-VERSION 2026-09-21 by Codex] Rejects unknown
+//   ClientHello versions before limiter, voucher, crypto, or resource state.
 //   [SERVER-DECOMPOSITION-PHASE1 2026-09-14 by Codex] Moves typed runtime
 //   supervision and shutdown policy into a private focused child module.
 //   [ANONYMOUS-MAILBOX-CLEANUP-RUNTIME 2026-09-13 by Codex] Runs bounded
@@ -989,6 +991,7 @@ use aeronyx_core::protocol::{
     DataPacket, MessageType, NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor,
     NodeDiscoveryMessage, NodePolicy, NodeProtocolFeature, OnionRouteFailureDisposition,
     OnionRoutePlanError, OnionRoutePurpose, SignedNodeDescriptor, VerifiedOnionRoute,
+    PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2,
 };
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
@@ -1368,6 +1371,19 @@ fn log_handshake_rejection_class(reason: HandshakeRejectionClass, active_session
 
 fn log_handshake_rejection(error: &ServerError, active_sessions: usize) {
     log_handshake_rejection_class(handshake_rejection_class(error), active_sessions);
+}
+
+/// Admit only the frozen handshake versions before any stateful ingress gate.
+///
+/// [HANDSHAKE-PRE-ADMISSION-VERSION 2026-09-21 by Codex] Datagram shape has
+/// already established a fixed ClientHello header, so byte 1 is bounded and
+/// sufficient. This deliberately performs no logging or mutation: unknown
+/// versions cannot consume global/per-IP tokens or voucher observations.
+fn client_hello_wire_version_is_supported(datagram: &[u8]) -> bool {
+    matches!(
+        datagram.get(1).copied(),
+        Some(PROTOCOL_VERSION_V1) | Some(PROTOCOL_VERSION_V2)
+    )
 }
 
 const ONION_ROUTE_SELECTION_CANDIDATE_LIMIT: usize = 8;
@@ -15108,6 +15124,9 @@ impl Server {
 
                                 match ProtocolCodec::classify_datagram(data) {
                                     MessageType::ClientHello => {
+                                        if !client_hello_wire_version_is_supported(data) {
+                                            continue;
+                                        }
                                         // [2026-09-12] Two token buckets before any crypto.
                                         if !handshake_limiter.allow(source.addr.ip()) {
                                             continue;
@@ -17059,7 +17078,7 @@ mod tests {
     };
 
     use super::{
-        await_commitment_tip_announcement_or_newer,
+        await_commitment_tip_announcement_or_newer, client_hello_wire_version_is_supported,
         commitment_coordinator_lease_degraded_retry_delay,
         commitment_coordinator_lease_production_valid_for, commitment_follower_success_retry_delay,
         commitment_witness_startup_decision, custody_witness_auto_renewal_due,
@@ -17121,8 +17140,11 @@ mod tests {
         VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS,
     };
     use crate::services::chat_relay_anonymous_mailbox_source::ExactAnonymousMailboxTargetPin;
+    use aeronyx_core::crypto::handshake::{
+        create_client_hello, verify_server_hello, DefaultHandshakeCrypto, HandshakeCrypto,
+    };
     use aeronyx_core::crypto::transport::{DefaultTransportCrypto, TransportCrypto};
-    use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
+    use aeronyx_core::crypto::{EphemeralKeyPair, IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
     use aeronyx_core::ledger::{RecordCommitmentBlockV1, GENESIS_PREV_HASH};
     use aeronyx_core::protocol::anonymous_mailbox::{
@@ -17143,10 +17165,12 @@ mod tests {
         CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1, CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1,
         CHAT_VERIFIED_SUBMIT_REJECTED_V1,
     };
+    use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
     use aeronyx_core::protocol::onion::is_onion_blob;
     use aeronyx_core::protocol::{
-        NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor, NodeDiscoveryMessage,
-        NodeProtocolFeature, OnionRoutePurpose, SignedNodeDescriptor,
+        MessageType, NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor,
+        NodeDiscoveryMessage, NodeProtocolFeature, OnionRoutePurpose, SignedNodeDescriptor,
+        PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2,
     };
     use aeronyx_transport::{Transport, UdpTransport};
     use axum::{
@@ -17234,8 +17258,10 @@ mod tests {
     use crate::services::peer_store::PeerStoreVerifiedDeliveryWitnessRound;
     use crate::services::{
         AofWriter, ChatRelayService, DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore,
-        DirectoryReplicaSyncRuntime, MemPool, PeerStore, PeerStoreImportReport, SessionManager,
+        DirectoryReplicaSyncRuntime, HandshakeLimiter, MemPool, PeerStore, PeerStoreImportReport,
+        SessionManager,
     };
+    use crate::voucher_verifier::VoucherVerifier;
     use tokio::sync::Mutex as TokioMutex;
 
     #[derive(Clone, Default)]
@@ -17282,6 +17308,117 @@ mod tests {
             .expect("captured server log mutex")
             .clone();
         String::from_utf8(bytes).expect("captured server logs are UTF-8")
+    }
+
+    fn capture_core_handshake_debug_logs(operation: impl FnOnce()) -> String {
+        let captured = CapturedServerLogs::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(captured.clone())
+            .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.level() <= &tracing::Level::DEBUG
+                    && metadata.target().ends_with("crypto::handshake")
+            }));
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, operation);
+        let bytes = captured
+            .0
+            .lock()
+            .expect("captured core handshake log mutex")
+            .clone();
+        String::from_utf8(bytes).expect("captured core handshake logs are UTF-8")
+    }
+
+    #[tokio::test]
+    async fn client_hello_version_preflight_precedes_stateful_admission() {
+        // [HANDSHAKE-PRE-ADMISSION-VERSION 2026-09-21 by Codex] Mirror the
+        // production gate order with deterministic clocks and counters. An
+        // unknown version must not consume either limiter or voucher state.
+        let datagram = |version| {
+            let mut bytes = vec![0u8; CLIENT_HELLO_SIZE];
+            bytes[0] = MessageType::ClientHello.as_byte();
+            bytes[1] = version;
+            bytes
+        };
+        let limiter = HandshakeLimiter::new(1.0, 1.0, 1.0, 2.0);
+        let verifier = VoucherVerifier::new();
+        let now = Instant::now();
+
+        let logs = capture_server_info_logs(|| {
+            for version in [0, 3, u8::MAX] {
+                assert!(!client_hello_wire_version_is_supported(&datagram(version)));
+            }
+        });
+        assert!(
+            logs.is_empty(),
+            "unknown-version preflight must be silent: {logs}"
+        );
+
+        for version in [0, 3, u8::MAX] {
+            let bytes = datagram(version);
+            if client_hello_wire_version_is_supported(&bytes) {
+                assert!(limiter.allow_at(Ipv4Addr::new(198, 51, 100, 1).into(), now));
+                assert!(verifier.accept_client_hello_extension(Vec::new()).await);
+            }
+        }
+        assert_eq!(verifier.metrics_snapshot().total, 0);
+
+        for (version, host) in [(PROTOCOL_VERSION_V1, 11), (PROTOCOL_VERSION_V2, 12)] {
+            let bytes = datagram(version);
+            assert!(client_hello_wire_version_is_supported(&bytes));
+            assert!(limiter.allow_at(Ipv4Addr::new(198, 51, 100, host).into(), now));
+            assert!(verifier.accept_client_hello_extension(Vec::new()).await);
+        }
+        let voucher_metrics = verifier.metrics_snapshot();
+        assert_eq!(voucher_metrics.total, 2);
+        assert_eq!(voucher_metrics.missing, 2);
+        assert!(
+            !limiter.allow_at(Ipv4Addr::new(198, 51, 100, 13).into(), now),
+            "two supported hellos must retain the historical global cap"
+        );
+
+        let per_ip = HandshakeLimiter::new(1.0, 1.0, 100.0, 10.0);
+        let source = Ipv4Addr::new(203, 0, 113, 21).into();
+        assert!(per_ip.allow_at(source, now));
+        assert!(
+            !per_ip.allow_at(source, now),
+            "supported hellos must retain the historical per-IP cap"
+        );
+    }
+
+    #[test]
+    fn v1_handshake_process_and_verify_logs_redact_assigned_ip() {
+        // [V1-HANDSHAKE-IP-LOG-PRIVACY 2026-09-21 by Codex] Exercise both the
+        // production server-side V1 derivation and client-side verifier with a
+        // conspicuous address while preserving the actual wire value.
+        let server = DefaultHandshakeCrypto::new(IdentityKeyPair::generate());
+        let client = IdentityKeyPair::generate();
+        let ephemeral = EphemeralKeyPair::generate();
+        let hello = create_client_hello(&client, ephemeral.public_key_bytes(), PROTOCOL_VERSION_V1);
+        let sentinel = [198, 51, 100, 247];
+        let logs = capture_core_handshake_debug_logs(|| {
+            server.verify_client_hello(&hello).expect("V1 ClientHello");
+            let (server_hello, _) = server
+                .process_handshake(&hello, sentinel, [0xA5; 16])
+                .expect("V1 server handshake");
+            assert_eq!(server_hello.assigned_ip, sentinel);
+            verify_server_hello(&server_hello, &client.public_key_bytes()).expect("V1 ServerHello");
+        });
+        assert!(
+            logs.contains("assigned_ip"),
+            "coarse flow event missing: {logs}"
+        );
+        assert!(
+            logs.matches("<redacted:4 bytes>").count() >= 3,
+            "all server/client assigned-IP diagnostics must be redacted: {logs}"
+        );
+        for forbidden in ["198.51.100.247", "[198, 51, 100, 247]"] {
+            assert!(
+                !logs.contains(forbidden),
+                "assigned IP leaked as {forbidden}: {logs}"
+            );
+        }
     }
 
     #[test]

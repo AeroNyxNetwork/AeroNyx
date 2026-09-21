@@ -44,9 +44,10 @@
 //! - Timestamp validation prevents replay attacks
 //! - All signature operations should be constant-time where possible
 //! - Never log shared secrets, session keys, signatures, signed transcript
-//!   bytes, or raw public keys in production node logs.
+//!   bytes, raw public keys, or assigned virtual addresses in production logs.
 //!
 //! ## Last Modified
+//! v0.1.3 - Redacted assigned virtual addresses from V1 server/client logs
 //! v0.1.2 - Downgraded successful handshake diagnostic logs to debug level for production nodes
 //! v0.1.1 - Redacted sensitive handshake material from crypto logs
 //! v0.1.0 - Initial handshake crypto implementation
@@ -363,9 +364,11 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
     ) -> Result<(ServerHello, SessionKey)> {
         debug!("[CRYPTO-DEBUG] ========== process_handshake START ==========");
 
+        // [V1-HANDSHAKE-IP-LOG-PRIVACY 2026-09-21 by Codex] The assigned
+        // address is session-correlating state. Keep only its fixed byte size.
         debug!(
-            "[CRYPTO-DEBUG] Input - assigned_ip: {}.{}.{}.{}",
-            assigned_ip[0], assigned_ip[1], assigned_ip[2], assigned_ip[3]
+            "[CRYPTO-DEBUG] Input - assigned_ip: {}",
+            redacted_len(&assigned_ip)
         );
         debug!(
             "[CRYPTO-DEBUG] Input - session_id: {}",
@@ -446,11 +449,8 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
             redacted_len(&server_hello.server_ephemeral_key)
         );
         debug!(
-            "[CRYPTO-DEBUG]   assigned_ip: {}.{}.{}.{}",
-            server_hello.assigned_ip[0],
-            server_hello.assigned_ip[1],
-            server_hello.assigned_ip[2],
-            server_hello.assigned_ip[3]
+            "[CRYPTO-DEBUG]   assigned_ip: {}",
+            redacted_len(&server_hello.assigned_ip)
         );
         debug!(
             "[CRYPTO-DEBUG]   session_id: {}",
@@ -583,12 +583,11 @@ pub fn verify_server_hello(server_hello: &ServerHello, client_public: &[u8; 32])
         "[CRYPTO-DEBUG]   server_ephemeral_key: {}",
         redacted_len(&server_hello.server_ephemeral_key)
     );
+    // [V1-HANDSHAKE-IP-LOG-PRIVACY 2026-09-21 by Codex] A client verifier
+    // must not reintroduce the exact address removed from the server path.
     debug!(
-        "[CRYPTO-DEBUG]   assigned_ip: {}.{}.{}.{}",
-        server_hello.assigned_ip[0],
-        server_hello.assigned_ip[1],
-        server_hello.assigned_ip[2],
-        server_hello.assigned_ip[3]
+        "[CRYPTO-DEBUG]   assigned_ip: {}",
+        redacted_len(&server_hello.assigned_ip)
     );
     debug!(
         "[CRYPTO-DEBUG]   session_id: {}",
@@ -756,8 +755,10 @@ pub fn derive_client_session_keys_v2(
     extension: &[u8],
     server_hello: &ServerHello,
 ) -> Result<SessionKeys> {
-    let client_sign_data = DefaultHandshakeCrypto::client_hello_sign_data_v2(client_hello, extension);
-    let server_sign_data = DefaultHandshakeCrypto::server_hello_sign_data_v2(server_hello, client_hello);
+    let client_sign_data =
+        DefaultHandshakeCrypto::client_hello_sign_data_v2(client_hello, extension);
+    let server_sign_data =
+        DefaultHandshakeCrypto::server_hello_sign_data_v2(server_hello, client_hello);
     let transcript = transcript_hash_v2(&client_sign_data, &server_sign_data);
     derive_session_keys_v2(shared_secret, &transcript)
 }
@@ -782,7 +783,9 @@ mod tests {
         let client_eph = EphemeralKeyPair::generate();
         let extension = b"AVCH\x03\x00abc";
         let hello = create_client_hello_v2(&client, client_eph.public_key_bytes(), extension);
-        server.verify_client_hello_v2(&hello, extension).expect("client hello verifies");
+        server
+            .verify_client_hello_v2(&hello, extension)
+            .expect("client hello verifies");
         let (server_hello, server_keys) = server
             .process_handshake_v2(&hello, extension, [10, 7, 0, 2], [0x33u8; 16])
             .expect("server side");
@@ -795,7 +798,10 @@ mod tests {
 
         assert_eq!(client_keys.c2s, server_keys.c2s, "c2s agrees");
         assert_eq!(client_keys.s2c, server_keys.s2c, "s2c agrees");
-        assert_ne!(server_keys.c2s, server_keys.s2c, "the two directions never share a key");
+        assert_ne!(
+            server_keys.c2s, server_keys.s2c,
+            "the two directions never share a key"
+        );
         assert_eq!(server_hello.version, PROTOCOL_VERSION_V2);
     }
 
@@ -804,10 +810,16 @@ mod tests {
         let (server, client) = v2_pair();
         let eph = EphemeralKeyPair::generate();
         let hello = create_client_hello_v2(&client, eph.public_key_bytes(), b"AVCH\x01\x00x");
-        assert!(server.verify_client_hello_v2(&hello, b"AVCH\x01\x00y").is_err(),
-            "a swapped voucher must not verify under the original signature");
-        assert!(server.verify_client_hello_v2(&hello, b"").is_err(),
-            "a stripped voucher must not verify either");
+        assert!(
+            server
+                .verify_client_hello_v2(&hello, b"AVCH\x01\x00y")
+                .is_err(),
+            "a swapped voucher must not verify under the original signature"
+        );
+        assert!(
+            server.verify_client_hello_v2(&hello, b"").is_err(),
+            "a stripped voucher must not verify either"
+        );
     }
 
     #[test]
@@ -819,7 +831,11 @@ mod tests {
             .process_handshake_v2(&hello, b"", [10, 7, 0, 3], [0x44u8; 16])
             .unwrap();
         // The same client, a fresh hello: the old ServerHello no longer verifies.
-        let later = create_client_hello_v2(&client, EphemeralKeyPair::generate().public_key_bytes(), b"");
+        let later = create_client_hello_v2(
+            &client,
+            EphemeralKeyPair::generate().public_key_bytes(),
+            b"",
+        );
         assert!(verify_server_hello_v2(&server_hello, &later, None).is_err());
         // Pinning: a different expected node key fails before the signature.
         assert!(verify_server_hello_v2(&server_hello, &hello, Some(&[0u8; 32])).is_err());
@@ -831,7 +847,10 @@ mod tests {
         let eph = EphemeralKeyPair::generate();
         let v1 = create_client_hello(&client, eph.public_key_bytes(), 0x01);
         assert!(server.verify_client_hello_v2(&v1, b"").is_err());
-        assert!(server.verify_client_hello(&v1).is_ok(), "v0x01 clients keep working");
+        assert!(
+            server.verify_client_hello(&v1).is_ok(),
+            "v0x01 clients keep working"
+        );
     }
 
     /// Interop vector shared with the app core (rust/src/udp_client.rs tests):
@@ -843,9 +862,18 @@ mod tests {
         let server_sign_data: Vec<u8> = (100u8..218).collect();
         let th = transcript_hash_v2(&client_sign_data, &server_sign_data);
         let keys = derive_session_keys_v2(&shared, &th).unwrap();
-        assert_eq!(hex::encode(th), "743d6e151ea92bb3965f9dd98d843730b64a5e4036090b62537fb5f923a4426f");
-        assert_eq!(hex::encode(keys.c2s.as_bytes()), "f8569af8dd0f13954c07be5b80a4b09efda38100c358b821c653aaecdb9e3b1a");
-        assert_eq!(hex::encode(keys.s2c.as_bytes()), "ee00bd70f541a1e05e04e6960737e4d4d41f522a7ed7bf0e2191a42b6ae047d0");
+        assert_eq!(
+            hex::encode(th),
+            "743d6e151ea92bb3965f9dd98d843730b64a5e4036090b62537fb5f923a4426f"
+        );
+        assert_eq!(
+            hex::encode(keys.c2s.as_bytes()),
+            "f8569af8dd0f13954c07be5b80a4b09efda38100c358b821c653aaecdb9e3b1a"
+        );
+        assert_eq!(
+            hex::encode(keys.s2c.as_bytes()),
+            "ee00bd70f541a1e05e04e6960737e4d4d41f522a7ed7bf0e2191a42b6ae047d0"
+        );
     }
 
     #[test]
