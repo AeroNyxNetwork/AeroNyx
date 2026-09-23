@@ -214,7 +214,7 @@ impl std::fmt::Display for ProviderType {
 // ProviderConfig
 // ============================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
     #[serde(rename = "type")]
@@ -228,6 +228,14 @@ pub struct ProviderConfig {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
+}
+
+// [PRIVACY-SAFE-DEBUG 2026-09-23 by Codex] Provider configuration may include
+// credentials and private service endpoints, so formatting is constant.
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProviderConfig(<redacted>)")
+    }
 }
 
 // ============================================
@@ -662,6 +670,32 @@ impl Default for SuperNodeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_debug_does_not_expose_credentials_or_endpoint_metadata() {
+        let provider = ProviderConfig {
+            name: "provider-name-marker-8b36".into(),
+            provider_type: ProviderType::OpenaiCompatible,
+            api_base: "https://private-endpoint-marker.invalid/v1".into(),
+            api_key: Some("api-key-marker-764f".into()),
+            model: "model-marker-a291".into(),
+            max_tokens: Some(91_337),
+            temperature: Some(1.75),
+        };
+
+        let debug = format!("{provider:?}");
+        assert_eq!(debug, "ProviderConfig(<redacted>)");
+        for marker in [
+            provider.name.as_str(),
+            provider.api_base.as_str(),
+            provider.api_key.as_deref().unwrap(),
+            provider.model.as_str(),
+            "91337",
+            "1.75",
+        ] {
+            assert!(!debug.contains(marker), "leaked marker: {marker}");
+        }
+    }
 
     #[test]
     fn test_default_is_disabled() {

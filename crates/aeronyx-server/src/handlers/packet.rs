@@ -162,7 +162,6 @@ pub struct PacketDropReasonCounters {
 /// | 0xAF         | —            | Voice        |
 ///
 /// Only Vpn increments bytes_rx / TrafficTracker.
-#[derive(Debug)]
 pub enum DecryptedPayload {
     Vpn(Vec<u8>),
     /// [PROTOCOL-V2] Authenticated liveness probe; answer with a pong.
@@ -188,6 +187,24 @@ pub enum DecryptedPayload {
         dst_ip: Ipv4Addr,
         payload: Vec<u8>,
     },
+}
+
+// [PRIVACY-SAFE-DEBUG 2026-09-23 by Codex] Packet payloads can contain VPN,
+// message, voice, wallet, and routing material. Preserve only the variant name.
+impl std::fmt::Debug for DecryptedPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let variant = match self {
+            Self::Vpn(_) => "Vpn",
+            Self::ControlPing { .. } => "ControlPing",
+            Self::ControlPong => "ControlPong",
+            Self::ControlDisconnect { .. } => "ControlDisconnect",
+            Self::KeepaliveAck { .. } => "KeepaliveAck",
+            Self::MemChain(_) => "MemChain",
+            Self::VoiceSignal { .. } => "VoiceSignal",
+            Self::Voice { .. } => "Voice",
+        };
+        write!(f, "DecryptedPayload::{variant}(<redacted>)")
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -576,11 +593,20 @@ impl PacketHandler {
         let mut encrypted = vec![0u8; frame.len() + ENCRYPTION_OVERHEAD];
         let actual_len = self
             .crypto
-            .encrypt(&session.session_key, counter, session.id.as_bytes(), frame, &mut encrypted)
+            .encrypt(
+                &session.session_key,
+                counter,
+                session.id.as_bytes(),
+                frame,
+                &mut encrypted,
+            )
             .map_err(ServerError::Core)?;
         encrypted.truncate(actual_len);
         session.stats.record_control_tx();
-        Ok(encode_data_packet(&DataPacket::new(*session.id.as_bytes(), counter, encrypted)).to_vec())
+        Ok(
+            encode_data_packet(&DataPacket::new(*session.id.as_bytes(), counter, encrypted))
+                .to_vec(),
+        )
     }
 
     pub fn handle_tun_packet(&self, ip_packet: &[u8]) -> Result<(Vec<u8>, std::net::SocketAddr)> {
@@ -964,6 +990,41 @@ mod tests {
     }
 
     #[test]
+    fn decrypted_payload_debug_exposes_only_variant_names() {
+        let vpn_marker = b"vpn-payload-marker-73b0".to_vec();
+        let vpn_debug = format!("{:?}", DecryptedPayload::Vpn(vpn_marker.clone()));
+        assert_eq!(vpn_debug, "DecryptedPayload::Vpn(<redacted>)");
+        assert!(!vpn_debug.contains(std::str::from_utf8(&vpn_marker).unwrap()));
+
+        let wallet_marker = "wallet-marker-91d7".to_string();
+        let signal_marker = b"voice-signal-marker-c8f1".to_vec();
+        let signal_debug = format!(
+            "{:?}",
+            DecryptedPayload::VoiceSignal {
+                discriminant: 0xDEAD_BEEF,
+                target_wallet: Some(wallet_marker.clone()),
+                payload: signal_marker.clone(),
+            }
+        );
+        assert_eq!(signal_debug, "DecryptedPayload::VoiceSignal(<redacted>)");
+        assert!(!signal_debug.contains(&wallet_marker));
+        assert!(!signal_debug.contains(std::str::from_utf8(&signal_marker).unwrap()));
+        assert!(!signal_debug.contains("3735928559"));
+
+        let voice_marker = b"voice-payload-marker-5a24".to_vec();
+        let voice_debug = format!(
+            "{:?}",
+            DecryptedPayload::Voice {
+                dst_ip: Ipv4Addr::new(198, 51, 100, 231),
+                payload: voice_marker.clone(),
+            }
+        );
+        assert_eq!(voice_debug, "DecryptedPayload::Voice(<redacted>)");
+        assert!(!voice_debug.contains("198.51.100.231"));
+        assert!(!voice_debug.contains(std::str::from_utf8(&voice_marker).unwrap()));
+    }
+
+    #[test]
     fn test_extract_ipv4_src() {
         let src = Ipv4Addr::new(192, 168, 1, 100);
         let dst = Ipv4Addr::new(8, 8, 8, 8);
@@ -1085,7 +1146,9 @@ mod tests {
     fn test_udp_short_packet_records_privacy_safe_drop_reason() {
         let handler = make_handler();
 
-        assert!(handler.handle_udp_packet(&[0x01, 0x02, 0x03], "127.0.0.1:40000".parse().unwrap()).is_err());
+        assert!(handler
+            .handle_udp_packet(&[0x01, 0x02, 0x03], "127.0.0.1:40000".parse().unwrap())
+            .is_err());
 
         let status = handler.runtime_status();
         assert_eq!(status.drop_reasons.short_packet, 1);

@@ -218,12 +218,20 @@ pub type DeviceId = [u8; 16];
 /// Associates one device with one active session.
 ///
 /// Stored inside `wallet_index` Vec — one entry per connected device.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DeviceEntry {
     /// Stable device identifier (persisted on the client side).
     pub device_id: DeviceId,
     /// The current active SessionId for this device.
     pub session_id: SessionId,
+}
+
+// [PRIVACY-SAFE-DEBUG 2026-09-23 by Codex] Device and session identifiers are
+// routing capabilities; Debug must remain useful as a type marker only.
+impl std::fmt::Debug for DeviceEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeviceEntry(<redacted>)")
+    }
 }
 
 // ============================================
@@ -623,7 +631,7 @@ pub struct StatsSnapshot {
 /// live outside [`SessionManager`]. Returning one owned snapshot lets every
 /// termination source finalize those resources identically without retaining a
 /// live session or re-reading maps after removal.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionTermination {
     /// Removed session identifier used only for internal route/event cleanup.
     pub session_id: SessionId,
@@ -633,6 +641,14 @@ pub struct SessionTermination {
     pub wallet_hex: String,
     /// Final aggregate transport statistics.
     pub stats: StatsSnapshot,
+}
+
+// [PRIVACY-SAFE-DEBUG 2026-09-23 by Codex] Termination snapshots retain the
+// exact identifiers needed for cleanup, but formatting must never export them.
+impl std::fmt::Debug for SessionTermination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionTermination(<redacted>)")
+    }
 }
 
 /// Result of one authenticated, identity-bounded session admission.
@@ -997,20 +1013,11 @@ impl Session {
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (window_base, highest_seen) = self.replay_window_info();
-        f.debug_struct("Session")
-            .field("id", &self.id)
-            .field("state", &self.state())
-            .field("virtual_ip", &self.virtual_ip)
-            .field("client_endpoint", &self.client_endpoint)
-            .field("endpoint", &self.endpoint())
-            .field("idle_time", &self.idle_time())
-            .field("client_inactive_time", &self.client_inactive_time())
-            .field(
-                "replay_window",
-                &format!("[{}..{}]", window_base, highest_seen),
-            )
-            .finish_non_exhaustive()
+        // [PRIVACY-SAFE-DEBUG 2026-09-23 by Codex] A live session contains
+        // keys, identities, endpoints, assigned IPs, counters, and timing data.
+        // Keep this representation constant so future fields cannot leak by
+        // accidentally being added to a structured formatter.
+        f.write_str("Session(<redacted>)")
     }
 }
 
@@ -1793,6 +1800,62 @@ mod tests {
     fn test_session_creation() {
         let session = create_test_session();
         assert!(session.is_established());
+    }
+
+    #[test]
+    fn privacy_safe_debug_redacts_session_and_cleanup_identifiers() {
+        let identity = IdentityKeyPair::generate();
+        let session_id = SessionId::generate();
+        let endpoint: SocketAddr = "203.0.113.211:43117".parse().unwrap();
+        let virtual_ip = Ipv4Addr::new(100, 127, 251, 219);
+        let session = Session::new(
+            session_id.clone(),
+            identity.public_key(),
+            SessionKey::from_bytes([0xD7; 32]),
+            virtual_ip,
+            endpoint,
+        );
+        let session_debug = format!("{session:?}");
+
+        assert_eq!(session_debug, "Session(<redacted>)");
+        for marker in [
+            format!("{session_id:?}"),
+            endpoint.to_string(),
+            virtual_ip.to_string(),
+            hex::encode(identity.public_key_bytes()),
+            hex::encode([0xD7; 32]),
+        ] {
+            assert!(!session_debug.contains(&marker), "leaked marker: {marker}");
+        }
+
+        let device_id = [0xE9; 16];
+        let device = DeviceEntry {
+            device_id,
+            session_id: session_id.clone(),
+        };
+        let device_debug = format!("{device:?}");
+        assert_eq!(device_debug, "DeviceEntry(<redacted>)");
+        assert!(!device_debug.contains(&hex::encode(device_id)));
+        assert!(!device_debug.contains(&format!("{session_id:?}")));
+
+        let termination = SessionTermination {
+            session_id: session_id.clone(),
+            virtual_ip,
+            wallet_hex: "wallet-debug-marker-4d6dcf3a".to_string(),
+            stats: SessionStats::default().snapshot(),
+        };
+        let termination_debug = format!("{termination:?}");
+        assert_eq!(termination_debug, "SessionTermination(<redacted>)");
+        for marker in [
+            format!("{session_id:?}"),
+            virtual_ip.to_string(),
+            termination.wallet_hex.clone(),
+        ] {
+            assert!(
+                !termination_debug.contains(&marker),
+                "leaked marker: {marker}"
+            );
+        }
     }
 
     // v1.0.0-Membership: wallet_hex is cached and correct.

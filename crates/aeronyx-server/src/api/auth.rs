@@ -360,7 +360,7 @@ fn legacy_auth_error_response(status: StatusCode, error: &str) -> Response {
 ///
 /// `sub` is the 64-char hex Ed25519 public key — the single source of truth
 /// for owner identity in SaaS mode. All other fields are standard JWT claims.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Claims {
     /// Ed25519 public key (64 hex chars) — the authenticated owner.
     pub sub: String,
@@ -372,8 +372,16 @@ pub struct Claims {
     pub iss: String,
 }
 
+// [PRIVACY-SAFE-DEBUG 2026-09-23 by Codex] JWT claims identify the owner and
+// expose token lifetime metadata, so their diagnostic representation is fixed.
+impl std::fmt::Debug for Claims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Claims(<redacted>)")
+    }
+}
+
 /// Request body for `POST /api/auth/token`.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct TokenRequest {
     /// Ed25519 public key as 64 hex chars.
     pub pubkey: String,
@@ -383,15 +391,27 @@ pub struct TokenRequest {
     pub signature: String,
 }
 
+impl std::fmt::Debug for TokenRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenRequest(<redacted>)")
+    }
+}
+
 /// Request body for `POST /api/auth/challenge`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TokenChallengeV2Request {
     /// Ed25519 public key as 64 hex chars. The response canonicalizes case.
     pub pubkey: String,
 }
 
+impl std::fmt::Debug for TokenChallengeV2Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenChallengeV2Request(<redacted>)")
+    }
+}
+
 /// Stateless challenge returned by `POST /api/auth/challenge`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TokenChallengeV2Response {
     /// Protocol version for explicit client dispatch.
     pub version: u8,
@@ -409,8 +429,14 @@ pub struct TokenChallengeV2Response {
     pub challenge_mac: String,
 }
 
+impl std::fmt::Debug for TokenChallengeV2Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenChallengeV2Response(<redacted>)")
+    }
+}
+
 /// Request body for `POST /api/auth/token/v2`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TokenV2Request {
     /// Ed25519 public key as 64 hex chars.
     pub pubkey: String,
@@ -426,11 +452,25 @@ pub struct TokenV2Request {
     pub signature: String,
 }
 
+impl std::fmt::Debug for TokenV2Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenV2Request(<redacted>)")
+    }
+}
+
 /// Successful response from `POST /api/auth/token`.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct TokenResponse {
     pub token: String,
     pub expires_at: u64,
+}
+
+// [PRIVACY-SAFE-DEBUG 2026-09-23 by Codex] Authentication responses carry a
+// bearer credential; neither the token nor associated metadata may be logged.
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenResponse(<redacted>)")
+    }
 }
 
 // ============================================
@@ -1248,6 +1288,88 @@ mod tests {
         AuthState {
             jwt_secret: make_test_secret(),
             token_ttl_secs: 3_600,
+        }
+    }
+
+    #[test]
+    fn token_response_debug_never_exposes_bearer_material() {
+        let response = TokenResponse {
+            token: "jwt-debug-marker-cc93.header.signature".to_string(),
+            expires_at: 9_876_543_210,
+        };
+
+        let debug = format!("{response:?}");
+        assert_eq!(debug, "TokenResponse(<redacted>)");
+        assert!(!debug.contains(&response.token));
+        assert!(!debug.contains(&response.expires_at.to_string()));
+    }
+
+    #[test]
+    fn auth_wire_debug_never_exposes_identity_or_proof_material() {
+        let identity = "identity-marker-2eb2";
+        let signature = "signature-marker-d54b";
+        let nonce = "nonce-marker-35a9";
+        let mac = "mac-marker-737b";
+        let challenge = "challenge-marker-6cec";
+
+        let values = [
+            format!(
+                "{:?}",
+                Claims {
+                    sub: identity.into(),
+                    iat: 7_654_321,
+                    exp: 7_654_999,
+                    iss: "issuer-marker-0c31".into(),
+                }
+            ),
+            format!(
+                "{:?}",
+                TokenRequest {
+                    pubkey: identity.into(),
+                    timestamp: 7_654_322,
+                    signature: signature.into(),
+                }
+            ),
+            format!(
+                "{:?}",
+                TokenChallengeV2Request {
+                    pubkey: identity.into(),
+                }
+            ),
+            format!(
+                "{:?}",
+                TokenChallengeV2Response {
+                    version: 2,
+                    pubkey: identity.into(),
+                    nonce: nonce.into(),
+                    issued_at: 7_654_323,
+                    expires_at: 7_654_998,
+                    challenge: challenge.into(),
+                    challenge_mac: mac.into(),
+                }
+            ),
+            format!(
+                "{:?}",
+                TokenV2Request {
+                    pubkey: identity.into(),
+                    nonce: nonce.into(),
+                    issued_at: 7_654_324,
+                    expires_at: 7_654_997,
+                    challenge_mac: mac.into(),
+                    signature: signature.into(),
+                }
+            ),
+        ];
+
+        assert_eq!(values[0], "Claims(<redacted>)");
+        assert_eq!(values[1], "TokenRequest(<redacted>)");
+        assert_eq!(values[2], "TokenChallengeV2Request(<redacted>)");
+        assert_eq!(values[3], "TokenChallengeV2Response(<redacted>)");
+        assert_eq!(values[4], "TokenV2Request(<redacted>)");
+        for debug in values {
+            for marker in [identity, signature, nonce, mac, challenge, "765432"] {
+                assert!(!debug.contains(marker), "leaked marker: {marker}");
+            }
         }
     }
 
