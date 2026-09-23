@@ -251,6 +251,9 @@ pub mod blind_vault_replica_workflow;
 pub mod chat;
 pub mod codec;
 pub mod discovery;
+// [PERMISSIONLESS-ENDPOINT-PROOF 2026-09-23 by Codex] Core-only fresh,
+// exact-context endpoint-possession evidence; promotion remains server-owned.
+pub mod discovery_endpoint_proof;
 pub mod memchain;
 pub mod messages;
 pub mod onion;
@@ -389,6 +392,13 @@ pub use discovery::{
     decode_discovery_message, encode_discovery_message, NodeBootstrapSnapshot, NodeCapability,
     NodeCapacity, NodeDescriptor, NodeDiscoveryMessage, NodePolicy, NodeProtocolFeature,
     SignedNodeDescriptor, NODE_BOOTSTRAP_SNAPSHOT_SCHEMA_VERSION, NODE_DESCRIPTOR_SCHEMA_VERSION,
+};
+pub use discovery_endpoint_proof::{
+    canonical_public_endpoint_commitment, DiscoveryEndpointChallengeV1,
+    DiscoveryEndpointProofError, DiscoveryEndpointProofV1,
+    DISCOVERY_ENDPOINT_CHALLENGE_FRAME_BYTES_V1, DISCOVERY_ENDPOINT_CHALLENGE_FUTURE_SKEW_SECS,
+    DISCOVERY_ENDPOINT_CHALLENGE_MAX_TTL_SECS, DISCOVERY_ENDPOINT_PROOF_FRAME_BYTES_V1,
+    DISCOVERY_ENDPOINT_PROOF_VERSION_V1,
 };
 pub use memchain::{
     decode_memchain, encode_memchain, MemChainMessage, MAX_CHAT_PULL_CURSOR_V2_BYTES,
