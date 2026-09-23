@@ -251,6 +251,9 @@ pub mod blind_vault_replica_workflow;
 pub mod chat;
 pub mod codec;
 pub mod discovery;
+// [PERMISSIONLESS-ENDPOINT-ATTESTATION 2026-09-24 by Codex] Observer-signed
+// evidence only; transport, quorum, promotion, and routing remain separate.
+pub mod discovery_endpoint_attestation;
 // [PERMISSIONLESS-ENDPOINT-PROOF 2026-09-23 by Codex] Core-only fresh,
 // exact-context endpoint-possession evidence; promotion remains server-owned.
 pub mod discovery_endpoint_proof;
@@ -392,6 +395,12 @@ pub use discovery::{
     decode_discovery_message, encode_discovery_message, NodeBootstrapSnapshot, NodeCapability,
     NodeCapacity, NodeDescriptor, NodeDiscoveryMessage, NodePolicy, NodeProtocolFeature,
     SignedNodeDescriptor, NODE_BOOTSTRAP_SNAPSHOT_SCHEMA_VERSION, NODE_DESCRIPTOR_SCHEMA_VERSION,
+};
+pub use discovery_endpoint_attestation::{
+    discovery_endpoint_evidence_commitment_v1, DiscoveryEndpointAttestationError,
+    DiscoveryEndpointAttestationPurposeV1, DiscoveryEndpointEvidenceAttestationV1,
+    DISCOVERY_ENDPOINT_ATTESTATION_FRAME_BYTES_V1, DISCOVERY_ENDPOINT_ATTESTATION_FUTURE_SKEW_SECS,
+    DISCOVERY_ENDPOINT_ATTESTATION_MAX_TTL_SECS, DISCOVERY_ENDPOINT_ATTESTATION_VERSION_V1,
 };
 pub use discovery_endpoint_proof::{
     canonical_public_endpoint_commitment, DiscoveryEndpointChallengeV1,
