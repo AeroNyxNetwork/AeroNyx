@@ -1057,7 +1057,9 @@ use crate::api::mpi::{
     build_mpi_router, build_mpi_router_with_source, BaselineSnapshot, Mode, MpiState,
     SessionEmbeddingCache,
 };
-use crate::api::public_node_router::{build_public_node_router, PublicNodeRouterDependencies};
+use crate::api::public_node_router::{
+    build_public_node_router, public_endpoint_flow_context, PublicNodeRouterDependencies,
+};
 use crate::api::voice::build_voice_router;
 use crate::api::vpn_health::{
     build_vpn_health_router_with_anonymous_mailbox_readiness,
@@ -1123,8 +1125,9 @@ use crate::services::peer_store::{
 use crate::services::{
     start_dns_proxy, BlindVaultService, DirectoryChainAppendReport, DirectoryChainStore,
     DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore, DirectoryReplicaSyncRuntime,
-    HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService, SessionManager,
-    SessionTermination,
+    DiscoveryEndpointEvidenceStoreConfig, HandshakeService, IpPoolService, NodePolicyRuntime,
+    PeerStore, RoutingService, SessionManager, SessionTermination,
+    SqliteDiscoveryEndpointEvidenceStore,
 };
 // v1.0.0-Membership
 use crate::services::deny_list::DenyList;
@@ -3971,6 +3974,36 @@ impl MemChainStorageRequirement {
     }
 }
 
+// [PERMISSIONLESS-ENDPOINT-EVIDENCE 2026-09-24 by Codex] Keep blocking
+// private-database admission out of the listener composition and make the
+// default-off zero-side-effect boundary directly testable.
+async fn open_endpoint_evidence_store(
+    discovery: &DiscoveryConfig,
+    identity: &IdentityKeyPair,
+) -> Result<Option<Arc<SqliteDiscoveryEndpointEvidenceStore>>> {
+    if !discovery.permissionless_endpoint_evidence_enabled {
+        return Ok(None);
+    }
+    let config = DiscoveryEndpointEvidenceStoreConfig {
+        db_path: discovery
+            .permissionless_endpoint_evidence_db_path
+            .clone()
+            .into(),
+        max_entries: discovery.permissionless_endpoint_evidence_max_entries,
+        retention_ttl_secs: discovery.permissionless_endpoint_evidence_ttl_secs,
+        cleanup_batch_size: discovery.permissionless_endpoint_evidence_cleanup_batch,
+    };
+    let verifier_node_id = identity.public_key_bytes();
+    let expected_context = public_endpoint_flow_context(verifier_node_id);
+    let store = tokio::task::spawn_blocking(move || {
+        SqliteDiscoveryEndpointEvidenceStore::open(config, verifier_node_id, expected_context)
+    })
+    .await
+    .map_err(|_| ServerError::startup_failed("Endpoint evidence startup task failed"))?
+    .map_err(|_| ServerError::startup_failed("Endpoint evidence store unavailable"))?;
+    Ok(Some(Arc::new(store)))
+}
+
 impl Server {
     pub fn new(
         config: ServerConfig,
@@ -6217,6 +6250,8 @@ impl Server {
                 "Anonymous mailbox source requires authenticated VPN MPI runtime",
             ));
         }
+        let endpoint_evidence =
+            open_endpoint_evidence_store(&self.config.discovery, &self.identity).await?;
         let shutdown_rx = self.shutdown_tx.subscribe();
         let shutdown_rx_vpn = self.shutdown_tx.subscribe();
         let shutdown_rx_public = self.shutdown_tx.subscribe();
@@ -6369,6 +6404,7 @@ impl Server {
                     endpoint_proof_enabled: public_endpoint_proof_enabled,
                     endpoint_proof_max_entries: public_endpoint_proof_max_entries,
                     endpoint_proof_ttl_secs: public_endpoint_proof_ttl_secs,
+                    endpoint_evidence,
                 });
                 listener_tasks.spawn(async move {
                     Self::serve_public_discovery_api(
@@ -16585,7 +16621,8 @@ mod tests {
         custody_witness_renewal_warning_window_secs, custody_witness_runtime_audit_interval_secs,
         custody_witness_runtime_failure, data_plane_receive_failure_action,
         discovery_heartbeat_status_value, handshake_rejection_class, log_handshake_rejection,
-        memchain_index_rejection_reason, peer_store_heartbeat_status_value, prefix_to_netmask,
+        memchain_index_rejection_reason, open_endpoint_evidence_store,
+        peer_store_heartbeat_status_value, prefix_to_netmask,
         required_runtime_supervisor_channel_closed, retry_required_data_plane_receive,
         take_pre_ready_runtime_failure, unix_now_secs, CommitmentCoordinatorLeaseRound,
         CommitmentFollowerRoundOutcome, CommitmentSyncTaskLivenessGuard,
@@ -27487,5 +27524,51 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_evidence_disabled_has_zero_filesystem_side_effect() {
+        std::fs::create_dir_all("target/test-temp").expect("external-disk test temp root");
+        let directory = tempfile::TempDir::new_in("target/test-temp").expect("private directory");
+        let absent = directory.path().join("disabled/evidence.sqlite3");
+        let mut discovery = DiscoveryConfig::default();
+        discovery.permissionless_endpoint_evidence_db_path = absent.to_string_lossy().into_owned();
+
+        let opened = open_endpoint_evidence_store(&discovery, &IdentityKeyPair::generate())
+            .await
+            .expect("disabled evidence");
+        assert!(opened.is_none());
+        assert!(!absent.exists());
+        assert!(!absent.parent().expect("parent").exists());
+    }
+
+    #[tokio::test]
+    async fn endpoint_evidence_foreign_schema_fails_startup_closed() {
+        std::fs::create_dir_all("target/test-temp").expect("external-disk test temp root");
+        let directory = tempfile::TempDir::new_in("target/test-temp").expect("private directory");
+        let path = directory.path().join("foreign.sqlite3");
+        rusqlite::Connection::open(&path)
+            .expect("foreign database")
+            .execute_batch("CREATE TABLE unrelated(value INTEGER);")
+            .expect("foreign schema");
+        let mut discovery = DiscoveryConfig::default();
+        discovery.permissionless_endpoint_proof_enabled = true;
+        discovery.permissionless_endpoint_evidence_enabled = true;
+        discovery.permissionless_endpoint_evidence_db_path = path.to_string_lossy().into_owned();
+
+        assert!(
+            open_endpoint_evidence_store(&discovery, &IdentityKeyPair::generate())
+                .await
+                .is_err()
+        );
+        let connection = rusqlite::Connection::open(path).expect("foreign database remains");
+        let mailbox_objects: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'discovery_endpoint_%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema count");
+        assert_eq!(mailbox_objects, 0);
     }
 }

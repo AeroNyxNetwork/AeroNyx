@@ -479,6 +479,21 @@ pub struct DiscoveryConfig {
     /// Lifetime of one issued endpoint challenge, in seconds.
     #[serde(default = "DiscoveryConfig::default_permissionless_endpoint_proof_ttl_secs")]
     pub permissionless_endpoint_proof_ttl_secs: u64,
+    /// Enables durable retention of already-verified endpoint evidence.
+    #[serde(default)]
+    pub permissionless_endpoint_evidence_enabled: bool,
+    /// Dedicated private SQLite path for endpoint evidence.
+    #[serde(default)]
+    pub permissionless_endpoint_evidence_db_path: String,
+    /// Maximum retained endpoint evidence rows.
+    #[serde(default = "DiscoveryConfig::default_permissionless_endpoint_evidence_max_entries")]
+    pub permissionless_endpoint_evidence_max_entries: usize,
+    /// Evidence retention after local observation, in seconds.
+    #[serde(default = "DiscoveryConfig::default_permissionless_endpoint_evidence_ttl_secs")]
+    pub permissionless_endpoint_evidence_ttl_secs: u64,
+    /// Maximum expired rows removed during one evidence admission.
+    #[serde(default = "DiscoveryConfig::default_permissionless_endpoint_evidence_cleanup_batch")]
+    pub permissionless_endpoint_evidence_cleanup_batch: usize,
     /// Optional region label for nodeboard and future peer selection.
     #[serde(default)]
     pub region: Option<String>,
@@ -635,6 +650,24 @@ impl DiscoveryConfig {
     #[must_use]
     pub const fn default_permissionless_endpoint_proof_ttl_secs() -> u64 {
         120
+    }
+
+    /// Default maximum number of retained endpoint evidence rows.
+    #[must_use]
+    pub const fn default_permissionless_endpoint_evidence_max_entries() -> usize {
+        16_384
+    }
+
+    /// Default endpoint evidence retention interval, in seconds.
+    #[must_use]
+    pub const fn default_permissionless_endpoint_evidence_ttl_secs() -> u64 {
+        24 * 60 * 60
+    }
+
+    /// Default maximum expired rows removed during one admission.
+    #[must_use]
+    pub const fn default_permissionless_endpoint_evidence_cleanup_batch() -> usize {
+        256
     }
 
     /// Default public discovery visibility.
@@ -1131,6 +1164,51 @@ impl DiscoveryConfig {
                 ));
             }
         }
+        // [PERMISSIONLESS-ENDPOINT-EVIDENCE 2026-09-24 by Codex] Durable
+        // evidence is an independent opt-in, but it may never outlive the
+        // authenticated V2 proof surface that supplies its authority.
+        if self.permissionless_endpoint_evidence_max_entries == 0
+            || self.permissionless_endpoint_evidence_max_entries > 65_536
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.permissionless_endpoint_evidence_max_entries",
+                "must be between 1 and 65536",
+            ));
+        }
+        if self.permissionless_endpoint_evidence_ttl_secs == 0
+            || self.permissionless_endpoint_evidence_ttl_secs > 7 * 24 * 60 * 60
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.permissionless_endpoint_evidence_ttl_secs",
+                "must be between 1 and 604800 seconds",
+            ));
+        }
+        if self.permissionless_endpoint_evidence_cleanup_batch == 0
+            || self.permissionless_endpoint_evidence_cleanup_batch > 4_096
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.permissionless_endpoint_evidence_cleanup_batch",
+                "must be between 1 and 4096",
+            ));
+        }
+        if self.permissionless_endpoint_evidence_enabled {
+            if !self.permissionless_endpoint_proof_enabled {
+                return Err(ServerError::config_invalid(
+                    "discovery.permissionless_endpoint_evidence_enabled",
+                    "requires discovery.permissionless_endpoint_proof_enabled = true",
+                ));
+            }
+            if self
+                .permissionless_endpoint_evidence_db_path
+                .trim()
+                .is_empty()
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.permissionless_endpoint_evidence_db_path",
+                    "must be configured when endpoint evidence is enabled",
+                ));
+            }
+        }
 
         for peer_id in self
             .allowed_peer_ids
@@ -1565,6 +1643,14 @@ impl Default for DiscoveryConfig {
                 Self::default_permissionless_endpoint_proof_max_entries(),
             permissionless_endpoint_proof_ttl_secs:
                 Self::default_permissionless_endpoint_proof_ttl_secs(),
+            permissionless_endpoint_evidence_enabled: false,
+            permissionless_endpoint_evidence_db_path: String::new(),
+            permissionless_endpoint_evidence_max_entries:
+                Self::default_permissionless_endpoint_evidence_max_entries(),
+            permissionless_endpoint_evidence_ttl_secs:
+                Self::default_permissionless_endpoint_evidence_ttl_secs(),
+            permissionless_endpoint_evidence_cleanup_batch:
+                Self::default_permissionless_endpoint_evidence_cleanup_batch(),
             region: None,
             descriptor_ttl_secs: Self::default_descriptor_ttl_secs(),
             public_discovery: Self::default_public_discovery(),
@@ -2725,6 +2811,52 @@ permissionless_endpoint_proof_ttl_secs = 0
 [discovery]
 permissionless_endpoint_proof_ttl_secs = 301
 "#,
+        ] {
+            assert!(ServerConfig::from_str(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn test_permissionless_endpoint_evidence_is_default_off_and_dependency_bound() {
+        let legacy = ServerConfig::from_str("[discovery]\nenabled = true\n")
+            .expect("legacy discovery config");
+        assert!(!legacy.discovery.permissionless_endpoint_evidence_enabled);
+        assert!(legacy
+            .discovery
+            .permissionless_endpoint_evidence_db_path
+            .is_empty());
+
+        let valid = r#"
+[discovery]
+enabled = true
+public_api_listen_addr = "0.0.0.0:8422"
+permissionless_endpoint_proof_enabled = true
+permissionless_endpoint_evidence_enabled = true
+permissionless_endpoint_evidence_db_path = "/var/lib/aeronyx/endpoint-evidence.sqlite3"
+permissionless_endpoint_evidence_max_entries = 64
+permissionless_endpoint_evidence_ttl_secs = 3600
+permissionless_endpoint_evidence_cleanup_batch = 16
+"#;
+        assert!(ServerConfig::from_str(valid).is_ok());
+
+        for invalid in [
+            r#"
+[discovery]
+enabled = true
+public_api_listen_addr = "0.0.0.0:8422"
+permissionless_endpoint_evidence_enabled = true
+permissionless_endpoint_evidence_db_path = "/var/lib/aeronyx/evidence.sqlite3"
+"#,
+            r#"
+[discovery]
+enabled = true
+public_api_listen_addr = "0.0.0.0:8422"
+permissionless_endpoint_proof_enabled = true
+permissionless_endpoint_evidence_enabled = true
+"#,
+            "[discovery]\npermissionless_endpoint_evidence_max_entries = 0\n",
+            "[discovery]\npermissionless_endpoint_evidence_ttl_secs = 604801\n",
+            "[discovery]\npermissionless_endpoint_evidence_cleanup_batch = 4097\n",
         ] {
             assert!(ServerConfig::from_str(invalid).is_err());
         }

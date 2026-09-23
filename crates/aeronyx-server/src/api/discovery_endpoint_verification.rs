@@ -25,7 +25,8 @@ use axum::Router;
 
 use crate::services::{
     DiscoveryEndpointChallengeIssueOutcome, DiscoveryEndpointChallengeRequestV1,
-    DiscoveryEndpointProofConsumeOutcome, DiscoveryEndpointVerificationService,
+    DiscoveryEndpointEvidenceRecordOutcome, DiscoveryEndpointProofConsumeOutcome,
+    DiscoveryEndpointVerificationService, SqliteDiscoveryEndpointEvidenceStore,
 };
 
 // [AUTHENTICATED-ENDPOINT-PROOF-ADAPTER 2026-09-24 by Codex] Keep a distinct,
@@ -66,6 +67,7 @@ const VERIFY_OUTCOME_REJECTED: u8 = 6;
 pub(crate) struct VerifiedEndpointProofPeerContext {
     peer_node_id: [u8; 32],
     challenger_context: [u8; 32],
+    authenticated_transport_frame: Option<Arc<[u8]>>,
 }
 
 impl fmt::Debug for VerifiedEndpointProofPeerContext {
@@ -89,7 +91,14 @@ impl VerifiedEndpointProofPeerContext {
         Some(Self {
             peer_node_id,
             challenger_context,
+            authenticated_transport_frame: None,
         })
+    }
+
+    /// Attaches the exact canonical V2 carrier accepted by the public router.
+    pub(crate) fn with_authenticated_transport_frame(mut self, frame: Arc<[u8]>) -> Self {
+        self.authenticated_transport_frame = Some(frame);
+        self
     }
 }
 
@@ -111,6 +120,7 @@ impl EndpointProofClock for SystemEndpointProofClock {
 #[derive(Clone)]
 struct EndpointProofAdapterState {
     service: Arc<DiscoveryEndpointVerificationService>,
+    evidence: Option<Arc<SqliteDiscoveryEndpointEvidenceStore>>,
     clock: Arc<dyn EndpointProofClock>,
 }
 
@@ -123,11 +133,19 @@ struct EndpointProofAdapterState {
 pub(crate) fn build_discovery_endpoint_verification_router(
     service: Arc<DiscoveryEndpointVerificationService>,
 ) -> Router {
-    build_router_with_clock(service, Arc::new(SystemEndpointProofClock))
+    build_discovery_endpoint_verification_router_with_evidence(service, None)
+}
+
+pub(crate) fn build_discovery_endpoint_verification_router_with_evidence(
+    service: Arc<DiscoveryEndpointVerificationService>,
+    evidence: Option<Arc<SqliteDiscoveryEndpointEvidenceStore>>,
+) -> Router {
+    build_router_with_clock(service, evidence, Arc::new(SystemEndpointProofClock))
 }
 
 fn build_router_with_clock(
     service: Arc<DiscoveryEndpointVerificationService>,
+    evidence: Option<Arc<SqliteDiscoveryEndpointEvidenceStore>>,
     clock: Arc<dyn EndpointProofClock>,
 ) -> Router {
     Router::new()
@@ -137,7 +155,11 @@ fn build_router_with_clock(
         )
         .route("/api/discovery/endpoint-proof/verify", post(verify_proof))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_FRAME_BYTES))
-        .with_state(EndpointProofAdapterState { service, clock })
+        .with_state(EndpointProofAdapterState {
+            service,
+            evidence,
+            clock,
+        })
 }
 
 async fn issue_challenge(
@@ -195,14 +217,51 @@ async fn verify_proof(
     {
         return coarse_response(StatusCode::FORBIDDEN, "authentication_mismatch");
     }
+    let observed_at = state.clock.now();
     let Ok(outcome) = state.service.verify_and_consume_at(
         request.request_id,
         request.challenge_frame,
         request.proof_frame,
-        state.clock.now(),
+        observed_at,
     ) else {
         return coarse_response(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
     };
+    if matches!(
+        outcome,
+        DiscoveryEndpointProofConsumeOutcome::Accepted
+            | DiscoveryEndpointProofConsumeOutcome::Existing
+    ) {
+        // [PERMISSIONLESS-ENDPOINT-EVIDENCE 2026-09-24 by Codex] A verified
+        // response is not successful until its exact authenticated carrier is durable.
+        if let Some(evidence) = state.evidence {
+            let Some(transport_frame) = auth.authenticated_transport_frame else {
+                return coarse_response(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
+            };
+            let challenge_frame = request.challenge_frame.to_vec();
+            let proof_frame = request.proof_frame.to_vec();
+            let persisted = tokio::task::spawn_blocking(move || {
+                evidence.record_verified_at(
+                    transport_frame.as_ref(),
+                    &challenge_frame,
+                    &proof_frame,
+                    observed_at,
+                )
+            })
+            .await;
+            match persisted {
+                Ok(Ok(
+                    DiscoveryEndpointEvidenceRecordOutcome::Inserted
+                    | DiscoveryEndpointEvidenceRecordOutcome::Existing,
+                )) => {}
+                Ok(Ok(DiscoveryEndpointEvidenceRecordOutcome::Conflict))
+                | Ok(Ok(DiscoveryEndpointEvidenceRecordOutcome::AtCapacity))
+                | Ok(Err(_))
+                | Err(_) => {
+                    return coarse_response(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
+                }
+            }
+        }
+    }
     let status = match outcome {
         DiscoveryEndpointProofConsumeOutcome::Accepted
         | DiscoveryEndpointProofConsumeOutcome::Existing => StatusCode::OK,
@@ -405,7 +464,7 @@ mod tests {
             )
             .expect("service"),
         );
-        let router = build_router_with_clock(service, Arc::new(FixedClock(NOW)));
+        let router = build_router_with_clock(service, None, Arc::new(FixedClock(NOW)));
         match auth {
             Some(auth) => router.layer(Extension(auth)),
             None => router,
@@ -493,8 +552,8 @@ mod tests {
             )
             .expect("service"),
         );
-        let router =
-            build_router_with_clock(service, Arc::new(FixedClock(NOW))).layer(Extension(auth));
+        let router = build_router_with_clock(service, None, Arc::new(FixedClock(NOW)))
+            .layer(Extension(auth));
         let (_, issue_body) = post_frame(
             router.clone(),
             "/api/discovery/endpoint-proof/challenge",
@@ -551,7 +610,7 @@ mod tests {
             )
             .expect("service"),
         );
-        let base = build_router_with_clock(service, Arc::new(FixedClock(NOW)));
+        let base = build_router_with_clock(service, None, Arc::new(FixedClock(NOW)));
         let (_, issue_body) = post_frame(
             base.clone().layer(Extension(correct_auth)),
             "/api/discovery/endpoint-proof/challenge",
@@ -589,7 +648,7 @@ mod tests {
             )
             .expect("service"),
         );
-        let base = build_router_with_clock(service, Arc::new(FixedClock(NOW)));
+        let base = build_router_with_clock(service, None, Arc::new(FixedClock(NOW)));
         let issue = issue_frame(request_id, [0x22; 32], "8.8.8.8:51820");
         let (_, issue_body) = post_frame(
             base.clone().layer(Extension(correct_auth.clone())),

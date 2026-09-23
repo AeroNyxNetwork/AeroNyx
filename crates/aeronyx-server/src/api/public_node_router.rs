@@ -40,7 +40,7 @@ use crate::api::discovery::{
     build_discovery_router_with_local_entry, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
 };
 use crate::api::discovery_endpoint_verification::{
-    build_discovery_endpoint_verification_router, VerifiedEndpointProofPeerContext,
+    build_discovery_endpoint_verification_router_with_evidence, VerifiedEndpointProofPeerContext,
 };
 use crate::api::memchain_peer::build_memchain_peer_router_with_runtime;
 use crate::services::chat_relay::ChatRelayService;
@@ -49,7 +49,7 @@ use crate::services::memchain::MemoryStorage;
 use crate::services::{
     BlindVaultService, DirectoryChainStore, DirectoryReplicaStore, DirectoryReplicaSyncRuntime,
     DiscoveryEndpointVerificationConfig, DiscoveryEndpointVerificationService, PeerStore,
-    SessionManager,
+    SessionManager, SqliteDiscoveryEndpointEvidenceStore,
 };
 
 const ADEA_MAGIC: [u8; 4] = *b"ADEA";
@@ -90,6 +90,7 @@ pub(crate) struct PublicNodeRouterDependencies {
     pub(crate) endpoint_proof_enabled: bool,
     pub(crate) endpoint_proof_max_entries: usize,
     pub(crate) endpoint_proof_ttl_secs: u64,
+    pub(crate) endpoint_evidence: Option<Arc<SqliteDiscoveryEndpointEvidenceStore>>,
 }
 
 /// Builds the complete public node router.
@@ -142,6 +143,7 @@ pub(crate) fn build_public_node_router(deps: PublicNodeRouterDependencies) -> Ro
         deps.node_identity.as_ref().clone(),
         deps.endpoint_proof_max_entries,
         deps.endpoint_proof_ttl_secs,
+        deps.endpoint_evidence,
     ) {
         app = app.merge(endpoint_proof_router);
     }
@@ -181,6 +183,7 @@ fn build_optional_public_endpoint_transport_router(
     challenger_identity: IdentityKeyPair,
     max_entries: usize,
     challenge_ttl_secs: u64,
+    evidence: Option<Arc<SqliteDiscoveryEndpointEvidenceStore>>,
 ) -> Option<Router> {
     if !enabled {
         return None;
@@ -197,6 +200,7 @@ fn build_optional_public_endpoint_transport_router(
     Some(build_public_endpoint_transport_router(
         Arc::new(service),
         challenger_node_id,
+        evidence,
     ))
 }
 
@@ -209,9 +213,10 @@ struct PublicEndpointTransportState {
 fn build_public_endpoint_transport_router(
     service: Arc<DiscoveryEndpointVerificationService>,
     challenger_node_id: [u8; 32],
+    evidence: Option<Arc<SqliteDiscoveryEndpointEvidenceStore>>,
 ) -> Router {
     let flow_context = public_endpoint_flow_context(challenger_node_id);
-    let stage_c = build_discovery_endpoint_verification_router(service);
+    let stage_c = build_discovery_endpoint_verification_router_with_evidence(service, evidence);
     Router::new()
         .route(
             DiscoveryEndpointTransportOperationV1::Issue.path(),
@@ -267,12 +272,17 @@ async fn dispatch_authenticated_transport(
     {
         return coarse_rejection();
     }
-    let Some(context) = VerifiedEndpointProofPeerContext::from_authenticated_peer(
+    let Some(mut context) = VerifiedEndpointProofPeerContext::from_authenticated_peer(
         transport.target_node_id(),
         state.flow_context,
     ) else {
         return coarse_rejection();
     };
+    if operation == DiscoveryEndpointTransportOperationV1::Verify {
+        // [PERMISSIONLESS-ENDPOINT-EVIDENCE 2026-09-24 by Codex] Preserve the
+        // canonical authenticated bytes only for the private persistence boundary.
+        context = context.with_authenticated_transport_frame(Arc::from(body.as_ref()));
+    }
     let Ok(request) = Request::builder()
         .method("POST")
         .uri(operation.path())
@@ -362,7 +372,7 @@ fn validate_verify_binding(
     Ok(())
 }
 
-fn public_endpoint_flow_context(challenger_node_id: [u8; 32]) -> [u8; 32] {
+pub(crate) fn public_endpoint_flow_context(challenger_node_id: [u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(PUBLIC_ENDPOINT_FLOW_CONTEXT_DOMAIN);
     hasher.update(challenger_node_id);
@@ -388,6 +398,7 @@ fn coarse_unavailable() -> Response {
 mod tests {
     use super::*;
 
+    use crate::services::DiscoveryEndpointEvidenceStoreConfig;
     use aeronyx_core::protocol::discovery::{DirectoryDescriptorCommitmentV1, NodeDescriptor};
     use aeronyx_core::protocol::discovery_endpoint_proof::{
         DiscoveryEndpointAuthenticatedTransportV1, DiscoveryEndpointProofV1,
@@ -490,8 +501,49 @@ mod tests {
     }
 
     fn enabled_router(challenger: &IdentityKeyPair, max_entries: usize) -> Router {
-        build_optional_public_endpoint_transport_router(true, challenger.clone(), max_entries, 60)
-            .expect("enabled router")
+        build_optional_public_endpoint_transport_router(
+            true,
+            challenger.clone(),
+            max_entries,
+            60,
+            None,
+        )
+        .expect("enabled router")
+    }
+
+    fn enabled_router_with_evidence(
+        challenger: &IdentityKeyPair,
+        max_entries: usize,
+        evidence: Arc<SqliteDiscoveryEndpointEvidenceStore>,
+    ) -> Router {
+        build_optional_public_endpoint_transport_router(
+            true,
+            challenger.clone(),
+            max_entries,
+            60,
+            Some(evidence),
+        )
+        .expect("enabled router")
+    }
+
+    fn evidence_store(
+        path: &std::path::Path,
+        challenger: &IdentityKeyPair,
+        max_entries: usize,
+    ) -> Arc<SqliteDiscoveryEndpointEvidenceStore> {
+        Arc::new(
+            SqliteDiscoveryEndpointEvidenceStore::open(
+                DiscoveryEndpointEvidenceStoreConfig {
+                    db_path: path.to_path_buf(),
+                    max_entries,
+                    retention_ttl_secs: 3600,
+                    cleanup_batch_size: 16,
+                },
+                challenger.public_key_bytes(),
+                public_endpoint_flow_context(challenger.public_key_bytes()),
+            )
+            .expect("evidence store"),
+        )
     }
 
     async fn post(router: Router, path: &str, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
@@ -521,7 +573,8 @@ mod tests {
     async fn disabled_gate_has_no_router_or_verifier_state() {
         let challenger = key(3);
         assert!(
-            build_optional_public_endpoint_transport_router(false, challenger, 0, 0,).is_none()
+            build_optional_public_endpoint_transport_router(false, challenger, 0, 0, None)
+                .is_none()
         );
         let (status, _) = post(
             Router::new(),
@@ -623,6 +676,145 @@ mod tests {
         )
         .await;
         assert_eq!(replay_response[8], 2);
+    }
+
+    #[tokio::test]
+    async fn accepted_v2_proof_is_durable_and_exact_replay_is_idempotent() {
+        std::fs::create_dir_all("target/test-temp").expect("external-disk test temp root");
+        let directory =
+            tempfile::TempDir::new_in("target/test-temp").expect("private evidence directory");
+        let path = directory.path().join("endpoint-evidence.sqlite3");
+        let now = unix_now_secs();
+        let challenger = key(3);
+        let target = key(9);
+        let endpoint = "8.8.8.8:51820";
+        let signed_descriptor = descriptor(&target, 7, now, endpoint);
+        let request_id = [0x31; 32];
+        let flow_context = public_endpoint_flow_context(challenger.public_key_bytes());
+        let inner = issue_inner(
+            request_id,
+            descriptor_commitment(&signed_descriptor),
+            endpoint,
+        );
+        let store = evidence_store(&path, &challenger, 1);
+        let router = enabled_router_with_evidence(&challenger, 4, Arc::clone(&store));
+        let (_, issued) = post(
+            router.clone(),
+            DiscoveryEndpointTransportOperationV1::Issue.path(),
+            v2_transport(
+                DiscoveryEndpointTransportOperationV1::Issue,
+                request_id,
+                flow_context,
+                now,
+                &inner,
+                &signed_descriptor,
+                &target,
+            ),
+        )
+        .await;
+        let challenge_frame = challenge_from_issue_response(&issued);
+        let challenge = DiscoveryEndpointChallengeV1::decode(&challenge_frame).expect("challenge");
+        let proof = DiscoveryEndpointProofV1::respond(
+            &challenge,
+            &flow_context,
+            challenge.issued_at().saturating_add(1),
+            &target,
+        )
+        .expect("proof")
+        .encode();
+        let verify = v2_transport(
+            DiscoveryEndpointTransportOperationV1::Verify,
+            request_id,
+            flow_context,
+            now,
+            &verify_inner(request_id, &challenge_frame, &proof),
+            &signed_descriptor,
+            &target,
+        );
+        let mut tampered = verify.clone();
+        let final_byte = tampered.last_mut().expect("transport signature byte");
+        *final_byte ^= 0x01;
+        let (rejected, _) = post(
+            router.clone(),
+            DiscoveryEndpointTransportOperationV1::Verify.path(),
+            tampered,
+        )
+        .await;
+        assert_eq!(rejected, StatusCode::BAD_REQUEST);
+        assert_eq!(store.snapshot().expect("rejected snapshot").retained, 0);
+        let (accepted, accepted_body) = post(
+            router.clone(),
+            DiscoveryEndpointTransportOperationV1::Verify.path(),
+            verify.clone(),
+        )
+        .await;
+        assert_eq!(accepted, StatusCode::OK);
+        assert_eq!(accepted_body[8], 1);
+        let (existing, existing_body) = post(
+            router.clone(),
+            DiscoveryEndpointTransportOperationV1::Verify.path(),
+            verify,
+        )
+        .await;
+        assert_eq!(existing, StatusCode::OK);
+        assert_eq!(existing_body[8], 2);
+        assert_eq!(store.snapshot().expect("snapshot").retained, 1);
+
+        let second_target = key(10);
+        let second_request_id = [0x32; 32];
+        let second_descriptor = descriptor(&second_target, 8, now, "8.8.4.4:51820");
+        let second_inner = issue_inner(
+            second_request_id,
+            descriptor_commitment(&second_descriptor),
+            "8.8.4.4:51820",
+        );
+        let (_, second_issued) = post(
+            router.clone(),
+            DiscoveryEndpointTransportOperationV1::Issue.path(),
+            v2_transport(
+                DiscoveryEndpointTransportOperationV1::Issue,
+                second_request_id,
+                flow_context,
+                now,
+                &second_inner,
+                &second_descriptor,
+                &second_target,
+            ),
+        )
+        .await;
+        let second_challenge_frame = challenge_from_issue_response(&second_issued);
+        let second_challenge = DiscoveryEndpointChallengeV1::decode(&second_challenge_frame)
+            .expect("second challenge");
+        let second_proof = DiscoveryEndpointProofV1::respond(
+            &second_challenge,
+            &flow_context,
+            second_challenge.issued_at().saturating_add(1),
+            &second_target,
+        )
+        .expect("second proof")
+        .encode();
+        let second_verify = v2_transport(
+            DiscoveryEndpointTransportOperationV1::Verify,
+            second_request_id,
+            flow_context,
+            now,
+            &verify_inner(second_request_id, &second_challenge_frame, &second_proof),
+            &second_descriptor,
+            &second_target,
+        );
+        let (at_capacity, at_capacity_body) = post(
+            router,
+            DiscoveryEndpointTransportOperationV1::Verify.path(),
+            second_verify,
+        )
+        .await;
+        assert_eq!(at_capacity, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(at_capacity_body, b"service_unavailable");
+        assert_eq!(store.snapshot().expect("capacity snapshot").retained, 1);
+        drop(store);
+
+        let reopened = evidence_store(&path, &challenger, 1);
+        assert_eq!(reopened.snapshot().expect("restart snapshot").retained, 1);
     }
 
     #[tokio::test]
