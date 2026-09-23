@@ -5,6 +5,7 @@
 //!
 //! ## Submodules
 //! - [`storage`] + [`storage_crypto`] + [`storage_ops`]: SQLite core (split v2.2.0)
+//! - `storage_feedback`: raw-log ingestion and memory feedback persistence
 //! - [`storage_graph`]: Cognitive graph CRUD (Episodes/Entities/Edges/etc.) (v2.4.0+Search split)
 //! - [`storage_miner`]: Miner step support + EntityTimeline (v2.4.0+Search split)
 //! - [`storage_supernode`]: cognitive_tasks + llm_usage_log CRUD (v2.5.0+SuperNode)
@@ -58,6 +59,8 @@
 //!   another independently configured inference engine.
 //!
 //! ## Last Modified
+//! [MEMCHAIN-STORAGE-FEEDBACK-SPLIT 2026-09-23 by Codex] Isolated raw-log
+//! ingestion and feedback persistence from the commitment-heavy operations module.
 //! [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Re-exported the
 //! single-snapshot custody vault/policy result and its typed readiness.
 //! [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Re-exported only the
@@ -104,6 +107,9 @@
 // ── Storage engine ──
 pub mod storage;
 pub mod storage_crypto;
+// [MEMCHAIN-STORAGE-FEEDBACK-SPLIT 2026-09-23 by Codex] Keep raw-log and
+// feedback persistence behind one focused extension module.
+mod storage_feedback;
 pub mod storage_ops;
 // v2.4.0+Search: Cognitive graph CRUD (split from storage_ops.rs)
 pub mod storage_graph;
