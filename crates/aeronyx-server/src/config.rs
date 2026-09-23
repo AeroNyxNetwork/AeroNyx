@@ -120,6 +120,8 @@ const MAX_DIRECTORY_GOSSIP_PROOF_MIN_AGE_SECS: u64 = 48 * 60 * 60;
 const MAX_DISCOVERY_GOSSIP_CONCURRENCY: u16 = 64;
 const MAX_PINNED_ROUTE_DOMAINS: usize = 256;
 const MAX_ROUTE_DOMAIN_ATTESTOR_NODE_IDS: usize = 16;
+const MAX_PERMISSIONLESS_ENDPOINT_PROOF_ENTRIES: usize = 65_536;
+const MAX_PERMISSIONLESS_ENDPOINT_PROOF_TTL_SECS: u64 = 300;
 
 /// Validates one bounded fail-closed node identity pin set.
 ///
@@ -463,6 +465,20 @@ pub struct DiscoveryConfig {
     /// by default so existing deployments never expose the full local API.
     #[serde(default)]
     pub public_api_listen_addr: Option<SocketAddr>,
+    // [PERMISSIONLESS-ENDPOINT-PROOF 2026-09-24 by Codex] Roll out public
+    // candidate verification independently from ordinary discovery.
+    /// Enables descriptor-authenticated endpoint proof routes on the public listener.
+    ///
+    /// This is independently default-off. It never mounts on local, node, or
+    /// VPN listeners and does not grant discovery promotion authority.
+    #[serde(default)]
+    pub permissionless_endpoint_proof_enabled: bool,
+    /// Maximum retained endpoint-proof challenge and replay records.
+    #[serde(default = "DiscoveryConfig::default_permissionless_endpoint_proof_max_entries")]
+    pub permissionless_endpoint_proof_max_entries: usize,
+    /// Lifetime of one issued endpoint challenge, in seconds.
+    #[serde(default = "DiscoveryConfig::default_permissionless_endpoint_proof_ttl_secs")]
+    pub permissionless_endpoint_proof_ttl_secs: u64,
     /// Optional region label for nodeboard and future peer selection.
     #[serde(default)]
     pub region: Option<String>,
@@ -607,6 +623,18 @@ impl DiscoveryConfig {
     #[must_use]
     pub const fn default_descriptor_ttl_secs() -> u64 {
         3600
+    }
+
+    /// Default retained endpoint-proof challenge capacity.
+    #[must_use]
+    pub const fn default_permissionless_endpoint_proof_max_entries() -> usize {
+        1024
+    }
+
+    /// Default endpoint-proof challenge lifetime.
+    #[must_use]
+    pub const fn default_permissionless_endpoint_proof_ttl_secs() -> u64 {
+        120
     }
 
     /// Default public discovery visibility.
@@ -1069,6 +1097,41 @@ impl DiscoveryConfig {
             ));
         }
 
+        // [PERMISSIONLESS-ENDPOINT-PROOF 2026-09-24 by Codex] Bound all
+        // public verifier state and reject partial listener activation.
+        if self.permissionless_endpoint_proof_max_entries == 0
+            || self.permissionless_endpoint_proof_max_entries
+                > MAX_PERMISSIONLESS_ENDPOINT_PROOF_ENTRIES
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.permissionless_endpoint_proof_max_entries",
+                "must be between 1 and 65536",
+            ));
+        }
+        if self.permissionless_endpoint_proof_ttl_secs == 0
+            || self.permissionless_endpoint_proof_ttl_secs
+                > MAX_PERMISSIONLESS_ENDPOINT_PROOF_TTL_SECS
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.permissionless_endpoint_proof_ttl_secs",
+                "must be between 1 and 300 seconds",
+            ));
+        }
+        if self.permissionless_endpoint_proof_enabled {
+            if !self.enabled {
+                return Err(ServerError::config_invalid(
+                    "discovery.permissionless_endpoint_proof_enabled",
+                    "requires discovery.enabled = true",
+                ));
+            }
+            if self.public_api_listen_addr.is_none() {
+                return Err(ServerError::config_invalid(
+                    "discovery.permissionless_endpoint_proof_enabled",
+                    "requires discovery.public_api_listen_addr",
+                ));
+            }
+        }
+
         for peer_id in self
             .allowed_peer_ids
             .iter()
@@ -1497,6 +1560,11 @@ impl Default for DiscoveryConfig {
             require_route_domain_attestations_for_multi_hop: false,
             public_endpoint: None,
             public_api_listen_addr: None,
+            permissionless_endpoint_proof_enabled: false,
+            permissionless_endpoint_proof_max_entries:
+                Self::default_permissionless_endpoint_proof_max_entries(),
+            permissionless_endpoint_proof_ttl_secs:
+                Self::default_permissionless_endpoint_proof_ttl_secs(),
             region: None,
             descriptor_ttl_secs: Self::default_descriptor_ttl_secs(),
             public_discovery: Self::default_public_discovery(),
@@ -1868,6 +1936,15 @@ mod tests {
         assert_eq!(
             config.discovery.descriptor_ttl_secs,
             DiscoveryConfig::default_descriptor_ttl_secs()
+        );
+        assert!(!config.discovery.permissionless_endpoint_proof_enabled);
+        assert_eq!(
+            config.discovery.permissionless_endpoint_proof_max_entries,
+            DiscoveryConfig::default_permissionless_endpoint_proof_max_entries()
+        );
+        assert_eq!(
+            config.discovery.permissionless_endpoint_proof_ttl_secs,
+            DiscoveryConfig::default_permissionless_endpoint_proof_ttl_secs()
         );
         assert!(config.discovery.public_discovery);
     }
@@ -2594,6 +2671,63 @@ enabled = true
 public_api_listen_addr = "0.0.0.0:0"
 "#;
         assert!(ServerConfig::from_str(toml_str).is_err());
+    }
+
+    #[test]
+    fn test_permissionless_endpoint_proof_rollout_gate_and_bounds() {
+        let legacy = r#"
+[discovery]
+enabled = true
+"#;
+        let legacy_config = ServerConfig::from_str(legacy).expect("legacy discovery config");
+        assert!(
+            !legacy_config
+                .discovery
+                .permissionless_endpoint_proof_enabled
+        );
+
+        let valid = r#"
+[discovery]
+enabled = true
+public_api_listen_addr = "0.0.0.0:8422"
+permissionless_endpoint_proof_enabled = true
+permissionless_endpoint_proof_max_entries = 64
+permissionless_endpoint_proof_ttl_secs = 30
+"#;
+        let valid_config = ServerConfig::from_str(valid).expect("valid endpoint proof config");
+        assert!(valid_config.discovery.permissionless_endpoint_proof_enabled);
+
+        for invalid in [
+            r#"
+[discovery]
+enabled = false
+public_api_listen_addr = "0.0.0.0:8422"
+permissionless_endpoint_proof_enabled = true
+"#,
+            r#"
+[discovery]
+enabled = true
+permissionless_endpoint_proof_enabled = true
+"#,
+            r#"
+[discovery]
+permissionless_endpoint_proof_max_entries = 0
+"#,
+            r#"
+[discovery]
+permissionless_endpoint_proof_max_entries = 65537
+"#,
+            r#"
+[discovery]
+permissionless_endpoint_proof_ttl_secs = 0
+"#,
+            r#"
+[discovery]
+permissionless_endpoint_proof_ttl_secs = 301
+"#,
+        ] {
+            assert!(ServerConfig::from_str(invalid).is_err());
+        }
     }
 
     #[test]

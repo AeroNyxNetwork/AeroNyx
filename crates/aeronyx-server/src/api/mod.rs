@@ -520,6 +520,9 @@ pub mod discovery;
 // items remain crate-private and unmounted until verified middleware owns identity.
 pub mod discovery_endpoint_verification;
 pub mod memchain_peer;
+// [PERMISSIONLESS-ENDPOINT-PROOF 2026-09-24 by Codex] Keep public candidate
+// authentication composition separate from local and peer API surfaces.
+pub(crate) mod public_node_router;
 pub mod voice;
 pub mod vpn_health;
 

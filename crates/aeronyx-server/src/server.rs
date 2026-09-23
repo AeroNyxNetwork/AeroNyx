@@ -993,7 +993,7 @@ use aeronyx_core::protocol::{
     OnionRoutePlanError, OnionRoutePurpose, SignedNodeDescriptor, VerifiedOnionRoute,
     PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2,
 };
-use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
+use aeronyx_transport::traits::{Transport, TunConfig};
 use aeronyx_transport::UdpTransport;
 
 #[cfg(target_os = "linux")]
@@ -1011,14 +1011,13 @@ use crate::api::chat_handlers::build_chat_router;
 #[cfg(test)]
 use crate::api::chat_peer::blind_relay_delivery_receipt_is_valid;
 use crate::api::chat_peer::{
-    build_chat_peer_router, build_chat_peer_router_with_anonymous_mailbox,
-    prepare_peer_blind_relay_http_request_with, prepare_peer_chat_relay_request_v1,
-    prepare_peer_chat_relay_request_v2, prepare_peer_chat_relay_request_v3,
-    verify_blind_relay_delivery_receipt, verify_peer_chat_relay_receipt,
-    BlindRelayDeliveryReceiptVerificationFailure, BlindRelayRequestPreparationError,
-    DirectRelayReceiptVerificationFailure, PeerBlindRelayRequest, PeerBlindRelayResponse,
-    PeerChatRelayResponse, PeerChatRelayResponseV2, PreparedAuthenticatedPeerChatRelayHttpRequest,
-    PreparedPeerChatRelayHttpRequest,
+    build_chat_peer_router_with_anonymous_mailbox, prepare_peer_blind_relay_http_request_with,
+    prepare_peer_chat_relay_request_v1, prepare_peer_chat_relay_request_v2,
+    prepare_peer_chat_relay_request_v3, verify_blind_relay_delivery_receipt,
+    verify_peer_chat_relay_receipt, BlindRelayDeliveryReceiptVerificationFailure,
+    BlindRelayRequestPreparationError, DirectRelayReceiptVerificationFailure,
+    PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayResponse, PeerChatRelayResponseV2,
+    PreparedAuthenticatedPeerChatRelayHttpRequest,
 };
 use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica_and_runtime;
 use crate::api::directory_replica_status::{
@@ -1058,6 +1057,7 @@ use crate::api::mpi::{
     build_mpi_router, build_mpi_router_with_source, BaselineSnapshot, Mode, MpiState,
     SessionEmbeddingCache,
 };
+use crate::api::public_node_router::{build_public_node_router, PublicNodeRouterDependencies};
 use crate::api::voice::build_voice_router;
 use crate::api::vpn_health::{
     build_vpn_health_router_with_anonymous_mailbox_readiness,
@@ -6321,6 +6321,17 @@ impl Server {
         // expose the same process capability. They must consume one pressure
         // budget rather than multiplying limits by the number of routers.
         let blind_vault_admission = Arc::new(BlindVaultApiAdmissionRuntime::default());
+        // [PERMISSIONLESS-ENDPOINT-PROOF 2026-09-24 by Codex] Only the
+        // dedicated public listener receives the descriptor-authenticated
+        // candidate router; local, VPN, and node-peer apps remain unchanged.
+        let public_endpoint_proof_enabled =
+            self.config.discovery.permissionless_endpoint_proof_enabled;
+        let public_endpoint_proof_max_entries = self
+            .config
+            .discovery
+            .permissionless_endpoint_proof_max_entries;
+        let public_endpoint_proof_ttl_secs =
+            self.config.discovery.permissionless_endpoint_proof_ttl_secs;
 
         Ok(tokio::spawn(async move {
             // [RUNTIME-SUPERVISION 2026-07-29 by Codex] Required listeners
@@ -6328,32 +6339,37 @@ impl Server {
             // a detached task that the process cannot observe.
             let mut listener_tasks = JoinSet::new();
             if let Some((public_addr, public_listener)) = public_api_listener {
-                let public_app = Self::build_public_discovery_router(
-                    Arc::clone(&peer_store),
-                    discovery_api_policy.clone(),
-                    chat_relay.clone(),
-                    Arc::clone(&sessions),
-                    Arc::clone(&udp),
-                    Arc::clone(&node_identity),
-                    Arc::clone(&peer_http_client),
-                    local_capability_status.clone(),
-                    public_directory_chain_store,
-                    public_directory_replica_store,
-                    public_directory_replica_sync_runtime,
-                    public_directory_chain_sync_peer_ids,
-                    public_directory_observation_witness_min_verified,
+                let public_app = build_public_node_router(PublicNodeRouterDependencies {
+                    peer_store: Arc::clone(&peer_store),
+                    discovery_api_policy: discovery_api_policy.clone(),
+                    chat_relay: chat_relay.clone(),
+                    sessions: Arc::clone(&sessions),
+                    udp: Arc::clone(&udp),
+                    node_identity: Arc::clone(&node_identity),
+                    peer_http_client: Arc::clone(&peer_http_client),
+                    local_capability_status: local_capability_status.clone(),
+                    directory_chain_store: public_directory_chain_store,
+                    directory_replica_store: public_directory_replica_store,
+                    directory_replica_sync_runtime: public_directory_replica_sync_runtime,
+                    directory_chain_sync_peer_ids: public_directory_chain_sync_peer_ids,
+                    directory_observation_witness_min_verified:
+                        public_directory_observation_witness_min_verified,
                     directory_observation_witness_maturity_delay_secs,
-                    public_directory_full_node_mirror_enabled,
-                    public_directory_full_node_mirror_max_producers,
-                    commitment_storage.clone(),
+                    directory_full_node_mirror_enabled: public_directory_full_node_mirror_enabled,
+                    directory_full_node_mirror_max_producers:
+                        public_directory_full_node_mirror_max_producers,
+                    commitment_storage: commitment_storage.clone(),
                     commitment_lease_authorized_coordinator,
-                    public_commitment_sync_tip_notifier,
-                    public_blind_vault,
+                    commitment_sync_tip_notifier: public_commitment_sync_tip_notifier,
+                    blind_vault: public_blind_vault,
                     blind_vault_public_api_enabled,
-                    Arc::clone(&blind_vault_admission),
-                    public_anonymous_mailbox
+                    blind_vault_admission: Arc::clone(&blind_vault_admission),
+                    anonymous_mailbox: public_anonymous_mailbox
                         .map(|store| store as Arc<dyn AnonymousMailboxCustodyRepository>),
-                );
+                    endpoint_proof_enabled: public_endpoint_proof_enabled,
+                    endpoint_proof_max_entries: public_endpoint_proof_max_entries,
+                    endpoint_proof_ttl_secs: public_endpoint_proof_ttl_secs,
+                });
                 listener_tasks.spawn(async move {
                     Self::serve_public_discovery_api(
                         public_addr,
@@ -6793,108 +6809,6 @@ impl Server {
             role,
             address: listen_addr,
             result,
-        }
-    }
-
-    fn build_public_discovery_router(
-        peer_store: Arc<PeerStore>,
-        discovery_api_policy: DiscoveryApiPolicy,
-        chat_relay: Option<Arc<ChatRelayService>>,
-        sessions: Arc<SessionManager>,
-        udp: Arc<UdpTransport>,
-        node_identity: Arc<IdentityKeyPair>,
-        peer_http_client: Arc<reqwest::Client>,
-        local_capability_status: DiscoveryLocalCapabilityStatus,
-        directory_chain_store: Option<Arc<DirectoryChainStore>>,
-        directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
-        directory_replica_sync_runtime: Arc<DirectoryReplicaSyncRuntime>,
-        directory_chain_sync_peer_ids: Vec<[u8; 32]>,
-        directory_observation_witness_min_verified: usize,
-        directory_observation_witness_maturity_delay_secs: u64,
-        directory_full_node_mirror_enabled: bool,
-        directory_full_node_mirror_max_producers: usize,
-        commitment_storage: Option<Arc<MemoryStorage>>,
-        commitment_lease_authorized_coordinator: Option<[u8; 32]>,
-        commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
-        blind_vault: Option<Arc<BlindVaultService>>,
-        blind_vault_public_api_enabled: bool,
-        blind_vault_admission: Arc<BlindVaultApiAdmissionRuntime>,
-        anonymous_mailbox: Option<Arc<dyn AnonymousMailboxCustodyRepository>>,
-    ) -> axum::Router {
-        let block_peer_store = Arc::clone(&peer_store);
-        let block_identity = Arc::clone(&node_identity);
-        let directory_peer_store = Arc::clone(&peer_store);
-        let directory_identity = Arc::clone(&node_identity);
-        // [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] Keep public status
-        // capability truth coupled to the actual peer-route prerequisites.
-        let witness_carrier_route_enabled =
-            directory_chain_store.is_some() && directory_replica_store.is_some();
-        // [BLIND-VAULT-ONION-DISPATCH 2026-08-10 by Codex] Anonymous onion
-        // writes share the same explicit public API gate as direct Blind Vault
-        // requests. Initializing local maintenance storage alone must never
-        // make it reachable through the Internet-facing peer listener.
-        let blind_vault_for_onion = blind_vault_public_api_enabled
-            .then(|| blind_vault.clone())
-            .flatten();
-        let app = build_discovery_router_with_local_entry(
-            Arc::clone(&peer_store),
-            discovery_api_policy,
-            local_capability_status,
-            directory_replica_store.clone(),
-            node_identity.public_key_bytes(),
-        )
-        .merge(build_chat_peer_router_with_anonymous_mailbox(
-            chat_relay,
-            sessions,
-            udp,
-            Arc::clone(&peer_store),
-            Arc::clone(&node_identity),
-            peer_http_client,
-            blind_vault_for_onion,
-            anonymous_mailbox,
-        ))
-        .merge(build_directory_replica_status_router_with_witness_carrier(
-            directory_replica_store.clone(),
-            Arc::clone(&directory_replica_sync_runtime),
-            directory_chain_sync_peer_ids.clone(),
-            directory_observation_witness_min_verified,
-            directory_observation_witness_maturity_delay_secs,
-            directory_full_node_mirror_enabled,
-            directory_full_node_mirror_max_producers,
-            witness_carrier_route_enabled,
-            DirectoryReplicaStatusScope::PublicAggregate,
-        ));
-        let app = if let Some(store) = directory_chain_store {
-            app.merge(build_directory_chain_peer_router_with_replica_and_runtime(
-                store,
-                directory_replica_store,
-                directory_peer_store,
-                directory_identity,
-                directory_chain_sync_peer_ids,
-                directory_full_node_mirror_enabled,
-                directory_replica_sync_runtime,
-            ))
-        } else {
-            app
-        };
-        let app = match (blind_vault_public_api_enabled, blind_vault) {
-            (true, Some(vault)) => app.merge(build_blind_vault_router_with_admission_runtime(
-                vault,
-                node_identity,
-                blind_vault_admission,
-            )),
-            _ => app,
-        };
-        if let Some(storage) = commitment_storage {
-            app.merge(build_memchain_peer_router_with_runtime(
-                storage,
-                block_peer_store,
-                block_identity,
-                commitment_lease_authorized_coordinator,
-                commitment_sync_tip_notifier,
-            ))
-        } else {
-            app
         }
     }
 
