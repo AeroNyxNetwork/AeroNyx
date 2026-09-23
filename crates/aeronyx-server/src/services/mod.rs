@@ -299,6 +299,10 @@ pub mod directory_replica;
 // [PERMISSIONLESS-ENDPOINT-EVIDENCE 2026-09-24 by Codex] Durable proof
 // evidence remains isolated from peer promotion and routing state.
 mod discovery_endpoint_evidence;
+// [PERMISSIONLESS-ENDPOINT-ATTESTATION-INBOX 2026-09-24 by Codex] Keep
+// independently signed observations in a bounded quarantine repository with
+// no peer promotion, ranking, routing, or advertisement authority.
+mod discovery_endpoint_attestation_inbox;
 mod discovery_endpoint_verification;
 pub mod dns_proxy;
 pub mod handshake;
@@ -357,6 +361,11 @@ pub use directory_replica::{
     DirectoryReplicaResolutionCommand, DirectoryReplicaResolutionReport, DirectoryReplicaStore,
     DirectoryReplicaStoreError, DirectoryReplicaStoreSnapshot, DirectoryReplicaSyncObservation,
     DirectoryReplicaSyncRuntime, DirectoryReplicaTip,
+};
+pub use discovery_endpoint_attestation_inbox::{
+    DiscoveryEndpointAttestationEligibilitySnapshot, DiscoveryEndpointAttestationInboxConfig,
+    DiscoveryEndpointAttestationInboxError, DiscoveryEndpointAttestationRecordOutcome,
+    SqliteDiscoveryEndpointAttestationInbox, VerifiedDiscoveryEndpointAttestationV1,
 };
 pub use discovery_endpoint_evidence::{
     DiscoveryEndpointEvidenceError, DiscoveryEndpointEvidenceRecordOutcome,
