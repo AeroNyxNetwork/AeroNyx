@@ -296,6 +296,9 @@ pub mod deny_list;
 // composition-only challenge issuance and one-time proof consumption.
 pub mod directory_chain;
 pub mod directory_replica;
+// [PERMISSIONLESS-ENDPOINT-EVIDENCE 2026-09-24 by Codex] Durable proof
+// evidence remains isolated from peer promotion and routing state.
+mod discovery_endpoint_evidence;
 mod discovery_endpoint_verification;
 pub mod dns_proxy;
 pub mod handshake;
@@ -354,6 +357,11 @@ pub use directory_replica::{
     DirectoryReplicaResolutionCommand, DirectoryReplicaResolutionReport, DirectoryReplicaStore,
     DirectoryReplicaStoreError, DirectoryReplicaStoreSnapshot, DirectoryReplicaSyncObservation,
     DirectoryReplicaSyncRuntime, DirectoryReplicaTip,
+};
+pub use discovery_endpoint_evidence::{
+    DiscoveryEndpointEvidenceError, DiscoveryEndpointEvidenceRecordOutcome,
+    DiscoveryEndpointEvidenceSnapshot, DiscoveryEndpointEvidenceStoreConfig,
+    SqliteDiscoveryEndpointEvidenceStore,
 };
 pub use discovery_endpoint_verification::{
     DiscoveryEndpointChallengeIssueOutcome, DiscoveryEndpointChallengeRequestV1,
