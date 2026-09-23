@@ -569,9 +569,11 @@ pub async fn issue_token_challenge_v2(
         }
     };
 
+    // [AUTH-LOG-REDACTION 2026-09-23 by Codex] Authentication logs expose
+    // only fixed event classes, never identity, proof, token, or timing data.
     debug!(
-        pubkey = &canonical_pubkey[..8],
-        expires_at, "[AUTH_V2] Stateless token challenge issued"
+        event = "auth_challenge_issued",
+        "[AUTH_V2] Authentication event"
     );
     auth_response_no_store(
         (
@@ -628,10 +630,8 @@ pub async fn issue_token_v2(
         req.issued_at > now.saturating_add(TOKEN_CHALLENGE_V2_CLOCK_SKEW_SECS);
     if !valid_duration || issued_too_far_ahead || now > req.expires_at {
         debug!(
-            pubkey = &req.pubkey[..8],
-            issued_at = req.issued_at,
-            expires_at = req.expires_at,
-            "[AUTH_V2] Token request rejected: challenge timing invalid"
+            event = "auth_challenge_timing_rejected",
+            "[AUTH_V2] Authentication event"
         );
         return auth_error_response(
             StatusCode::UNAUTHORIZED,
@@ -646,8 +646,8 @@ pub async fn issue_token_v2(
         token_challenge_v2_message(&canonical_pubkey, &nonce_b64, req.issued_at, req.expires_at);
     if !verify_token_challenge_v2_mac(&state.jwt_secret, &challenge, &challenge_mac) {
         debug!(
-            pubkey = &canonical_pubkey[..8],
-            "[AUTH_V2] Token request rejected: challenge MAC invalid"
+            event = "auth_challenge_proof_rejected",
+            "[AUTH_V2] Authentication event"
         );
         return auth_error_response(
             StatusCode::UNAUTHORIZED,
@@ -678,8 +678,8 @@ pub async fn issue_token_v2(
     };
     if identity.verify(challenge.as_bytes(), &signature).is_err() {
         debug!(
-            pubkey = &canonical_pubkey[..8],
-            "[AUTH_V2] Token request rejected: signature verification failed"
+            event = "auth_signature_rejected",
+            "[AUTH_V2] Authentication event"
         );
         return auth_error_response(
             StatusCode::UNAUTHORIZED,
@@ -742,9 +742,8 @@ pub async fn issue_token(
 
     if drift > TIMESTAMP_TOLERANCE_SECS {
         debug!(
-            drift_secs = drift,
-            pubkey = &req.pubkey[..8],
-            "[AUTH] Token request rejected: timestamp drift too large"
+            event = "auth_challenge_timing_rejected",
+            "[AUTH] Authentication event"
         );
         return legacy_auth_error_response(
             StatusCode::UNAUTHORIZED,
@@ -776,8 +775,8 @@ pub async fn issue_token(
         .is_err()
     {
         debug!(
-            pubkey = &req.pubkey[..8],
-            "[AUTH] Token request rejected: signature verification failed"
+            event = "auth_signature_rejected",
+            "[AUTH] Authentication event"
         );
         return legacy_auth_error_response(StatusCode::UNAUTHORIZED, "invalid signature");
     }
@@ -826,15 +825,15 @@ fn claim_token_challenge(
     fingerprint: [u8; 32],
     challenge_expires_at: u64,
     now: u64,
-    canonical_pubkey: &str,
+    _canonical_pubkey: &str,
     protocol: &'static str,
 ) -> Result<(), Response> {
     match token_replay_guard().claim(fingerprint, challenge_expires_at, now) {
         TokenReplayDecision::Accepted => Ok(()),
         TokenReplayDecision::Duplicate => {
             warn!(
-                pubkey = &canonical_pubkey[..8],
-                protocol, "[AUTH] Token request rejected: verified challenge replayed"
+                event = "auth_challenge_replayed",
+                "[AUTH] Authentication event"
             );
             Err(auth_error_response(
                 StatusCode::CONFLICT,
@@ -866,10 +865,7 @@ fn issue_jwt_response(
 ) -> Response {
     match issue_jwt(pubkey, issued_at, expires_at, jwt_secret) {
         Ok(token) => {
-            info!(
-                pubkey = &pubkey[..8],
-                expires_at, protocol, "[AUTH] JWT issued"
-            );
+            info!(event = "auth_token_issued", "[AUTH] Authentication event");
             auth_response_no_store(
                 (StatusCode::OK, Json(TokenResponse { token, expires_at })).into_response(),
             )
@@ -991,22 +987,27 @@ fn ensure_memchain_secret(
                 format!("Failed to migrate {} in {}: {}", key, path.display(), error)
             })?;
             info!(
-                path = %path.display(),
-                key,
-                "[AUTH] Migrated legacy secret into the canonical memchain section"
+                event = "auth_secret_migrated",
+                "[AUTH] Credential lifecycle event"
             );
             return Ok(secret);
         }
     }
 
     let secret = generate_secret();
-    info!(key, "[AUTH] Generated new secret (64 chars alphanumeric)");
+    info!(
+        event = "auth_secret_generated",
+        "[AUTH] Credential lifecycle event"
+    );
 
     if let Some(path) = config_path {
         write_secret_to_config(path, key, &secret).map_err(|error| {
             format!("Failed to persist {} to {}: {}", key, path.display(), error)
         })?;
-        info!(path = %path.display(), key, "[AUTH] Secret written to config file");
+        info!(
+            event = "auth_secret_persisted",
+            "[AUTH] Credential lifecycle event"
+        );
     }
 
     Ok(secret)
@@ -1276,9 +1277,56 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use aeronyx_core::crypto::keys::IdentityKeyPair;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex as StdMutex};
     use tempfile::TempDir;
+    use tracing_subscriber::{fmt::MakeWriter, prelude::*};
 
     const TEST_SECRET: &str = "test-secret-that-is-at-least-32-chars-long-for-safety";
+
+    #[derive(Clone, Default)]
+    struct CapturedAuthLogs(Arc<StdMutex<Vec<u8>>>);
+
+    struct CapturedAuthLogWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl Write for CapturedAuthLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured auth log mutex")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for CapturedAuthLogs {
+        type Writer = CapturedAuthLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedAuthLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_auth_info_logs<T>(operation: impl FnOnce() -> T) -> (T, String) {
+        let captured = CapturedAuthLogs::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(captured.clone())
+            .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.level() <= &tracing::Level::INFO
+                    && metadata.target().ends_with("api::auth")
+            }));
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let result = tracing::subscriber::with_default(subscriber, operation);
+        let logs = String::from_utf8(captured.0.lock().expect("captured auth log mutex").clone())
+            .expect("captured auth logs are UTF-8");
+        (result, logs)
+    }
 
     fn make_test_secret() -> String {
         TEST_SECRET.to_string()
@@ -1370,6 +1418,28 @@ mod tests {
             for marker in [identity, signature, nonce, mac, challenge, "765432"] {
                 assert!(!debug.contains(marker), "leaked marker: {marker}");
             }
+        }
+    }
+
+    #[test]
+    fn generated_secret_log_contains_only_fixed_event_class() {
+        let (secret, logs) = capture_auth_info_logs(|| {
+            ensure_memchain_secret(None, None, "credential-name-marker-287a", 32)
+                .expect("generate auth secret")
+        });
+
+        assert_eq!(secret.len(), 64);
+        assert!(logs.contains("auth_secret_generated"));
+        for forbidden in [
+            secret.as_str(),
+            "credential-name-marker-287a",
+            "jwt_secret",
+            "api_secret",
+        ] {
+            assert!(
+                !logs.contains(forbidden),
+                "credential material leaked into logs: {forbidden} in {logs}"
+            );
         }
     }
 
