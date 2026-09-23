@@ -40,6 +40,35 @@ use serde::{Deserialize, Serialize};
 // Constants
 // ============================================
 
+/// A protocol version with an implemented handshake path.
+///
+/// [VPN-PROTOCOL-VERSION-POLICY 2026-09-23 by Codex] This exhaustive enum and
+/// [`classify_supported_protocol_version`] are the single source of truth for
+/// protocol admission. Consumers must match this enum so a future version
+/// cannot silently inherit an older handshake path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SupportedProtocolVersion {
+    /// Legacy v1 symmetric transport-key handshake.
+    V1 = 0x01,
+    /// V2 directional transport-key handshake.
+    V2 = 0x02,
+}
+
+impl SupportedProtocolVersion {
+    /// Returns the frozen wire value for this supported version.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Protocol v0x01: one session key for both directions.
+pub const PROTOCOL_VERSION_V1: u8 = SupportedProtocolVersion::V1.as_u8();
+
+/// Protocol v0x02: directional keys and transcript-bound handshakes.
+pub const PROTOCOL_VERSION_V2: u8 = SupportedProtocolVersion::V2.as_u8();
+
 /// Current protocol version.
 ///
 /// # Version 0x02
@@ -52,17 +81,33 @@ use serde::{Deserialize, Serialize};
 ///
 /// [PROTOCOL-V2-DEFAULT-ACTIVATION 2026-09-20 by Codex] New handshakes default
 /// to v2 while the supported range remains additive for deployed v1 clients.
-pub const CURRENT_PROTOCOL_VERSION: u8 = 0x02;
+pub const CURRENT_PROTOCOL_VERSION: u8 = PROTOCOL_VERSION_V2;
 
 /// Minimum supported protocol version.
 ///
 /// Servers will reject clients with versions below this.
-pub const MIN_SUPPORTED_VERSION: u8 = 0x01;
+pub const MIN_SUPPORTED_VERSION: u8 = PROTOCOL_VERSION_V1;
 
 /// Maximum supported protocol version.
 ///
 /// Servers will reject clients with versions above this.
-pub const MAX_SUPPORTED_VERSION: u8 = 0x02;
+pub const MAX_SUPPORTED_VERSION: u8 = PROTOCOL_VERSION_V2;
+
+/// Classifies a raw wire version into an implemented handshake path.
+#[must_use]
+pub const fn classify_supported_protocol_version(version: u8) -> Option<SupportedProtocolVersion> {
+    match version {
+        PROTOCOL_VERSION_V1 => Some(SupportedProtocolVersion::V1),
+        PROTOCOL_VERSION_V2 => Some(SupportedProtocolVersion::V2),
+        _ => None,
+    }
+}
+
+/// Returns whether a raw wire version has an implemented handshake path.
+#[must_use]
+pub const fn is_supported_protocol_version(version: u8) -> bool {
+    classify_supported_protocol_version(version).is_some()
+}
 
 // ============================================
 // ProtocolVersion
@@ -110,7 +155,7 @@ impl ProtocolVersion {
     /// Checks if this version is supported by the current implementation.
     #[must_use]
     pub const fn is_supported(&self) -> bool {
-        self.0 >= MIN_SUPPORTED_VERSION && self.0 <= MAX_SUPPORTED_VERSION
+        is_supported_protocol_version(self.0)
     }
 
     /// Checks if this version is compatible with another version.
@@ -201,10 +246,7 @@ mod tests {
     use super::*;
     use crate::{
         crypto::{handshake::DefaultHandshakeCrypto, keys::IdentityKeyPair},
-        protocol::{
-            is_supported_hello_version, ClientHello, MessageType, PROTOCOL_VERSION_V1,
-            PROTOCOL_VERSION_V2,
-        },
+        protocol::{is_supported_hello_version, ClientHello, MessageType},
     };
 
     const SIGNED_HELLO_TIMESTAMP: i64 = 1_700_000_000;
@@ -272,6 +314,33 @@ mod tests {
         assert!(!ProtocolVersion::new(0).is_supported());
         assert!(!ProtocolVersion::new(3).is_supported());
         assert!(!ProtocolVersion::new(0xFF).is_supported());
+    }
+
+    #[test]
+    fn supported_version_classifier_is_closed_and_matches_public_admission() {
+        assert_eq!(
+            classify_supported_protocol_version(PROTOCOL_VERSION_V1),
+            Some(SupportedProtocolVersion::V1)
+        );
+        assert_eq!(
+            classify_supported_protocol_version(PROTOCOL_VERSION_V2),
+            Some(SupportedProtocolVersion::V2)
+        );
+        assert_eq!(SupportedProtocolVersion::V1.as_u8(), PROTOCOL_VERSION_V1);
+        assert_eq!(SupportedProtocolVersion::V2.as_u8(), PROTOCOL_VERSION_V2);
+
+        for raw in u8::MIN..=u8::MAX {
+            assert_eq!(
+                is_supported_protocol_version(raw),
+                is_supported_hello_version(raw),
+                "message admission drifted for version {raw}"
+            );
+            assert_eq!(
+                ProtocolVersion::new(raw).is_supported(),
+                classify_supported_protocol_version(raw).is_some(),
+                "typed admission drifted for version {raw}"
+            );
+        }
     }
 
     #[test]

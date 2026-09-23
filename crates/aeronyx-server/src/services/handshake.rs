@@ -75,9 +75,10 @@ use tracing::{debug, info, warn};
 use aeronyx_core::crypto::handshake::{DefaultHandshakeCrypto, HandshakeCrypto};
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::error::CoreError;
-use aeronyx_core::protocol::{
-    ClientHello, ServerHello, CURRENT_PROTOCOL_VERSION, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2,
+use aeronyx_core::protocol::version::{
+    classify_supported_protocol_version, SupportedProtocolVersion,
 };
+use aeronyx_core::protocol::{ClientHello, ServerHello, CURRENT_PROTOCOL_VERSION};
 
 use crate::error::{Result, ServerError};
 use crate::services::deny_list::DenyList;
@@ -169,24 +170,27 @@ impl HandshakeService {
         extension: &[u8],
         client_addr: SocketAddr,
     ) -> Result<HandshakeResult> {
-        // [V2-HANDSHAKE-CLOSED-VERSION-ADMISSION 2026-09-21 by Codex]
-        // Version dispatch is a closed set. In particular, a future or
-        // malformed version must never inherit the legacy symmetric-key path.
-        // Keep this before policy, signature work, and every durable/resource
-        // mutation so unsupported input has no admission side effect.
-        match client_hello.version {
-            PROTOCOL_VERSION_V1 | PROTOCOL_VERSION_V2 => {}
-            got => {
+        // [VPN-PROTOCOL-VERSION-POLICY 2026-09-23 by Codex] Classify through
+        // the core policy before policy, cryptography, or resource mutation.
+        // Exhaustive dispatch prevents a newly admitted version from silently
+        // inheriting the legacy symmetric-key path.
+        let supported_version = match classify_supported_protocol_version(client_hello.version) {
+            Some(supported_version) => supported_version,
+            None => {
+                let got = client_hello.version;
                 return Err(CoreError::UnsupportedVersion {
                     got,
                     expected: CURRENT_PROTOCOL_VERSION,
                 }
                 .into());
             }
-        }
+        };
         self.validate_candidate(client_hello)?;
-        if client_hello.version == PROTOCOL_VERSION_V2 {
-            return self.process_v2(client_hello, extension, client_addr);
+        match supported_version {
+            SupportedProtocolVersion::V2 => {
+                return self.process_v2(client_hello, extension, client_addr);
+            }
+            SupportedProtocolVersion::V1 => {}
         }
         debug!("Processing handshake");
 
