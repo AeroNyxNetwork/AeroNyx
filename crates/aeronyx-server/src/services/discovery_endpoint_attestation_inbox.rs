@@ -39,6 +39,7 @@ const MAX_LOGICAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RETENTION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_CLEANUP_BATCH: usize = 4_096;
 const SLOT_DOMAIN: &[u8] = b"AeroNyx/DiscoveryEndpointAttestationSlotV1\0";
+const CANDIDATE_GROUP_DOMAIN: &[u8] = b"AeroNyx/DiscoveryEndpointAttestationCandidateGroupV1\0";
 
 /// Bounded policy for one dedicated attestation inbox.
 #[derive(Clone, PartialEq, Eq)]
@@ -112,6 +113,34 @@ pub struct DiscoveryEndpointAttestationEligibilitySnapshot {
     pub max_distinct_observers: usize,
     /// `(distinct observer count, number of exact subject-slot groups)`.
     pub groups_by_distinct_observers: Vec<(usize, usize)>,
+}
+
+/// Bounded, identity-free facts for one exact attestation candidate group.
+// [PERMISSIONLESS-ENDPOINT-ELIGIBILITY 2026-09-24 by Codex] This projection
+// intentionally keeps node, observer, and endpoint material inside SQLite.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DiscoveryEndpointCandidateFacts {
+    pub(crate) group_commitment: [u8; 32],
+    pub(crate) descriptor_sequence: u64,
+    pub(crate) distinct_observers: usize,
+    pub(crate) overlap_started_at: u64,
+    pub(crate) overlap_expires_at: u64,
+    pub(crate) newest_observed_at: u64,
+    pub(crate) newest_expires_at: u64,
+}
+
+impl fmt::Debug for DiscoveryEndpointCandidateFacts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryEndpointCandidateFacts")
+            .field("descriptor_sequence", &self.descriptor_sequence)
+            .field("distinct_observers", &self.distinct_observers)
+            .field("overlap_started_at", &self.overlap_started_at)
+            .field("overlap_expires_at", &self.overlap_expires_at)
+            .field("newest_observed_at", &self.newest_observed_at)
+            .field("newest_expires_at", &self.newest_expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Canonical ADAT that passed the exact caller-selected context policy.
@@ -421,6 +450,103 @@ impl SqliteDiscoveryEndpointAttestationInbox {
             max_distinct_observers: max_observers,
             groups_by_distinct_observers: histogram.into_iter().collect(),
         })
+    }
+
+    /// Returns bounded factual projections for exact candidate groups.
+    ///
+    /// The age window is applied to every counted observation. This method
+    /// does not decide eligibility, promotion, ranking, or routeability.
+    pub(crate) fn candidate_facts_at(
+        &self,
+        now: u64,
+        maximum_evidence_age_secs: u64,
+        limit: usize,
+    ) -> Result<Vec<DiscoveryEndpointCandidateFacts>, DiscoveryEndpointAttestationInboxError> {
+        if now == 0
+            || maximum_evidence_age_secs == 0
+            || maximum_evidence_age_secs > MAX_RETENTION_TTL_SECS
+            || limit == 0
+            || limit > self.config.max_entries
+        {
+            return Err(DiscoveryEndpointAttestationInboxError::Rejected);
+        }
+        let cutoff = now.saturating_sub(maximum_evidence_age_secs);
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT subject_node_id,descriptor_sequence,descriptor_hash,endpoint_commitment,
+                        COUNT(DISTINCT observer_node_id),MAX(observed_at),
+                        MIN(retained_expires_at),MAX(retained_expires_at)
+                 FROM discovery_endpoint_attestation_inbox_v1
+                 WHERE observed_at>=?1 AND observed_at<=?2
+                 GROUP BY subject_node_id,descriptor_sequence,descriptor_hash,endpoint_commitment
+                 ORDER BY subject_node_id,descriptor_sequence,descriptor_hash,endpoint_commitment
+                 LIMIT ?3",
+            )
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+        let mut rows = statement
+            .query(params![
+                as_i64(cutoff)?,
+                as_i64(now)?,
+                i64::try_from(limit)
+                    .map_err(|_| DiscoveryEndpointAttestationInboxError::Rejected)?
+            ])
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+        let mut facts = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?
+        {
+            let subject = array32(
+                row.get(0)
+                    .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?,
+            )?;
+            let descriptor_sequence = as_u64(
+                row.get(1)
+                    .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?,
+            )?;
+            let descriptor_hash = array32(
+                row.get(2)
+                    .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?,
+            )?;
+            let endpoint_commitment = array32(
+                row.get(3)
+                    .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?,
+            )?;
+            let newest_observed_at = as_u64(
+                row.get(5)
+                    .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?,
+            )?;
+            let overlap_expires_at = as_u64(
+                row.get(6)
+                    .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?,
+            )?;
+            facts.push(DiscoveryEndpointCandidateFacts {
+                group_commitment: candidate_group_commitment(
+                    &subject,
+                    descriptor_sequence,
+                    &descriptor_hash,
+                    &endpoint_commitment,
+                ),
+                descriptor_sequence,
+                distinct_observers: usize::try_from(
+                    row.get::<_, i64>(4)
+                        .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?,
+                )
+                .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?,
+                overlap_started_at: newest_observed_at,
+                overlap_expires_at,
+                newest_observed_at,
+                newest_expires_at: as_u64(
+                    row.get(7)
+                        .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?,
+                )?,
+            });
+        }
+        Ok(facts)
     }
 }
 
@@ -742,6 +868,27 @@ fn slot_commitment(value: &DiscoveryEndpointEvidenceAttestationV1) -> [u8; 32] {
     h.update(value.endpoint_commitment());
     h.finalize().into()
 }
+
+fn candidate_group_commitment(
+    subject_node_id: &[u8; 32],
+    descriptor_sequence: u64,
+    descriptor_hash: &[u8; 32],
+    endpoint_commitment: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(CANDIDATE_GROUP_DOMAIN);
+    h.update(subject_node_id);
+    h.update(descriptor_sequence.to_be_bytes());
+    h.update(descriptor_hash);
+    h.update(endpoint_commitment);
+    h.finalize().into()
+}
+
+fn array32(value: Vec<u8>) -> Result<[u8; 32], DiscoveryEndpointAttestationInboxError> {
+    value
+        .try_into()
+        .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)
+}
 fn as_i64(value: u64) -> Result<i64, DiscoveryEndpointAttestationInboxError> {
     i64::try_from(value).map_err(|_| DiscoveryEndpointAttestationInboxError::Rejected)
 }
@@ -783,6 +930,29 @@ mod tests {
         expires_at: u64,
         descriptor_sequence: u64,
     ) -> Fixture {
+        fixture_with_endpoint(
+            observer_seed,
+            target_seed,
+            nonce_seed,
+            context_seed,
+            observed_at,
+            expires_at,
+            descriptor_sequence,
+            ENDPOINT,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fixture_with_endpoint(
+        observer_seed: u8,
+        target_seed: u8,
+        nonce_seed: u8,
+        context_seed: u8,
+        observed_at: u64,
+        expires_at: u64,
+        descriptor_sequence: u64,
+        endpoint_text: &str,
+    ) -> Fixture {
         let observer = key(observer_seed);
         let target = key(target_seed);
         let context = [context_seed; 32];
@@ -793,11 +963,11 @@ mod tests {
             NOW + 10_000,
             "1.0.0",
         );
-        descriptor.public_endpoint = Some(ENDPOINT.to_string());
+        descriptor.public_endpoint = Some(endpoint_text.to_string());
         let descriptor = SignedNodeDescriptor::sign(descriptor, &target).expect("descriptor");
         let pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
             .expect("descriptor pin");
-        let endpoint = canonical_public_endpoint_commitment(ENDPOINT).expect("endpoint");
+        let endpoint = canonical_public_endpoint_commitment(endpoint_text).expect("endpoint");
         let challenge = DiscoveryEndpointChallengeV1::issue(
             target.public_key_bytes(),
             pin.descriptor_hash,
@@ -939,6 +1109,65 @@ mod tests {
         ] {
             assert!(!debug.contains(&hex::encode(secret)));
         }
+    }
+
+    #[test]
+    fn candidate_facts_are_bounded_deduplicated_and_exactly_grouped() {
+        let dir = tempdir();
+        let store =
+            SqliteDiscoveryEndpointAttestationInbox::open(config(&dir, 8, 8192)).expect("open");
+        let first = fixture(3, 9, 1, 7, NOW, NOW + 60, 4);
+        let second = fixture(4, 9, 2, 8, NOW + 1, NOW + 59, 4);
+        let other_sequence = fixture(5, 9, 3, 9, NOW + 1, NOW + 59, 5);
+        let other_endpoint =
+            fixture_with_endpoint(6, 9, 4, 10, NOW + 1, NOW + 59, 4, "8.8.4.4:51820");
+        for item in [&first, &second, &other_sequence, &other_endpoint] {
+            store
+                .record_verified_at(&item.verified, item.verified.value.observed_at())
+                .expect("insert");
+        }
+        assert_eq!(
+            store
+                .record_verified_at(&first.verified, NOW + 2)
+                .expect("exact replay"),
+            DiscoveryEndpointAttestationRecordOutcome::Existing
+        );
+
+        let facts = store
+            .candidate_facts_at(NOW + 2, 30, 8)
+            .expect("candidate facts");
+        assert_eq!(facts.len(), 3);
+        let mut observer_counts = facts
+            .iter()
+            .map(|fact| fact.distinct_observers)
+            .collect::<Vec<_>>();
+        observer_counts.sort_unstable();
+        assert_eq!(observer_counts, vec![1, 1, 2]);
+        assert_eq!(
+            facts
+                .iter()
+                .map(|fact| fact.group_commitment)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+        let exact = facts
+            .iter()
+            .find(|fact| fact.distinct_observers == 2)
+            .expect("exact group");
+        assert_eq!(exact.overlap_started_at, NOW + 1);
+        assert_eq!(exact.overlap_expires_at, NOW + 59);
+        let debug = format!("{facts:?}");
+        for secret in [
+            first.verified.value.subject_node_id(),
+            first.verified.value.observer_node_id(),
+            first.verified.value.endpoint_commitment(),
+            facts[0].group_commitment,
+        ] {
+            assert!(!debug.contains(&hex::encode(secret)));
+        }
+        assert!(store.candidate_facts_at(NOW, 30, 0).is_err());
+        assert!(store.candidate_facts_at(NOW, 30, 9).is_err());
     }
 
     #[test]

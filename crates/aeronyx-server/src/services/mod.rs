@@ -303,6 +303,9 @@ mod discovery_endpoint_evidence;
 // independently signed observations in a bounded quarantine repository with
 // no peer promotion, ranking, routing, or advertisement authority.
 mod discovery_endpoint_attestation_inbox;
+// [PERMISSIONLESS-ENDPOINT-ELIGIBILITY 2026-09-24 by Codex] Pure policy may
+// classify quarantine candidates but cannot promote or route them.
+pub(crate) mod discovery_endpoint_eligibility;
 mod discovery_endpoint_verification;
 pub mod dns_proxy;
 pub mod handshake;
