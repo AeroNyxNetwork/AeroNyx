@@ -292,8 +292,11 @@ mod chat_relay_verified_submit;
 mod chat_relay_verified_submit_coordinator;
 mod chat_relay_verified_submit_store;
 pub mod deny_list;
+// [PERMISSIONLESS-ENDPOINT-VERIFICATION 2026-09-24 by Codex] Bounded,
+// composition-only challenge issuance and one-time proof consumption.
 pub mod directory_chain;
 pub mod directory_replica;
+mod discovery_endpoint_verification;
 pub mod dns_proxy;
 pub mod handshake;
 pub mod handshake_limiter;
@@ -351,6 +354,12 @@ pub use directory_replica::{
     DirectoryReplicaResolutionCommand, DirectoryReplicaResolutionReport, DirectoryReplicaStore,
     DirectoryReplicaStoreError, DirectoryReplicaStoreSnapshot, DirectoryReplicaSyncObservation,
     DirectoryReplicaSyncRuntime, DirectoryReplicaTip,
+};
+pub use discovery_endpoint_verification::{
+    DiscoveryEndpointChallengeIssueOutcome, DiscoveryEndpointChallengeRequestV1,
+    DiscoveryEndpointProofConsumeOutcome, DiscoveryEndpointVerificationConfig,
+    DiscoveryEndpointVerificationError, DiscoveryEndpointVerificationService,
+    DISCOVERY_ENDPOINT_VERIFICATION_MAX_ENTRIES,
 };
 pub use dns_proxy::{spawn_dns_proxy, start_dns_proxy};
 pub use handshake::HandshakeService;
