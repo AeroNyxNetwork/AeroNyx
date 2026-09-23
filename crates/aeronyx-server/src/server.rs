@@ -24083,9 +24083,12 @@ mod tests {
                 let snapshot_response = snapshot_response.clone();
                 async move {
                     calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                    // [ENDPOINT-ATTESTATION-TRANSPORT 2026-09-24 by Codex]
+                    // Test-only gossip mocks explicitly discard the dormant carrier.
                     let response = match message {
                         NodeDiscoveryMessage::DescriptorAnnounce { .. }
-                        | NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. } => {
+                        | NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. }
+                        | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => {
                             GossipResponse {
                                 applied: PeerStoreImportReport::empty(),
                                 response: None,
@@ -24162,7 +24165,10 @@ mod tests {
                                 StatusCode::OK
                             }
                             NodeDiscoveryMessage::DescriptorAnnounce { .. }
-                            | NodeDiscoveryMessage::SnapshotResponse { .. } => StatusCode::OK,
+                            | NodeDiscoveryMessage::SnapshotResponse { .. }
+                            | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => {
+                                StatusCode::OK
+                            }
                             NodeDiscoveryMessage::SnapshotRequest { .. } => {
                                 StatusCode::INTERNAL_SERVER_ERROR
                             }
@@ -24460,7 +24466,10 @@ mod tests {
                                 legacy_calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
                                 StatusCode::OK
                             }
-                            NodeDiscoveryMessage::SnapshotResponse { .. } => StatusCode::OK,
+                            NodeDiscoveryMessage::SnapshotResponse { .. }
+                            | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => {
+                                StatusCode::OK
+                            }
                         };
                         (
                             status,
@@ -24548,7 +24557,10 @@ mod tests {
                                 legacy_calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
                                 StatusCode::OK
                             }
-                            NodeDiscoveryMessage::SnapshotResponse { .. } => StatusCode::OK,
+                            NodeDiscoveryMessage::SnapshotResponse { .. }
+                            | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => {
+                                StatusCode::OK
+                            }
                         };
                         (
                             status,
@@ -24718,7 +24730,10 @@ mod tests {
                                 legacy_calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
                                 StatusCode::OK
                             }
-                            NodeDiscoveryMessage::SnapshotResponse { .. } => StatusCode::OK,
+                            NodeDiscoveryMessage::SnapshotResponse { .. }
+                            | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => {
+                                StatusCode::OK
+                            }
                         };
                         (
                             status,

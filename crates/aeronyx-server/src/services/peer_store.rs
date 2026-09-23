@@ -4720,6 +4720,9 @@ impl PeerStore {
             NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. } => {
                 self.record_rejected_directory_proof_import(now)
             }
+            NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => {
+                Self::rejected_endpoint_attestation_report()
+            }
         }
     }
 
@@ -4741,6 +4744,9 @@ impl PeerStore {
             NodeDiscoveryMessage::SnapshotResponse { snapshot } => snapshot.peers.clone(),
             NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. } => {
                 return self.record_rejected_directory_proof_import(now);
+            }
+            NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => {
+                return Self::rejected_endpoint_attestation_report();
             }
         };
 
@@ -4765,6 +4771,20 @@ impl PeerStore {
         }
         self.record_import_report(&report, now);
         report
+    }
+
+    // [ENDPOINT-ATTESTATION-TRANSPORT 2026-09-24 by Codex] PeerStore is not
+    // an attestation verifier or promotion authority. Direct callers receive
+    // a coarse rejection report without mutating peer, audit, or counters.
+    fn rejected_endpoint_attestation_report() -> PeerStoreImportReport {
+        PeerStoreImportReport {
+            total: 1,
+            inserted: 0,
+            candidates: 0,
+            unchanged: 0,
+            stale: 0,
+            rejected: 1,
+        }
     }
 
     /// Applies one descriptor through the normal verification, capacity, and
@@ -10223,6 +10243,35 @@ mod tests {
             issued_at + u64::try_from(attestors.len()).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn endpoint_attestation_direct_peer_store_entries_reject_without_mutation() {
+        // [ENDPOINT-ATTESTATION-TRANSPORT 2026-09-24 by Codex] Only the API
+        // adapter owns verification. Trusted and untrusted PeerStore entry
+        // points must reject this carrier without counters, audit, or peers.
+        let now = 1_780_000_000;
+        let store = PeerStore::new();
+        let message = NodeDiscoveryMessage::EndpointEvidenceAttestationV1 {
+            attestation_frame: vec![0x55; 289],
+        };
+        let before = store.status(now);
+        let expected = PeerStoreImportReport {
+            total: 1,
+            inserted: 0,
+            candidates: 0,
+            unchanged: 0,
+            stale: 0,
+            rejected: 1,
+        };
+
+        assert_eq!(store.apply_discovery_message(&message, now), expected);
+        assert_eq!(store.status(now), before);
+        assert_eq!(
+            store.apply_untrusted_discovery_message(&message, now),
+            expected
+        );
+        assert_eq!(store.status(now), before);
     }
 
     #[test]

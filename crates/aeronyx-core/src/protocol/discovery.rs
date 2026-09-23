@@ -234,6 +234,9 @@ use crate::crypto::{IdentityKeyPair, IdentityPublicKey};
 use crate::error::CoreError;
 use crate::ledger::{build_merkle_inclusion_proof, merkle_root, verify_merkle_inclusion_proof};
 use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
+use crate::protocol::discovery_endpoint_attestation::{
+    DiscoveryEndpointEvidenceAttestationV1, DISCOVERY_ENDPOINT_ATTESTATION_FRAME_BYTES_V1,
+};
 
 // ============================================
 // Serialization constants
@@ -4432,6 +4435,14 @@ pub enum NodeDiscoveryMessage {
         /// Compact producer-signed inclusion proof carrying the descriptor.
         proof: DirectoryDescriptorInclusionProofV1,
     },
+    /// Carries one canonical observer-signed endpoint evidence attestation.
+    ///
+    /// This transport object grants no persistence, forwarding, promotion,
+    /// ranking, routeability, readiness, quorum, or economic authority.
+    EndpointEvidenceAttestationV1 {
+        /// Exact fixed-width canonical ADAT V1 frame.
+        attestation_frame: Vec<u8>,
+    },
 }
 
 /// Encodes a discovery gossip message using bounded bincode.
@@ -4439,6 +4450,7 @@ pub enum NodeDiscoveryMessage {
 /// # Errors
 /// Returns `CoreError::MalformedMessage` when serialization fails.
 pub fn encode_discovery_message(message: &NodeDiscoveryMessage) -> Result<Vec<u8>, CoreError> {
+    validate_endpoint_attestation_message(message)?;
     encode_bincode_bounded(message, MAX_DISCOVERY_MESSAGE_BYTES)
         .map_err(|err| CoreError::malformed(format!("discovery message encode: {err}")))
 }
@@ -4448,12 +4460,35 @@ pub fn encode_discovery_message(message: &NodeDiscoveryMessage) -> Result<Vec<u8
 /// # Errors
 /// Returns `CoreError::MalformedMessage` when decoding fails.
 pub fn decode_discovery_message(bytes: &[u8]) -> Result<NodeDiscoveryMessage, CoreError> {
-    decode_bincode_bounded(
+    let message = decode_bincode_bounded(
         bytes,
         MAX_DISCOVERY_MESSAGE_BYTES,
         TrailingBytesPolicy::Reject,
     )
-    .map_err(|err| CoreError::malformed(format!("discovery message decode: {err}")))
+    .map_err(|err| CoreError::malformed(format!("discovery message decode: {err}")))?;
+    validate_endpoint_attestation_message(&message)?;
+    Ok(message)
+}
+
+// [ENDPOINT-ATTESTATION-TRANSPORT 2026-09-24 by Codex] The outer discovery
+// ceiling must never turn a single fixed ADAT object into a large byte carrier.
+fn validate_endpoint_attestation_message(message: &NodeDiscoveryMessage) -> Result<(), CoreError> {
+    let NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { attestation_frame } = message else {
+        return Ok(());
+    };
+    if attestation_frame.len() != DISCOVERY_ENDPOINT_ATTESTATION_FRAME_BYTES_V1 {
+        return Err(CoreError::malformed(
+            "endpoint evidence attestation frame has invalid length",
+        ));
+    }
+    let attestation = DiscoveryEndpointEvidenceAttestationV1::decode(attestation_frame)
+        .map_err(|_| CoreError::malformed("endpoint evidence attestation frame is invalid"))?;
+    if attestation.encode() != *attestation_frame {
+        return Err(CoreError::malformed(
+            "endpoint evidence attestation frame is non-canonical",
+        ));
+    }
+    Ok(())
 }
 
 // ============================================
@@ -4463,7 +4498,17 @@ pub fn decode_discovery_message(bytes: &[u8]) -> Result<NodeDiscoveryMessage, Co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::discovery_endpoint_attestation::{
+        discovery_endpoint_evidence_commitment_v1, DiscoveryEndpointAttestationPurposeV1,
+        DiscoveryEndpointEvidenceAttestationV1,
+    };
+    use crate::protocol::discovery_endpoint_proof::{
+        canonical_public_endpoint_commitment, DiscoveryEndpointChallengeV1,
+        DiscoveryEndpointProofV1,
+    };
     use bincode::Options;
+
+    const ENDPOINT_ATTESTATION_TEST_NOW: u64 = 1_780_000_000;
 
     fn descriptor_for(kp: &IdentityKeyPair) -> NodeDescriptor {
         let mut descriptor = NodeDescriptor::new(
@@ -4486,6 +4531,62 @@ mod tests {
             region: Some("test-region".to_string()),
         };
         descriptor
+    }
+
+    fn endpoint_attestation_frame() -> Vec<u8> {
+        let observer = IdentityKeyPair::from_bytes(&[0x11; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x22; 32]).unwrap();
+        let context = [0x33; 32];
+        let endpoint = canonical_public_endpoint_commitment("8.8.8.8:51820").unwrap();
+        let mut descriptor = descriptor_for(&subject);
+        descriptor.public_endpoint = Some("8.8.8.8:51820".to_string());
+        descriptor.issued_at = ENDPOINT_ATTESTATION_TEST_NOW - 60;
+        descriptor.expires_at = ENDPOINT_ATTESTATION_TEST_NOW + 3_600;
+        let descriptor = SignedNodeDescriptor::sign(descriptor, &subject).unwrap();
+        let commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).unwrap();
+        let challenge = DiscoveryEndpointChallengeV1::issue(
+            subject.public_key_bytes(),
+            commitment.descriptor_hash,
+            endpoint,
+            [0x44; 32],
+            context,
+            ENDPOINT_ATTESTATION_TEST_NOW,
+            ENDPOINT_ATTESTATION_TEST_NOW + 120,
+            &observer,
+        )
+        .unwrap();
+        let proof = DiscoveryEndpointProofV1::respond(
+            &challenge,
+            &context,
+            ENDPOINT_ATTESTATION_TEST_NOW + 1,
+            &subject,
+        )
+        .unwrap();
+        let evidence = discovery_endpoint_evidence_commitment_v1(&challenge, &proof);
+        let attestation = DiscoveryEndpointEvidenceAttestationV1::issue_from_verified_proof(
+            &descriptor,
+            &challenge,
+            &proof,
+            context,
+            DiscoveryEndpointAttestationPurposeV1::EndpointPossessionObservation,
+            ENDPOINT_ATTESTATION_TEST_NOW + 1,
+            ENDPOINT_ATTESTATION_TEST_NOW + 3_601,
+            &observer,
+        )
+        .unwrap();
+        attestation
+            .verify_at(
+                ENDPOINT_ATTESTATION_TEST_NOW + 2,
+                &observer.public_key_bytes(),
+                &commitment,
+                &endpoint,
+                &evidence,
+                &context,
+                DiscoveryEndpointAttestationPurposeV1::EndpointPossessionObservation,
+            )
+            .unwrap();
+        attestation.encode()
     }
 
     #[test]
@@ -5172,6 +5273,58 @@ mod tests {
         let encoded = encode_discovery_message(&message).unwrap();
         assert_eq!(&encoded[..4], &3u32.to_le_bytes());
         assert_eq!(decode_discovery_message(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn endpoint_attestation_carrier_is_append_only_canonical_and_frozen() {
+        // [ENDPOINT-ATTESTATION-TRANSPORT 2026-09-24 by Codex] The carrier is
+        // append-only at discriminant 4 and admits exactly one canonical ADAT.
+        let attestation_frame = endpoint_attestation_frame();
+        assert_eq!(
+            attestation_frame.len(),
+            DISCOVERY_ENDPOINT_ATTESTATION_FRAME_BYTES_V1
+        );
+        let message = NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { attestation_frame };
+        let encoded = encode_discovery_message(&message).unwrap();
+        assert_eq!(&encoded[..4], &4u32.to_le_bytes());
+        assert_eq!(encoded.len(), 301);
+        assert_eq!(decode_discovery_message(&encoded).unwrap(), message);
+        assert_eq!(
+            hex::encode(Sha256::digest(&encoded)),
+            "7cdcf74ff0bfb4f6e61de021fc2c218b5603838a6d254b247d8f0a31eb9ff78e"
+        );
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(decode_discovery_message(&trailing).is_err());
+    }
+
+    #[test]
+    fn endpoint_attestation_carrier_rejects_noncanonical_inner_frames() {
+        let canonical = endpoint_attestation_frame();
+        for malformed in [canonical[..canonical.len() - 1].to_vec(), {
+            let mut bytes = canonical.clone();
+            bytes.push(0);
+            bytes
+        }] {
+            assert!(encode_discovery_message(
+                &NodeDiscoveryMessage::EndpointEvidenceAttestationV1 {
+                    attestation_frame: malformed,
+                }
+            )
+            .is_err());
+        }
+
+        for offset in [4usize, 5, 224] {
+            let mut malformed = canonical.clone();
+            malformed[offset] ^= 0x7f;
+            assert!(encode_discovery_message(
+                &NodeDiscoveryMessage::EndpointEvidenceAttestationV1 {
+                    attestation_frame: malformed,
+                }
+            )
+            .is_err());
+        }
     }
 
     #[test]

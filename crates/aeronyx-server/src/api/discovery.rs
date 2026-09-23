@@ -248,10 +248,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aeronyx_core::protocol::discovery::{
-    decode_route_domain_attestation_certificate,
+    decode_route_domain_attestation_certificate, DirectoryDescriptorCommitmentV1,
     MAX_ROUTE_DOMAIN_ATTESTATION_CERTIFICATE_FRAME_BYTES,
 };
 use aeronyx_core::protocol::{
+    DiscoveryEndpointAttestationPurposeV1, DiscoveryEndpointEvidenceAttestationV1,
     NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage, NodeProtocolFeature,
     OnionRoutePurpose, SignedNodeDescriptor, MAX_VERIFIED_ONION_ROUTE_HOPS,
     ONION_FORWARD_HOP_REQUIRED_CAPABILITIES, ONION_ROUTE_PURPOSE_VALUES,
@@ -268,6 +269,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::api::directory_replica_sync::admit_directory_gossip_descriptor;
+use crate::api::public_node_router::public_endpoint_flow_context;
 use crate::config::DiscoveryConfig;
 use crate::services::{
     DirectoryReplicaStore, PeerStore, PeerStoreImportReport, PeerStoreStatus,
@@ -374,6 +376,11 @@ impl DiscoveryApiPolicy {
             }
             NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { proof, .. } => {
                 self.node_allowed(&proof.descriptor.node_id())
+            }
+            NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { attestation_frame } => {
+                DiscoveryEndpointEvidenceAttestationV1::decode(attestation_frame)
+                    .map(|attestation| self.node_allowed(&attestation.subject_node_id()))
+                    .unwrap_or(false)
             }
             NodeDiscoveryMessage::SnapshotResponse { snapshot } => snapshot
                 .peers
@@ -4172,8 +4179,17 @@ async fn gossip_handler(
             .into_response();
     }
 
+    let is_endpoint_attestation = matches!(
+        message,
+        NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. }
+    );
     let (admission_status, applied) = apply_gossip_message(&state, &message, now);
-    state.peer_store.mark_gossip_at(now);
+    // [ENDPOINT-ATTESTATION-TRANSPORT 2026-09-24 by Codex] The dormant
+    // attestation carrier is verified and discarded. Exact replay must not
+    // refresh gossip freshness or create any other PeerStore state.
+    if !is_endpoint_attestation {
+        state.peer_store.mark_gossip_at(now);
+    }
     if admission_status != StatusCode::OK {
         return (
             admission_status,
@@ -4195,7 +4211,8 @@ async fn gossip_handler(
         }
         NodeDiscoveryMessage::SnapshotResponse { .. }
         | NodeDiscoveryMessage::DescriptorAnnounce { .. }
-        | NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. } => None,
+        | NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. }
+        | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => None,
     };
 
     (StatusCode::OK, Json(GossipResponse { applied, response })).into_response()
@@ -4206,6 +4223,38 @@ fn apply_gossip_message(
     message: &NodeDiscoveryMessage,
     now: u64,
 ) -> (StatusCode, PeerStoreImportReport) {
+    if let NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { attestation_frame } = message {
+        // [ENDPOINT-ATTESTATION-TRANSPORT 2026-09-24 by Codex] Verify the
+        // dormant carrier completely, then discard it without touching peer state.
+        let accepted = DiscoveryEndpointEvidenceAttestationV1::decode(attestation_frame)
+            .and_then(|attestation| {
+                let descriptor = DirectoryDescriptorCommitmentV1 {
+                    node_id: attestation.subject_node_id(),
+                    sequence: attestation.descriptor_sequence(),
+                    descriptor_hash: attestation.descriptor_hash(),
+                };
+                let observer = attestation.observer_node_id();
+                let context = public_endpoint_flow_context(observer);
+                attestation.verify_at(
+                    now,
+                    &observer,
+                    &descriptor,
+                    &attestation.endpoint_commitment(),
+                    &attestation.evidence_commitment(),
+                    &context,
+                    DiscoveryEndpointAttestationPurposeV1::EndpointPossessionObservation,
+                )
+            })
+            .is_ok();
+        return if accepted {
+            (StatusCode::OK, PeerStoreImportReport::empty())
+        } else {
+            (
+                StatusCode::BAD_REQUEST,
+                state.peer_store.record_rejected_directory_proof_import(now),
+            )
+        };
+    }
     let NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 {
         producer,
         block_hash,
@@ -4444,7 +4493,9 @@ mod tests {
         AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
     };
     use aeronyx_core::protocol::{
-        NodeCapability, NodeCapacity, NodeDescriptor, NodePolicy, SignedNodeDescriptor,
+        canonical_public_endpoint_commitment, discovery_endpoint_evidence_commitment_v1,
+        DiscoveryEndpointChallengeV1, DiscoveryEndpointProofV1, NodeCapability, NodeCapacity,
+        NodeDescriptor, NodePolicy, SignedNodeDescriptor,
     };
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
@@ -4467,6 +4518,63 @@ mod tests {
             max_pps: None,
         };
         aeronyx_core::protocol::SignedNodeDescriptor::sign(descriptor, &kp).unwrap()
+    }
+
+    fn endpoint_attestation_message(now: u64) -> NodeDiscoveryMessage {
+        let observer = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x72; 32]).unwrap();
+        let context = public_endpoint_flow_context(observer.public_key_bytes());
+        let endpoint = canonical_public_endpoint_commitment("8.8.8.8:51820").unwrap();
+        let mut descriptor = NodeDescriptor::new(
+            subject.public_key_bytes(),
+            9,
+            now.saturating_sub(1),
+            now + 600,
+            "endpoint-attestation-api-test",
+        );
+        descriptor.public_endpoint = Some("8.8.8.8:51820".to_string());
+        let descriptor = SignedNodeDescriptor::sign(descriptor, &subject).unwrap();
+        let commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).unwrap();
+        let challenge = DiscoveryEndpointChallengeV1::issue(
+            subject.public_key_bytes(),
+            commitment.descriptor_hash,
+            endpoint,
+            [0x73; 32],
+            context,
+            now,
+            now + 120,
+            &observer,
+        )
+        .unwrap();
+        let proof =
+            DiscoveryEndpointProofV1::respond(&challenge, &context, now + 1, &subject).unwrap();
+        let evidence = discovery_endpoint_evidence_commitment_v1(&challenge, &proof);
+        let attestation = DiscoveryEndpointEvidenceAttestationV1::issue_from_verified_proof(
+            &descriptor,
+            &challenge,
+            &proof,
+            context,
+            DiscoveryEndpointAttestationPurposeV1::EndpointPossessionObservation,
+            now + 1,
+            now + 601,
+            &observer,
+        )
+        .unwrap();
+        attestation
+            .verify_at(
+                now + 2,
+                &observer.public_key_bytes(),
+                &commitment,
+                &endpoint,
+                &evidence,
+                &context,
+                DiscoveryEndpointAttestationPurposeV1::EndpointPossessionObservation,
+            )
+            .unwrap();
+        NodeDiscoveryMessage::EndpointEvidenceAttestationV1 {
+            attestation_frame: attestation.encode(),
+        }
     }
 
     fn route_domain_certificate_for(
@@ -6776,6 +6884,65 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn endpoint_attestation_gossip_verifies_discards_and_replays_without_state() {
+        // [ENDPOINT-ATTESTATION-TRANSPORT 2026-09-24 by Codex] A valid dormant
+        // carrier is transport evidence only: no peer, freshness, or audit state.
+        let now = now_secs();
+        let store = Arc::new(PeerStore::new());
+        let before = store.status(now + 2);
+        let body = serde_json::to_vec(&endpoint_attestation_message(now)).unwrap();
+        let app = build_discovery_router(Arc::clone(&store), DiscoveryApiPolicy::default());
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/discovery/gossip")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(store.status(now + 2), before);
+    }
+
+    #[tokio::test]
+    async fn endpoint_attestation_gossip_rejects_signature_tamper() {
+        let now = now_secs();
+        let store = Arc::new(PeerStore::new());
+        let mut message = endpoint_attestation_message(now);
+        let NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { attestation_frame } =
+            &mut message
+        else {
+            unreachable!();
+        };
+        let last = attestation_frame.len() - 1;
+        attestation_frame[last] ^= 1;
+        let app = build_discovery_router(Arc::clone(&store), DiscoveryApiPolicy::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/discovery/gossip")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&message).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.status(now + 2).runtime.last_gossip_at, None);
     }
 
     #[tokio::test]
