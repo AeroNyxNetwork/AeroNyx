@@ -34,6 +34,20 @@ const CHALLENGE_COMMITMENT_DOMAIN: &[u8] = b"AeroNyx/DiscoveryEndpointChallengeC
 const ENDPOINT_COMMITMENT_DOMAIN: &[u8] = b"AeroNyx/DiscoveryPublicEndpointV1\0";
 const PROOF_SIGNATURE_DOMAIN: &[u8] = b"AeroNyx/DiscoveryEndpointProofV1\0";
 
+// [PERMISSIONLESS-ENDPOINT-TRANSPORT 2026-09-24 by Codex] Keep transport
+// authentication separate from both endpoint evidence and the server adapter.
+const TRANSPORT_MAGIC: [u8; 4] = *b"ADET";
+const TRANSPORT_HEADER_BYTES: usize = 8;
+const TRANSPORT_FIXED_BODY_BYTES: usize = 32 * 6 + 8 * 2 + 2 + 64;
+const TRANSPORT_SIGNATURE_DOMAIN: &[u8] = b"AeroNyx/DiscoveryEndpointAuthenticatedTransportV1\0";
+const TRANSPORT_INNER_COMMITMENT_DOMAIN: &[u8] =
+    b"AeroNyx/DiscoveryEndpointAuthenticatedTransportInnerV1\0";
+const TRANSPORT_COMMITMENT_DOMAIN: &[u8] =
+    b"AeroNyx/DiscoveryEndpointAuthenticatedTransportCommitmentV1\0";
+const STAGE_C_INNER_MAGIC: [u8; 4] = *b"ADEA";
+const STAGE_C_INNER_VERSION_V1: u8 = 1;
+const STAGE_C_INNER_HEADER_BYTES: usize = 8;
+
 /// Frozen version of the permissionless endpoint-proof protocol.
 pub const DISCOVERY_ENDPOINT_PROOF_VERSION_V1: u8 = 1;
 /// Maximum lifetime of one challenge, in seconds.
@@ -44,6 +58,18 @@ pub const DISCOVERY_ENDPOINT_CHALLENGE_FUTURE_SKEW_SECS: u64 = 30;
 pub const DISCOVERY_ENDPOINT_CHALLENGE_FRAME_BYTES_V1: usize = CHALLENGE_FRAME_BYTES;
 /// Exact encoded length of a V1 proof frame.
 pub const DISCOVERY_ENDPOINT_PROOF_FRAME_BYTES_V1: usize = PROOF_FRAME_BYTES;
+/// Frozen version of the authenticated Stage C transport envelope.
+pub const DISCOVERY_ENDPOINT_TRANSPORT_VERSION_V1: u8 = 1;
+/// Maximum lifetime of one authenticated transport request, in seconds.
+pub const DISCOVERY_ENDPOINT_TRANSPORT_MAX_TTL_SECS: u64 = 120;
+/// Maximum accepted positive clock skew for an authenticated transport request.
+pub const DISCOVERY_ENDPOINT_TRANSPORT_FUTURE_SKEW_SECS: u64 = 30;
+/// Maximum exact Stage C ADEA frame carried by the authenticated transport.
+pub const DISCOVERY_ENDPOINT_TRANSPORT_MAX_INNER_BYTES_V1: usize = 644;
+/// Maximum canonical encoded transport frame length.
+pub const DISCOVERY_ENDPOINT_TRANSPORT_MAX_FRAME_BYTES_V1: usize = TRANSPORT_HEADER_BYTES
+    + TRANSPORT_FIXED_BODY_BYTES
+    + DISCOVERY_ENDPOINT_TRANSPORT_MAX_INNER_BYTES_V1;
 
 /// Coarse, privacy-safe endpoint-proof validation errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +99,35 @@ impl fmt::Display for DiscoveryEndpointProofError {
 }
 
 impl std::error::Error for DiscoveryEndpointProofError {}
+
+/// Frozen Stage C operation and path identity carried by authenticated transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DiscoveryEndpointTransportOperationV1 {
+    /// Issues or exactly replays one endpoint challenge.
+    Issue = 1,
+    /// Verifies and atomically consumes one endpoint proof.
+    Verify = 2,
+}
+
+impl DiscoveryEndpointTransportOperationV1 {
+    /// Returns the exact HTTP path bound by this operation's signature.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::Issue => "/api/discovery/endpoint-proof/challenge",
+            Self::Verify => "/api/discovery/endpoint-proof/verify",
+        }
+    }
+
+    const fn from_u8(value: u8) -> Result<Self, DiscoveryEndpointProofError> {
+        match value {
+            1 => Ok(Self::Issue),
+            2 => Ok(Self::Verify),
+            _ => Err(DiscoveryEndpointProofError::Unsupported),
+        }
+    }
+}
 
 /// Challenger-signed request proving the exact endpoint and discovery context.
 #[derive(Clone, PartialEq, Eq)]
@@ -471,6 +526,332 @@ impl DiscoveryEndpointProofV1 {
     }
 }
 
+/// Target-authenticated transport for one exact Stage C ADEA request frame.
+///
+/// This envelope proves only that the target node key signed one bounded,
+/// fresh request for the exact operation and path. It does not establish
+/// endpoint reachability, promote a descriptor, or grant routing authority.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DiscoveryEndpointAuthenticatedTransportV1 {
+    operation: DiscoveryEndpointTransportOperationV1,
+    request_id: [u8; 32],
+    target_node_id: [u8; 32],
+    descriptor_commitment: [u8; 32],
+    endpoint_commitment: [u8; 32],
+    flow_context: [u8; 32],
+    issued_at: u64,
+    expires_at: u64,
+    inner_commitment: [u8; 32],
+    inner_frame: Vec<u8>,
+    signature: [u8; 64],
+}
+
+impl fmt::Debug for DiscoveryEndpointAuthenticatedTransportV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryEndpointAuthenticatedTransportV1")
+            .field("operation", &self.operation)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DiscoveryEndpointAuthenticatedTransportV1 {
+    /// Builds and signs one canonical transport envelope.
+    ///
+    /// `inner_frame` must be a canonical Stage C ADEA V1 request whose kind
+    /// matches `operation` and whose first body field is the same request id.
+    ///
+    /// # Errors
+    /// Returns a coarse error for reserved fields, invalid time, malformed or
+    /// oversized inner bytes, or a signer that does not match the target id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign(
+        operation: DiscoveryEndpointTransportOperationV1,
+        request_id: [u8; 32],
+        descriptor_commitment: [u8; 32],
+        endpoint_commitment: [u8; 32],
+        flow_context: [u8; 32],
+        issued_at: u64,
+        expires_at: u64,
+        inner_frame: &[u8],
+        target: &IdentityKeyPair,
+    ) -> Result<Self, DiscoveryEndpointProofError> {
+        let target_node_id = target.public_key_bytes();
+        validate_transport_claims(
+            operation,
+            &request_id,
+            &target_node_id,
+            &descriptor_commitment,
+            &endpoint_commitment,
+            &flow_context,
+            issued_at,
+            expires_at,
+            inner_frame,
+        )?;
+        let mut transport = Self {
+            operation,
+            request_id,
+            target_node_id,
+            descriptor_commitment,
+            endpoint_commitment,
+            flow_context,
+            issued_at,
+            expires_at,
+            inner_commitment: domain_hash(TRANSPORT_INNER_COMMITMENT_DOMAIN, inner_frame),
+            inner_frame: inner_frame.to_vec(),
+            signature: [0; 64],
+        };
+        transport.signature = target.sign(&transport.signing_bytes());
+        Ok(transport)
+    }
+
+    /// Decodes one canonical bounded transport frame without trusting it.
+    ///
+    /// Call [`Self::verify_at`] before using any identity or context field.
+    ///
+    /// # Errors
+    /// Returns a coarse error for unsupported, malformed, non-canonical,
+    /// oversized, trailing, or reserved data.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DiscoveryEndpointProofError> {
+        if bytes.len() < TRANSPORT_HEADER_BYTES
+            || bytes.len() > DISCOVERY_ENDPOINT_TRANSPORT_MAX_FRAME_BYTES_V1
+        {
+            return Err(DiscoveryEndpointProofError::Malformed);
+        }
+        if bytes[..4] != TRANSPORT_MAGIC {
+            return Err(DiscoveryEndpointProofError::Malformed);
+        }
+        if bytes[4] != DISCOVERY_ENDPOINT_TRANSPORT_VERSION_V1 {
+            return Err(DiscoveryEndpointProofError::Unsupported);
+        }
+        let operation = DiscoveryEndpointTransportOperationV1::from_u8(bytes[5])?;
+        let body_len = usize::from(u16::from_be_bytes([bytes[6], bytes[7]]));
+        if body_len < TRANSPORT_FIXED_BODY_BYTES || bytes.len() != TRANSPORT_HEADER_BYTES + body_len
+        {
+            return Err(DiscoveryEndpointProofError::Malformed);
+        }
+        let body = &bytes[TRANSPORT_HEADER_BYTES..];
+        let mut offset = 0;
+        let request_id = take_array(body, &mut offset)?;
+        let target_node_id = take_array(body, &mut offset)?;
+        let descriptor_commitment = take_array(body, &mut offset)?;
+        let endpoint_commitment = take_array(body, &mut offset)?;
+        let flow_context = take_array(body, &mut offset)?;
+        let issued_at = take_u64(body, &mut offset)?;
+        let expires_at = take_u64(body, &mut offset)?;
+        let inner_commitment = take_array(body, &mut offset)?;
+        let inner_len = usize::from(u16::from_be_bytes(take_array(body, &mut offset)?));
+        if inner_len == 0 || inner_len > DISCOVERY_ENDPOINT_TRANSPORT_MAX_INNER_BYTES_V1 {
+            return Err(DiscoveryEndpointProofError::Malformed);
+        }
+        let inner_end = offset
+            .checked_add(inner_len)
+            .ok_or(DiscoveryEndpointProofError::Malformed)?;
+        let inner_frame = body
+            .get(offset..inner_end)
+            .ok_or(DiscoveryEndpointProofError::Malformed)?
+            .to_vec();
+        offset = inner_end;
+        let signature = take_array(body, &mut offset)?;
+        if offset != body.len()
+            || is_reserved(&inner_commitment)
+            || is_reserved(&signature)
+            || inner_commitment != domain_hash(TRANSPORT_INNER_COMMITMENT_DOMAIN, &inner_frame)
+        {
+            return Err(DiscoveryEndpointProofError::Malformed);
+        }
+        validate_transport_claims(
+            operation,
+            &request_id,
+            &target_node_id,
+            &descriptor_commitment,
+            &endpoint_commitment,
+            &flow_context,
+            issued_at,
+            expires_at,
+            &inner_frame,
+        )?;
+        let transport = Self {
+            operation,
+            request_id,
+            target_node_id,
+            descriptor_commitment,
+            endpoint_commitment,
+            flow_context,
+            issued_at,
+            expires_at,
+            inner_commitment,
+            inner_frame,
+            signature,
+        };
+        if transport.encode() != bytes {
+            return Err(DiscoveryEndpointProofError::Malformed);
+        }
+        Ok(transport)
+    }
+
+    /// Verifies freshness, exact expected operation, target, flow context, and signature.
+    ///
+    /// # Errors
+    /// Returns a coarse error for a stale request, context mismatch, or invalid
+    /// target signature.
+    pub fn verify_at(
+        &self,
+        now: u64,
+        expected_operation: DiscoveryEndpointTransportOperationV1,
+        expected_target_node_id: &[u8; 32],
+        expected_flow_context: &[u8; 32],
+    ) -> Result<(), DiscoveryEndpointProofError> {
+        validate_transport_claims(
+            self.operation,
+            &self.request_id,
+            &self.target_node_id,
+            &self.descriptor_commitment,
+            &self.endpoint_commitment,
+            &self.flow_context,
+            self.issued_at,
+            self.expires_at,
+            &self.inner_frame,
+        )?;
+        if self.operation != expected_operation
+            || &self.target_node_id != expected_target_node_id
+            || &self.flow_context != expected_flow_context
+            || self.inner_commitment
+                != domain_hash(TRANSPORT_INNER_COMMITMENT_DOMAIN, &self.inner_frame)
+        {
+            return Err(DiscoveryEndpointProofError::ContextMismatch);
+        }
+        validate_transport_time(self.issued_at, self.expires_at, now)?;
+        verify_signature(&self.target_node_id, &self.signing_bytes(), &self.signature)
+    }
+
+    /// Decodes and verifies one transport frame before exposing its authority.
+    ///
+    /// # Errors
+    /// Returns a coarse decode, context, time, or signature error.
+    pub fn decode_verified_at(
+        bytes: &[u8],
+        now: u64,
+        expected_operation: DiscoveryEndpointTransportOperationV1,
+        expected_target_node_id: &[u8; 32],
+        expected_flow_context: &[u8; 32],
+    ) -> Result<Self, DiscoveryEndpointProofError> {
+        let transport = Self::decode(bytes)?;
+        transport.verify_at(
+            now,
+            expected_operation,
+            expected_target_node_id,
+            expected_flow_context,
+        )?;
+        Ok(transport)
+    }
+
+    /// Returns the exact operation and bound path identity.
+    #[must_use]
+    pub const fn operation(&self) -> DiscoveryEndpointTransportOperationV1 {
+        self.operation
+    }
+
+    /// Returns the exact replay request id.
+    #[must_use]
+    pub const fn request_id(&self) -> [u8; 32] {
+        self.request_id
+    }
+
+    /// Returns the authenticated target node identity.
+    #[must_use]
+    pub const fn target_node_id(&self) -> [u8; 32] {
+        self.target_node_id
+    }
+
+    /// Returns the exact signed descriptor commitment.
+    #[must_use]
+    pub const fn descriptor_commitment(&self) -> [u8; 32] {
+        self.descriptor_commitment
+    }
+
+    /// Returns the canonical public endpoint commitment.
+    #[must_use]
+    pub const fn endpoint_commitment(&self) -> [u8; 32] {
+        self.endpoint_commitment
+    }
+
+    /// Returns the stable authenticated flow context.
+    #[must_use]
+    pub const fn flow_context(&self) -> [u8; 32] {
+        self.flow_context
+    }
+
+    /// Returns the exact inner ADEA frame commitment.
+    #[must_use]
+    pub const fn inner_commitment(&self) -> [u8; 32] {
+        self.inner_commitment
+    }
+
+    /// Returns the exact canonical Stage C ADEA request bytes.
+    #[must_use]
+    pub fn inner_frame(&self) -> &[u8] {
+        &self.inner_frame
+    }
+
+    /// Returns a commitment to this exact canonical signed transport frame.
+    #[must_use]
+    pub fn commitment(&self) -> [u8; 32] {
+        domain_hash(TRANSPORT_COMMITMENT_DOMAIN, &self.encode())
+    }
+
+    /// Encodes one canonical bounded transport frame.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let unsigned = self.unsigned_body();
+        let body_len = unsigned.len() + self.signature.len();
+        let body_len = u16::try_from(body_len).unwrap_or(u16::MAX);
+        let mut frame = Vec::with_capacity(TRANSPORT_HEADER_BYTES + usize::from(body_len));
+        frame.extend_from_slice(&TRANSPORT_MAGIC);
+        frame.push(DISCOVERY_ENDPOINT_TRANSPORT_VERSION_V1);
+        frame.push(self.operation as u8);
+        frame.extend_from_slice(&body_len.to_be_bytes());
+        frame.extend_from_slice(&unsigned);
+        frame.extend_from_slice(&self.signature);
+        frame
+    }
+
+    fn unsigned_body(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(TRANSPORT_FIXED_BODY_BYTES - 64 + self.inner_frame.len());
+        body.extend_from_slice(&self.request_id);
+        body.extend_from_slice(&self.target_node_id);
+        body.extend_from_slice(&self.descriptor_commitment);
+        body.extend_from_slice(&self.endpoint_commitment);
+        body.extend_from_slice(&self.flow_context);
+        body.extend_from_slice(&self.issued_at.to_be_bytes());
+        body.extend_from_slice(&self.expires_at.to_be_bytes());
+        body.extend_from_slice(&self.inner_commitment);
+        body.extend_from_slice(
+            &u16::try_from(self.inner_frame.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
+        body.extend_from_slice(&self.inner_frame);
+        body
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        let unsigned = self.unsigned_body();
+        let mut binding = Vec::with_capacity(1 + 2 + self.operation.path().len() + unsigned.len());
+        binding.push(self.operation as u8);
+        binding.extend_from_slice(
+            &u16::try_from(self.operation.path().len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
+        binding.extend_from_slice(self.operation.path().as_bytes());
+        binding.extend_from_slice(&unsigned);
+        domain_bytes(TRANSPORT_SIGNATURE_DOMAIN, &binding)
+    }
+}
+
 /// Commits to one canonical public IP socket endpoint.
 ///
 /// DNS names are intentionally excluded from V1 so resolution changes cannot
@@ -525,12 +906,78 @@ fn validate_claims(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_transport_claims(
+    operation: DiscoveryEndpointTransportOperationV1,
+    request_id: &[u8; 32],
+    target_node_id: &[u8; 32],
+    descriptor_commitment: &[u8; 32],
+    endpoint_commitment: &[u8; 32],
+    flow_context: &[u8; 32],
+    issued_at: u64,
+    expires_at: u64,
+    inner_frame: &[u8],
+) -> Result<(), DiscoveryEndpointProofError> {
+    if [
+        request_id,
+        target_node_id,
+        descriptor_commitment,
+        endpoint_commitment,
+        flow_context,
+    ]
+    .into_iter()
+    .any(is_reserved)
+        || issued_at == 0
+        || expires_at <= issued_at
+        || expires_at - issued_at > DISCOVERY_ENDPOINT_TRANSPORT_MAX_TTL_SECS
+    {
+        return Err(DiscoveryEndpointProofError::Malformed);
+    }
+    validate_stage_c_inner_frame(operation, request_id, inner_frame)
+}
+
+fn validate_stage_c_inner_frame(
+    operation: DiscoveryEndpointTransportOperationV1,
+    request_id: &[u8; 32],
+    inner_frame: &[u8],
+) -> Result<(), DiscoveryEndpointProofError> {
+    if inner_frame.len() < STAGE_C_INNER_HEADER_BYTES + 32
+        || inner_frame.len() > DISCOVERY_ENDPOINT_TRANSPORT_MAX_INNER_BYTES_V1
+        || inner_frame[..4] != STAGE_C_INNER_MAGIC
+    {
+        return Err(DiscoveryEndpointProofError::Malformed);
+    }
+    if inner_frame[4] != STAGE_C_INNER_VERSION_V1 || inner_frame[5] != operation as u8 {
+        return Err(DiscoveryEndpointProofError::Unsupported);
+    }
+    let body_len = usize::from(u16::from_be_bytes([inner_frame[6], inner_frame[7]]));
+    if inner_frame.len() != STAGE_C_INNER_HEADER_BYTES + body_len
+        || inner_frame[STAGE_C_INNER_HEADER_BYTES..STAGE_C_INNER_HEADER_BYTES + 32]
+            != request_id[..]
+    {
+        return Err(DiscoveryEndpointProofError::Malformed);
+    }
+    Ok(())
+}
+
 const fn validate_time(
     issued_at: u64,
     expires_at: u64,
     now: u64,
 ) -> Result<(), DiscoveryEndpointProofError> {
     let latest_issue = now.saturating_add(DISCOVERY_ENDPOINT_CHALLENGE_FUTURE_SKEW_SECS);
+    if issued_at > latest_issue || now > expires_at {
+        return Err(DiscoveryEndpointProofError::NotCurrentlyValid);
+    }
+    Ok(())
+}
+
+const fn validate_transport_time(
+    issued_at: u64,
+    expires_at: u64,
+    now: u64,
+) -> Result<(), DiscoveryEndpointProofError> {
+    let latest_issue = now.saturating_add(DISCOVERY_ENDPOINT_TRANSPORT_FUTURE_SKEW_SECS);
     if issued_at > latest_issue || now > expires_at {
         return Err(DiscoveryEndpointProofError::NotCurrentlyValid);
     }
@@ -686,6 +1133,47 @@ mod tests {
         (challenge, proof, context)
     }
 
+    fn stage_c_inner(
+        operation: DiscoveryEndpointTransportOperationV1,
+        request_id: [u8; 32],
+        body_tail: &[u8],
+    ) -> Vec<u8> {
+        let body_len = 32 + body_tail.len();
+        let mut frame = Vec::with_capacity(STAGE_C_INNER_HEADER_BYTES + body_len);
+        frame.extend_from_slice(&STAGE_C_INNER_MAGIC);
+        frame.push(STAGE_C_INNER_VERSION_V1);
+        frame.push(operation as u8);
+        frame.extend_from_slice(
+            &u16::try_from(body_len)
+                .expect("bounded Stage C body")
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(&request_id);
+        frame.extend_from_slice(body_tail);
+        frame
+    }
+
+    fn transport_fixture() -> DiscoveryEndpointAuthenticatedTransportV1 {
+        let target = key(9);
+        let request_id = [0x11; 32];
+        DiscoveryEndpointAuthenticatedTransportV1::sign(
+            DiscoveryEndpointTransportOperationV1::Issue,
+            request_id,
+            [0x22; 32],
+            canonical_public_endpoint_commitment("8.8.8.8:51820").expect("endpoint commitment"),
+            [0x44; 32],
+            NOW,
+            NOW + 60,
+            &stage_c_inner(
+                DiscoveryEndpointTransportOperationV1::Issue,
+                request_id,
+                &[0x55; 65],
+            ),
+            &target,
+        )
+        .expect("authenticated transport")
+    }
+
     #[test]
     fn canonical_roundtrip_and_golden_digests() {
         let (challenge, proof, context) = fixture();
@@ -714,6 +1202,269 @@ mod tests {
         assert_eq!(
             hex::encode(Sha256::digest(&proof_frame)),
             "fe2be71650d32d9cfc3f6138aff52be5169e6108422674bfd1cab4a4f06b90e3"
+        );
+    }
+
+    #[test]
+    fn authenticated_transport_roundtrip_and_golden_digest() {
+        let transport = transport_fixture();
+        let frame = transport.encode();
+        assert_eq!(frame.len(), 387);
+        assert_eq!(
+            DiscoveryEndpointAuthenticatedTransportV1::decode(&frame),
+            Ok(transport.clone())
+        );
+        assert_eq!(
+            transport.verify_at(
+                NOW + 1,
+                DiscoveryEndpointTransportOperationV1::Issue,
+                &key(9).public_key_bytes(),
+                &[0x44; 32],
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            DiscoveryEndpointAuthenticatedTransportV1::decode_verified_at(
+                &frame,
+                NOW + 1,
+                DiscoveryEndpointTransportOperationV1::Issue,
+                &key(9).public_key_bytes(),
+                &[0x44; 32],
+            ),
+            Ok(transport.clone())
+        );
+        assert_eq!(
+            transport.operation().path(),
+            "/api/discovery/endpoint-proof/challenge"
+        );
+        assert_ne!(
+            DiscoveryEndpointTransportOperationV1::Issue.path(),
+            DiscoveryEndpointTransportOperationV1::Verify.path()
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(&frame)),
+            "abfeaa957026694b4efe072ff5b8f5eb1f3d4dd6ebdbbc8de71e84047318832e"
+        );
+        assert_eq!(
+            hex::encode(transport.commitment()),
+            "4da5cebe7e690e982f44c06de996577ddcc70fe6be392d703a3d01406b8ba917"
+        );
+    }
+
+    #[test]
+    fn authenticated_transport_field_and_inner_tamper_fail_closed() {
+        let target_id = key(9).public_key_bytes();
+        let mut request_changed = transport_fixture();
+        request_changed.request_id[0] ^= 1;
+        request_changed.inner_frame[STAGE_C_INNER_HEADER_BYTES] ^= 1;
+        request_changed.inner_commitment = domain_hash(
+            TRANSPORT_INNER_COMMITMENT_DOMAIN,
+            &request_changed.inner_frame,
+        );
+        assert_eq!(
+            request_changed.verify_at(
+                NOW + 1,
+                DiscoveryEndpointTransportOperationV1::Issue,
+                &target_id,
+                &[0x44; 32],
+            ),
+            Err(DiscoveryEndpointProofError::SignatureRejected)
+        );
+
+        let mut descriptor_changed = transport_fixture();
+        descriptor_changed.descriptor_commitment[0] ^= 1;
+        assert_eq!(
+            descriptor_changed.verify_at(
+                NOW + 1,
+                DiscoveryEndpointTransportOperationV1::Issue,
+                &target_id,
+                &[0x44; 32],
+            ),
+            Err(DiscoveryEndpointProofError::SignatureRejected)
+        );
+
+        let mut endpoint_changed = transport_fixture();
+        endpoint_changed.endpoint_commitment[0] ^= 1;
+        assert_eq!(
+            endpoint_changed.verify_at(
+                NOW + 1,
+                DiscoveryEndpointTransportOperationV1::Issue,
+                &target_id,
+                &[0x44; 32],
+            ),
+            Err(DiscoveryEndpointProofError::SignatureRejected)
+        );
+
+        let mut operation_changed = transport_fixture();
+        operation_changed.operation = DiscoveryEndpointTransportOperationV1::Verify;
+        operation_changed.inner_frame[5] = DiscoveryEndpointTransportOperationV1::Verify as u8;
+        operation_changed.inner_commitment = domain_hash(
+            TRANSPORT_INNER_COMMITMENT_DOMAIN,
+            &operation_changed.inner_frame,
+        );
+        assert_eq!(
+            DiscoveryEndpointAuthenticatedTransportV1::decode(&operation_changed.encode())
+                .expect("structural operation substitution")
+                .verify_at(
+                    NOW + 1,
+                    DiscoveryEndpointTransportOperationV1::Verify,
+                    &target_id,
+                    &[0x44; 32],
+                ),
+            Err(DiscoveryEndpointProofError::SignatureRejected)
+        );
+
+        let mut inner_changed = transport_fixture();
+        *inner_changed.inner_frame.last_mut().expect("inner byte") ^= 1;
+        inner_changed.inner_commitment = domain_hash(
+            TRANSPORT_INNER_COMMITMENT_DOMAIN,
+            &inner_changed.inner_frame,
+        );
+        assert_eq!(
+            inner_changed.verify_at(
+                NOW + 1,
+                DiscoveryEndpointTransportOperationV1::Issue,
+                &target_id,
+                &[0x44; 32],
+            ),
+            Err(DiscoveryEndpointProofError::SignatureRejected)
+        );
+    }
+
+    #[test]
+    fn authenticated_transport_context_target_time_and_signature_fail_closed() {
+        let transport = transport_fixture();
+        assert_eq!(
+            transport.verify_at(
+                NOW + 1,
+                DiscoveryEndpointTransportOperationV1::Verify,
+                &key(9).public_key_bytes(),
+                &[0x44; 32],
+            ),
+            Err(DiscoveryEndpointProofError::ContextMismatch)
+        );
+        assert_eq!(
+            transport.verify_at(
+                NOW + 1,
+                DiscoveryEndpointTransportOperationV1::Issue,
+                &key(10).public_key_bytes(),
+                &[0x44; 32],
+            ),
+            Err(DiscoveryEndpointProofError::ContextMismatch)
+        );
+        assert_eq!(
+            transport.verify_at(
+                NOW + 1,
+                DiscoveryEndpointTransportOperationV1::Issue,
+                &key(9).public_key_bytes(),
+                &[0x45; 32],
+            ),
+            Err(DiscoveryEndpointProofError::ContextMismatch)
+        );
+        assert_eq!(
+            transport.verify_at(
+                NOW + 61,
+                DiscoveryEndpointTransportOperationV1::Issue,
+                &key(9).public_key_bytes(),
+                &[0x44; 32],
+            ),
+            Err(DiscoveryEndpointProofError::NotCurrentlyValid)
+        );
+
+        let mut future = transport.clone();
+        future.issued_at = NOW + DISCOVERY_ENDPOINT_TRANSPORT_FUTURE_SKEW_SECS + 2;
+        future.expires_at = future.issued_at + 10;
+        assert_eq!(
+            future.verify_at(
+                NOW,
+                DiscoveryEndpointTransportOperationV1::Issue,
+                &key(9).public_key_bytes(),
+                &[0x44; 32],
+            ),
+            Err(DiscoveryEndpointProofError::NotCurrentlyValid)
+        );
+
+        let mut bad_signature = transport;
+        bad_signature.signature[0] ^= 1;
+        assert_eq!(
+            bad_signature.verify_at(
+                NOW + 1,
+                DiscoveryEndpointTransportOperationV1::Issue,
+                &key(9).public_key_bytes(),
+                &[0x44; 32],
+            ),
+            Err(DiscoveryEndpointProofError::SignatureRejected)
+        );
+    }
+
+    #[test]
+    fn authenticated_transport_unknown_trailing_oversize_and_reserved_fail_closed() {
+        let transport = transport_fixture();
+        let mut unknown = transport.encode();
+        unknown[5] = 3;
+        assert_eq!(
+            DiscoveryEndpointAuthenticatedTransportV1::decode(&unknown),
+            Err(DiscoveryEndpointProofError::Unsupported)
+        );
+        let mut wrong_version = transport.encode();
+        wrong_version[4] = 2;
+        assert_eq!(
+            DiscoveryEndpointAuthenticatedTransportV1::decode(&wrong_version),
+            Err(DiscoveryEndpointProofError::Unsupported)
+        );
+        let mut trailing = transport.encode();
+        trailing.push(0);
+        assert_eq!(
+            DiscoveryEndpointAuthenticatedTransportV1::decode(&trailing),
+            Err(DiscoveryEndpointProofError::Malformed)
+        );
+        assert_eq!(
+            DiscoveryEndpointAuthenticatedTransportV1::decode(&vec![
+                0;
+                DISCOVERY_ENDPOINT_TRANSPORT_MAX_FRAME_BYTES_V1
+                    + 1
+            ]),
+            Err(DiscoveryEndpointProofError::Malformed)
+        );
+
+        let request_id = [0x11; 32];
+        assert_eq!(
+            DiscoveryEndpointAuthenticatedTransportV1::sign(
+                DiscoveryEndpointTransportOperationV1::Issue,
+                request_id,
+                [0x22; 32],
+                [0x33; 32],
+                [0; 32],
+                NOW,
+                NOW + 60,
+                &stage_c_inner(
+                    DiscoveryEndpointTransportOperationV1::Issue,
+                    request_id,
+                    &[0x55; 65],
+                ),
+                &key(9),
+            ),
+            Err(DiscoveryEndpointProofError::Malformed)
+        );
+        let oversized_inner = stage_c_inner(
+            DiscoveryEndpointTransportOperationV1::Issue,
+            request_id,
+            &vec![0; DISCOVERY_ENDPOINT_TRANSPORT_MAX_INNER_BYTES_V1],
+        );
+        assert!(oversized_inner.len() > DISCOVERY_ENDPOINT_TRANSPORT_MAX_INNER_BYTES_V1);
+        assert_eq!(
+            DiscoveryEndpointAuthenticatedTransportV1::sign(
+                DiscoveryEndpointTransportOperationV1::Issue,
+                request_id,
+                [0x22; 32],
+                [0x33; 32],
+                [0x44; 32],
+                NOW,
+                NOW + 60,
+                &oversized_inner,
+                &key(9),
+            ),
+            Err(DiscoveryEndpointProofError::Malformed)
         );
     }
 
