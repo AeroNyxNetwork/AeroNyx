@@ -34,6 +34,7 @@
 //! - [`voice`]: v1.0.0-Voice Peer virtual IP resolution for UDP direct-connect
 //! - [`chat_handlers`]: client/VPN-only encrypted media blob transfer
 //! - [`discovery`]: v0.1.0 Discovery snapshot/gossip endpoints
+//! - `discovery_endpoint_verification`: unmounted authenticated Stage C adapter
 //! - [`directory_chain_peer`]: signed bounded Directory Chain peer transport
 //! - [`directory_replica_status`]: privacy-tiered replica health endpoint
 //! - [`directory_replica_sync`]: bounded concurrent outbound replica coordinator
@@ -515,6 +516,9 @@ pub mod directory_chain_peer;
 pub mod directory_replica_status;
 pub mod directory_replica_sync;
 pub mod discovery;
+// [AUTHENTICATED-ENDPOINT-PROOF-ADAPTER 2026-09-24 by Codex] Its composition
+// items remain crate-private and unmounted until verified middleware owns identity.
+pub mod discovery_endpoint_verification;
 pub mod memchain_peer;
 pub mod voice;
 pub mod vpn_health;
