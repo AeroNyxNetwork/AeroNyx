@@ -84,25 +84,60 @@ pub(crate) enum DiscoveryEndpointIneligibilityReason {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum DiscoveryEndpointEligibilityDecision {
     Ineligible(DiscoveryEndpointIneligibilityReason),
-    EligibleForQuarantine {
-        group_commitment: [u8; 32],
-        policy_version: u64,
-        valid_until: u64,
-    },
+    EligibleForQuarantine(DiscoveryEndpointQuarantineAdmission),
+}
+
+/// Unforgeable-by-construction input accepted by the quarantine registry.
+// [PERMISSIONLESS-ENDPOINT-QUARANTINE-ADMISSION 2026-09-24 by Codex] Keep
+// construction private to the evaluator so storage cannot accept raw facts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiscoveryEndpointQuarantineAdmission {
+    group_commitment: [u8; 32],
+    policy_version: u64,
+    valid_until: u64,
+}
+
+impl DiscoveryEndpointQuarantineAdmission {
+    pub(crate) const fn group_commitment(&self) -> [u8; 32] {
+        self.group_commitment
+    }
+
+    pub(crate) const fn policy_version(&self) -> u64 {
+        self.policy_version
+    }
+
+    pub(crate) const fn valid_until(&self) -> u64 {
+        self.valid_until
+    }
+}
+
+impl fmt::Debug for DiscoveryEndpointQuarantineAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryEndpointQuarantineAdmission")
+            .field("policy_version", &self.policy_version)
+            .field("valid_until", &self.valid_until)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DiscoveryEndpointEligibilityDecision {
+    pub(crate) fn into_quarantine_admission(self) -> Option<DiscoveryEndpointQuarantineAdmission> {
+        match self {
+            Self::EligibleForQuarantine(admission) => Some(admission),
+            Self::Ineligible(_) => None,
+        }
+    }
 }
 
 impl fmt::Debug for DiscoveryEndpointEligibilityDecision {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ineligible(reason) => formatter.debug_tuple("Ineligible").field(reason).finish(),
-            Self::EligibleForQuarantine {
-                policy_version,
-                valid_until,
-                ..
-            } => formatter
+            Self::EligibleForQuarantine(admission) => formatter
                 .debug_struct("EligibleForQuarantine")
-                .field("policy_version", policy_version)
-                .field("valid_until", valid_until)
+                .field("policy_version", &admission.policy_version)
+                .field("valid_until", &admission.valid_until)
                 .finish_non_exhaustive(),
         }
     }
@@ -223,11 +258,13 @@ pub(crate) fn evaluate_endpoint_candidate(
         valid_until = valid_until.min(decision.valid_until);
     }
 
-    DiscoveryEndpointEligibilityDecision::EligibleForQuarantine {
-        group_commitment: facts.group_commitment,
-        policy_version: policy.policy_version,
-        valid_until,
-    }
+    DiscoveryEndpointEligibilityDecision::EligibleForQuarantine(
+        DiscoveryEndpointQuarantineAdmission {
+            group_commitment: facts.group_commitment,
+            policy_version: policy.policy_version,
+            valid_until,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -296,10 +333,12 @@ mod tests {
                 NOW,
                 None,
             ),
-            DiscoveryEndpointEligibilityDecision::EligibleForQuarantine {
-                policy_version: 4,
-                ..
-            }
+            DiscoveryEndpointEligibilityDecision::EligibleForQuarantine(
+                DiscoveryEndpointQuarantineAdmission {
+                    policy_version: 4,
+                    ..
+                }
+            )
         ));
         assert_eq!(
             evaluate_endpoint_candidate(
@@ -427,11 +466,13 @@ mod tests {
         }));
         assert_eq!(
             evaluate_endpoint_candidate(&facts(2), required, NOW, Some(&valid)),
-            DiscoveryEndpointEligibilityDecision::EligibleForQuarantine {
-                group_commitment: [0x31; 32],
-                policy_version: 9,
-                valid_until: NOW + 20,
-            }
+            DiscoveryEndpointEligibilityDecision::EligibleForQuarantine(
+                DiscoveryEndpointQuarantineAdmission {
+                    group_commitment: [0x31; 32],
+                    policy_version: 9,
+                    valid_until: NOW + 20,
+                }
+            )
         );
     }
 

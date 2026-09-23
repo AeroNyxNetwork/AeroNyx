@@ -306,6 +306,9 @@ mod discovery_endpoint_attestation_inbox;
 // [PERMISSIONLESS-ENDPOINT-ELIGIBILITY 2026-09-24 by Codex] Pure policy may
 // classify quarantine candidates but cannot promote or route them.
 pub(crate) mod discovery_endpoint_eligibility;
+// [PERMISSIONLESS-ENDPOINT-QUARANTINE-ADMISSION 2026-09-24 by Codex] Durable
+// quarantine remains isolated from PeerStore and every routeable projection.
+pub(crate) mod discovery_endpoint_quarantine;
 mod discovery_endpoint_verification;
 pub mod dns_proxy;
 pub mod handshake;
