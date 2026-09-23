@@ -90,6 +90,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aeronyx_core::protocol::version::{
+    classify_supported_protocol_version, CURRENT_PROTOCOL_VERSION, PROTOCOL_VERSION_V1,
+    PROTOCOL_VERSION_V2,
+};
 use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 use serde::Serialize;
 use serde_json::Value;
@@ -366,6 +370,28 @@ struct VpnTransportHealthStatus {
     privacy_boundary: &'static str,
 }
 
+/// Static VPN handshake support projected from the canonical core policy.
+///
+/// [VPN-HANDSHAKE-CAPABILITY-HEALTH 2026-09-23 by Codex] This is compile-time
+/// capability metadata, not a live handshake probe or a client-readiness claim.
+/// It contains no endpoint, session, identity, route, or traffic information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct VpnHandshakeCapabilityStatus {
+    version: u8,
+    v1_supported: bool,
+    v2_supported: bool,
+    default_version: u8,
+    mode: VpnHandshakeCapabilityMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum VpnHandshakeCapabilityMode {
+    LegacyOnly,
+    DualStack,
+    V2Only,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct PrivacyProtocolRuntimeStatus {
     active: bool,
@@ -448,6 +474,8 @@ struct VpnHealthResponse {
     supported_transports: Vec<&'static str>,
     preferred_transport: String,
     transport_health: VpnTransportHealthStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vpn_handshake_capability: Option<VpnHandshakeCapabilityStatus>,
     privacy_protocol_health: PrivacyProtocolHealthStatus,
     startup_self_check: StartupSelfCheckStatus,
     virtual_ip_range: String,
@@ -864,6 +892,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         supported_transports: transport_health.supported_transports.clone(),
         preferred_transport: transport_health.preferred_transport.clone(),
         transport_health,
+        vpn_handshake_capability: collect_vpn_handshake_capability(),
         privacy_protocol_health,
         startup_self_check,
         virtual_ip_range: ip_range,
@@ -1839,6 +1868,32 @@ fn collect_transport_health(
             "secrets, client public IPs, or wallet-level traffic"
         ),
     }
+}
+
+fn collect_vpn_handshake_capability() -> Option<VpnHandshakeCapabilityStatus> {
+    let v1_supported = classify_supported_protocol_version(PROTOCOL_VERSION_V1).is_some();
+    let v2_supported = classify_supported_protocol_version(PROTOCOL_VERSION_V2).is_some();
+    let mode = classify_vpn_handshake_capability_mode(v1_supported, v2_supported)?;
+
+    Some(VpnHandshakeCapabilityStatus {
+        version: 1,
+        v1_supported,
+        v2_supported,
+        default_version: CURRENT_PROTOCOL_VERSION,
+        mode,
+    })
+}
+
+fn classify_vpn_handshake_capability_mode(
+    v1_supported: bool,
+    v2_supported: bool,
+) -> Option<VpnHandshakeCapabilityMode> {
+    Some(match (v1_supported, v2_supported) {
+        (true, false) => VpnHandshakeCapabilityMode::LegacyOnly,
+        (true, true) => VpnHandshakeCapabilityMode::DualStack,
+        (false, true) => VpnHandshakeCapabilityMode::V2Only,
+        (false, false) => return None,
+    })
 }
 
 fn collect_privacy_protocol_health(
@@ -3314,6 +3369,63 @@ fn build_dns_query(name: &str) -> std::result::Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vpn_handshake_capability_reports_current_dual_stack_v2_default() {
+        let capability =
+            collect_vpn_handshake_capability().expect("current policy supports VPN handshakes");
+
+        assert_eq!(capability.version, 1);
+        assert!(capability.v1_supported);
+        assert!(capability.v2_supported);
+        assert_eq!(capability.default_version, PROTOCOL_VERSION_V2);
+        assert_eq!(capability.mode, VpnHandshakeCapabilityMode::DualStack);
+
+        let encoded = serde_json::to_value(capability).expect("serialize handshake capability");
+        assert_eq!(encoded["version"], 1);
+        assert_eq!(encoded["v1_supported"], true);
+        assert_eq!(encoded["v2_supported"], true);
+        assert_eq!(encoded["default_version"], 2);
+        assert_eq!(encoded["mode"], "dual_stack");
+        assert_eq!(encoded.as_object().map(serde_json::Map::len), Some(5));
+    }
+
+    #[test]
+    fn vpn_handshake_capability_uses_canonical_version_policy() {
+        let capability =
+            collect_vpn_handshake_capability().expect("current policy supports VPN handshakes");
+
+        assert_eq!(
+            capability.v1_supported,
+            classify_supported_protocol_version(PROTOCOL_VERSION_V1).is_some()
+        );
+        assert_eq!(
+            capability.v2_supported,
+            classify_supported_protocol_version(PROTOCOL_VERSION_V2).is_some()
+        );
+        assert_eq!(capability.default_version, CURRENT_PROTOCOL_VERSION);
+        assert_eq!(
+            classify_supported_protocol_version(capability.default_version),
+            Some(aeronyx_core::protocol::version::SupportedProtocolVersion::V2)
+        );
+    }
+
+    #[test]
+    fn vpn_handshake_capability_modes_are_closed() {
+        assert_eq!(
+            classify_vpn_handshake_capability_mode(true, false),
+            Some(VpnHandshakeCapabilityMode::LegacyOnly)
+        );
+        assert_eq!(
+            classify_vpn_handshake_capability_mode(true, true),
+            Some(VpnHandshakeCapabilityMode::DualStack)
+        );
+        assert_eq!(
+            classify_vpn_handshake_capability_mode(false, true),
+            Some(VpnHandshakeCapabilityMode::V2Only)
+        );
+        assert_eq!(classify_vpn_handshake_capability_mode(false, false), None);
+    }
 
     #[test]
     fn chat_relay_health_distinguishes_missing_enabled_runtime() {
