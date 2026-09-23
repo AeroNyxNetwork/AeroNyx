@@ -37,7 +37,8 @@ use crate::api::directory_replica_status::{
     build_directory_replica_status_router_with_witness_carrier, DirectoryReplicaStatusScope,
 };
 use crate::api::discovery::{
-    build_discovery_router_with_local_entry, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
+    build_discovery_router_with_local_entry_and_attestation_inbox, DiscoveryApiPolicy,
+    DiscoveryLocalCapabilityStatus,
 };
 use crate::api::discovery_endpoint_verification::{
     build_discovery_endpoint_verification_router_with_evidence, VerifiedEndpointProofPeerContext,
@@ -49,7 +50,7 @@ use crate::services::memchain::MemoryStorage;
 use crate::services::{
     BlindVaultService, DirectoryChainStore, DirectoryReplicaStore, DirectoryReplicaSyncRuntime,
     DiscoveryEndpointVerificationConfig, DiscoveryEndpointVerificationService, PeerStore,
-    SessionManager, SqliteDiscoveryEndpointEvidenceStore,
+    SessionManager, SqliteDiscoveryEndpointAttestationInbox, SqliteDiscoveryEndpointEvidenceStore,
 };
 
 const ADEA_MAGIC: [u8; 4] = *b"ADEA";
@@ -91,6 +92,8 @@ pub(crate) struct PublicNodeRouterDependencies {
     pub(crate) endpoint_proof_max_entries: usize,
     pub(crate) endpoint_proof_ttl_secs: u64,
     pub(crate) endpoint_evidence: Option<Arc<SqliteDiscoveryEndpointEvidenceStore>>,
+    /// Shared durable quarantine; it grants no routing or promotion authority.
+    pub(crate) endpoint_attestation_inbox: Option<Arc<SqliteDiscoveryEndpointAttestationInbox>>,
 }
 
 /// Builds the complete public node router.
@@ -109,12 +112,13 @@ pub(crate) fn build_public_node_router(deps: PublicNodeRouterDependencies) -> Ro
         .then(|| deps.blind_vault.clone())
         .flatten();
 
-    let mut app = build_discovery_router_with_local_entry(
+    let mut app = build_discovery_router_with_local_entry_and_attestation_inbox(
         Arc::clone(&deps.peer_store),
         deps.discovery_api_policy,
         deps.local_capability_status,
         deps.directory_replica_store.clone(),
         deps.node_identity.public_key_bytes(),
+        deps.endpoint_attestation_inbox,
     )
     .merge(build_chat_peer_router_with_anonymous_mailbox(
         deps.chat_relay,

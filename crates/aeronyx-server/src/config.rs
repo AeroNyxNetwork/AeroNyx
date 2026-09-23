@@ -494,6 +494,26 @@ pub struct DiscoveryConfig {
     /// Maximum expired rows removed during one evidence admission.
     #[serde(default = "DiscoveryConfig::default_permissionless_endpoint_evidence_cleanup_batch")]
     pub permissionless_endpoint_evidence_cleanup_batch: usize,
+    // [PERMISSIONLESS-ENDPOINT-ATTESTATION-INBOX-COMPOSITION 2026-09-24 by Codex]
+    // Persist third-party ADAT observations only under an independent opt-in.
+    /// Enables the durable endpoint-attestation quarantine inbox.
+    #[serde(default)]
+    pub permissionless_endpoint_attestation_inbox_enabled: bool,
+    /// Dedicated private `SQLite` path for endpoint attestations.
+    #[serde(default)]
+    pub permissionless_endpoint_attestation_inbox_db_path: String,
+    /// Maximum retained endpoint-attestation rows.
+    #[serde(default = "DiscoveryConfig::default_endpoint_attestation_inbox_max_entries")]
+    pub permissionless_endpoint_attestation_inbox_max_entries: usize,
+    /// Maximum logical canonical-frame bytes.
+    #[serde(default = "DiscoveryConfig::default_endpoint_attestation_inbox_max_bytes")]
+    pub permissionless_endpoint_attestation_inbox_max_bytes: u64,
+    /// Maximum local retention after admission, in seconds.
+    #[serde(default = "DiscoveryConfig::default_endpoint_attestation_inbox_ttl_secs")]
+    pub permissionless_endpoint_attestation_inbox_ttl_secs: u64,
+    /// Maximum expired rows removed by one admission.
+    #[serde(default = "DiscoveryConfig::default_endpoint_attestation_inbox_cleanup_batch")]
+    pub permissionless_endpoint_attestation_inbox_cleanup_batch: usize,
     /// Optional region label for nodeboard and future peer selection.
     #[serde(default)]
     pub region: Option<String>,
@@ -667,6 +687,30 @@ impl DiscoveryConfig {
     /// Default maximum expired rows removed during one admission.
     #[must_use]
     pub const fn default_permissionless_endpoint_evidence_cleanup_batch() -> usize {
+        256
+    }
+
+    /// Default maximum retained endpoint-attestation rows.
+    #[must_use]
+    pub const fn default_endpoint_attestation_inbox_max_entries() -> usize {
+        16_384
+    }
+
+    /// Default maximum logical endpoint-attestation bytes.
+    #[must_use]
+    pub const fn default_endpoint_attestation_inbox_max_bytes() -> u64 {
+        16 * 1024 * 1024
+    }
+
+    /// Default endpoint-attestation retention interval.
+    #[must_use]
+    pub const fn default_endpoint_attestation_inbox_ttl_secs() -> u64 {
+        24 * 60 * 60
+    }
+
+    /// Default bounded cleanup batch for endpoint attestations.
+    #[must_use]
+    pub const fn default_endpoint_attestation_inbox_cleanup_batch() -> usize {
         256
     }
 
@@ -1209,6 +1253,56 @@ impl DiscoveryConfig {
                 ));
             }
         }
+        if self.permissionless_endpoint_attestation_inbox_max_entries == 0
+            || self.permissionless_endpoint_attestation_inbox_max_entries > 65_536
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.permissionless_endpoint_attestation_inbox_max_entries",
+                "must be between 1 and 65536",
+            ));
+        }
+        if self.permissionless_endpoint_attestation_inbox_max_bytes < 289
+            || self.permissionless_endpoint_attestation_inbox_max_bytes > 64 * 1024 * 1024
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.permissionless_endpoint_attestation_inbox_max_bytes",
+                "must be between 289 and 67108864 bytes",
+            ));
+        }
+        if self.permissionless_endpoint_attestation_inbox_ttl_secs == 0
+            || self.permissionless_endpoint_attestation_inbox_ttl_secs > 7 * 24 * 60 * 60
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.permissionless_endpoint_attestation_inbox_ttl_secs",
+                "must be between 1 and 604800 seconds",
+            ));
+        }
+        if self.permissionless_endpoint_attestation_inbox_cleanup_batch == 0
+            || self.permissionless_endpoint_attestation_inbox_cleanup_batch > 4_096
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.permissionless_endpoint_attestation_inbox_cleanup_batch",
+                "must be between 1 and 4096",
+            ));
+        }
+        if self.permissionless_endpoint_attestation_inbox_enabled {
+            if !self.enabled || self.public_api_listen_addr.is_none() {
+                return Err(ServerError::config_invalid(
+                    "discovery.permissionless_endpoint_attestation_inbox_enabled",
+                    "requires discovery.enabled and discovery.public_api_listen_addr",
+                ));
+            }
+            if self
+                .permissionless_endpoint_attestation_inbox_db_path
+                .trim()
+                .is_empty()
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.permissionless_endpoint_attestation_inbox_db_path",
+                    "must be configured when endpoint attestation inbox is enabled",
+                ));
+            }
+        }
 
         for peer_id in self
             .allowed_peer_ids
@@ -1651,6 +1745,16 @@ impl Default for DiscoveryConfig {
                 Self::default_permissionless_endpoint_evidence_ttl_secs(),
             permissionless_endpoint_evidence_cleanup_batch:
                 Self::default_permissionless_endpoint_evidence_cleanup_batch(),
+            permissionless_endpoint_attestation_inbox_enabled: false,
+            permissionless_endpoint_attestation_inbox_db_path: String::new(),
+            permissionless_endpoint_attestation_inbox_max_entries:
+                Self::default_endpoint_attestation_inbox_max_entries(),
+            permissionless_endpoint_attestation_inbox_max_bytes:
+                Self::default_endpoint_attestation_inbox_max_bytes(),
+            permissionless_endpoint_attestation_inbox_ttl_secs:
+                Self::default_endpoint_attestation_inbox_ttl_secs(),
+            permissionless_endpoint_attestation_inbox_cleanup_batch:
+                Self::default_endpoint_attestation_inbox_cleanup_batch(),
             region: None,
             descriptor_ttl_secs: Self::default_descriptor_ttl_secs(),
             public_discovery: Self::default_public_discovery(),
@@ -2857,6 +2961,46 @@ permissionless_endpoint_evidence_enabled = true
             "[discovery]\npermissionless_endpoint_evidence_max_entries = 0\n",
             "[discovery]\npermissionless_endpoint_evidence_ttl_secs = 604801\n",
             "[discovery]\npermissionless_endpoint_evidence_cleanup_batch = 4097\n",
+        ] {
+            assert!(ServerConfig::from_str(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn test_endpoint_attestation_inbox_is_default_off_and_bounded() {
+        let legacy = ServerConfig::from_str("[discovery]\nenabled = true\n")
+            .expect("legacy discovery config");
+        assert!(
+            !legacy
+                .discovery
+                .permissionless_endpoint_attestation_inbox_enabled
+        );
+        assert!(legacy
+            .discovery
+            .permissionless_endpoint_attestation_inbox_db_path
+            .is_empty());
+
+        let valid = r#"
+[discovery]
+enabled = true
+public_api_listen_addr = "0.0.0.0:8422"
+permissionless_endpoint_attestation_inbox_enabled = true
+permissionless_endpoint_attestation_inbox_db_path = "/var/lib/aeronyx/endpoint-attestations.sqlite3"
+permissionless_endpoint_attestation_inbox_max_entries = 64
+permissionless_endpoint_attestation_inbox_max_bytes = 65536
+permissionless_endpoint_attestation_inbox_ttl_secs = 3600
+permissionless_endpoint_attestation_inbox_cleanup_batch = 16
+"#;
+        assert!(ServerConfig::from_str(valid).is_ok());
+
+        for invalid in [
+            "[discovery]\nenabled = true\npermissionless_endpoint_attestation_inbox_enabled = true\npermissionless_endpoint_attestation_inbox_db_path = \"/tmp/inbox.sqlite3\"\n",
+            "[discovery]\nenabled = true\npublic_api_listen_addr = \"0.0.0.0:8422\"\npermissionless_endpoint_attestation_inbox_enabled = true\n",
+            "[discovery]\npermissionless_endpoint_attestation_inbox_max_entries = 0\n",
+            "[discovery]\npermissionless_endpoint_attestation_inbox_max_bytes = 288\n",
+            "[discovery]\npermissionless_endpoint_attestation_inbox_max_bytes = 67108865\n",
+            "[discovery]\npermissionless_endpoint_attestation_inbox_ttl_secs = 604801\n",
+            "[discovery]\npermissionless_endpoint_attestation_inbox_cleanup_batch = 4097\n",
         ] {
             assert!(ServerConfig::from_str(invalid).is_err());
         }

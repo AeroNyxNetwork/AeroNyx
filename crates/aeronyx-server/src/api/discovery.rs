@@ -248,14 +248,14 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aeronyx_core::protocol::discovery::{
-    decode_route_domain_attestation_certificate, DirectoryDescriptorCommitmentV1,
+    decode_route_domain_attestation_certificate,
     MAX_ROUTE_DOMAIN_ATTESTATION_CERTIFICATE_FRAME_BYTES,
 };
 use aeronyx_core::protocol::{
-    DiscoveryEndpointAttestationPurposeV1, DiscoveryEndpointEvidenceAttestationV1,
-    NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage, NodeProtocolFeature,
-    OnionRoutePurpose, SignedNodeDescriptor, MAX_VERIFIED_ONION_ROUTE_HOPS,
-    ONION_FORWARD_HOP_REQUIRED_CAPABILITIES, ONION_ROUTE_PURPOSE_VALUES,
+    DiscoveryEndpointEvidenceAttestationV1, NodeBootstrapSnapshot, NodeCapability,
+    NodeDiscoveryMessage, NodeProtocolFeature, OnionRoutePurpose, SignedNodeDescriptor,
+    MAX_VERIFIED_ONION_ROUTE_HOPS, ONION_FORWARD_HOP_REQUIRED_CAPABILITIES,
+    ONION_ROUTE_PURPOSE_VALUES,
 };
 use axum::{
     body::Bytes,
@@ -272,8 +272,10 @@ use crate::api::directory_replica_sync::admit_directory_gossip_descriptor;
 use crate::api::public_node_router::public_endpoint_flow_context;
 use crate::config::DiscoveryConfig;
 use crate::services::{
-    DirectoryReplicaStore, PeerStore, PeerStoreImportReport, PeerStoreStatus,
-    RouteDomainCertificateImportError,
+    DirectoryReplicaStore, DiscoveryEndpointAttestationInboxError,
+    DiscoveryEndpointAttestationRecordOutcome, PeerStore, PeerStoreImportReport, PeerStoreStatus,
+    RouteDomainCertificateImportError, SqliteDiscoveryEndpointAttestationInbox,
+    VerifiedDiscoveryEndpointAttestationV1,
 };
 
 // ============================================
@@ -314,6 +316,8 @@ struct DiscoveryApiState {
     local_node_id: Option<[u8; 32]>,
     /// Audited local Directory replica used only as an admission trust anchor.
     directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
+    /// Optional durable ADAT quarantine. It has no peer promotion authority.
+    endpoint_attestation_inbox: Option<Arc<SqliteDiscoveryEndpointAttestationInbox>>,
     policy: DiscoveryApiPolicy,
     local_capabilities: DiscoveryLocalCapabilityStatus,
     rate_limit: Arc<Mutex<RateLimitState>>,
@@ -2882,6 +2886,7 @@ pub fn build_discovery_router_with_local_status_and_directory_admission(
         local_capabilities,
         directory_replica_store,
         None,
+        None,
     )
 }
 
@@ -2898,12 +2903,35 @@ pub fn build_discovery_router_with_local_entry(
     directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
     local_node_id: [u8; 32],
 ) -> Router {
+    build_discovery_router_with_local_entry_and_attestation_inbox(
+        peer_store,
+        policy,
+        local_capabilities,
+        directory_replica_store,
+        local_node_id,
+        None,
+    )
+}
+
+/// Builds the production discovery router with optional durable ADAT quarantine.
+///
+/// Existing builders delegate with no inbox so default-off behavior remains
+/// canonical verify-and-discard with no filesystem or task side effect.
+pub fn build_discovery_router_with_local_entry_and_attestation_inbox(
+    peer_store: Arc<PeerStore>,
+    policy: DiscoveryApiPolicy,
+    local_capabilities: DiscoveryLocalCapabilityStatus,
+    directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
+    local_node_id: [u8; 32],
+    endpoint_attestation_inbox: Option<Arc<SqliteDiscoveryEndpointAttestationInbox>>,
+) -> Router {
     build_discovery_router_state(
         peer_store,
         policy,
         local_capabilities,
         directory_replica_store,
         Some(local_node_id),
+        endpoint_attestation_inbox,
     )
 }
 
@@ -2913,6 +2941,7 @@ fn build_discovery_router_state(
     local_capabilities: DiscoveryLocalCapabilityStatus,
     directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
     local_node_id: Option<[u8; 32]>,
+    endpoint_attestation_inbox: Option<Arc<SqliteDiscoveryEndpointAttestationInbox>>,
 ) -> Router {
     // [PERMISSIONLESS-DISCOVERY-CANDIDATES 2026-09-14 by Codex] The public
     // gossip surface has no endpoint-possession proof. Enable the PeerStore's
@@ -2923,6 +2952,7 @@ fn build_discovery_router_state(
         peer_store,
         local_node_id,
         directory_replica_store,
+        endpoint_attestation_inbox,
         policy,
         local_capabilities,
         rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
@@ -4137,18 +4167,24 @@ async fn gossip_handler(
     Json(message): Json<NodeDiscoveryMessage>,
 ) -> impl IntoResponse {
     let now = now_secs();
+    let is_endpoint_attestation = matches!(
+        &message,
+        NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. }
+    );
     if !state
         .rate_limit
         .lock()
         .allow(now, state.policy.gossip_rate_limit_per_minute)
     {
-        state.peer_store.record_rate_limited(
-            now,
-            format!(
-                "global_limit_per_minute={}",
-                state.policy.gossip_rate_limit_per_minute
-            ),
-        );
+        if !is_endpoint_attestation {
+            state.peer_store.record_rate_limited(
+                now,
+                format!(
+                    "global_limit_per_minute={}",
+                    state.policy.gossip_rate_limit_per_minute
+                ),
+            );
+        }
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(GossipResponse {
@@ -4157,6 +4193,10 @@ async fn gossip_handler(
             }),
         )
             .into_response();
+    }
+
+    if let NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { attestation_frame } = &message {
+        return persist_or_discard_endpoint_attestation(&state, attestation_frame, now).await;
     }
 
     if !state.policy.message_allowed(&message) {
@@ -4179,17 +4219,8 @@ async fn gossip_handler(
             .into_response();
     }
 
-    let is_endpoint_attestation = matches!(
-        message,
-        NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. }
-    );
     let (admission_status, applied) = apply_gossip_message(&state, &message, now);
-    // [ENDPOINT-ATTESTATION-TRANSPORT 2026-09-24 by Codex] The dormant
-    // attestation carrier is verified and discarded. Exact replay must not
-    // refresh gossip freshness or create any other PeerStore state.
-    if !is_endpoint_attestation {
-        state.peer_store.mark_gossip_at(now);
-    }
+    state.peer_store.mark_gossip_at(now);
     if admission_status != StatusCode::OK {
         return (
             admission_status,
@@ -4218,43 +4249,58 @@ async fn gossip_handler(
     (StatusCode::OK, Json(GossipResponse { applied, response })).into_response()
 }
 
+// [PERMISSIONLESS-ENDPOINT-ATTESTATION-INBOX-COMPOSITION 2026-09-24 by Codex]
+// All policy locks are released before canonical verification and blocking
+// storage. Every outcome returns before any PeerStore mutation.
+async fn persist_or_discard_endpoint_attestation(
+    state: &DiscoveryApiState,
+    frame: &[u8],
+    now: u64,
+) -> axum::response::Response {
+    let empty = || GossipResponse {
+        applied: PeerStoreImportReport::empty(),
+        response: None,
+    };
+    let decoded = match DiscoveryEndpointEvidenceAttestationV1::decode(frame) {
+        Ok(decoded) => decoded,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(empty())).into_response(),
+    };
+    if !state.policy.node_allowed(&decoded.subject_node_id()) {
+        return (StatusCode::FORBIDDEN, Json(empty())).into_response();
+    }
+    let context = public_endpoint_flow_context(decoded.observer_node_id());
+    let verified = match VerifiedDiscoveryEndpointAttestationV1::verify(frame, now, context) {
+        Ok(verified) => verified,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(empty())).into_response(),
+    };
+    let Some(inbox) = state.endpoint_attestation_inbox.clone() else {
+        return (StatusCode::OK, Json(empty())).into_response();
+    };
+    let outcome =
+        tokio::task::spawn_blocking(move || inbox.record_verified_at(&verified, now)).await;
+    let status = match outcome {
+        Ok(Ok(
+            DiscoveryEndpointAttestationRecordOutcome::Inserted
+            | DiscoveryEndpointAttestationRecordOutcome::Existing,
+        )) => StatusCode::OK,
+        Ok(Ok(DiscoveryEndpointAttestationRecordOutcome::Conflict)) => StatusCode::CONFLICT,
+        Ok(Ok(DiscoveryEndpointAttestationRecordOutcome::AtCapacity))
+        | Ok(Err(
+            DiscoveryEndpointAttestationInboxError::UnsupportedSchema
+            | DiscoveryEndpointAttestationInboxError::Corrupt
+            | DiscoveryEndpointAttestationInboxError::Unavailable,
+        ))
+        | Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+        Ok(Err(DiscoveryEndpointAttestationInboxError::Rejected)) => StatusCode::BAD_REQUEST,
+    };
+    (status, Json(empty())).into_response()
+}
+
 fn apply_gossip_message(
     state: &DiscoveryApiState,
     message: &NodeDiscoveryMessage,
     now: u64,
 ) -> (StatusCode, PeerStoreImportReport) {
-    if let NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { attestation_frame } = message {
-        // [ENDPOINT-ATTESTATION-TRANSPORT 2026-09-24 by Codex] Verify the
-        // dormant carrier completely, then discard it without touching peer state.
-        let accepted = DiscoveryEndpointEvidenceAttestationV1::decode(attestation_frame)
-            .and_then(|attestation| {
-                let descriptor = DirectoryDescriptorCommitmentV1 {
-                    node_id: attestation.subject_node_id(),
-                    sequence: attestation.descriptor_sequence(),
-                    descriptor_hash: attestation.descriptor_hash(),
-                };
-                let observer = attestation.observer_node_id();
-                let context = public_endpoint_flow_context(observer);
-                attestation.verify_at(
-                    now,
-                    &observer,
-                    &descriptor,
-                    &attestation.endpoint_commitment(),
-                    &attestation.evidence_commitment(),
-                    &context,
-                    DiscoveryEndpointAttestationPurposeV1::EndpointPossessionObservation,
-                )
-            })
-            .is_ok();
-        return if accepted {
-            (StatusCode::OK, PeerStoreImportReport::empty())
-        } else {
-            (
-                StatusCode::BAD_REQUEST,
-                state.peer_store.record_rejected_directory_proof_import(now),
-            )
-        };
-    }
     let NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 {
         producer,
         block_hash,
@@ -4484,6 +4530,7 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::DiscoveryEndpointAttestationInboxConfig;
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::discovery::{
         directory_block_range_response_signing_bytes, encode_directory_sync_message,
@@ -4494,11 +4541,13 @@ mod tests {
     };
     use aeronyx_core::protocol::{
         canonical_public_endpoint_commitment, discovery_endpoint_evidence_commitment_v1,
-        DiscoveryEndpointChallengeV1, DiscoveryEndpointProofV1, NodeCapability, NodeCapacity,
-        NodeDescriptor, NodePolicy, SignedNodeDescriptor,
+        DiscoveryEndpointAttestationPurposeV1, DiscoveryEndpointChallengeV1,
+        DiscoveryEndpointProofV1, NodeCapability, NodeCapacity, NodeDescriptor, NodePolicy,
+        SignedNodeDescriptor,
     };
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
+    use tempfile::TempDir;
     use tower::ServiceExt;
 
     fn signed_descriptor() -> aeronyx_core::protocol::SignedNodeDescriptor {
@@ -4521,13 +4570,22 @@ mod tests {
     }
 
     fn endpoint_attestation_message(now: u64) -> NodeDiscoveryMessage {
+        endpoint_attestation_message_with(now, 0x72, 0x73, 9)
+    }
+
+    fn endpoint_attestation_message_with(
+        now: u64,
+        subject_seed: u8,
+        nonce_seed: u8,
+        descriptor_sequence: u64,
+    ) -> NodeDiscoveryMessage {
         let observer = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap();
-        let subject = IdentityKeyPair::from_bytes(&[0x72; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[subject_seed; 32]).unwrap();
         let context = public_endpoint_flow_context(observer.public_key_bytes());
         let endpoint = canonical_public_endpoint_commitment("8.8.8.8:51820").unwrap();
         let mut descriptor = NodeDescriptor::new(
             subject.public_key_bytes(),
-            9,
+            descriptor_sequence,
             now.saturating_sub(1),
             now + 600,
             "endpoint-attestation-api-test",
@@ -4540,7 +4598,7 @@ mod tests {
             subject.public_key_bytes(),
             commitment.descriptor_hash,
             endpoint,
-            [0x73; 32],
+            [nonce_seed; 32],
             context,
             now,
             now + 120,
@@ -6916,9 +6974,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoint_attestation_gossip_persists_exact_replay_without_peer_state() {
+        // [PERMISSIONLESS-ENDPOINT-ATTESTATION-INBOX-COMPOSITION 2026-09-24 by Codex]
+        // The durable quarantine records transport evidence while every
+        // PeerStore projection remains byte-for-byte unchanged.
+        std::fs::create_dir_all("target/test-temp").expect("external test root");
+        let directory = TempDir::new_in("target/test-temp").expect("tempdir");
+        let inbox_config = DiscoveryEndpointAttestationInboxConfig {
+            db_path: directory.path().join("attestations.sqlite3"),
+            max_entries: 8,
+            max_logical_bytes: 8 * 1024,
+            retention_ttl_secs: 600,
+            cleanup_batch_size: 8,
+        };
+        let inbox = Arc::new(
+            SqliteDiscoveryEndpointAttestationInbox::open(inbox_config.clone()).expect("open"),
+        );
+        let now = now_secs();
+        let store = Arc::new(PeerStore::new());
+        let before = store.status(now + 2);
+        let body = serde_json::to_vec(&endpoint_attestation_message(now)).unwrap();
+        let app = build_discovery_router_with_local_entry_and_attestation_inbox(
+            Arc::clone(&store),
+            DiscoveryApiPolicy::default(),
+            DiscoveryLocalCapabilityStatus::default(),
+            None,
+            [0x71; 32],
+            Some(Arc::clone(&inbox)),
+        );
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/discovery/gossip")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(store.status(now + 2), before);
+        let snapshot = inbox.eligibility_snapshot_at(now + 2).expect("snapshot");
+        assert_eq!(snapshot.retained_rows, 1);
+        assert_eq!(snapshot.fresh_rows, 1);
+        drop(app);
+        drop(inbox);
+        let reopened = SqliteDiscoveryEndpointAttestationInbox::open(inbox_config).expect("reopen");
+        assert_eq!(
+            reopened
+                .eligibility_snapshot_at(now + 2)
+                .expect("restart snapshot"),
+            snapshot
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_attestation_gossip_maps_conflict_and_capacity_without_peer_state() {
+        std::fs::create_dir_all("target/test-temp").expect("external test root");
+        let directory = TempDir::new_in("target/test-temp").expect("tempdir");
+        let inbox = Arc::new(
+            SqliteDiscoveryEndpointAttestationInbox::open(
+                DiscoveryEndpointAttestationInboxConfig {
+                    db_path: directory.path().join("attestations.sqlite3"),
+                    max_entries: 1,
+                    max_logical_bytes: 8 * 1024,
+                    retention_ttl_secs: 600,
+                    cleanup_batch_size: 8,
+                },
+            )
+            .expect("open"),
+        );
+        let now = now_secs();
+        let store = Arc::new(PeerStore::new());
+        let before = store.status(now + 2);
+        let app = build_discovery_router_with_local_entry_and_attestation_inbox(
+            Arc::clone(&store),
+            DiscoveryApiPolicy::default(),
+            DiscoveryLocalCapabilityStatus::default(),
+            None,
+            [0x71; 32],
+            Some(inbox),
+        );
+        let send = |message: NodeDiscoveryMessage| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/discovery/gossip")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&message).unwrap()))
+                    .unwrap(),
+            )
+        };
+
+        assert_eq!(
+            send(endpoint_attestation_message_with(now, 0x72, 0x73, 9))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(endpoint_attestation_message_with(now, 0x72, 0x74, 9))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            send(endpoint_attestation_message_with(now, 0x75, 0x76, 10))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(store.status(now + 2), before);
+    }
+
+    #[tokio::test]
     async fn endpoint_attestation_gossip_rejects_signature_tamper() {
         let now = now_secs();
         let store = Arc::new(PeerStore::new());
+        let before = store.status(now + 2);
         let mut message = endpoint_attestation_message(now);
         let NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { attestation_frame } =
             &mut message
@@ -6941,8 +7123,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(store.len(), 0);
-        assert_eq!(store.status(now + 2).runtime.last_gossip_at, None);
+        assert_eq!(store.status(now + 2), before);
     }
 
     #[tokio::test]
@@ -8590,6 +8771,7 @@ mod tests {
             peer_store: Arc::new(PeerStore::new()),
             local_node_id: None,
             directory_replica_store: None,
+            endpoint_attestation_inbox: None,
             policy: DiscoveryApiPolicy::default(),
             local_capabilities: DiscoveryLocalCapabilityStatus::default(),
             rate_limit,

@@ -1030,7 +1030,8 @@ use crate::api::directory_replica_sync::{
     DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS, DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS,
 };
 use crate::api::discovery::{
-    blind_relay_runtime_status_value, build_discovery_router_with_local_entry,
+    blind_relay_runtime_status_value,
+    build_discovery_router_with_local_entry_and_attestation_inbox,
     discovery_readiness_status_value, recovery_anchor_status_value, DiscoveryApiPolicy,
     DiscoveryBlindVaultCapabilityObservation, DiscoveryLocalCapabilityStatus, GossipResponse,
 };
@@ -1125,8 +1126,9 @@ use crate::services::peer_store::{
 use crate::services::{
     start_dns_proxy, BlindVaultService, DirectoryChainAppendReport, DirectoryChainStore,
     DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore, DirectoryReplicaSyncRuntime,
-    DiscoveryEndpointEvidenceStoreConfig, HandshakeService, IpPoolService, NodePolicyRuntime,
-    PeerStore, RoutingService, SessionManager, SessionTermination,
+    DiscoveryEndpointAttestationInboxConfig, DiscoveryEndpointEvidenceStoreConfig,
+    HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService, SessionManager,
+    SessionTermination, SqliteDiscoveryEndpointAttestationInbox,
     SqliteDiscoveryEndpointEvidenceStore,
 };
 // v1.0.0-Membership
@@ -4004,6 +4006,33 @@ async fn open_endpoint_evidence_store(
     Ok(Some(Arc::new(store)))
 }
 
+// [PERMISSIONLESS-ENDPOINT-ATTESTATION-INBOX-COMPOSITION 2026-09-24 by Codex]
+// Open and audit the independent quarantine before any listener is bound.
+// Disabled configuration returns before deriving a path or touching disk.
+async fn open_endpoint_attestation_inbox(
+    discovery: &DiscoveryConfig,
+) -> Result<Option<Arc<SqliteDiscoveryEndpointAttestationInbox>>> {
+    if !discovery.permissionless_endpoint_attestation_inbox_enabled {
+        return Ok(None);
+    }
+    let config = DiscoveryEndpointAttestationInboxConfig {
+        db_path: discovery
+            .permissionless_endpoint_attestation_inbox_db_path
+            .clone()
+            .into(),
+        max_entries: discovery.permissionless_endpoint_attestation_inbox_max_entries,
+        max_logical_bytes: discovery.permissionless_endpoint_attestation_inbox_max_bytes,
+        retention_ttl_secs: discovery.permissionless_endpoint_attestation_inbox_ttl_secs,
+        cleanup_batch_size: discovery.permissionless_endpoint_attestation_inbox_cleanup_batch,
+    };
+    let inbox =
+        tokio::task::spawn_blocking(move || SqliteDiscoveryEndpointAttestationInbox::open(config))
+            .await
+            .map_err(|_| ServerError::startup_failed("Endpoint attestation startup task failed"))?
+            .map_err(|_| ServerError::startup_failed("Endpoint attestation inbox unavailable"))?;
+    Ok(Some(Arc::new(inbox)))
+}
+
 impl Server {
     pub fn new(
         config: ServerConfig,
@@ -6252,6 +6281,8 @@ impl Server {
         }
         let endpoint_evidence =
             open_endpoint_evidence_store(&self.config.discovery, &self.identity).await?;
+        let endpoint_attestation_inbox =
+            open_endpoint_attestation_inbox(&self.config.discovery).await?;
         let shutdown_rx = self.shutdown_tx.subscribe();
         let shutdown_rx_vpn = self.shutdown_tx.subscribe();
         let shutdown_rx_public = self.shutdown_tx.subscribe();
@@ -6405,6 +6436,7 @@ impl Server {
                     endpoint_proof_max_entries: public_endpoint_proof_max_entries,
                     endpoint_proof_ttl_secs: public_endpoint_proof_ttl_secs,
                     endpoint_evidence,
+                    endpoint_attestation_inbox: endpoint_attestation_inbox.clone(),
                 });
                 listener_tasks.spawn(async move {
                     Self::serve_public_discovery_api(
@@ -6673,12 +6705,13 @@ impl Server {
                 // [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] Both
                 // operator and public gossip surfaces use the same audited
                 // replica trust anchor; absent replicas fail proof gossip closed.
-                .merge(build_discovery_router_with_local_entry(
+                .merge(build_discovery_router_with_local_entry_and_attestation_inbox(
                     Arc::clone(&peer_store),
                     discovery_api_policy,
                     local_capability_status,
                     directory_replica_store.clone(),
                     node_identity.public_key_bytes(),
+                    endpoint_attestation_inbox,
                 ))
                 .merge(build_directory_replica_status_router_with_witness_carrier(
                     directory_replica_store.clone(),
@@ -16621,8 +16654,8 @@ mod tests {
         custody_witness_renewal_warning_window_secs, custody_witness_runtime_audit_interval_secs,
         custody_witness_runtime_failure, data_plane_receive_failure_action,
         discovery_heartbeat_status_value, handshake_rejection_class, log_handshake_rejection,
-        memchain_index_rejection_reason, open_endpoint_evidence_store,
-        peer_store_heartbeat_status_value, prefix_to_netmask,
+        memchain_index_rejection_reason, open_endpoint_attestation_inbox,
+        open_endpoint_evidence_store, peer_store_heartbeat_status_value, prefix_to_netmask,
         required_runtime_supervisor_channel_closed, retry_required_data_plane_receive,
         take_pre_ready_runtime_failure, unix_now_secs, CommitmentCoordinatorLeaseRound,
         CommitmentFollowerRoundOutcome, CommitmentSyncTaskLivenessGuard,
@@ -27585,5 +27618,39 @@ mod tests {
             )
             .expect("schema count");
         assert_eq!(mailbox_objects, 0);
+    }
+
+    #[tokio::test]
+    async fn endpoint_attestation_inbox_disabled_has_zero_filesystem_side_effect() {
+        std::fs::create_dir_all("target/test-temp").expect("external-disk test temp root");
+        let directory = tempfile::TempDir::new_in("target/test-temp").expect("private directory");
+        let absent = directory.path().join("disabled/attestations.sqlite3");
+        let mut discovery = DiscoveryConfig::default();
+        discovery.permissionless_endpoint_attestation_inbox_db_path =
+            absent.to_string_lossy().into_owned();
+
+        let opened = open_endpoint_attestation_inbox(&discovery)
+            .await
+            .expect("disabled inbox");
+        assert!(opened.is_none());
+        assert!(!absent.exists());
+        assert!(!absent.parent().expect("parent").exists());
+    }
+
+    #[tokio::test]
+    async fn endpoint_attestation_inbox_foreign_schema_fails_startup_closed() {
+        std::fs::create_dir_all("target/test-temp").expect("external-disk test temp root");
+        let directory = tempfile::TempDir::new_in("target/test-temp").expect("private directory");
+        let path = directory.path().join("foreign-attestations.sqlite3");
+        rusqlite::Connection::open(&path)
+            .expect("foreign database")
+            .execute_batch("CREATE TABLE unrelated(value INTEGER);")
+            .expect("foreign schema");
+        let mut discovery = DiscoveryConfig::default();
+        discovery.permissionless_endpoint_attestation_inbox_enabled = true;
+        discovery.permissionless_endpoint_attestation_inbox_db_path =
+            path.to_string_lossy().into_owned();
+
+        assert!(open_endpoint_attestation_inbox(&discovery).await.is_err());
     }
 }
