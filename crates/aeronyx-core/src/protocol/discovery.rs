@@ -244,6 +244,8 @@ use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, Tra
 /// Descriptors are intended to be small control-plane objects. Keeping a
 /// strict cap prevents unbounded memory allocation when reading bootstrap
 /// snapshots or future gossip payloads.
+/// Maximum canonical encoded length of one signed node descriptor.
+pub const MAX_SIGNED_NODE_DESCRIPTOR_BYTES: usize = 16 * 1024;
 const MAX_DESCRIPTOR_BYTES: u64 = 16 * 1024;
 
 // [ANONYMOUS-MAILBOX-WORK-POLICY 2026-09-07 by Codex] Keep the public work
@@ -1232,6 +1234,38 @@ impl SignedNodeDescriptor {
             descriptor,
             signature,
         })
+    }
+
+    /// Encodes this signed descriptor with the canonical bounded discovery codec.
+    ///
+    /// # Errors
+    /// Returns a malformed-message error when the descriptor exceeds the
+    /// existing descriptor bound or cannot be serialized canonically.
+    pub fn encode_canonical(&self) -> Result<Vec<u8>, CoreError> {
+        encode_bincode_bounded(self, MAX_DESCRIPTOR_BYTES)
+            .map_err(|error| CoreError::malformed(format!("signed descriptor encode: {error}")))
+    }
+
+    /// Decodes one canonical bounded signed descriptor without trusting it.
+    ///
+    /// Call [`Self::verify_at`] before using the descriptor as current routing
+    /// authority. Trailing bytes and non-canonical encodings fail closed.
+    ///
+    /// # Errors
+    /// Returns a malformed-message error for oversized, trailing, malformed,
+    /// or non-canonical bytes.
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, CoreError> {
+        let descriptor: Self =
+            decode_bincode_bounded(bytes, MAX_DESCRIPTOR_BYTES, TrailingBytesPolicy::Reject)
+                .map_err(|error| {
+                    CoreError::malformed(format!("signed descriptor decode: {error}"))
+                })?;
+        if descriptor.encode_canonical()?.as_slice() != bytes {
+            return Err(CoreError::malformed(
+                "signed descriptor encoding is non-canonical",
+            ));
+        }
+        Ok(descriptor)
     }
 
     /// Verifies the descriptor signature and expiry at `now`.
@@ -4462,6 +4496,27 @@ mod tests {
         assert!(signed.verify_at(1_700_000_100).is_ok());
         assert_eq!(signed.node_id(), kp.public_key_bytes());
         assert_eq!(signed.sequence(), 7);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn signed_descriptor_canonical_codec_rejects_trailing_and_oversize() {
+        let kp = IdentityKeyPair::from_bytes(&[0x5a; 32]).unwrap();
+        let signed = SignedNodeDescriptor::sign(descriptor_for(&kp), &kp).unwrap();
+        let encoded = signed.encode_canonical().unwrap();
+        assert_eq!(
+            SignedNodeDescriptor::decode_canonical(&encoded).unwrap(),
+            signed
+        );
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(SignedNodeDescriptor::decode_canonical(&trailing).is_err());
+        assert!(SignedNodeDescriptor::decode_canonical(&vec![
+            0;
+            MAX_SIGNED_NODE_DESCRIPTOR_BYTES + 1
+        ])
+        .is_err());
     }
 
     #[test]
