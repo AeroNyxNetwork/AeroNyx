@@ -8,6 +8,8 @@
 //! content-key, or plaintext fields.
 //!
 //! ## Last Modified
+//! v1.0.8-SourceJournalCrossEntryRestart — Prove lost-response source reopen
+//! inside the full no-socket one-hop mailbox lifecycle.
 //! v1.0.7-PolicyRejectionTerminal — Sign only typed pre-write ticket rejection.
 //! v1.0.6-ItemExpiryTerminal — Prove exact terminal Pull expiry after ACK.
 //! v1.0.5-LostPullReplay — Prove source retry after ACK and target restart.
@@ -354,6 +356,7 @@ fn map_ticket_issue(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -774,19 +777,17 @@ mod tests {
         source_seed: u8,
         resolver: Arc<CrossEntryExactResolver>,
         journal_key: u8,
+        journal_path: &Path,
     ) -> AnonymousMailboxSourceCoordinator {
         let config = AnonymousMailboxSourceConfig {
             enabled: true,
+            db_path: journal_path.display().to_string(),
             max_journal_entries: 16,
             max_journal_bytes: 8 * 1024 * 1024,
             ..AnonymousMailboxSourceConfig::default()
         };
-        let journal = SqliteAnonymousMailboxSourceJournal::new(
-            Connection::open_in_memory().expect("source journal"),
-            [journal_key; 32],
-            &config,
-        )
-        .expect("source journal schema");
+        let journal = SqliteAnonymousMailboxSourceJournal::open(config, [journal_key; 32])
+            .expect("private durable source journal");
         AnonymousMailboxSourceCoordinator::new(
             Arc::new(IdentityKeyPair::from_bytes(&[source_seed; 32]).expect("source identity")),
             resolver,
@@ -1753,8 +1754,13 @@ mod tests {
             exact_calls: AtomicUsize::new(0),
             wrong_target_calls: AtomicUsize::new(0),
         });
-        let entry_m = cross_entry_coordinator(0xb2, Arc::clone(&m_resolver), 0xb3);
-        let entry_r = cross_entry_coordinator(0xb4, Arc::clone(&r_resolver), 0xb5);
+        // [ANONYMOUS-MAILBOX-SOURCE-RESTART-VERTICAL 2026-09-24 by Codex]
+        // Keep M and R in separate private durable journals. Reopen each
+        // source after a lost terminal response, in addition to restarting T.
+        let m_journal_path = private_directory.join("sender-source.sqlite");
+        let r_journal_path = private_directory.join("reader-source.sqlite");
+        let entry_m = cross_entry_coordinator(0xb2, Arc::clone(&m_resolver), 0xb3, &m_journal_path);
+        let entry_r = cross_entry_coordinator(0xb4, Arc::clone(&r_resolver), 0xb5, &r_journal_path);
         let depositor = IdentityKeyPair::from_bytes(&[0xb6; 32]).expect("deposit capability");
         let reader = IdentityKeyPair::from_bytes(&[0xb7; 32]).expect("read capability");
         let mailbox_id = [0xb8; 32];
@@ -1920,6 +1926,12 @@ mod tests {
             put_route,
             AnonymousMailboxTerminalFrameV1::Put(put.clone()),
         );
+        drop(entry_m);
+        let entry_m = cross_entry_coordinator(0xb2, Arc::clone(&m_resolver), 0xb3, &m_journal_path);
+        assert!(matches!(
+            entry_m.result(put_route),
+            Ok(AnonymousMailboxSourceResult::Armed)
+        ));
         let replay = entry_m
             .begin_dispatch(put_route, 1_800_000_001)
             .expect("exact armed replay");
@@ -2013,7 +2025,7 @@ mod tests {
         // first Pull response is lost after T commits its result. A holder of
         // the same read capability ACKs the known opaque item before R retries
         // the exact armed Pull across a T restart.
-        let (_, _lost_sealed_pull) = dispatch_cross_entry_terminal(
+        let (pull_body, _lost_sealed_pull) = dispatch_cross_entry_terminal(
             &entry_r,
             &transport,
             restarted.clone(),
@@ -2021,6 +2033,19 @@ mod tests {
             descriptor_commitment,
             pull_route,
             AnonymousMailboxTerminalFrameV1::PullOne(pull.clone()),
+        );
+        drop(entry_r);
+        let entry_r = cross_entry_coordinator(0xb4, Arc::clone(&r_resolver), 0xb5, &r_journal_path);
+        assert!(matches!(
+            entry_r.result(pull_route),
+            Ok(AnonymousMailboxSourceResult::Armed)
+        ));
+        assert_eq!(
+            entry_r
+                .begin_dispatch(pull_route, 1_800_000_002)
+                .expect("source Pull remains exact after reopen")
+                .body(),
+            pull_body
         );
         let ack = AnonymousMailboxAckV1::new(
             mailbox_id,
@@ -2032,7 +2057,7 @@ mod tests {
         )
         .expect("ack request");
         let ack_route = [0xc4; 16];
-        let (_, _lost_sealed_ack) = dispatch_cross_entry_terminal(
+        let (ack_body, _lost_sealed_ack) = dispatch_cross_entry_terminal(
             &entry_r,
             &transport,
             restarted.clone(),
@@ -2041,6 +2066,12 @@ mod tests {
             ack_route,
             AnonymousMailboxTerminalFrameV1::Ack(ack.clone()),
         );
+        drop(entry_r);
+        let entry_r = cross_entry_coordinator(0xb4, Arc::clone(&r_resolver), 0xb5, &r_journal_path);
+        assert!(matches!(
+            entry_r.result(ack_route),
+            Ok(AnonymousMailboxSourceResult::Armed)
+        ));
         assert_eq!(
             durable_item_state(&store_config.db_path),
             (0, 0, 0, Vec::new())
@@ -2048,6 +2079,7 @@ mod tests {
         let ack_replay = entry_r
             .begin_dispatch(ack_route, 1_800_000_003)
             .expect("exact Ack replay after lost response");
+        assert_eq!(ack_replay.body(), ack_body);
         let sealed_ack = transport.deliver(&ack_replay, restarted.clone(), 1_800_000_003);
         let AnonymousMailboxTerminalFrameV1::AckResponse(ack_response) =
             complete_cross_entry_response(&entry_r, ack_route, &sealed_ack)
@@ -2073,6 +2105,7 @@ mod tests {
         let pull_replay = entry_r
             .begin_dispatch(pull_route, 1_800_000_003)
             .expect("lost Pull replays the exact armed source request");
+        assert_eq!(pull_replay.body(), pull_body);
         let sealed_pull_replay =
             transport.deliver(&pull_replay, restarted_after_ack.clone(), 1_800_000_003);
         let AnonymousMailboxTerminalFrameV1::PullOneResponse(pull_response) =
@@ -2225,12 +2258,15 @@ mod tests {
             (0, 0, 0, Vec::new())
         );
 
-        assert_eq!(m_resolver.wrong_target_calls.load(Ordering::Relaxed), 1);
+        // [ANONYMOUS-MAILBOX-SOURCE-RESTART-VERTICAL 2026-09-24 by Codex]
+        // The source's pre-journal TicketIssue target guard rejects a foreign
+        // T before resolver I/O; neither entry probes an alternate target.
+        assert_eq!(m_resolver.wrong_target_calls.load(Ordering::Relaxed), 0);
         assert_eq!(r_resolver.wrong_target_calls.load(Ordering::Relaxed), 0);
         assert_eq!(transport.exact_calls.load(Ordering::Relaxed), 10);
         assert_eq!(transport.alternate_calls.load(Ordering::Relaxed), 0);
         assert_eq!(m_resolver.exact_calls.load(Ordering::Relaxed), 10);
-        assert_eq!(r_resolver.exact_calls.load(Ordering::Relaxed), 8);
+        assert_eq!(r_resolver.exact_calls.load(Ordering::Relaxed), 9);
     }
 
     #[test]
