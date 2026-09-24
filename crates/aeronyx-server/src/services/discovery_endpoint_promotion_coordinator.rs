@@ -10,8 +10,10 @@
 //! This is endpoint control at one instant, not route delivery, Sybil
 //! independence, economic eligibility, or permission to skip quarantine.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -78,6 +80,7 @@ const MINIMUM_OBSERVATION_SPAN_SECS: u64 = 5;
 const PROMOTION_POLICY_VERSION: u64 = 1;
 const MAX_FACT_AGE_SECS: u64 = 120;
 const PROMOTION_CAPACITY: usize = 256;
+const ATTESTATION_GOSSIP_FANOUT: usize = 2;
 const OBSERVATION_CONTEXT_DOMAIN: &[u8] = b"AeroNyx/PermissionlessEndpointObservationContextV1\0";
 
 /// Coarse failure with no node id, endpoint, descriptor, or evidence payload.
@@ -101,12 +104,48 @@ pub(crate) struct PermissionlessPromotionCoordinator {
     revocations: SqliteDiscoveryEndpointQuarantineRevocationRegistry,
     observer: Arc<IdentityKeyPair>,
     client: reqwest::Client,
+    attestation_gossip_cursor: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
 struct PendingVerifiedObservation {
     challenge: DiscoveryEndpointQuarantineChallenge,
     fresh: DiscoveryEndpointFreshQuarantineAdmission,
+}
+
+/// Selects at most two already-verified public peers for one opaque fact.
+///
+/// [PERMISSIONLESS-ATTESTATION-ROTATION 2026-09-25 by Codex] The caller's
+/// cursor advances independently of node ids, and filtering precedes the
+/// transport budget. For a stable eligible view, repeated live-process rounds
+/// cover every peer without using the candidate's key as a public locator or
+/// log field.
+fn select_attestation_gossip_targets(
+    mut identities: Vec<([u8; 32], String)>,
+    observer_id: [u8; 32],
+    candidate_id: [u8; 32],
+    round: u64,
+) -> Vec<reqwest::Url> {
+    identities.sort_unstable_by_key(|(node_id, _)| *node_id);
+    let mut seen_urls = HashSet::new();
+    let mut targets = identities
+        .into_iter()
+        .filter(|(node_id, endpoint)| {
+            *node_id != observer_id
+                && *node_id != candidate_id
+                && peer_endpoint_is_public_ip(endpoint)
+        })
+        .filter_map(|(_, endpoint)| {
+            canonical_peer_http_url(&endpoint, "/api/discovery/gossip").ok()
+        })
+        .filter(|url| seen_urls.insert(url.clone()))
+        .collect::<Vec<_>>();
+    if !targets.is_empty() {
+        let start = (round as usize) % targets.len();
+        targets.rotate_left(start);
+        targets.truncate(ATTESTATION_GOSSIP_FANOUT);
+    }
+    targets
 }
 
 impl PermissionlessPromotionCoordinator {
@@ -164,6 +203,11 @@ impl PermissionlessPromotionCoordinator {
             revocations,
             observer,
             client,
+            // [PERMISSIONLESS-ATTESTATION-ROTATION 2026-09-25 by Codex]
+            // A restart may repeat a bounded round, but never grants route
+            // authority. Wall-clock seeding varies the initial offset when
+            // restart times differ; cursor persistence is not claimed.
+            attestation_gossip_cursor: AtomicU64::new(unix_now_secs()),
         })
     }
 
@@ -297,20 +341,21 @@ impl PermissionlessPromotionCoordinator {
             attestation_frame: frame,
         };
         let observer_id = self.observer.public_key_bytes();
-        for (node_id, endpoint) in self
-            .peer_store
-            .valid_public_endpoint_identities(unix_now_secs())
-            .into_iter()
-            .filter(|(node_id, _)| *node_id != observer_id && *node_id != candidate.node_id())
-            .take(2)
-        {
-            let _ = node_id;
-            if !peer_endpoint_is_public_ip(&endpoint) {
-                continue;
-            }
-            let Ok(url) = canonical_peer_http_url(&endpoint, "/api/discovery/gossip") else {
-                continue;
-            };
+        // [PERMISSIONLESS-ATTESTATION-ROTATION 2026-09-25 by Codex] Filter
+        // invalid/colliding public transports before consuming the two-peer
+        // budget, then rotate the complete verified view each retry. An
+        // attestation is only evidence; gossip never promotes a route.
+        let round = self
+            .attestation_gossip_cursor
+            .fetch_add(1, Ordering::Relaxed);
+        let targets = select_attestation_gossip_targets(
+            self.peer_store
+                .valid_public_endpoint_identities(unix_now_secs()),
+            observer_id,
+            candidate.node_id(),
+            round,
+        );
+        for url in targets {
             let _ = self.client.post(url).json(&message).send().await;
         }
     }
@@ -839,6 +884,55 @@ mod tests {
     fn test_root() -> TempDir {
         std::fs::create_dir_all("target/test-temp").expect("test root");
         TempDir::new_in("target/test-temp").expect("temporary directory")
+    }
+
+    #[test]
+    fn attestation_gossip_retries_cover_verified_peers_without_widening_fanout() {
+        // [PERMISSIONLESS-ATTESTATION-ROTATION 2026-09-25 by Codex] An
+        // observer restart may repeat a round, but neither private endpoints,
+        // duplicate transports, nor the candidate consume its two-peer cap.
+        // No HTTP request or identity-bearing log is needed for this proof.
+        let observer = [0x01; 32];
+        let candidate = [0x02; 32];
+        let mut identities = vec![
+            (observer, "https://8.8.8.8:8422".to_string()),
+            (candidate, "https://8.8.4.4:8422".to_string()),
+            ([0x03; 32], "https://127.0.0.1:8422".to_string()),
+            ([0x04; 32], "https://example.com:8422".to_string()),
+            ([0x20; 32], "https://8.8.8.10:8422".to_string()),
+        ];
+        assert!(select_attestation_gossip_targets(
+            identities[..4].to_vec(),
+            observer,
+            candidate,
+            0,
+        )
+        .is_empty());
+        for offset in 0..6u8 {
+            identities.push((
+                [0x10 + offset; 32],
+                format!("https://8.8.8.{}:8422", 10 + offset),
+            ));
+        }
+        identities.reverse();
+        let mut covered = HashSet::new();
+        for round in 0..6 {
+            let selected =
+                select_attestation_gossip_targets(identities.clone(), observer, candidate, round);
+            assert_eq!(selected.len(), ATTESTATION_GOSSIP_FANOUT);
+            for url in selected {
+                assert!(url.as_str().ends_with("/api/discovery/gossip"));
+                assert!(!url.as_str().contains("127.0.0.1"));
+                assert!(!url.as_str().contains("example.com"));
+                covered.insert(url);
+            }
+        }
+        assert_eq!(covered.len(), 6, "all eligible transports get a turn");
+        assert_eq!(
+            select_attestation_gossip_targets(identities.clone(), observer, candidate, 0),
+            select_attestation_gossip_targets(identities, observer, candidate, 0),
+            "a repeated round after restart is bounded and deterministic"
+        );
     }
 
     #[test]
