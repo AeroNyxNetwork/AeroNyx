@@ -8,6 +8,7 @@
 //! content-key, or plaintext fields.
 //!
 //! ## Last Modified
+//! v1.0.6-ItemExpiryTerminal — Prove exact terminal Pull expiry after ACK.
 //! v1.0.5-LostPullReplay — Prove source retry after ACK and target restart.
 //! v1.0.4-NoSocketSmtr — Prove exact pinned-target S/M/T/R retries and restart.
 //! v1.0.3-LeaseReplay — Preserve durable exact lease-create replay after
@@ -1940,11 +1941,11 @@ mod tests {
         let (_, sealed_empty) = dispatch_cross_entry_terminal(
             &entry_r,
             &transport,
-            restarted_after_ack,
+            restarted_after_ack.clone(),
             &target,
             descriptor_commitment,
             empty_route,
-            AnonymousMailboxTerminalFrameV1::PullOne(empty_pull),
+            AnonymousMailboxTerminalFrameV1::PullOne(empty_pull.clone()),
         );
         let AnonymousMailboxTerminalFrameV1::PullOneResponse(empty_response) =
             complete_cross_entry_response(&entry_r, empty_route, &sealed_empty)
@@ -1953,6 +1954,80 @@ mod tests {
         };
         assert_eq!(empty_response.outcome, AnonymousMailboxOutcomeV1::Accepted);
         assert!(empty_response.sealed_payload.is_empty());
+        assert_eq!(
+            durable_item_state(&store_config.db_path),
+            (0, 0, 0, Vec::new())
+        );
+
+        // [ANONYMOUS-MAILBOX-ITEM-EXPIRY-TERMINAL 2026-09-24 by Codex]
+        // Reuse the exact signed Pull bytes after ACK and restart. The
+        // one-shot source session opens a target-signed Item at the item's
+        // expiry, but the same request is rejected one second later; an
+        // unrelated exact Empty replay remains valid until lease expiry.
+        let AnonymousMailboxTerminalFrameV1::PullOneResponse(boundary_response) =
+            execute_terminal_frame_at(
+                restarted_after_ack.clone(),
+                &target,
+                [0xc7; 16],
+                AnonymousMailboxTerminalFrameV1::PullOne(pull.clone()),
+                put.expires_at,
+            )
+        else {
+            panic!("boundary Pull response kind");
+        };
+        boundary_response
+            .verify_for_request(
+                AnonymousMailboxOperationV1::PullOne,
+                &pull.request_id,
+                &pull.request_commitment().expect("exact Pull commitment"),
+                &target.public_key_bytes(),
+            )
+            .expect("item expiry boundary response remains request-bound");
+        assert_eq!(
+            boundary_response.outcome,
+            AnonymousMailboxOutcomeV1::Accepted
+        );
+        let boundary_item = AnonymousMailboxPullResultV1::decode(&boundary_response.sealed_payload)
+            .expect("canonical Item at expiry equality");
+        assert_eq!(boundary_item.item_id, put.item_id);
+        assert_eq!(boundary_item.sealed_commitment, put.sealed_commitment());
+        assert_eq!(boundary_item.sealed_item, opaque_item);
+        assert!(matches!(
+            execute_terminal_result_at(
+                restarted_after_ack.clone(),
+                &target,
+                [0xc8; 16],
+                AnonymousMailboxTerminalFrameV1::PullOne(pull),
+                put.expires_at + 1,
+            ),
+            Err(AnonymousMailboxTerminalFailure::Rejected)
+        ));
+        let AnonymousMailboxTerminalFrameV1::PullOneResponse(still_empty_response) =
+            execute_terminal_frame_at(
+                restarted_after_ack,
+                &target,
+                [0xc9; 16],
+                AnonymousMailboxTerminalFrameV1::PullOne(empty_pull.clone()),
+                put.expires_at + 1,
+            )
+        else {
+            panic!("exact Empty replay response kind");
+        };
+        still_empty_response
+            .verify_for_request(
+                AnonymousMailboxOperationV1::PullOne,
+                &empty_pull.request_id,
+                &empty_pull
+                    .request_commitment()
+                    .expect("exact Empty Pull commitment"),
+                &target.public_key_bytes(),
+            )
+            .expect("exact Empty replay response remains request-bound");
+        assert_eq!(
+            still_empty_response.outcome,
+            AnonymousMailboxOutcomeV1::Accepted
+        );
+        assert!(still_empty_response.sealed_payload.is_empty());
         assert_eq!(
             durable_item_state(&store_config.db_path),
             (0, 0, 0, Vec::new())
