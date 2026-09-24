@@ -501,6 +501,10 @@ try:
     result["purpose_receipt_v2_advertised"] = "anpf1-pbdr2" in features
     if not result["privacy_relay_advertised"]:
         finish("capability_missing")
+    # [JOIN-RELEASE-ACCEPTANCE 2026-09-24 by Codex] The binary marker alone
+    # cannot prove the live descriptor actually advertises this contract.
+    if not result["purpose_receipt_v2_advertised"]:
+        finish("protocol_feature_missing")
     other_peers = [peer for peer in local_snapshot["peers"]
                    if signed_fresh(peer) and peer["descriptor"].get("node_id") != list(public_key)]
     valid_count = snapshot_status.get("valid_peers")
@@ -622,16 +626,23 @@ PY
 validate_join_binary() {
     local binary="${REPO_DIR}/target/release/aeronyx-server"
     [ -x "${binary}" ] || return 1
+    # [JOIN-RELEASE-ACCEPTANCE 2026-09-24 by Codex] A binary without the v2
+    # receipt marker must fail before service start, not after local discovery.
+    LC_ALL=C grep -aFq -- "anpf1-pbdr2" "${binary}" || return 1
     "${binary}" validate -c "${CONFIG_FILE}" >/dev/null 2>&1
 }
 
 verify_join_commit_pin() {
     [ -n "${SOURCE_COMMIT}" ] || return 0
-    local binary="${REPO_DIR}/target/release/aeronyx-server" actual_head
+    local binary="${REPO_DIR}/target/release/aeronyx-server" actual_head source_status
     actual_head="$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null)" \
         || die "Pinned join source is unavailable"
     [ "${actual_head}" = "${SOURCE_COMMIT}" ] \
         || die "Pinned join source changed before service start"
+    source_status="$(git -C "${REPO_DIR}" status --porcelain --untracked-files=normal 2>/dev/null)" \
+        || die "Pinned join source status is unavailable"
+    [ -z "${source_status}" ] \
+        || die "Pinned join source tree changed before service start"
     [ -x "${binary}" ] && LC_ALL=C grep -aFq -- "${SOURCE_COMMIT}" "${binary}" \
         || die "Pinned join binary does not embed the requested full commit"
 }

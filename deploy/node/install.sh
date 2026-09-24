@@ -1210,6 +1210,15 @@ prepare_repo() {
     [ "${DRY_RUN}" -eq 1 ] || [ -f "${REPO_DIR}/Cargo.toml" ] || die "Cargo.toml not found in ${REPO_DIR}"
 }
 
+# [JOIN-RELEASE-ACCEPTANCE 2026-09-24 by Codex] Git status failure is not an
+# empty status; every pre-build, pre-promotion, and pre-start gate fails closed.
+pinned_source_tree_clean() {
+    local source_status
+    source_status="$(git -C "${REPO_DIR}" status --porcelain --untracked-files=normal 2>/dev/null)" \
+        || die "Pinned source status is unavailable"
+    [ -z "${source_status}" ] || die "Pinned source tree changed"
+}
+
 prepare_pinned_repo() {
     local actual_origin fetched_tip actual_head current_tip
     # [PERMISSIONLESS-JOIN-COMMIT-PIN 2026-09-24 by Codex] Existing checkouts
@@ -1218,8 +1227,7 @@ prepare_pinned_repo() {
         || die "Pinned install requires a valid branch name"
     if is_git_worktree; then
         ensure_tracked_worktree_clean
-        [ -z "$(git -C "${REPO_DIR}" status --porcelain --untracked-files=normal)" ] \
-            || die "Pinned install checkout contains untracked source files"
+        pinned_source_tree_clean
         if [ "${DRY_RUN}" -eq 0 ]; then
             actual_origin="$(git -C "${REPO_DIR}" remote get-url origin 2>/dev/null)" \
                 || die "Pinned install origin is unavailable"
@@ -1248,8 +1256,7 @@ prepare_pinned_repo() {
         || die "Requested commit is not reachable from the fetched origin branch"
     git -C "${REPO_DIR}" checkout --detach "${SOURCE_COMMIT}" >/dev/null \
         || die "Pinned checkout failed"
-    [ -z "$(git -C "${REPO_DIR}" status --porcelain --untracked-files=normal)" ] \
-        || die "Pinned checkout retained local source changes"
+    pinned_source_tree_clean
     actual_head="$(git -C "${REPO_DIR}" rev-parse HEAD)"
     current_tip="$(git -C "${REPO_DIR}" rev-parse "refs/remotes/origin/${BRANCH}^{commit}")"
     [ "${actual_head}" = "${SOURCE_COMMIT}" ] \
@@ -1435,8 +1442,7 @@ verify_pinned_release() {
     local stable_binary="${REPO_DIR}/target/release/aeronyx-server"
     [ "$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null)" = "${SOURCE_COMMIT}" ] \
         || die "Pinned source changed before service start"
-    [ -z "$(git -C "${REPO_DIR}" status --porcelain --untracked-files=normal)" ] \
-        || die "Pinned source tree changed before service start"
+    pinned_source_tree_clean
     [ -x "${stable_binary}" ] \
         && LC_ALL=C grep -aFq -- "${SOURCE_COMMIT}" "${stable_binary}" \
         || die "Pinned stable binary does not embed the requested full commit"
@@ -1461,8 +1467,8 @@ build_binary() {
             cd "${REPO_DIR}"
             if [ -n "${SOURCE_COMMIT}" ]; then
                 [ "$(git rev-parse HEAD)" = "${SOURCE_COMMIT}" ] \
-                    && [ -z "$(git status --porcelain --untracked-files=normal)" ] \
                     || die "Pinned source changed before Cargo build"
+                pinned_source_tree_clean
             fi
             export AERONYX_GIT_COMMIT="${build_git_commit}"
             export CARGO_TARGET_DIR="${BUILD_TARGET_DIR}"
@@ -1472,8 +1478,7 @@ build_binary() {
         if [ -n "${SOURCE_COMMIT}" ]; then
             [ "$(git -C "${REPO_DIR}" rev-parse HEAD)" = "${SOURCE_COMMIT}" ] \
                 || die "Pinned source changed before binary promotion"
-            [ -z "$(git -C "${REPO_DIR}" status --porcelain --untracked-files=normal)" ] \
-                || die "Pinned source tree changed before binary promotion"
+            pinned_source_tree_clean
             LC_ALL=C grep -aFq -- "${SOURCE_COMMIT}" "${BUILD_BINARY}" \
                 || die "Built binary does not embed the requested full commit"
         fi
@@ -1483,8 +1488,17 @@ build_binary() {
     stable_binary="${REPO_DIR}/target/release/aeronyx-server"
     staging_binary="${stable_binary}.install.$$"
     run mkdir -p "$(dirname "${stable_binary}")"
-    run install -m 0755 "${BUILD_BINARY}" "${staging_binary}"
-    run mv -f "${staging_binary}" "${stable_binary}"
+    # [JOIN-RELEASE-ACCEPTANCE 2026-09-24 by Codex] A failed copy may have
+    # created a partial staging file. Keep the stable binary untouched and
+    # remove that exact candidate before reporting failure.
+    if ! run install -m 0755 "${BUILD_BINARY}" "${staging_binary}"; then
+        [ "${DRY_RUN}" -eq 1 ] || rm -f -- "${staging_binary}"
+        die "Validated release binary staging failed"
+    fi
+    if ! run mv -f "${staging_binary}" "${stable_binary}"; then
+        [ "${DRY_RUN}" -eq 1 ] || rm -f -- "${staging_binary}"
+        die "Validated release binary promotion failed"
+    fi
     ok "Validated release binary promoted atomically: ${stable_binary}"
 }
 

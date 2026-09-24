@@ -129,6 +129,9 @@ write("unsigned.json", unsigned)
 expired = json.loads(json.dumps(snapshot))
 expired["peers"][0]["descriptor"]["expires_at"] = now - 1
 write("expired.json", expired)
+no_v2 = json.loads(json.dumps(snapshot))
+no_v2["peers"][0]["descriptor"]["software_version"] = "0.1.0+anpf1-brsr1"
+write("no_v2.json", no_v2)
 PY
 }
 
@@ -291,6 +294,15 @@ LOCAL_MODE="unsigned"
 assert_fails "unsigned local descriptor is rejected" join_prepare_once "${TEST_ROOT}/unsigned.bin"
 LOCAL_MODE="expired"
 assert_fails "expired local descriptor is rejected" join_prepare_once "${TEST_ROOT}/expired.bin"
+LOCAL_MODE="no_v2"
+result="$(join_prepare_once "${TEST_ROOT}/no-v2.bin")" \
+    && fail "descriptor without v2 receipt marker was ready to submit"
+[[ "${result}" == *'"reason":"protocol_feature_missing"'* \
+    && "${result}" == *'"route_ready":false'* ]] \
+    || fail "missing v2 receipt marker did not fail closed"
+[ ! -e "${TEST_ROOT}/no-v2.bin" ] \
+    || fail "missing v2 receipt marker created a submit request"
+pass "local descriptor without v2 receipt marker cannot be submitted"
 unset LOCAL_MODE
 unset SEED_MODE
 
@@ -414,8 +426,9 @@ printf '[package]\nname = "pin-fixture"\nversion = "0.1.0"\n' >"${PIN_SOURCE}/Ca
 mkdir -p "${PIN_SOURCE}/src"
 printf 'pub fn pinned_source() -> u8 { 1 }\n' >"${PIN_SOURCE}/src/lib.rs"
 printf 'unchanged tracked source\n' >"${PIN_SOURCE}/README.md"
+printf '# fixture lockfile\n' >"${PIN_SOURCE}/Cargo.lock"
 printf 'target/\n' >"${PIN_SOURCE}/.gitignore"
-command git -C "${PIN_SOURCE}" add -- Cargo.toml README.md .gitignore src/lib.rs
+command git -C "${PIN_SOURCE}" add -- Cargo.toml Cargo.lock README.md .gitignore src/lib.rs
 command git -C "${PIN_SOURCE}" -c user.name=Fixture -c user.email=fixture@example.invalid \
     commit -q -m initial
 PIN_COMMIT="$(command git -C "${PIN_SOURCE}" rev-parse HEAD)"
@@ -615,9 +628,11 @@ assert_fails "pinned join rejects missing binary before start" run_join
 [[ "$(wc -l <"${TEST_ROOT}/post_calls")" -eq "${post_count_before}" ]] \
     || fail "pinned join posted after binary mismatch"
 mkdir -p "${REPO_DIR}/target/release"
-printf '#!/bin/sh\n# %s\n' "${PIN_COMMIT}" \
+printf '#!/bin/sh\n# %s anpf1-pbdr2\n' "${PIN_COMMIT}" \
     >"${REPO_DIR}/target/release/aeronyx-server"
 chmod 755 "${REPO_DIR}/target/release/aeronyx-server"
+unset -f validate_join_binary
+source "${NODE_SCRIPT%/*}/lib/operator_join.sh"
 result="$(run_join)" || fail "pinned join rejected exact source and binary fixture"
 [[ "${result}" == *'"status":"accepted"'* ]] \
     || fail "pinned join lost Stage-A response"
@@ -632,7 +647,39 @@ command grep -q -- "${PIN_COMMIT}" "${TEST_ROOT}/installer_args" \
 ) || fail "installer prestart release check rejected exact binary fixture"
 pass "join forwards full pin and starts only after matching source and binary"
 
+status_unavailable_join() {
+    git() {
+        [ "${3:-}" != status ] || return 1
+        command git "$@"
+    }
+    run_join
+}
 rm -f -- "${TEST_ROOT}/systemctl_calls"
+post_count_before="$(wc -l <"${TEST_ROOT}/post_calls")"
+assert_fails "pinned join rejects unavailable Git source status" status_unavailable_join
+[ ! -e "${TEST_ROOT}/systemctl_calls" ] \
+    || fail "unavailable Git source status started service"
+[[ "$(wc -l <"${TEST_ROOT}/post_calls")" -eq "${post_count_before}" ]] \
+    || fail "unavailable Git source status sent POST"
+if bash -c '
+    set -euo pipefail
+    install_path="$1"
+    test_repo="$2"
+    test_commit="$3"
+    set --
+    source "${install_path}"
+    REPO_DIR="${test_repo}"
+    SOURCE_COMMIT="${test_commit}"
+    git() {
+        [ "${3:-}" != status ] || return 1
+        command git "$@"
+    }
+    verify_pinned_release
+' bash "${INSTALL_SCRIPT}" "${REPO_DIR}" "${PIN_COMMIT}" >/dev/null 2>&1; then
+    fail "installer accepted unavailable Git source status"
+fi
+pass "unavailable Git status fails both pre-start pin gates closed"
+
 post_count_before="$(wc -l <"${TEST_ROOT}/post_calls")"
 printf '#!/bin/sh\n# wrong binary marker\n' \
     >"${REPO_DIR}/target/release/aeronyx-server"
@@ -645,6 +692,29 @@ pass "binary runtime mismatch prevents service start and POST"
 
 printf '#!/bin/sh\n# %s\n' "${PIN_COMMIT}" \
     >"${REPO_DIR}/target/release/aeronyx-server"
+assert_fails "pinned join rejects missing v2 binary marker" run_join
+[ ! -e "${TEST_ROOT}/systemctl_calls" ] \
+    || fail "missing v2 binary marker started service"
+[[ "$(wc -l <"${TEST_ROOT}/post_calls")" -eq "${post_count_before}" ]] \
+    || fail "missing v2 binary marker sent POST"
+pass "missing v2 binary marker causes zero start and POST"
+
+printf '#!/bin/sh\n# %s anpf1-pbdr2\n' "${PIN_COMMIT}" \
+    >"${REPO_DIR}/target/release/aeronyx-server"
+post_installer_drift_join() {
+    run_installer() {
+        printf 'post-installer tracked source drift\n' >>"${REPO_DIR}/src/lib.rs"
+    }
+    run_join
+}
+assert_fails "pinned join rejects post-installer source drift" post_installer_drift_join
+[ ! -e "${TEST_ROOT}/systemctl_calls" ] \
+    || fail "post-installer source drift started service"
+[[ "$(wc -l <"${TEST_ROOT}/post_calls")" -eq "${post_count_before}" ]] \
+    || fail "post-installer source drift sent POST"
+command git -C "${REPO_DIR}" restore -- src/lib.rs
+pass "post-installer tracked source drift causes zero start and POST"
+
 command git -C "${REPO_DIR}" checkout -q --detach \
     "refs/remotes/origin/main"
 assert_fails "pinned join rejects checkout drift" run_join
@@ -654,6 +724,78 @@ assert_fails "pinned join rejects checkout drift" run_join
     || fail "checkout drift sent POST"
 command git -C "${REPO_DIR}" checkout -q --detach "${PIN_COMMIT}"
 pass "source checkout drift prevents service start and POST"
+
+# [JOIN-RELEASE-ACCEPTANCE 2026-09-24 by Codex] A rejected isolated build
+# must never replace the stable binary or leave a promoted staging name.
+printf 'previous stable binary\n' >"${REPO_DIR}/target/release/aeronyx-server"
+cp "${REPO_DIR}/target/release/aeronyx-server" "${TEST_ROOT}/stable-before"
+mkdir -p "${TEST_ROOT}/isolated-build/release"
+if bash -c '
+    set -euo pipefail
+    install_path="$1"
+    test_repo="$2"
+    test_config="$3"
+    test_commit="$4"
+    test_target="$5"
+    set --
+    source "${install_path}"
+    REPO_DIR="${test_repo}"
+    CONFIG_FILE="${test_config}"
+    SOURCE_COMMIT="${test_commit}"
+    BUILD_TARGET_DIR="${test_target}"
+    BUILD_BINARY="${BUILD_TARGET_DIR}/release/aeronyx-server"
+    run_pinned_cargo() {
+        printf "#!/bin/sh\n# rejected candidate\n" >"${BUILD_BINARY}"
+        chmod 755 "${BUILD_BINARY}"
+    }
+    build_binary
+' bash "${INSTALL_SCRIPT}" "${REPO_DIR}" "${CONFIG_FILE}" \
+    "${PIN_COMMIT}" "${TEST_ROOT}/isolated-build" >/dev/null 2>&1; then
+    fail "binary without pinned marker was promoted"
+fi
+cmp -s "${REPO_DIR}/target/release/aeronyx-server" "${TEST_ROOT}/stable-before" \
+    || fail "failed build changed stable binary"
+if compgen -G "${REPO_DIR}/target/release/aeronyx-server.install.*" >/dev/null; then
+    fail "failed build left a staging binary"
+fi
+pass "rejected isolated build leaves stable binary and promotion slot untouched"
+
+if bash -c '
+    set -euo pipefail
+    install_path="$1"
+    test_repo="$2"
+    test_config="$3"
+    test_commit="$4"
+    test_target="$5"
+    set --
+    source "${install_path}"
+    REPO_DIR="${test_repo}"
+    CONFIG_FILE="${test_config}"
+    SOURCE_COMMIT="${test_commit}"
+    BUILD_TARGET_DIR="${test_target}"
+    BUILD_BINARY="${BUILD_TARGET_DIR}/release/aeronyx-server"
+    run_pinned_cargo() {
+        printf "#!/bin/sh\n# %s anpf1-pbdr2\n" "${SOURCE_COMMIT}" >"${BUILD_BINARY}"
+        chmod 755 "${BUILD_BINARY}"
+    }
+    run() {
+        if [ "$1" = install ]; then
+            printf "partial staging copy\n" >"${@: -1}"
+            return 1
+        fi
+        command "$@"
+    }
+    build_binary
+' bash "${INSTALL_SCRIPT}" "${REPO_DIR}" "${CONFIG_FILE}" \
+    "${PIN_COMMIT}" "${TEST_ROOT}/isolated-build" >/dev/null 2>&1; then
+    fail "partial staging copy was reported as a successful promotion"
+fi
+cmp -s "${REPO_DIR}/target/release/aeronyx-server" "${TEST_ROOT}/stable-before" \
+    || fail "partial staging copy changed stable binary"
+if compgen -G "${REPO_DIR}/target/release/aeronyx-server.install.*" >/dev/null; then
+    fail "failed staging copy left a partial release artifact"
+fi
+pass "failed staging copy preserves stable binary and removes partial artifact"
 
 SOURCE_COMMIT=short
 assert_fails "join rejects abbreviated commit" validate_join_options

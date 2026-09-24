@@ -569,9 +569,14 @@ installer fetches that origin branch once (or clones it on first install),
 requires the commit to be reachable from the fetched branch, checks out the
 exact commit detached, and embeds the full SHA in the release binary. The
 join gate checks source HEAD and that binary marker before service start or
-POST. A moving branch tip cannot silently replace the requested commit; a
-changed checkout, missing marker, untrusted existing origin, or already
-active service fails closed without restarting it. `join --commit --check-only`
+POST. [JOIN-RELEASE-ACCEPTANCE 2026-09-24 by Codex] The pre-start gate also
+requires the v2 purpose-bound receipt marker in the binary and rechecks the
+pinned source tree for tracked or untracked drift. A signed local descriptor
+that omits the v2 marker cannot be submitted, even if the binary passed its
+pre-start consistency check. A moving branch tip cannot silently replace the
+requested commit; a changed checkout, missing marker, untrusted existing
+origin, or already active service fails closed without restarting it.
+`join --commit --check-only`
 is rejected because it does not build. Omitting `--commit` while leaving
 `AERONYX_COMMIT` unset retains the existing branch-following behavior and
 must not be described as pinned. The embedded-SHA marker scan is a local
