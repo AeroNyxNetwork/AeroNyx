@@ -838,7 +838,7 @@ impl MemoryStorage {
     }
 
     /// Builds a snapshot at an explicit time for deterministic boundary tests.
-    fn record_commitment_sync_status_at(&self, now: u64) -> RecordCommitmentSyncStatus {
+    pub(super) fn record_commitment_sync_status_at(&self, now: u64) -> RecordCommitmentSyncStatus {
         // [FOLLOWER-CERTIFICATE-TIP-BINDING 2026-07-29 by Codex] A certificate
         // decision is valid only for the audited tip it evaluated. Derive the
         // externally visible state against the latest complete integrity

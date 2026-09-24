@@ -6335,14 +6335,18 @@ fn test_malformed_expiry_notification_isolated_without_blocking_valid_rows() {
 #[test]
 fn expired_notifications_are_wired_to_authenticated_chat_pull() {
     let source = include_str!("../server.rs");
+    // [SERVER-BACKGROUND-TASKS-SPLIT 2026-09-25 by Codex] The cleanup worker
+    // and management reporter live in separate owned runtime modules.
+    let background = include_str!("../server/background_tasks.rs");
+    let api_runtime = include_str!("../server/api_runtime.rs");
     assert!(source.contains("relay.pull_pending_notifications(&wallet)"));
     assert!(source.contains("Self::push_expired_notifications("));
     assert!(source.contains("has_more |= notification_has_more || !delivery_complete"));
     assert!(source.contains("self.spawn_chat_relay_cleanup_task(Arc::clone(relay))"));
-    assert!(source.contains("tokio::task::spawn_blocking(move || cleanup_relay.run_cleanup())"));
-    assert!(source.contains("tokio::time::MissedTickBehavior::Skip"));
-    assert!(source.contains("relay.record_maintenance_worker_failure(reason)"));
-    assert!(source.contains("\"maintenance\": relay.maintenance_status()"));
+    assert!(background.contains("tokio::task::spawn_blocking(move || cleanup_relay.run_cleanup())"));
+    assert!(background.contains("tokio::time::MissedTickBehavior::Skip"));
+    assert!(background.contains("relay.record_maintenance_worker_failure(reason)"));
+    assert!(api_runtime.contains("\"maintenance\": relay.maintenance_status()"));
 }
 
 // ── node_secret derivation (preserved) ───────────────────────────────

@@ -1208,7 +1208,7 @@ mod api_runtime;
 // initialization and transport shutdown in one focused child; data-plane
 // handshake/session task bodies remain in data_plane_runtime.
 mod session_runtime;
-pub(super) use background_tasks::{
+use background_tasks::{
     anonymous_mailbox_custody_cleanup_failure_disposition,
     anonymous_mailbox_source_cleanup_failure_disposition, run_anonymous_mailbox_cleanup_loop,
     AnonymousMailboxCleanupCycleOutcome, AnonymousMailboxCleanupFailureDisposition,
@@ -6542,7 +6542,11 @@ mod tests {
             .without_time()
             .with_writer(captured.clone())
             .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
-                metadata.level() <= &tracing::Level::INFO && metadata.target().ends_with("server")
+                // [SERVER-LOG-TEST-TARGET 2026-09-25 by Codex] The handshake
+                // rejection emitter lives in the extracted data-plane module.
+                metadata.level() <= &tracing::Level::INFO
+                    && (metadata.target().ends_with("server")
+                        || metadata.target().ends_with("server::data_plane_runtime"))
             }));
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, operation);

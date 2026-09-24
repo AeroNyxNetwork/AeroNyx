@@ -1651,8 +1651,10 @@ impl PeerStore {
                 continue;
             }
 
-            let descriptor = self.peers.read().get(&node_id).cloned();
-            let Some(descriptor) = descriptor else {
+            // [ROUTEABILITY-RESTORE-RACE 2026-09-25 by Codex] Keep the current
+            // surface pinned until its evidence is written.
+            let peers = self.peers.read();
+            let Some(descriptor) = peers.get(&node_id) else {
                 rejected = rejected.saturating_add(1);
                 continue;
             };

@@ -368,7 +368,7 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 // existing helper paths while the child module owns aggregate sync status.
 #[path = "storage_commitment_sync_status.rs"]
 mod storage_commitment_sync_status;
-pub(super) use storage_commitment_sync_status::{
+use storage_commitment_sync_status::{
     privacy_safe_sync_error_code, record_commitment_follower_readiness,
     record_monotonic_observation,
 };

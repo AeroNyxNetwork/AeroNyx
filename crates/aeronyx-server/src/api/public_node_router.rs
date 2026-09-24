@@ -654,7 +654,9 @@ mod tests {
 
     #[test]
     fn endpoint_transport_composition_is_public_listener_only() {
-        let server = include_str!("../server.rs");
+        // [SERVER-API-RUNTIME-SPLIT 2026-09-25 by Codex] Inspect the module
+        // that actually assembles the public and local listeners.
+        let server = include_str!("../server/api_runtime.rs");
         assert_eq!(server.matches("build_public_node_router(").count(), 1);
         let public_branch = server
             .find("if let Some((public_addr, public_listener)) = public_api_listener")

@@ -890,7 +890,7 @@ impl PeerStore {
         }
     }
 
-    fn route_path_status(&self, now: u64) -> PeerStoreRoutePathStatus {
+    pub(super) fn route_path_status(&self, now: u64) -> PeerStoreRoutePathStatus {
         PeerStoreRoutePathStatus {
             chat_single_hop: self.route_path_plan_preview(
                 "chat_single_hop",

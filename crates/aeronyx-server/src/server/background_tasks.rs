@@ -1,6 +1,7 @@
 // [SERVER-BACKGROUND-TASKS-SPLIT 2026-09-25 by Codex]
 // Periodic cleanup and background-task ownership remains shutdown aware.
 use super::*;
+use crate::services::chat_relay_mailbox::AnonymousMailboxCleanupReport;
 
 /// Owns the management-plane sender and every long-lived management task
 /// until the main runtime adopts them.

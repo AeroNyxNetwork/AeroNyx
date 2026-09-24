@@ -576,17 +576,18 @@ mod tests {
 
     #[test]
     fn blob_router_wiring_stays_on_client_surface() {
-        let server_source = include_str!("../server.rs");
-        assert!(server_source.contains(".merge(chat_blob_router)"));
-
+        // [SERVER-API-RUNTIME-SPLIT 2026-09-25 by Codex] Router composition
+        // now lives in the API-runtime child, not the startup facade.
+        let server_source = include_str!("../server/api_runtime.rs");
         let public_router_start = server_source
-            .find("fn build_public_discovery_router(")
-            .expect("public router builder");
-        let public_router_end = server_source[public_router_start..]
-            .find("async fn serve_public_discovery_api(")
-            .map(|offset| public_router_start + offset)
-            .expect("public router builder boundary");
+            .find("if let Some((public_addr, public_listener)) = public_api_listener")
+            .expect("public listener branch");
+        let public_router_end = server_source
+            .find("let chat_blob_router =")
+            .expect("client blob router branch");
+        assert!(public_router_start < public_router_end);
         let public_router_source = &server_source[public_router_start..public_router_end];
+        assert!(server_source[public_router_end..].contains(".merge(chat_blob_router)"));
         assert!(!public_router_source.contains("build_chat_router"));
         assert!(!public_router_source.contains("chat_blob_router"));
     }

@@ -7379,6 +7379,55 @@ mod tests {
     }
 
     #[test]
+    fn routeability_restore_cannot_outlive_descriptor_surface_rotation() {
+        // [ROUTEABILITY-RESTORE-RACE 2026-09-25 by Codex] Hold the health
+        // lock so restore must retain the descriptor read lock while waiting.
+        let now = 1_700_000_100;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut body = signed_descriptor_for(&peer_kp, 7, now + 4_000).descriptor;
+        body.public_endpoint = Some("https://route-a.example".to_string());
+        let original = SignedNodeDescriptor::sign(body.clone(), &peer_kp).unwrap();
+        let node_id = original.node_id();
+        let source = PeerStore::new();
+        source
+            .upsert_verified_from_source(original.clone(), now, "gossip_announce")
+            .unwrap();
+        source.record_route_forward_success(&node_id, now + 1);
+        let evidence = source.export_routeability_cache_evidence(now + 2);
+
+        let restored = Arc::new(PeerStore::new());
+        restored
+            .upsert_verified_from_source(original, now + 2, "cache")
+            .unwrap();
+        let route_health_guard = restored.route_health.write();
+        let restore_store = Arc::clone(&restored);
+        let restore = std::thread::spawn(move || {
+            restore_store.restore_routeability_cache_evidence(&evidence, now + 3)
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while restored.peers.try_write().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(restored.peers.try_write().is_none());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(restored.peers.try_write().is_none());
+
+        body.sequence = 8;
+        body.issued_at = now + 4;
+        body.public_endpoint = Some("https://route-b.example".to_string());
+        let rotated = SignedNodeDescriptor::sign(body, &peer_kp).unwrap();
+        let rotate_store = Arc::clone(&restored);
+        let rotate = std::thread::spawn(move || {
+            rotate_store.upsert_verified_from_source(rotated, now + 4, "gossip_announce")
+        });
+        drop(route_health_guard);
+        assert_eq!(restore.join().unwrap().restored, 1);
+        assert!(rotate.join().unwrap().unwrap());
+        assert!(!restored.is_routeable_now(&node_id, now + 5));
+    }
+
+    #[test]
     fn test_route_quarantine_cache_survives_restart_without_failure_details() {
         let now = 1_700_000_100;
         let peer_kp = IdentityKeyPair::generate();
