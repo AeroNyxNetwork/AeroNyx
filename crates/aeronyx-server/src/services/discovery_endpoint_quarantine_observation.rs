@@ -38,6 +38,7 @@ const MAX_CLEANUP_BATCH: usize = 4_096;
 const CHALLENGE_ID_DOMAIN: &[u8] = b"AeroNyx/EndpointQuarantineChallengeIdV1\0";
 const CHALLENGE_REQUEST_DOMAIN: &[u8] = b"AeroNyx/EndpointQuarantineChallengeRequestV1\0";
 const OBSERVATION_DOMAIN: &[u8] = b"AeroNyx/EndpointQuarantineObservationV1\0";
+const SATISFIED_EVIDENCE_DOMAIN: &[u8] = b"AeroNyx/EndpointQuarantineSatisfiedEvidenceV1\0";
 
 /// Bounded policy for an isolated challenge/observation registry.
 #[derive(Clone, PartialEq, Eq)]
@@ -106,6 +107,7 @@ pub(crate) struct DiscoveryEndpointQuarantineChallenge {
     challenge_id: [u8; 32],
     admission_commitment: [u8; 32],
     request_commitment: [u8; 32],
+    policy_version: u64,
     issued_at: u64,
     expires_at: u64,
 }
@@ -114,8 +116,53 @@ impl fmt::Debug for DiscoveryEndpointQuarantineChallenge {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DiscoveryEndpointQuarantineChallenge")
+            .field("policy_version", &self.policy_version)
             .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Registry-minted proof that one fresh challenge currently meets policy.
+// [PERMISSIONLESS-ENDPOINT-QUARANTINE-REVOCATION 2026-09-24 by Codex] This
+// capability is the only positive input accepted by the revocation boundary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiscoveryEndpointSatisfiedQuarantineEvidence {
+    evidence_commitment: [u8; 32],
+    admission_commitment: [u8; 32],
+    challenge_id: [u8; 32],
+    policy_epoch: u64,
+    valid_until: u64,
+}
+
+impl DiscoveryEndpointSatisfiedQuarantineEvidence {
+    pub(crate) const fn evidence_commitment(&self) -> [u8; 32] {
+        self.evidence_commitment
+    }
+
+    pub(crate) const fn admission_commitment(&self) -> [u8; 32] {
+        self.admission_commitment
+    }
+
+    pub(crate) const fn challenge_id(&self) -> [u8; 32] {
+        self.challenge_id
+    }
+
+    pub(crate) const fn policy_epoch(&self) -> u64 {
+        self.policy_epoch
+    }
+
+    pub(crate) const fn valid_until(&self) -> u64 {
+        self.valid_until
+    }
+}
+
+impl fmt::Debug for DiscoveryEndpointSatisfiedQuarantineEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryEndpointSatisfiedQuarantineEvidence")
+            .field("policy_epoch", &self.policy_epoch)
+            .field("valid_until", &self.valid_until)
             .finish_non_exhaustive()
     }
 }
@@ -305,6 +352,7 @@ impl SqliteDiscoveryEndpointQuarantineObservationRegistry {
             challenge_id,
             admission_commitment,
             request_commitment,
+            policy_version: admission.policy_version(),
             issued_at,
             expires_at,
         };
@@ -489,6 +537,51 @@ impl SqliteDiscoveryEndpointQuarantineObservationRegistry {
         Ok(DiscoveryEndpointQuarantineObservationOutcome::Recorded(
             state,
         ))
+    }
+
+    /// Returns a positive capability only while the exact evidence is fresh.
+    pub(crate) fn satisfied_evidence_at(
+        &self,
+        challenge: DiscoveryEndpointQuarantineChallenge,
+        now: u64,
+    ) -> Result<
+        Option<DiscoveryEndpointSatisfiedQuarantineEvidence>,
+        DiscoveryEndpointQuarantineObservationError,
+    > {
+        if now == 0 {
+            return Err(DiscoveryEndpointQuarantineObservationError::Rejected);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| DiscoveryEndpointQuarantineObservationError::Unavailable)?;
+        let Some(stored) = load_challenge_connection(&connection, &challenge.challenge_id)? else {
+            return Ok(None);
+        };
+        if stored != challenge {
+            return Err(DiscoveryEndpointQuarantineObservationError::Corrupt);
+        }
+        if challenge.expires_at < now
+            || evidence_state_connection(
+                &connection,
+                &challenge.challenge_id,
+                self.config.minimum_observation_span_secs,
+            )? != DiscoveryEndpointQuarantineEvidenceState::EvidenceSatisfied
+        {
+            return Ok(None);
+        }
+        Ok(Some(DiscoveryEndpointSatisfiedQuarantineEvidence {
+            evidence_commitment: satisfied_quarantine_evidence_commitment(
+                &challenge.admission_commitment,
+                &challenge.challenge_id,
+                challenge.policy_version,
+                challenge.expires_at,
+            ),
+            admission_commitment: challenge.admission_commitment,
+            challenge_id: challenge.challenge_id,
+            policy_epoch: challenge.policy_version,
+            valid_until: challenge.expires_at,
+        }))
     }
 
     pub(crate) fn cleanup_expired_at(
@@ -753,6 +846,10 @@ fn startup_audit(
                 row.get(2)
                     .map_err(|_| DiscoveryEndpointQuarantineObservationError::Corrupt)?,
             )?,
+            policy_version: as_u64(
+                row.get(5)
+                    .map_err(|_| DiscoveryEndpointQuarantineObservationError::Corrupt)?,
+            )?,
             issued_at: as_u64(
                 row.get(6)
                     .map_err(|_| DiscoveryEndpointQuarantineObservationError::Corrupt)?,
@@ -872,9 +969,17 @@ fn load_challenge(
     challenge_id: &[u8; 32],
 ) -> Result<Option<DiscoveryEndpointQuarantineChallenge>, DiscoveryEndpointQuarantineObservationError>
 {
-    let raw = tx
+    load_challenge_connection(tx, challenge_id)
+}
+
+fn load_challenge_connection(
+    connection: &Connection,
+    challenge_id: &[u8; 32],
+) -> Result<Option<DiscoveryEndpointQuarantineChallenge>, DiscoveryEndpointQuarantineObservationError>
+{
+    let raw = connection
         .query_row(
-            "SELECT challenge_id,admission_commitment,request_commitment,issued_at,expires_at
+            "SELECT challenge_id,admission_commitment,request_commitment,policy_version,issued_at,expires_at
              FROM discovery_endpoint_quarantine_challenge_v1 WHERE challenge_id=?1",
             params![&challenge_id[..]],
             |row| {
@@ -884,16 +989,18 @@ fn load_challenge(
                     row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             },
         )
         .optional()
         .map_err(|_| DiscoveryEndpointQuarantineObservationError::Unavailable)?;
-    raw.map(|(id, admission, request, issued, expires)| {
+    raw.map(|(id, admission, request, policy, issued, expires)| {
         Ok(DiscoveryEndpointQuarantineChallenge {
             challenge_id: array32(id)?,
             admission_commitment: array32(admission)?,
             request_commitment: array32(request)?,
+            policy_version: as_u64(policy)?,
             issued_at: as_u64(issued)?,
             expires_at: as_u64(expires)?,
         })
@@ -1169,6 +1276,21 @@ fn observation_commitment(
     hash.update([direction as u8]);
     hash.update(evidence);
     hash.update(observed_at.to_be_bytes());
+    hash.finalize().into()
+}
+
+pub(crate) fn satisfied_quarantine_evidence_commitment(
+    admission: &[u8; 32],
+    challenge_id: &[u8; 32],
+    policy_epoch: u64,
+    valid_until: u64,
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(SATISFIED_EVIDENCE_DOMAIN);
+    hash.update(admission);
+    hash.update(challenge_id);
+    hash.update(policy_epoch.to_be_bytes());
+    hash.update(valid_until.to_be_bytes());
     hash.finalize().into()
 }
 

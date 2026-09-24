@@ -312,6 +312,9 @@ pub(crate) mod discovery_endpoint_quarantine;
 // [PERMISSIONLESS-ENDPOINT-QUARANTINE-OBSERVATION 2026-09-24 by Codex]
 // Evidence satisfaction remains isolated state with no routeability authority.
 pub(crate) mod discovery_endpoint_quarantine_observation;
+// [PERMISSIONLESS-ENDPOINT-QUARANTINE-REVOCATION 2026-09-24 by Codex]
+// Negative evidence and policy epochs remain isolated from routeable state.
+pub(crate) mod discovery_endpoint_quarantine_revocation;
 mod discovery_endpoint_verification;
 pub mod dns_proxy;
 pub mod handshake;
