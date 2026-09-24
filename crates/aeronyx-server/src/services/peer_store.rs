@@ -219,6 +219,9 @@
 //!   listeners. Do not reuse that bulk reset as a runtime route-health tool.
 //!
 //! ## Last Modified
+//! v0.90.0-OpenNodeAdmission - [OPEN-NODE-ADMISSION 2026-09-24 by Codex]
+//! Added a canonical, bounded, permissionless descriptor candidate boundary
+//! with strict endpoint/shape checks and no route or economic authority
 //! v0.89.0-ExpiredCacheSequenceFencing - Rejects conflicting authentic expired
 //! cache descriptors that reuse one node identity and sequence after restart
 //! v0.88.0-BlindRelayGlobalAdmission - Broadened the existing privacy-safe
@@ -2862,6 +2865,30 @@ enum CandidateAdmissionOutcome {
     Candidate,
     Unchanged,
     Stale,
+    Conflict,
+    Saturated,
+    Rejected,
+}
+
+/// Coarse result of permissionless open-node admission.
+///
+/// The result intentionally contains no node identity, endpoint, descriptor,
+/// signature, commitment, or transport metadata. Admission grants only a
+/// bounded Stage-A candidate slot; endpoint possession and route authority
+/// remain separate reviewed transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermissionlessNodeAdmissionOutcome {
+    /// A new or higher-sequence descriptor entered the candidate lane.
+    Admitted,
+    /// The exact same signed descriptor was already retained.
+    ExactReplay,
+    /// The descriptor sequence rolled back relative to retained state.
+    Stale,
+    /// The same identity and sequence were presented with different content.
+    Conflict,
+    /// The independent candidate lane is at its hard capacity.
+    Saturated,
+    /// Canonical, cryptographic, temporal, or endpoint checks failed.
     Rejected,
 }
 
@@ -3013,6 +3040,58 @@ impl PeerStore {
                     .saturating_add(UNTRUSTED_DISCOVERY_MAX_FUTURE_SKEW_SECS)
     }
 
+    fn permissionless_descriptor_shape_is_valid(
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+    ) -> bool {
+        if !Self::untrusted_candidate_is_within_limits(descriptor, now)
+            || descriptor.sequence() == 0
+            || !descriptor.descriptor.policy.public_discovery
+            || descriptor.descriptor.software_version.is_empty()
+            || descriptor.descriptor.software_version.len() > 256
+            || descriptor
+                .descriptor
+                .software_version
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
+        {
+            return false;
+        }
+
+        let Some(endpoint) = descriptor.descriptor.public_endpoint.as_deref() else {
+            return false;
+        };
+        if endpoint.trim() != endpoint || !crate::api::peer_endpoint_is_public_ip(endpoint) {
+            return false;
+        }
+
+        let mut capabilities = HashSet::new();
+        if !descriptor
+            .descriptor
+            .capabilities
+            .iter()
+            .all(|capability| capabilities.insert(*capability))
+        {
+            return false;
+        }
+
+        match (
+            descriptor.descriptor.schema_version,
+            descriptor.descriptor.kem_alg,
+            descriptor.descriptor.kem_public,
+        ) {
+            (1 | 2, 0, public_key) if public_key == [0; 32] => {}
+            (2, 1, public_key) if public_key != [0; 32] => {}
+            _ => return false,
+        }
+
+        let Ok(canonical) = descriptor.encode_canonical() else {
+            return false;
+        };
+        SignedNodeDescriptor::decode_canonical(&canonical)
+            .is_ok_and(|decoded| decoded == *descriptor)
+    }
+
     fn has_locally_established_identity(&self, node_id: &[u8; 32]) -> bool {
         self.peers.read().contains_key(node_id)
     }
@@ -3067,6 +3146,28 @@ impl PeerStore {
         };
         let node_id = descriptor.node_id();
         let sequence = descriptor.sequence();
+
+        // [OPEN-NODE-ADMISSION 2026-09-24 by Codex] Candidate admission must
+        // never forget a stronger sequence already held in the live store.
+        // A higher sequence may wait as a candidate, but a rollback or
+        // same-sequence content conflict fails before candidate mutation.
+        // Keep the live-store read guard until the candidate mutation is
+        // complete. Otherwise a concurrent live upsert could advance the
+        // sequence between this comparison and candidate insertion.
+        let peers = self.peers.read();
+        if let Some(existing) = peers.get(&node_id) {
+            if sequence < existing.sequence() {
+                return CandidateAdmissionOutcome::Stale;
+            }
+            if sequence == existing.sequence() {
+                return if &descriptor == existing {
+                    CandidateAdmissionOutcome::Unchanged
+                } else {
+                    CandidateAdmissionOutcome::Conflict
+                };
+            }
+        }
+
         let mut state = self.untrusted_discovery_candidates.write();
         Self::prune_untrusted_candidate_state(&mut state, now);
 
@@ -3078,7 +3179,7 @@ impl PeerStore {
                 return if commitment == existing.commitment {
                     CandidateAdmissionOutcome::Unchanged
                 } else {
-                    CandidateAdmissionOutcome::Rejected
+                    CandidateAdmissionOutcome::Conflict
                 };
             }
         } else if let Some(tombstone) = state.tombstones.get(&node_id) {
@@ -3089,7 +3190,7 @@ impl PeerStore {
                 return if commitment == tombstone.commitment {
                     CandidateAdmissionOutcome::Unchanged
                 } else {
-                    CandidateAdmissionOutcome::Rejected
+                    CandidateAdmissionOutcome::Conflict
                 };
             }
         }
@@ -3097,7 +3198,7 @@ impl PeerStore {
         if !state.candidates.contains_key(&node_id)
             && state.candidates.len() >= UNTRUSTED_DISCOVERY_CANDIDATE_CAPACITY
         {
-            return CandidateAdmissionOutcome::Rejected;
+            return CandidateAdmissionOutcome::Saturated;
         }
 
         state.tombstones.remove(&node_id);
@@ -3108,7 +3209,62 @@ impl PeerStore {
                 commitment,
             },
         );
+        drop(state);
+        drop(peers);
         CandidateAdmissionOutcome::Candidate
+    }
+
+    /// Admits one canonical self-signed descriptor into the bounded Stage-A
+    /// candidate lane without consulting a central allowlist.
+    ///
+    /// [OPEN-NODE-ADMISSION 2026-09-24 by Codex] This boundary authenticates
+    /// the node key and exact descriptor fields, constrains lifetime and SSRF
+    /// surface, and fences replay/rollback. It intentionally grants no
+    /// endpoint-possession, routeability, ranking, advertisement, stake, or
+    /// consensus authority; future ETH-derived economics must enter through a
+    /// separate candidate-bound projection rather than new descriptor fields.
+    pub(crate) fn admit_permissionless_descriptor(
+        &self,
+        descriptor: SignedNodeDescriptor,
+        now: u64,
+    ) -> PermissionlessNodeAdmissionOutcome {
+        let outcome = if Self::permissionless_descriptor_shape_is_valid(&descriptor, now) {
+            match self.admit_untrusted_candidate(descriptor, now) {
+                CandidateAdmissionOutcome::Candidate => {
+                    PermissionlessNodeAdmissionOutcome::Admitted
+                }
+                CandidateAdmissionOutcome::Unchanged => {
+                    PermissionlessNodeAdmissionOutcome::ExactReplay
+                }
+                CandidateAdmissionOutcome::Stale => PermissionlessNodeAdmissionOutcome::Stale,
+                CandidateAdmissionOutcome::Conflict => PermissionlessNodeAdmissionOutcome::Conflict,
+                CandidateAdmissionOutcome::Saturated => {
+                    PermissionlessNodeAdmissionOutcome::Saturated
+                }
+                CandidateAdmissionOutcome::Rejected => PermissionlessNodeAdmissionOutcome::Rejected,
+            }
+        } else {
+            PermissionlessNodeAdmissionOutcome::Rejected
+        };
+
+        let mut report = PeerStoreImportReport {
+            total: 1,
+            inserted: 0,
+            candidates: 0,
+            unchanged: 0,
+            stale: 0,
+            rejected: 0,
+        };
+        match outcome {
+            PermissionlessNodeAdmissionOutcome::Admitted => report.candidates = 1,
+            PermissionlessNodeAdmissionOutcome::ExactReplay => report.unchanged = 1,
+            PermissionlessNodeAdmissionOutcome::Stale => report.stale = 1,
+            PermissionlessNodeAdmissionOutcome::Conflict
+            | PermissionlessNodeAdmissionOutcome::Saturated
+            | PermissionlessNodeAdmissionOutcome::Rejected => report.rejected = 1,
+        }
+        self.record_import_report(&report, now);
+        outcome
     }
 
     /// Replaces the exact identities allowed to store a delivery-cache anchor.
@@ -4766,7 +4922,9 @@ impl PeerStore {
                 CandidateAdmissionOutcome::Candidate => report.candidates += 1,
                 CandidateAdmissionOutcome::Unchanged => report.unchanged += 1,
                 CandidateAdmissionOutcome::Stale => report.stale += 1,
-                CandidateAdmissionOutcome::Rejected => report.rejected += 1,
+                CandidateAdmissionOutcome::Conflict
+                | CandidateAdmissionOutcome::Saturated
+                | CandidateAdmissionOutcome::Rejected => report.rejected += 1,
             }
         }
         self.record_import_report(&report, now);
@@ -10215,6 +10373,24 @@ mod tests {
         SignedNodeDescriptor::sign(descriptor, kp).unwrap()
     }
 
+    fn permissionless_descriptor_for(
+        kp: &IdentityKeyPair,
+        sequence: u64,
+        now: u64,
+        endpoint: &str,
+    ) -> SignedNodeDescriptor {
+        let mut descriptor = NodeDescriptor::new(
+            kp.public_key_bytes(),
+            sequence,
+            now.saturating_sub(1),
+            now + 600,
+            "1.0.0+anpf1-brsr1",
+        );
+        descriptor.public_endpoint = Some(endpoint.to_string());
+        descriptor.capabilities = vec![NodeCapability::PrivacyRelay, NodeCapability::ChatRelay];
+        SignedNodeDescriptor::sign(descriptor, kp).unwrap()
+    }
+
     fn route_domain_certificate_for(
         subject_node_id: [u8; 32],
         route_domain: [u8; 16],
@@ -12869,6 +13045,153 @@ mod tests {
         assert!(store
             .upsert_verified(signed_descriptor(1, now + 600), now)
             .expect("independently anchored live import"));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn permissionless_admission_is_exact_replay_safe_and_live_sequence_fenced() {
+        let now = 1_780_000_000;
+        let identity = IdentityKeyPair::generate();
+        let descriptor = permissionless_descriptor_for(&identity, 7, now, "https://8.8.8.8:8422");
+        let store = PeerStore::with_max_peers(1);
+
+        assert_eq!(
+            store.admit_permissionless_descriptor(descriptor.clone(), now),
+            PermissionlessNodeAdmissionOutcome::Admitted
+        );
+        assert_eq!(
+            store.admit_permissionless_descriptor(descriptor.clone(), now),
+            PermissionlessNodeAdmissionOutcome::ExactReplay
+        );
+
+        let mut conflict_body = descriptor.descriptor.clone();
+        conflict_body.capabilities.push(NodeCapability::AgentRelay);
+        let conflict = SignedNodeDescriptor::sign(conflict_body, &identity).unwrap();
+        assert_eq!(
+            store.admit_permissionless_descriptor(conflict, now),
+            PermissionlessNodeAdmissionOutcome::Conflict
+        );
+
+        let live = permissionless_descriptor_for(&identity, 9, now, "https://8.8.8.8:8422");
+        assert!(store.upsert_verified(live, now).unwrap());
+        assert_eq!(
+            store.admit_permissionless_descriptor(descriptor, now),
+            PermissionlessNodeAdmissionOutcome::Stale
+        );
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn permissionless_admission_rejects_unsafe_or_ambiguous_descriptor_shapes() {
+        let now = 1_780_000_000;
+        let identity = IdentityKeyPair::generate();
+        let store = PeerStore::new();
+
+        let mut bad_signature =
+            permissionless_descriptor_for(&identity, 1, now, "https://8.8.8.8:8422");
+        bad_signature.signature[0] ^= 0x01;
+        assert_eq!(
+            store.admit_permissionless_descriptor(bad_signature, now),
+            PermissionlessNodeAdmissionOutcome::Rejected
+        );
+
+        assert_eq!(
+            store.admit_permissionless_descriptor(
+                permissionless_descriptor_for(&identity, 0, now, "https://8.8.8.8:8422"),
+                now,
+            ),
+            PermissionlessNodeAdmissionOutcome::Rejected
+        );
+
+        let mut overlong =
+            permissionless_descriptor_for(&identity, 1, now, "https://8.8.8.8:8422").descriptor;
+        overlong.expires_at = now + UNTRUSTED_DISCOVERY_MAX_LIFETIME_SECS + 1;
+        assert_eq!(
+            store.admit_permissionless_descriptor(
+                SignedNodeDescriptor::sign(overlong, &identity).unwrap(),
+                now,
+            ),
+            PermissionlessNodeAdmissionOutcome::Rejected
+        );
+
+        for endpoint in [
+            "http://127.0.0.1:8422",
+            "http://10.0.0.1:8422",
+            "https://node.example:8422",
+            " https://8.8.8.8:8422",
+        ] {
+            assert_eq!(
+                store.admit_permissionless_descriptor(
+                    permissionless_descriptor_for(&identity, 1, now, endpoint),
+                    now,
+                ),
+                PermissionlessNodeAdmissionOutcome::Rejected
+            );
+        }
+
+        let mut duplicate =
+            permissionless_descriptor_for(&identity, 2, now, "https://8.8.8.8:8422").descriptor;
+        duplicate.capabilities.push(NodeCapability::ChatRelay);
+        assert_eq!(
+            store.admit_permissionless_descriptor(
+                SignedNodeDescriptor::sign(duplicate, &identity).unwrap(),
+                now,
+            ),
+            PermissionlessNodeAdmissionOutcome::Rejected
+        );
+
+        let mut invalid_kem =
+            permissionless_descriptor_for(&identity, 3, now, "https://8.8.8.8:8422").descriptor;
+        invalid_kem.kem_alg = 1;
+        assert_eq!(
+            store.admit_permissionless_descriptor(
+                SignedNodeDescriptor::sign(invalid_kem, &identity).unwrap(),
+                now,
+            ),
+            PermissionlessNodeAdmissionOutcome::Rejected
+        );
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn permissionless_admission_capacity_is_hard_and_independent_from_live_peers() {
+        let now = 1_780_000_000;
+        let store = PeerStore::with_max_peers(1);
+        let mut first = None;
+        for index in 0..UNTRUSTED_DISCOVERY_CANDIDATE_CAPACITY {
+            let identity = IdentityKeyPair::generate();
+            let descriptor =
+                permissionless_descriptor_for(&identity, 1, now, "https://8.8.8.8:8422");
+            if index == 0 {
+                first = Some(descriptor.clone());
+            }
+            assert_eq!(
+                store.admit_permissionless_descriptor(descriptor, now),
+                PermissionlessNodeAdmissionOutcome::Admitted
+            );
+        }
+        let overflow = IdentityKeyPair::generate();
+        assert_eq!(
+            store.admit_permissionless_descriptor(
+                permissionless_descriptor_for(&overflow, 1, now, "https://8.8.8.8:8422"),
+                now,
+            ),
+            PermissionlessNodeAdmissionOutcome::Saturated
+        );
+        assert_eq!(
+            store.admit_permissionless_descriptor(first.unwrap(), now),
+            PermissionlessNodeAdmissionOutcome::ExactReplay,
+            "capacity must not reject an exact retry already retained"
+        );
+        assert_eq!(store.len(), 0);
+
+        let live = permissionless_descriptor_for(
+            &IdentityKeyPair::generate(),
+            1,
+            now,
+            "https://9.9.9.9:8422",
+        );
+        assert!(store.upsert_verified(live, now).unwrap());
         assert_eq!(store.len(), 1);
     }
 

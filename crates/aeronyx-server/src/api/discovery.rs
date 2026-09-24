@@ -9,6 +9,8 @@
 //! management backend.
 //!
 //! ## Main Functionality
+//! - `POST /api/discovery/join`: accepts one canonical binary self-signed node
+//!   descriptor into a bounded, non-routeable permissionless candidate lane
 //! - `GET /api/discovery/snapshot`: returns a JSON bootstrap snapshot of
 //!   verified descriptors from the local `PeerStore`
 //! - `POST /api/discovery/gossip`: accepts a JSON `NodeDiscoveryMessage`,
@@ -143,6 +145,9 @@
 //!   even during the short interval between local persistence and witnessing.
 //!
 //! ## Last Modified
+//! v0.63.0-OpenNodeAdmission - [OPEN-NODE-ADMISSION 2026-09-24 by Codex]
+//! Added canonical allowlist-independent Stage-A node admission without route
+//! or economic authority
 //! v0.62.0-PublicRuntimeEventProjection - Projected public blind-relay runtime
 //! events through a closed aggregate allowlist without exporting audit detail
 //! v0.61.0-OnionCandidateExclusionTelemetry - Add k-anonymous aggregate
@@ -249,7 +254,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aeronyx_core::protocol::discovery::{
     decode_route_domain_attestation_certificate,
-    MAX_ROUTE_DOMAIN_ATTESTATION_CERTIFICATE_FRAME_BYTES,
+    MAX_ROUTE_DOMAIN_ATTESTATION_CERTIFICATE_FRAME_BYTES, MAX_SIGNED_NODE_DESCRIPTOR_BYTES,
 };
 use aeronyx_core::protocol::{
     DiscoveryEndpointEvidenceAttestationV1, NodeBootstrapSnapshot, NodeCapability,
@@ -271,6 +276,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::directory_replica_sync::admit_directory_gossip_descriptor;
 use crate::api::public_node_router::public_endpoint_flow_context;
 use crate::config::DiscoveryConfig;
+use crate::services::peer_store::PermissionlessNodeAdmissionOutcome;
 use crate::services::{
     DirectoryReplicaStore, DiscoveryEndpointAttestationInboxError,
     DiscoveryEndpointAttestationRecordOutcome, PeerStore, PeerStoreImportReport, PeerStoreStatus,
@@ -321,6 +327,7 @@ struct DiscoveryApiState {
     policy: DiscoveryApiPolicy,
     local_capabilities: DiscoveryLocalCapabilityStatus,
     rate_limit: Arc<Mutex<RateLimitState>>,
+    node_admission_rate_limit: Arc<Mutex<RateLimitState>>,
     route_domain_certificate_rate_limit: Arc<Mutex<RateLimitState>>,
 }
 
@@ -401,10 +408,34 @@ impl DiscoveryApiPolicy {
         self.allowed_peer_ids.is_empty() || self.allowed_peer_ids.contains(&node_id)
     }
 
+    fn node_denied(&self, node_id: &[u8; 32]) -> bool {
+        self.denied_peer_ids.contains(&hex::encode(node_id))
+    }
+
     fn pinned_route_domain(&self, node_id: &[u8; 32]) -> Option<&str> {
         self.pinned_route_domains
             .get(&hex::encode(node_id))
             .map(String::as_str)
+    }
+}
+
+/// Aggregate-only response for permissionless Stage-A node admission.
+#[derive(Debug, Clone, Copy, Serialize)]
+struct OpenNodeAdmissionResponse {
+    accepted: bool,
+    status: &'static str,
+    route_authority: bool,
+    economic_admission: &'static str,
+}
+
+impl OpenNodeAdmissionResponse {
+    const fn new(accepted: bool, status: &'static str) -> Self {
+        Self {
+            accepted,
+            status,
+            route_authority: false,
+            economic_admission: "reserved_future_eth_projection_not_enforced",
+        }
     }
 }
 
@@ -2956,9 +2987,15 @@ fn build_discovery_router_state(
         policy,
         local_capabilities,
         rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
+        node_admission_rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
         route_domain_certificate_rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
     };
     Router::new()
+        .route(
+            "/api/discovery/join",
+            post(open_node_admission_handler)
+                .layer(DefaultBodyLimit::max(MAX_SIGNED_NODE_DESCRIPTOR_BYTES)),
+        )
         .route("/api/discovery/snapshot", get(snapshot_handler))
         .route("/api/discovery/gossip", post(gossip_handler))
         .route(
@@ -2981,6 +3018,77 @@ fn build_discovery_router_state(
 // ============================================
 // Handlers
 // ============================================
+
+async fn open_node_admission_handler(
+    State(state): State<DiscoveryApiState>,
+    body: Bytes,
+) -> axum::response::Response {
+    let now = now_secs();
+    if !state
+        .node_admission_rate_limit
+        .lock()
+        .allow(now, state.policy.gossip_rate_limit_per_minute)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(OpenNodeAdmissionResponse::new(false, "rate_limited")),
+        )
+            .into_response();
+    }
+
+    // [OPEN-NODE-ADMISSION 2026-09-24 by Codex] Decode the exact bounded wire
+    // bytes before policy or store mutation. This endpoint does not accept a
+    // JSON projection whose ignored/duplicate fields could obscure the signed
+    // canonical transcript.
+    let descriptor = match SignedNodeDescriptor::decode_canonical(&body) {
+        Ok(descriptor) => descriptor,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(OpenNodeAdmissionResponse::new(false, "rejected")),
+            )
+                .into_response();
+        }
+    };
+    if state.policy.node_denied(&descriptor.node_id()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(OpenNodeAdmissionResponse::new(false, "rejected")),
+        )
+            .into_response();
+    }
+
+    let outcome = state
+        .peer_store
+        .admit_permissionless_descriptor(descriptor, now);
+    let (status_code, response) = match outcome {
+        PermissionlessNodeAdmissionOutcome::Admitted => (
+            StatusCode::OK,
+            OpenNodeAdmissionResponse::new(true, "candidate_admitted"),
+        ),
+        PermissionlessNodeAdmissionOutcome::ExactReplay => (
+            StatusCode::OK,
+            OpenNodeAdmissionResponse::new(true, "exact_replay"),
+        ),
+        PermissionlessNodeAdmissionOutcome::Stale => (
+            StatusCode::CONFLICT,
+            OpenNodeAdmissionResponse::new(false, "stale"),
+        ),
+        PermissionlessNodeAdmissionOutcome::Conflict => (
+            StatusCode::CONFLICT,
+            OpenNodeAdmissionResponse::new(false, "conflict"),
+        ),
+        PermissionlessNodeAdmissionOutcome::Saturated => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            OpenNodeAdmissionResponse::new(false, "capacity_reached"),
+        ),
+        PermissionlessNodeAdmissionOutcome::Rejected => (
+            StatusCode::BAD_REQUEST,
+            OpenNodeAdmissionResponse::new(false, "rejected"),
+        ),
+    };
+    (status_code, Json(response)).into_response()
+}
 
 async fn snapshot_handler(
     State(state): State<DiscoveryApiState>,
@@ -4567,6 +4675,154 @@ mod tests {
             max_pps: None,
         };
         aeronyx_core::protocol::SignedNodeDescriptor::sign(descriptor, &kp).unwrap()
+    }
+
+    fn open_node_descriptor(
+        identity: &IdentityKeyPair,
+        sequence: u64,
+        endpoint: &str,
+    ) -> SignedNodeDescriptor {
+        let now = now_secs();
+        let mut descriptor = NodeDescriptor::new(
+            identity.public_key_bytes(),
+            sequence,
+            now.saturating_sub(1),
+            now + 600,
+            "1.0.0+anpf1-brsr1",
+        );
+        descriptor.public_endpoint = Some(endpoint.to_string());
+        descriptor.capabilities = vec![NodeCapability::PrivacyRelay, NodeCapability::ChatRelay];
+        SignedNodeDescriptor::sign(descriptor, identity).unwrap()
+    }
+
+    async fn post_open_node(app: Router, body: Vec<u8>) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/discovery/join")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn open_node_admission_is_allowlist_independent_private_and_non_routeable() {
+        let identity = IdentityKeyPair::generate();
+        let descriptor = open_node_descriptor(&identity, 1, "https://8.8.8.8:8422");
+        let descriptor_bytes = descriptor.encode_canonical().unwrap();
+        let node_hex = hex::encode(descriptor.node_id());
+        let store = Arc::new(PeerStore::new());
+        let mut policy = DiscoveryApiPolicy::default();
+        policy.allowed_peer_ids.insert("11".repeat(32));
+
+        let response = post_open_node(
+            build_discovery_router(Arc::clone(&store), policy),
+            descriptor_bytes,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4_096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["accepted"], true);
+        assert_eq!(body["status"], "candidate_admitted");
+        assert_eq!(body["route_authority"], false);
+        assert_eq!(
+            body["economic_admission"],
+            "reserved_future_eth_projection_not_enforced"
+        );
+        let rendered = String::from_utf8(bytes.to_vec()).unwrap();
+        for forbidden in [
+            node_hex.as_str(),
+            "8.8.8.8",
+            "8422",
+            "signature",
+            "descriptor",
+        ] {
+            assert!(!rendered.contains(forbidden), "response leaked {forbidden}");
+        }
+        assert_eq!(store.len(), 0, "Stage-A admission must not grant routing");
+        assert_eq!(store.status(now_secs()).runtime.candidate_admitted, 1);
+    }
+
+    #[tokio::test]
+    async fn open_node_admission_is_canonical_replay_and_policy_safe() {
+        let identity = IdentityKeyPair::generate();
+        let descriptor = open_node_descriptor(&identity, 7, "https://8.8.8.8:8422");
+        let canonical = descriptor.encode_canonical().unwrap();
+        let store = Arc::new(PeerStore::new());
+        let app = build_discovery_router(Arc::clone(&store), DiscoveryApiPolicy::default());
+
+        assert_eq!(
+            post_open_node(app.clone(), canonical.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let exact = post_open_node(app.clone(), canonical.clone()).await;
+        assert_eq!(exact.status(), StatusCode::OK);
+        let exact_body = axum::body::to_bytes(exact.into_body(), 4_096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&exact_body).unwrap()["status"],
+            "exact_replay"
+        );
+
+        let mut conflict_body = descriptor.descriptor.clone();
+        conflict_body.public_endpoint = Some("https://9.9.9.9:8422".to_string());
+        let conflict = SignedNodeDescriptor::sign(conflict_body, &identity)
+            .unwrap()
+            .encode_canonical()
+            .unwrap();
+        assert_eq!(
+            post_open_node(app.clone(), conflict).await.status(),
+            StatusCode::CONFLICT
+        );
+
+        let mut trailing = canonical;
+        trailing.push(0);
+        assert_eq!(
+            post_open_node(app.clone(), trailing).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let private = open_node_descriptor(&identity, 8, "http://127.0.0.1:8422")
+            .encode_canonical()
+            .unwrap();
+        assert_eq!(
+            post_open_node(app, private).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(store.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn open_node_admission_honors_denylist_and_body_ceiling() {
+        let identity = IdentityKeyPair::generate();
+        let descriptor = open_node_descriptor(&identity, 1, "https://8.8.8.8:8422");
+        let mut policy = DiscoveryApiPolicy::default();
+        policy
+            .denied_peer_ids
+            .insert(hex::encode(descriptor.node_id()));
+        let app = build_discovery_router(Arc::new(PeerStore::new()), policy);
+        assert_eq!(
+            post_open_node(app, descriptor.encode_canonical().unwrap())
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let oversized = vec![0u8; MAX_SIGNED_NODE_DESCRIPTOR_BYTES + 1];
+        let app = build_discovery_router(Arc::new(PeerStore::new()), DiscoveryApiPolicy::default());
+        assert_eq!(
+            post_open_node(app, oversized).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     fn endpoint_attestation_message(now: u64) -> NodeDiscoveryMessage {
@@ -8775,6 +9031,7 @@ mod tests {
             policy: DiscoveryApiPolicy::default(),
             local_capabilities: DiscoveryLocalCapabilityStatus::default(),
             rate_limit,
+            node_admission_rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
             route_domain_certificate_rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
         };
         let response = gossip_handler(
