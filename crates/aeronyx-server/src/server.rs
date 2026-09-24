@@ -1204,6 +1204,10 @@ mod background_tasks;
 // assembly and management task construction in a focused child while keeping
 // startup call sites and failure ordering stable.
 mod api_runtime;
+// [SERVER-SESSION-RUNTIME-SPLIT 2026-09-25 by Codex] Keep VPN service
+// initialization and transport shutdown in one focused child; data-plane
+// handshake/session task bodies remain in data_plane_runtime.
+mod session_runtime;
 pub(super) use background_tasks::{
     anonymous_mailbox_custody_cleanup_failure_disposition,
     anonymous_mailbox_source_cleanup_failure_disposition, run_anonymous_mailbox_cleanup_loop,
@@ -2854,9 +2858,7 @@ impl Server {
             }
         }
 
-        if let Err(e) = udp.shutdown().await {
-            warn!("UDP shutdown error: {}", e);
-        }
+        Self::shutdown_udp_transport(udp.as_ref()).await;
 
         if let (Some(ref st), Some(ref mp), Some(ref aw)) = (&storage, &mempool, &aof_writer) {
             info!(
@@ -5216,60 +5218,6 @@ impl Server {
         report.inserted > 0 || report.unchanged > 0
     }
 
-    fn init_services(
-        &self,
-    ) -> Result<(Arc<IpPoolService>, Arc<SessionManager>, Arc<RoutingService>)> {
-        let (network, prefix) = self.config.parse_ip_range()?;
-        let ip_pool = Arc::new(IpPoolService::new(
-            network,
-            prefix,
-            self.config.gateway_ip(),
-        )?);
-        let sessions = Arc::new(SessionManager::new(
-            self.config.max_sessions(),
-            Duration::from_secs(self.config.session_timeout_secs()),
-        ));
-        let routing = Arc::new(RoutingService::new());
-        info!(
-            capacity = ip_pool.capacity(),
-            max_sessions = self.config.max_sessions(),
-            "Services initialized"
-        );
-        Ok((ip_pool, sessions, routing))
-    }
-
-    #[cfg(target_os = "linux")]
-    async fn init_tun(&self) -> Result<Arc<LinuxTun>> {
-        let (_network, prefix_len) = self.config.parse_ip_range()?;
-        let cfg = TunConfig::new(self.config.device_name())
-            .with_address(self.config.gateway_ip())
-            .with_netmask(prefix_to_netmask(prefix_len))
-            .with_mtu(self.config.mtu());
-        let tun = LinuxTun::create(cfg)
-            .await
-            .map_err(|e| ServerError::startup_failed(format!("TUN: {}", e)))?;
-        tun.up()
-            .await
-            .map_err(|e| ServerError::startup_failed(format!("TUN up: {}", e)))?;
-        info!(
-            "TUN '{}' initialized @ {}",
-            tun.name(),
-            self.config.gateway_ip()
-        );
-        Ok(Arc::new(tun))
-    }
-
-    // ============================================
-    // UDP Task
-    // ============================================
-
-    /// Handles one opt-in client request that requires terminal-verifiable
-    /// onion delivery without changing legacy `ChatRelay` availability.
-    ///
-    /// [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] The response carries the
-    /// terminal's exact signed receipt only to the authenticated source
-    /// session. Aggregate health retains counters, never receipt bytes, route
-    /// ids, terminal identities, message ids, or payload commitments.
     async fn handle_verified_chat_submit(
         request: ChatRelayVerifiedSubmitRequestV1,
         session: &Arc<crate::services::Session>,
