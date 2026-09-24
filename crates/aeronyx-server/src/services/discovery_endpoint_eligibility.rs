@@ -90,9 +90,12 @@ pub(crate) enum DiscoveryEndpointEligibilityDecision {
 /// Unforgeable-by-construction input accepted by the quarantine registry.
 // [PERMISSIONLESS-ENDPOINT-QUARANTINE-ADMISSION 2026-09-24 by Codex] Keep
 // construction private to the evaluator so storage cannot accept raw facts.
+// [PERMISSIONLESS-ENDPOINT-PROMOTION-READINESS 2026-09-24 by Codex] Preserve
+// the signed descriptor sequence before any later readiness decision.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DiscoveryEndpointQuarantineAdmission {
     group_commitment: [u8; 32],
+    descriptor_sequence: u64,
     policy_version: u64,
     valid_until: u64,
 }
@@ -100,6 +103,10 @@ pub(crate) struct DiscoveryEndpointQuarantineAdmission {
 impl DiscoveryEndpointQuarantineAdmission {
     pub(crate) const fn group_commitment(&self) -> [u8; 32] {
         self.group_commitment
+    }
+
+    pub(crate) const fn descriptor_sequence(&self) -> u64 {
+        self.descriptor_sequence
     }
 
     pub(crate) const fn policy_version(&self) -> u64 {
@@ -261,6 +268,7 @@ pub(crate) fn evaluate_endpoint_candidate(
     DiscoveryEndpointEligibilityDecision::EligibleForQuarantine(
         DiscoveryEndpointQuarantineAdmission {
             group_commitment: facts.group_commitment,
+            descriptor_sequence: facts.descriptor_sequence,
             policy_version: policy.policy_version,
             valid_until,
         },
@@ -469,6 +477,7 @@ mod tests {
             DiscoveryEndpointEligibilityDecision::EligibleForQuarantine(
                 DiscoveryEndpointQuarantineAdmission {
                     group_commitment: [0x31; 32],
+                    descriptor_sequence: 7,
                     policy_version: 9,
                     valid_until: NOW + 20,
                 }

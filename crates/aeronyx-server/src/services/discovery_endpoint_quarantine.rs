@@ -28,11 +28,11 @@ use super::chat_relay_backup_sqlite::{
 use super::chat_relay_mailbox::{prepare_private_sqlite_target, verify_private_file};
 use super::discovery_endpoint_eligibility::DiscoveryEndpointQuarantineAdmission;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MINIMUM_SYNCHRONOUS_LEVEL: i64 = 2;
 const MAX_ENTRIES: usize = 65_536;
 const MAX_CLEANUP_BATCH: usize = 4_096;
-const ADMISSION_DOMAIN: &[u8] = b"AeroNyx/DiscoveryEndpointQuarantineAdmissionV1\0";
+const ADMISSION_DOMAIN: &[u8] = b"AeroNyx/DiscoveryEndpointQuarantineAdmissionV2\0";
 
 /// Bounded policy for one dedicated quarantine registry.
 #[derive(Clone, PartialEq, Eq)]
@@ -89,6 +89,8 @@ pub(crate) struct DiscoveryEndpointQuarantineSnapshot {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DiscoveryEndpointFreshQuarantineAdmission {
     admission_commitment: [u8; 32],
+    group_commitment: [u8; 32],
+    descriptor_sequence: u64,
     policy_version: u64,
     valid_until: u64,
 }
@@ -96,6 +98,14 @@ pub(crate) struct DiscoveryEndpointFreshQuarantineAdmission {
 impl DiscoveryEndpointFreshQuarantineAdmission {
     pub(crate) const fn admission_commitment(&self) -> [u8; 32] {
         self.admission_commitment
+    }
+
+    pub(crate) const fn group_commitment(&self) -> [u8; 32] {
+        self.group_commitment
+    }
+
+    pub(crate) const fn descriptor_sequence(&self) -> u64 {
+        self.descriptor_sequence
     }
 
     pub(crate) const fn policy_version(&self) -> u64 {
@@ -111,6 +121,7 @@ impl fmt::Debug for DiscoveryEndpointFreshQuarantineAdmission {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DiscoveryEndpointFreshQuarantineAdmission")
+            .field("descriptor_sequence", &self.descriptor_sequence)
             .field("policy_version", &self.policy_version)
             .field("valid_until", &self.valid_until)
             .finish_non_exhaustive()
@@ -186,9 +197,11 @@ impl SqliteDiscoveryEndpointQuarantineRegistry {
             return Err(DiscoveryEndpointQuarantineError::Rejected);
         }
         let group = admission.group_commitment();
+        let descriptor_sequence = admission.descriptor_sequence();
         let policy_version = admission.policy_version();
         let valid_until = admission.valid_until();
-        let commitment = admission_commitment(&group, policy_version, valid_until);
+        let commitment =
+            admission_commitment(&group, descriptor_sequence, policy_version, valid_until);
         let mut connection = self
             .connection
             .lock()
@@ -219,11 +232,13 @@ impl SqliteDiscoveryEndpointQuarantineRegistry {
         }
         tx.execute(
             "INSERT INTO discovery_endpoint_quarantine_v1(
-               group_commitment,admission_commitment,policy_version,valid_until,admitted_at
-             ) VALUES(?1,?2,?3,?4,?5)",
+               group_commitment,admission_commitment,descriptor_sequence,policy_version,
+               valid_until,admitted_at
+             ) VALUES(?1,?2,?3,?4,?5,?6)",
             params![
                 &group[..],
                 &commitment[..],
+                as_i64(descriptor_sequence)?,
                 as_i64(policy_version)?,
                 as_i64(valid_until)?,
                 as_i64(now)?,
@@ -308,7 +323,7 @@ impl SqliteDiscoveryEndpointQuarantineRegistry {
             .map_err(|_| DiscoveryEndpointQuarantineError::Unavailable)?;
         let row = connection
             .query_row(
-                "SELECT group_commitment,policy_version,valid_until
+                "SELECT group_commitment,descriptor_sequence,policy_version,valid_until
                  FROM discovery_endpoint_quarantine_v1 WHERE admission_commitment=?1",
                 params![&exact_commitment[..]],
                 |row| {
@@ -316,20 +331,23 @@ impl SqliteDiscoveryEndpointQuarantineRegistry {
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )
             .optional()
             .map_err(|_| DiscoveryEndpointQuarantineError::Unavailable)?;
-        let Some((group, policy_version, valid_until)) = row else {
+        let Some((group, descriptor_sequence, policy_version, valid_until)) = row else {
             return Ok(None);
         };
         let group = array32(group)?;
+        let descriptor_sequence = as_u64(descriptor_sequence)?;
         let policy_version = as_u64(policy_version)?;
         let valid_until = as_u64(valid_until)?;
         if group.iter().all(|byte| *byte == 0)
             || policy_version == 0
-            || exact_commitment != admission_commitment(&group, policy_version, valid_until)
+            || exact_commitment
+                != admission_commitment(&group, descriptor_sequence, policy_version, valid_until)
         {
             return Err(DiscoveryEndpointQuarantineError::Corrupt);
         }
@@ -338,6 +356,8 @@ impl SqliteDiscoveryEndpointQuarantineRegistry {
         }
         Ok(Some(DiscoveryEndpointFreshQuarantineAdmission {
             admission_commitment: exact_commitment,
+            group_commitment: group,
+            descriptor_sequence,
             policy_version,
             valid_until,
         }))
@@ -385,11 +405,24 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), DiscoveryEndpoin
              CREATE TABLE discovery_endpoint_quarantine_v1(
                group_commitment BLOB PRIMARY KEY CHECK(length(group_commitment)=32),
                admission_commitment BLOB NOT NULL UNIQUE CHECK(length(admission_commitment)=32),
-               policy_version INTEGER NOT NULL,valid_until INTEGER NOT NULL,admitted_at INTEGER NOT NULL
+               descriptor_sequence INTEGER NOT NULL,policy_version INTEGER NOT NULL,
+               valid_until INTEGER NOT NULL,admitted_at INTEGER NOT NULL
              );
              CREATE INDEX discovery_endpoint_quarantine_expiry_v1
                ON discovery_endpoint_quarantine_v1(valid_until,group_commitment);
-             PRAGMA user_version=1;",
+             PRAGMA user_version=2;",
+        )
+        .map_err(|_| DiscoveryEndpointQuarantineError::Unavailable)?;
+    } else if version == 1 {
+        // [PERMISSIONLESS-ENDPOINT-PROMOTION-READINESS 2026-09-24 by Codex]
+        // V1 rows cannot be promoted because they never persisted the signed
+        // descriptor sequence. Discard them atomically instead of inventing it.
+        tx.execute_batch(
+            "DELETE FROM discovery_endpoint_quarantine_v1;
+             UPDATE discovery_endpoint_quarantine_meta_v1 SET rows=0 WHERE singleton=1;
+             ALTER TABLE discovery_endpoint_quarantine_v1
+               ADD COLUMN descriptor_sequence INTEGER NOT NULL DEFAULT 0;
+             PRAGMA user_version=2;",
         )
         .map_err(|_| DiscoveryEndpointQuarantineError::Unavailable)?;
     } else if version != SCHEMA_VERSION {
@@ -417,7 +450,8 @@ fn startup_audit(
     }
     let mut statement = connection
         .prepare(
-            "SELECT group_commitment,admission_commitment,policy_version,valid_until,admitted_at
+            "SELECT group_commitment,admission_commitment,descriptor_sequence,policy_version,
+                    valid_until,admitted_at
              FROM discovery_endpoint_quarantine_v1",
         )
         .map_err(|_| DiscoveryEndpointQuarantineError::Unavailable)?;
@@ -436,22 +470,26 @@ fn startup_audit(
             row.get(1)
                 .map_err(|_| DiscoveryEndpointQuarantineError::Corrupt)?,
         )?;
-        let policy = as_u64(
+        let descriptor_sequence = as_u64(
             row.get(2)
                 .map_err(|_| DiscoveryEndpointQuarantineError::Corrupt)?,
         )?;
-        let valid_until = as_u64(
+        let policy = as_u64(
             row.get(3)
                 .map_err(|_| DiscoveryEndpointQuarantineError::Corrupt)?,
         )?;
-        let admitted_at = as_u64(
+        let valid_until = as_u64(
             row.get(4)
+                .map_err(|_| DiscoveryEndpointQuarantineError::Corrupt)?,
+        )?;
+        let admitted_at = as_u64(
+            row.get(5)
                 .map_err(|_| DiscoveryEndpointQuarantineError::Corrupt)?,
         )?;
         if group.iter().all(|byte| *byte == 0)
             || policy == 0
             || valid_until < admitted_at
-            || stored != admission_commitment(&group, policy, valid_until)
+            || stored != admission_commitment(&group, descriptor_sequence, policy, valid_until)
         {
             return Err(DiscoveryEndpointQuarantineError::Corrupt);
         }
@@ -459,10 +497,16 @@ fn startup_audit(
     Ok(())
 }
 
-fn admission_commitment(group: &[u8; 32], policy_version: u64, valid_until: u64) -> [u8; 32] {
+fn admission_commitment(
+    group: &[u8; 32],
+    descriptor_sequence: u64,
+    policy_version: u64,
+    valid_until: u64,
+) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(ADMISSION_DOMAIN);
     hash.update(group);
+    hash.update(descriptor_sequence.to_be_bytes());
     hash.update(policy_version.to_be_bytes());
     hash.update(valid_until.to_be_bytes());
     hash.finalize().into()
@@ -474,6 +518,7 @@ pub(crate) fn quarantine_admission_commitment(
 ) -> [u8; 32] {
     admission_commitment(
         &admission.group_commitment(),
+        admission.descriptor_sequence(),
         admission.policy_version(),
         admission.valid_until(),
     )
@@ -782,6 +827,69 @@ mod tests {
                 .retained_candidates,
             1
         );
+    }
+
+    #[test]
+    fn v1_rows_are_discarded_instead_of_receiving_an_invented_sequence() {
+        let directory = tempdir();
+        let cfg = config(&directory, 4);
+        let legacy = rusqlite::Connection::open(&cfg.db_path).expect("legacy database");
+        legacy
+            .execute_batch(
+                "CREATE TABLE discovery_endpoint_quarantine_meta_v1(
+                   singleton INTEGER PRIMARY KEY CHECK(singleton=1),rows INTEGER NOT NULL
+                 );
+                 INSERT INTO discovery_endpoint_quarantine_meta_v1 VALUES(1,1);
+                 CREATE TABLE discovery_endpoint_quarantine_v1(
+                   group_commitment BLOB PRIMARY KEY CHECK(length(group_commitment)=32),
+                   admission_commitment BLOB NOT NULL UNIQUE CHECK(length(admission_commitment)=32),
+                   policy_version INTEGER NOT NULL,valid_until INTEGER NOT NULL,
+                   admitted_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX discovery_endpoint_quarantine_expiry_v1
+                   ON discovery_endpoint_quarantine_v1(valid_until,group_commitment);
+                 PRAGMA user_version=1;",
+            )
+            .expect("legacy schema");
+        legacy
+            .execute(
+                "INSERT INTO discovery_endpoint_quarantine_v1 VALUES(?1,?2,1,?3,?4)",
+                params![&[0x71_u8; 32][..], &[0x72_u8; 32][..], NOW + 20, NOW],
+            )
+            .expect("legacy row");
+        drop(legacy);
+
+        let registry =
+            SqliteDiscoveryEndpointQuarantineRegistry::open(cfg.clone()).expect("migrate");
+        assert_eq!(
+            registry.snapshot_at(NOW).expect("snapshot"),
+            DiscoveryEndpointQuarantineSnapshot {
+                retained_candidates: 0,
+                fresh_candidates: 0,
+                maximum_valid_until: None,
+            }
+        );
+        drop(registry);
+        let migrated = rusqlite::Connection::open(&cfg.db_path).expect("migrated database");
+        let version: i64 = migrated
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("schema version");
+        let rows: i64 = migrated
+            .query_row(
+                "SELECT COUNT(*) FROM discovery_endpoint_quarantine_v1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("rows");
+        let sequence_column: i64 = migrated
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('discovery_endpoint_quarantine_v1')
+                 WHERE name='descriptor_sequence'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sequence column");
+        assert_eq!((version, rows, sequence_column), (2, 0, 1));
     }
 
     #[test]

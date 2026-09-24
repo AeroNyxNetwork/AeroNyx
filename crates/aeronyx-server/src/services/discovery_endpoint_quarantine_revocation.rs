@@ -28,6 +28,7 @@ use super::chat_relay_backup_sqlite::{
     configure_full_durability, restrict_private_sqlite_permissions,
 };
 use super::chat_relay_mailbox::{prepare_private_sqlite_target, verify_private_file};
+use super::discovery_endpoint_quarantine::DiscoveryEndpointFreshQuarantineAdmission;
 use super::discovery_endpoint_quarantine_observation::{
     satisfied_quarantine_evidence_commitment, DiscoveryEndpointSatisfiedQuarantineEvidence,
 };
@@ -39,6 +40,8 @@ const MAX_NEGATIVE_PER_STATE: usize = 64;
 const MAX_NEGATIVE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_CLEANUP_BATCH: usize = 4_096;
 const NEGATIVE_OBSERVATION_DOMAIN: &[u8] = b"AeroNyx/EndpointQuarantineNegativeObservationV1\0";
+const PROMOTION_READINESS_DOMAIN: &[u8] = b"AeroNyx/EndpointPromotionReadinessV1\0";
+const PROMOTION_READINESS_TTL_SECS: u64 = 120;
 
 /// Bounded storage and retention policy.
 #[derive(Clone, PartialEq, Eq)]
@@ -173,6 +176,65 @@ pub(crate) struct DiscoveryEndpointQuarantineRevocationSnapshot {
     pub(crate) current_positive_states: usize,
     pub(crate) revoked_states: usize,
     pub(crate) retained_negative_observations: usize,
+}
+
+/// Short-lived proof that every private quarantine gate agreed in one snapshot.
+// [PERMISSIONLESS-ENDPOINT-PROMOTION-READINESS 2026-09-24 by Codex] This token
+// is not a route, rank, peer-store mutation, or network capability. Only this
+// registry can mint it after re-reading its mutable revocation state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiscoveryEndpointPromotionReadiness {
+    readiness_commitment: [u8; 32],
+    admission_commitment: [u8; 32],
+    positive_commitment: [u8; 32],
+    challenge_id: [u8; 32],
+    group_commitment: [u8; 32],
+    descriptor_sequence: u64,
+    policy_epoch: u64,
+    evaluated_at: u64,
+    valid_until: u64,
+}
+
+impl DiscoveryEndpointPromotionReadiness {
+    pub(crate) const fn readiness_commitment(&self) -> [u8; 32] {
+        self.readiness_commitment
+    }
+
+    pub(crate) const fn admission_commitment(&self) -> [u8; 32] {
+        self.admission_commitment
+    }
+
+    pub(crate) const fn group_commitment(&self) -> [u8; 32] {
+        self.group_commitment
+    }
+
+    pub(crate) const fn descriptor_sequence(&self) -> u64 {
+        self.descriptor_sequence
+    }
+
+    pub(crate) const fn policy_epoch(&self) -> u64 {
+        self.policy_epoch
+    }
+
+    pub(crate) const fn evaluated_at(&self) -> u64 {
+        self.evaluated_at
+    }
+
+    pub(crate) const fn valid_until(&self) -> u64 {
+        self.valid_until
+    }
+}
+
+impl fmt::Debug for DiscoveryEndpointPromotionReadiness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryEndpointPromotionReadiness")
+            .field("descriptor_sequence", &self.descriptor_sequence)
+            .field("policy_epoch", &self.policy_epoch)
+            .field("evaluated_at", &self.evaluated_at)
+            .field("valid_until", &self.valid_until)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Dedicated durable revocation registry.
@@ -473,6 +535,135 @@ impl SqliteDiscoveryEndpointQuarantineRevocationRegistry {
         Ok(DiscoveryEndpointQuarantineNegativeOutcome::Revoked)
     }
 
+    /// Evaluates immutable F.4/F.5 capabilities against one current F.6
+    /// snapshot. `None` is deliberately coarse and cannot disclose which gate
+    /// rejected the candidate.
+    pub(crate) fn promotion_readiness_at(
+        &self,
+        admission: DiscoveryEndpointFreshQuarantineAdmission,
+        evidence: DiscoveryEndpointSatisfiedQuarantineEvidence,
+        now: u64,
+    ) -> Result<
+        Option<DiscoveryEndpointPromotionReadiness>,
+        DiscoveryEndpointQuarantineRevocationError,
+    > {
+        if now == 0 {
+            return Err(DiscoveryEndpointQuarantineRevocationError::Rejected);
+        }
+        let policy_matches = admission.policy_version() == evidence.policy_epoch();
+        if admission.admission_commitment() != evidence.admission_commitment()
+            || !policy_matches
+            || admission.valid_until() < now
+            || evidence.valid_until() < now
+            || admission.group_commitment().iter().all(|byte| *byte == 0)
+            || validate_satisfied_evidence(&evidence, now).is_err()
+        {
+            return Ok(None);
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Unavailable)?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Unavailable)?;
+        let (_, _, current_epoch) = load_meta(&tx)?;
+        let Some(state) = load_state(&tx, &admission.admission_commitment())? else {
+            tx.commit()
+                .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Unavailable)?;
+            drop(connection);
+            return Ok(None);
+        };
+        if !state_allows_readiness(
+            &state,
+            &evidence,
+            current_epoch,
+            negative_count(&tx, &admission.admission_commitment())?,
+            now,
+        ) {
+            tx.commit()
+                .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Unavailable)?;
+            drop(connection);
+            return Ok(None);
+        }
+        let valid_until = admission
+            .valid_until()
+            .min(evidence.valid_until())
+            .min(state.valid_until)
+            .min(
+                now.checked_add(PROMOTION_READINESS_TTL_SECS)
+                    .ok_or(DiscoveryEndpointQuarantineRevocationError::Rejected)?,
+            );
+        let mut readiness = DiscoveryEndpointPromotionReadiness {
+            readiness_commitment: [0; 32],
+            admission_commitment: admission.admission_commitment(),
+            positive_commitment: evidence.evidence_commitment(),
+            challenge_id: evidence.challenge_id(),
+            group_commitment: admission.group_commitment(),
+            descriptor_sequence: admission.descriptor_sequence(),
+            policy_epoch: current_epoch,
+            evaluated_at: now,
+            valid_until,
+        };
+        readiness.readiness_commitment = promotion_readiness_commitment(&readiness);
+        tx.commit()
+            .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Unavailable)?;
+        drop(connection);
+        Ok(Some(readiness))
+    }
+
+    /// Revalidates a previously minted token against current mutable policy.
+    /// Revocation or an epoch advance therefore invalidates an old token even
+    /// before its short wall-clock expiry.
+    pub(crate) fn verify_promotion_readiness_at(
+        &self,
+        readiness: &DiscoveryEndpointPromotionReadiness,
+        now: u64,
+    ) -> Result<bool, DiscoveryEndpointQuarantineRevocationError> {
+        if now == 0
+            || readiness.evaluated_at == 0
+            || readiness.policy_epoch == 0
+            || readiness.admission_commitment.iter().all(|byte| *byte == 0)
+            || readiness.positive_commitment.iter().all(|byte| *byte == 0)
+            || readiness.challenge_id.iter().all(|byte| *byte == 0)
+            || readiness.group_commitment.iter().all(|byte| *byte == 0)
+            || readiness.evaluated_at > now
+            || readiness.valid_until < readiness.evaluated_at
+            || readiness.valid_until < now
+            || readiness.valid_until
+                > readiness
+                    .evaluated_at
+                    .saturating_add(PROMOTION_READINESS_TTL_SECS)
+            || readiness.readiness_commitment != promotion_readiness_commitment(readiness)
+        {
+            return Ok(false);
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Unavailable)?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Unavailable)?;
+        let (_, _, current_epoch) = load_meta(&tx)?;
+        let state = load_state(&tx, &readiness.admission_commitment)?;
+        let valid = current_epoch == readiness.policy_epoch
+            && matches!(
+                state,
+                Some(stored)
+                    if stored.state == DiscoveryEndpointQuarantinePolicyState::Positive
+                        && stored.positive_commitment == readiness.positive_commitment
+                        && stored.challenge_id == readiness.challenge_id
+                        && stored.policy_epoch == readiness.policy_epoch
+                        && stored.valid_until >= now
+            )
+            && negative_count(&tx, &readiness.admission_commitment)? == 0;
+        tx.commit()
+            .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Unavailable)?;
+        drop(connection);
+        Ok(valid)
+    }
+
     pub(crate) fn cleanup_expired_at(
         &self,
         now: u64,
@@ -571,6 +762,37 @@ fn validate_satisfied_evidence(
         return Err(DiscoveryEndpointQuarantineRevocationError::Rejected);
     }
     Ok(())
+}
+
+fn state_allows_readiness(
+    state: &StoredPolicyState,
+    evidence: &DiscoveryEndpointSatisfiedQuarantineEvidence,
+    current_epoch: u64,
+    negative_observations: usize,
+    now: u64,
+) -> bool {
+    state.state == DiscoveryEndpointQuarantinePolicyState::Positive
+        && negative_observations == 0
+        && current_epoch == evidence.policy_epoch()
+        && state.policy_epoch == current_epoch
+        && state.positive_commitment == evidence.evidence_commitment()
+        && state.challenge_id == evidence.challenge_id()
+        && state.valid_until == evidence.valid_until()
+        && state.valid_until >= now
+}
+
+fn promotion_readiness_commitment(readiness: &DiscoveryEndpointPromotionReadiness) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(PROMOTION_READINESS_DOMAIN);
+    hash.update(readiness.admission_commitment);
+    hash.update(readiness.positive_commitment);
+    hash.update(readiness.challenge_id);
+    hash.update(readiness.group_commitment);
+    hash.update(readiness.descriptor_sequence.to_be_bytes());
+    hash.update(readiness.policy_epoch.to_be_bytes());
+    hash.update(readiness.evaluated_at.to_be_bytes());
+    hash.update(readiness.valid_until.to_be_bytes());
+    hash.finalize().into()
 }
 
 fn preflight_negative(
@@ -1144,8 +1366,8 @@ mod tests {
         DiscoveryEndpointStakePolicyMode,
     };
     use crate::services::discovery_endpoint_quarantine::{
-        quarantine_admission_commitment, DiscoveryEndpointQuarantineConfig,
-        SqliteDiscoveryEndpointQuarantineRegistry,
+        quarantine_admission_commitment, DiscoveryEndpointFreshQuarantineAdmission,
+        DiscoveryEndpointQuarantineConfig, SqliteDiscoveryEndpointQuarantineRegistry,
     };
     use crate::services::discovery_endpoint_quarantine_observation::{
         DiscoveryEndpointObservationDirection, DiscoveryEndpointQuarantineChallengeOutcome,
@@ -1180,6 +1402,12 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct SatisfiedFixture {
+        fresh: DiscoveryEndpointFreshQuarantineAdmission,
+        evidence: DiscoveryEndpointSatisfiedQuarantineEvidence,
+    }
+
     fn tempdir() -> TempDir {
         std::fs::create_dir_all("target/test-temp").expect("external test root");
         TempDir::new_in("target/test-temp").expect("tempdir")
@@ -1205,7 +1433,7 @@ mod tests {
         seed: u8,
         policy_epoch: u64,
         valid_until: u64,
-    ) -> DiscoveryEndpointSatisfiedQuarantineEvidence {
+    ) -> SatisfiedFixture {
         let facts = DiscoveryEndpointCandidateFacts {
             group_commitment: [seed; 32],
             descriptor_sequence: 7,
@@ -1294,16 +1522,17 @@ mod tests {
                 Some(&AcceptPositiveEvidence),
             )
             .expect("inbound");
-        observation
+        let evidence = observation
             .satisfied_evidence_at(challenge, NOW + 6)
             .expect("satisfied lookup")
-            .expect("satisfied evidence")
+            .expect("satisfied evidence");
+        SatisfiedFixture { fresh, evidence }
     }
 
     #[test]
     fn negative_replay_conflict_revocation_restart_and_debug_are_deterministic() {
         let directory = tempdir();
-        let evidence = satisfied(&directory, 0x31, 1, NOW + 120);
+        let evidence = satisfied(&directory, 0x31, 1, NOW + 120).evidence;
         let cfg = config(&directory, "revocation.sqlite3", 4, 4);
         let registry =
             SqliteDiscoveryEndpointQuarantineRevocationRegistry::open(cfg.clone()).expect("open");
@@ -1420,8 +1649,8 @@ mod tests {
     #[test]
     fn negative_first_and_higher_epoch_are_irreversible_in_one_policy_domain() {
         let directory = tempdir();
-        let epoch_one = satisfied(&directory, 0x32, 1, NOW + 120);
-        let epoch_two = satisfied(&directory, 0x33, 2, NOW + 120);
+        let epoch_one = satisfied(&directory, 0x32, 1, NOW + 120).evidence;
+        let epoch_two = satisfied(&directory, 0x33, 2, NOW + 120).evidence;
         let registry = SqliteDiscoveryEndpointQuarantineRevocationRegistry::open(config(
             &directory,
             "epoch.sqlite3",
@@ -1510,10 +1739,126 @@ mod tests {
     }
 
     #[test]
+    fn readiness_is_deterministic_private_and_revocation_invalidates_it() {
+        let directory = tempdir();
+        let fixture = satisfied(&directory, 0x36, 1, NOW + 120);
+        let other = satisfied(&directory, 0x37, 1, NOW + 120);
+        let registry = SqliteDiscoveryEndpointQuarantineRevocationRegistry::open(config(
+            &directory,
+            "readiness.sqlite3",
+            4,
+            4,
+        ))
+        .expect("open");
+        assert_eq!(
+            registry
+                .retain_positive_at(fixture.evidence, NOW + 6)
+                .expect("positive"),
+            DiscoveryEndpointQuarantinePositiveOutcome::Retained
+        );
+        let first = registry
+            .promotion_readiness_at(fixture.fresh, fixture.evidence, NOW + 6)
+            .expect("evaluate")
+            .expect("ready");
+        let repeated = registry
+            .promotion_readiness_at(fixture.fresh, fixture.evidence, NOW + 6)
+            .expect("repeat")
+            .expect("ready repeat");
+        assert_eq!(first, repeated);
+        assert_eq!(first.descriptor_sequence(), 7);
+        assert_eq!(first.policy_epoch(), 1);
+        assert_eq!(first.evaluated_at(), NOW + 6);
+        assert!(first.valid_until() <= NOW + 126);
+        assert_eq!(
+            first.admission_commitment(),
+            fixture.fresh.admission_commitment()
+        );
+        assert!(registry
+            .verify_promotion_readiness_at(&first, NOW + 6)
+            .expect("verify"));
+        assert!(registry
+            .promotion_readiness_at(other.fresh, fixture.evidence, NOW + 6)
+            .expect("mismatched admission")
+            .is_none());
+
+        let debug = format!("{first:?}");
+        for secret in [
+            first.readiness_commitment(),
+            first.admission_commitment(),
+            first.group_commitment(),
+            fixture.evidence.evidence_commitment(),
+            fixture.evidence.challenge_id(),
+        ] {
+            assert!(!debug.contains(&hex::encode(secret)));
+        }
+        let mut tampered = first;
+        tampered.descriptor_sequence = tampered.descriptor_sequence.saturating_add(1);
+        assert!(!registry
+            .verify_promotion_readiness_at(&tampered, NOW + 6)
+            .expect("tamper rejection"));
+
+        assert_eq!(
+            registry
+                .record_negative_at(
+                    fixture.evidence,
+                    [0x46; 32],
+                    [0x56; 32],
+                    NOW + 7,
+                    NOW + 7,
+                    Some(&FixedNegative(Ok(()))),
+                )
+                .expect("revoke"),
+            DiscoveryEndpointQuarantineNegativeOutcome::Revoked
+        );
+        assert!(!registry
+            .verify_promotion_readiness_at(&first, NOW + 7)
+            .expect("revoked token"));
+        assert!(registry
+            .promotion_readiness_at(fixture.fresh, fixture.evidence, NOW + 7)
+            .expect("reacquire after revoke")
+            .is_none());
+    }
+
+    #[test]
+    fn epoch_advance_and_expiry_prevent_readiness_reacquisition() {
+        let directory = tempdir();
+        let epoch_one = satisfied(&directory, 0x38, 1, NOW + 120);
+        let epoch_two = satisfied(&directory, 0x39, 2, NOW + 120);
+        let registry = SqliteDiscoveryEndpointQuarantineRevocationRegistry::open(config(
+            &directory,
+            "readiness-epoch.sqlite3",
+            4,
+            4,
+        ))
+        .expect("open");
+        registry
+            .retain_positive_at(epoch_one.evidence, NOW + 6)
+            .expect("epoch one");
+        let old = registry
+            .promotion_readiness_at(epoch_one.fresh, epoch_one.evidence, NOW + 6)
+            .expect("epoch one readiness")
+            .expect("epoch one ready");
+        registry
+            .retain_positive_at(epoch_two.evidence, NOW + 6)
+            .expect("epoch two");
+        assert!(!registry
+            .verify_promotion_readiness_at(&old, NOW + 6)
+            .expect("old epoch invalid"));
+        assert!(registry
+            .promotion_readiness_at(epoch_one.fresh, epoch_one.evidence, NOW + 6)
+            .expect("old epoch reacquire")
+            .is_none());
+        assert!(registry
+            .promotion_readiness_at(epoch_two.fresh, epoch_two.evidence, NOW + 121)
+            .expect("expired")
+            .is_none());
+    }
+
+    #[test]
     fn capacity_ttl_cleanup_corruption_and_routeability_boundaries_fail_closed() {
         let directory = tempdir();
-        let first = satisfied(&directory, 0x34, 1, NOW + 20);
-        let second = satisfied(&directory, 0x35, 1, NOW + 120);
+        let first = satisfied(&directory, 0x34, 1, NOW + 20).evidence;
+        let second = satisfied(&directory, 0x35, 1, NOW + 120).evidence;
         let cfg = config(&directory, "capacity.sqlite3", 1, 1);
         let registry =
             SqliteDiscoveryEndpointQuarantineRevocationRegistry::open(cfg.clone()).expect("open");
