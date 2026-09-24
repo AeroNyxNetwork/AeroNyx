@@ -111,6 +111,9 @@ pub mod storage_crypto;
 // feedback persistence behind one focused extension module.
 mod storage_feedback;
 pub mod storage_ops;
+// [MEMCHAIN-COMMITMENT-CHAIN-SPLIT 2026-09-25 by Codex] Keep canonical
+// block persistence/audit/range operations in one live storage domain.
+mod storage_commitment_chain;
 // [MEMCHAIN-CHECKPOINT-EVIDENCE-SPLIT 2026-09-25 by Codex] Keep canonical
 // checkpoint-vault validation, bounded retention, and incident reconstruction
 // behind one focused private extension module.
