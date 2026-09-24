@@ -8,6 +8,10 @@
 //! HTTP, server startup, client APIs, discovery, or any participant identity.
 //! All methods are synchronous deliberately: a future composition root must
 //! invoke the SQLite-backed journal through an explicit blocking boundary.
+//!
+//! ## Last Modified
+//! v1.0.1-TicketTargetGuard — Reject an inner TicketIssue target mismatch
+//! before journal admission and on durable record recovery.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -1091,7 +1095,11 @@ impl AnonymousMailboxSourceCoordinator {
         terminal_frame: Vec<u8>,
         now: u64,
     ) -> Result<AnonymousMailboxSourcePrepared, AnonymousMailboxSourceError> {
-        ensure_request_frame(&terminal_frame)?;
+        // [ANONYMOUS-MAILBOX-TICKET-TARGET 2026-09-24 by Codex] A canonical
+        // TicketIssue must name the exact pinned responder before even reading
+        // the journal. A different inner target cannot receive a signed
+        // rejection from this node and would otherwise strand an Armed row.
+        ensure_ticket_target(&terminal_frame, &pin.target_node_id)?;
         let request_commitment = source_request_commitment(
             &route_id,
             &pin.target_node_id,
@@ -1231,6 +1239,11 @@ impl AnonymousMailboxSourceCoordinator {
         if record.phase == AnonymousMailboxSourcePhase::Ambiguous {
             return Err(AnonymousMailboxSourceError::Ambiguous);
         }
+        // Historic Armed rows could have passed the old source admission.
+        // Keep the journal readable, but never release such a row to I/O.
+        let terminal_frame = decode_state(&record.state)?.terminal_frame;
+        ensure_ticket_target(&terminal_frame, &record.target_node_id)
+            .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;
 
         let descriptor = self
             .resolver
@@ -1731,6 +1744,27 @@ fn ensure_request_frame(frame: &[u8]) -> Result<(), AnonymousMailboxSourceError>
     match decode_anonymous_mailbox_terminal_frame(frame)
         .map_err(|_| AnonymousMailboxSourceError::Rejected)?
     {
+        AnonymousMailboxTerminalFrameV1::LeaseCreate(_)
+        | AnonymousMailboxTerminalFrameV1::Put(_)
+        | AnonymousMailboxTerminalFrameV1::PullOne(_)
+        | AnonymousMailboxTerminalFrameV1::Ack(_)
+        | AnonymousMailboxTerminalFrameV1::TicketIssue(_) => Ok(()),
+        _ => Err(AnonymousMailboxSourceError::Rejected),
+    }
+}
+
+fn ensure_ticket_target(
+    frame: &[u8],
+    target_node_id: &[u8; 32],
+) -> Result<(), AnonymousMailboxSourceError> {
+    let request = decode_anonymous_mailbox_terminal_frame(frame)
+        .map_err(|_| AnonymousMailboxSourceError::Rejected)?;
+    match request {
+        AnonymousMailboxTerminalFrameV1::TicketIssue(request)
+            if &request.target_node_id != target_node_id =>
+        {
+            Err(AnonymousMailboxSourceError::Rejected)
+        }
         AnonymousMailboxTerminalFrameV1::LeaseCreate(_)
         | AnonymousMailboxTerminalFrameV1::Put(_)
         | AnonymousMailboxTerminalFrameV1::PullOne(_)
@@ -3033,6 +3067,94 @@ mod tests {
             1,
             "no candidate fallback"
         );
+    }
+
+    #[test]
+    fn wrong_target_ticket_never_enters_journal_or_dispatch_and_valid_retry_remains_exact() {
+        let target = target();
+        let other = IdentityKeyPair::from_bytes(&[0x75; 32]).expect("other target");
+        let descriptor = mailbox_descriptor(&target);
+        let commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
+            .expect("commitment");
+        let resolver = Arc::new(ExactOnlyResolver {
+            descriptor,
+            calls: AtomicUsize::new(0),
+        });
+        let journal = Arc::new(journal());
+        let coordinator = AnonymousMailboxSourceCoordinator::new(
+            Arc::new(IdentityKeyPair::from_bytes(&[0x76; 32]).expect("source")),
+            resolver.clone(),
+            journal.clone(),
+        );
+        let route_id = [0x77; 16];
+        let pin = ExactAnonymousMailboxTargetPin::new(target.public_key_bytes(), commitment);
+        assert!(matches!(
+            coordinator.prepare(pin.clone(), route_id, ticket_request(&other), NOW),
+            Err(AnonymousMailboxSourceError::Rejected)
+        ));
+        assert!(journal.load(&route_id).expect("journal read").is_none());
+        assert!(matches!(
+            coordinator.begin_dispatch(route_id, NOW),
+            Err(AnonymousMailboxSourceError::Rejected)
+        ));
+        assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            load_source_meta(&*journal.connection.lock())
+                .expect("journal totals")
+                .entries,
+            0,
+            "wrong-target request cannot reserve durable quota"
+        );
+
+        let terminal = ticket_request(&target);
+        let prepared = coordinator
+            .prepare(pin.clone(), route_id, terminal.clone(), NOW)
+            .expect("valid target prepare");
+        let retry = coordinator
+            .prepare(pin, route_id, terminal, NOW + 1)
+            .expect("valid exact retry");
+        assert_eq!(prepared.body(), retry.body());
+        assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn previously_journaled_wrong_target_ticket_cannot_dispatch() {
+        let journal = Arc::new(journal());
+        let target = target();
+        let other = IdentityKeyPair::from_bytes(&[0x78; 32]).expect("other target");
+        let mut record = journal_record(0x79, 0x7a, AnonymousMailboxSourcePhase::Prepared);
+        let terminal = ticket_request(&other);
+        record.request_commitment = source_request_commitment(
+            &record.route_id,
+            &record.target_node_id,
+            &record.descriptor_commitment,
+            &terminal,
+        );
+        record.state = encode_state(&record.body, &terminal, None, None).expect("legacy state");
+        journal
+            .insert_or_exact(&record)
+            .expect("simulate previously accepted row");
+        journal
+            .audit_startup()
+            .expect("legacy journal stays readable");
+        let resolver = Arc::new(ExactOnlyResolver {
+            descriptor: mailbox_descriptor(&target),
+            calls: AtomicUsize::new(0),
+        });
+        let coordinator = AnonymousMailboxSourceCoordinator::new(
+            Arc::new(IdentityKeyPair::from_bytes(&[0x7b; 32]).expect("source")),
+            resolver.clone(),
+            journal.clone(),
+        );
+        assert!(matches!(
+            coordinator.begin_dispatch(record.route_id, NOW),
+            Err(AnonymousMailboxSourceError::Corrupt)
+        ));
+        assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            coordinator.result(record.route_id),
+            Ok(AnonymousMailboxSourceResult::Prepared)
+        ));
     }
 
     #[test]
