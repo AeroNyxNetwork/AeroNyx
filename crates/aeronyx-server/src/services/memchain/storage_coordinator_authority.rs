@@ -1283,7 +1283,7 @@ impl MemoryStorage {
         .await
     }
 
-    async fn release_record_commitment_coordinator_lease_at(
+    pub(super) async fn release_record_commitment_coordinator_lease_at(
         &self,
         chain_id: &[u8; 32],
         coordinator: &[u8; 32],
