@@ -111,6 +111,10 @@ pub mod storage_crypto;
 // feedback persistence behind one focused extension module.
 mod storage_feedback;
 pub mod storage_ops;
+// [MEMCHAIN-CHECKPOINT-EVIDENCE-SPLIT 2026-09-25 by Codex] Keep canonical
+// checkpoint-vault validation, bounded retention, and incident reconstruction
+// behind one focused private extension module.
+mod storage_checkpoint_evidence;
 // [CUSTODY-WITNESS-VAULT-MODULE 2026-09-24 by Codex] Keep signed receipt
 // admission, bounded SQLite retention, and restart readiness in one domain.
 mod storage_witness_receipts;
