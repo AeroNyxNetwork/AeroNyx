@@ -562,6 +562,10 @@ retains the candidate. `--check-only` validates local readiness without a
 POST. Before an attempted config replacement, the command creates a private
 backup beside `server.toml` for operator review.
 
+The repository-local entrypoint sources `lib/operator_join.sh` from its own
+directory; copy or deploy that sibling module with `aeronyx-node.sh`. Sourcing
+the module defines functions only and does not install or contact a seed.
+
 Success requires the local Rust service to publish its current public-key-
 matched, unexpired, signed descriptor and the chosen seed API to return HTTP
 200 with `accepted=true`, `route_authority=false`, and status

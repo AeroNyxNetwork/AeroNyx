@@ -15,6 +15,10 @@ NODE_SCRIPT="${SCRIPT_DIR}/../aeronyx-node.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aeronyx-join-test.XXXXXX")"
 trap 'rm -rf -- "${TEST_ROOT}"' EXIT
 
+# [PERMISSIONLESS-NODE-JOIN-MODULE 2026-09-24 by Codex] Sourcing the wrapper
+# and sibling module must be inert, even before HTTP/systemd fixtures exist.
+curl() { printf 'FAIL: source attempted HTTP\n' >&2; exit 1; }
+systemctl() { printf 'FAIL: source attempted systemd\n' >&2; exit 1; }
 source "${NODE_SCRIPT}"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
