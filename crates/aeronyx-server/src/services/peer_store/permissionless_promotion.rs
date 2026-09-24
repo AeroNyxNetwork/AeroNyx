@@ -387,12 +387,13 @@ mod tests {
                 "request_failed",
             ));
         }
+        let quarantined_at = now + u64::from(PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD);
         let pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).unwrap();
         store.permissionless_promotions.write().insert(
             descriptor.node_id(),
             PermissionlessPromotionGate {
                 descriptor_hash: pin.descriptor_hash,
-                valid_until: now + PEER_ROUTE_FAILURE_QUARANTINE_SECS + 90,
+                valid_until: quarantined_at + PEER_ROUTE_FAILURE_QUARANTINE_SECS + 90,
                 active: true,
                 verified_control_probe: false,
                 generation: 0,
@@ -400,11 +401,11 @@ mod tests {
         );
         assert!(!store.record_permissionless_promotion_probe_verified(
             &descriptor,
-            now + PEER_ROUTE_RECOVERY_PROBE_AFTER_SECS,
+            quarantined_at + PEER_ROUTE_RECOVERY_PROBE_AFTER_SECS,
         ));
         assert!(store.record_permissionless_promotion_probe_verified(
             &descriptor,
-            now + PEER_ROUTE_FAILURE_QUARANTINE_SECS + 1,
+            quarantined_at + PEER_ROUTE_FAILURE_QUARANTINE_SECS + 1,
         ));
     }
 }
