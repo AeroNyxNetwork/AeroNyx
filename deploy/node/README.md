@@ -543,8 +543,8 @@ DNS names are rejected for this admission path to avoid rebinding.
 
 ```bash
 sudo ./deploy/node/aeronyx-node.sh join \
-  --seed "http://SEED_PUBLIC_IP:8422" \
-  --public-endpoint "http://YOUR_PUBLIC_IP:8422" \
+  --seed "https://SEED_PUBLIC_IP:8422" \
+  --public-endpoint "https://YOUR_PUBLIC_IP:8422" \
   --join-timeout 180 --json
 ```
 
@@ -567,20 +567,28 @@ directory; copy or deploy that sibling module with `aeronyx-node.sh`. Sourcing
 the module defines functions only and does not install or contact a seed.
 
 Success requires the local Rust service to publish its current public-key-
-matched, unexpired, signed descriptor and the chosen seed API to return HTTP
-200 with `accepted=true`, `route_authority=false`, and status
-`candidate_admitted` or `exact_replay`. Output is aggregate JSON only:
+matched, unexpired, signed descriptor and the chosen seed API to return HTTPS
+200 over a system-validated public-IP certificate with `accepted=true`,
+`route_authority=false`, and status `candidate_admitted` or `exact_replay`.
+Output is aggregate JSON only:
 Stage-A acceptance, readiness hints, seed counts, and a fixed reason code.
 It never prints node identities, seed URLs, routes, messages, payloads, or
-keys. Signature/TTL, HTTP rejection, and malformed responses fail closed.
+keys. Signature/TTL, TLS trust failure, HTTP rejection, and malformed
+responses fail closed. [PERMISSIONLESS-JOIN-HTTP-HONESTY 2026-09-24 by Codex]
+A plain HTTP seed may report the same JSON without storing the candidate:
+the CLI therefore returns nonzero with `reason=submission_unconfirmed` and
+`signed_descriptor_accepted=false`, even for HTTP 200. Do not treat that
+report as Stage-A confirmation or automatically resend it.
 Transport timeout is ambiguous after bytes may have been sent, so the command
 does not automatically retry or fall through to another seed.
 
 This API grants only a **bounded, non-routeable Stage-A candidate**. It is not
 proof of endpoint possession, routeability, terminal delivery, economic
 admission, or any central registration requirement. The HTTP response is not
-a seed-signed receipt; use HTTPS with a valid IP certificate where available.
-Plain HTTP seed IPs retain on-path spoofing risk. Commercial VPN registration
+a seed-signed receipt; HTTPS authenticates the responding seed transport, but
+does not cryptographically prove durable storage. Production-grade confirmation
+across arbitrary seeds needs a future seed-signed receipt bound to the exact
+descriptor commitment, seed identity, and time. Commercial VPN registration
 remains the separate `quickstart` workflow above.
 
 ### Post-start admission gate

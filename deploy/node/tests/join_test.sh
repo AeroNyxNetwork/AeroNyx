@@ -33,7 +33,7 @@ assert_fails() {
 }
 
 JOIN_PUBLIC_ENDPOINT="https://9.9.9.9:8422"
-JOIN_SEEDS=("http://8.8.8.8:8422")
+JOIN_SEEDS=("https://8.8.8.8:8422")
 JOIN_TIMEOUT=1
 JSON=1
 CONFIG_FILE="${TEST_ROOT}/server.toml"
@@ -149,9 +149,10 @@ curl() {
             done
             [ -n "${output}" ] || return 22
             printf 'post\n' >>"${TEST_ROOT}/post_calls"
-            if [ "${SEED_MODE:-accept}" = "timeout" ]; then
-                return 28
-            fi
+            case "${SEED_MODE:-accept}" in
+                timeout) return 28 ;;
+                tls_fail) return 60 ;;
+            esac
             local source_mode="${SEED_MODE:-accept}"
             case "${source_mode}" in
                 conflict|malformed|false_ok) source_mode="reject" ;;
@@ -184,7 +185,7 @@ with open(sys.argv[1], "rb") as handle:
     config = tomllib.load(handle)
 assert config["discovery"]["unknown_setting"] == "preserve-me"
 assert config["other"]["unknown"] == 42
-assert config["discovery"]["seed_endpoints"] == ["http://8.8.8.8:8422"]
+assert config["discovery"]["seed_endpoints"] == ["https://8.8.8.8:8422"]
 assert config["discovery"]["public_discovery"] is True
 PY
 pass "config edit preserves unknown TOML and is idempotent"
@@ -220,12 +221,37 @@ result="$(join_submit_once "${request_path}")" || fail "candidate admission reje
 [[ "${result}" != *'8.8.8.8'* && "${result}" != *'9.9.9.9'* \
     && "${result}" != *'node_id'* && "${result}" != *'signature'* \
     && "${result}" != *'payload'* ]] || fail "admission output leaked descriptor data"
-pass "request-bound Stage-A admission is not route-ready"
+pass "HTTPS-authenticated Stage-A report is not route-ready"
+
+# [PERMISSIONLESS-JOIN-HTTP-HONESTY 2026-09-24 by Codex] An impostor can
+# return the exact success JSON over HTTP without persisting the candidate.
+# The operator must see a single unconfirmed submission, never acceptance.
+JOIN_SEEDS=("http://8.8.8.8:8422")
+post_count_before="$(wc -l <"${TEST_ROOT}/post_calls")"
+result="$(join_submit_once "${request_path}")" \
+    && fail "spoofable HTTP 200 was reported as accepted"
+[[ "${result}" == *'"reason":"submission_unconfirmed"'* \
+    && "${result}" == *'"signed_descriptor_accepted":false'* \
+    && "${result}" == *'"admission_stage":"none"'* \
+    && "${result}" == *'"route_ready":false'* ]] \
+    || fail "HTTP report was not fail-closed"
+[[ "$(wc -l <"${TEST_ROOT}/post_calls")" -eq "$((post_count_before + 1))" ]] \
+    || fail "HTTP report triggered a retry"
+JOIN_SEEDS=("https://8.8.8.8:8422")
+pass "fake HTTP 200 without seed storage remains unconfirmed"
 
 SEED_MODE="replay"
 result="$(join_submit_once "${request_path}")" || fail "exact replay was not idempotent"
 [[ "${result}" == *'"status":"accepted"'* ]] || fail "exact replay was not accepted"
 pass "exact replay remains idempotent"
+
+SEED_MODE="tls_fail"
+result="$(join_submit_once "${request_path}")" \
+    && fail "HTTPS certificate validation failure was accepted"
+[[ "${result}" == *'"reason":"tls_auth_failed"'* \
+    && "${result}" == *'"signed_descriptor_accepted":false'* ]] \
+    || fail "TLS trust failure was not explicit and fail-closed"
+pass "HTTPS trust failure cannot confirm admission"
 
 SEED_MODE="timeout"
 result="$(join_submit_once "${request_path}")" && fail "ambiguous timeout was accepted"
@@ -287,7 +313,7 @@ assert_fails "loopback seed rejected" bash -c 'source "$1"; JOIN_PUBLIC_ENDPOINT
 assert_fails "DNS self endpoint rejected by Stage-A policy" bash -c 'source "$1"; JOIN_PUBLIC_ENDPOINT=https://node.example; JOIN_SEEDS=(http://8.8.8.8:8422); validate_join_options' bash "${NODE_SCRIPT}"
 assert_fails "seed credentials rejected" bash -c 'source "$1"; JOIN_PUBLIC_ENDPOINT=https://9.9.9.9:8422; JOIN_SEEDS=(http://user:pass@8.8.8.8:8422); validate_join_options' bash "${NODE_SCRIPT}"
 assert_fails "seed query rejected" bash -c 'source "$1"; JOIN_PUBLIC_ENDPOINT=https://9.9.9.9:8422; JOIN_SEEDS=(http://8.8.8.8:8422?x=1); validate_join_options' bash "${NODE_SCRIPT}"
-JOIN_SEEDS=("http://8.8.8.8:8422")
+JOIN_SEEDS=("https://8.8.8.8:8422")
 pass "seed policy rejects local/private targets"
 
 # Exercise the full orchestration without root, systemd, install, or sockets.

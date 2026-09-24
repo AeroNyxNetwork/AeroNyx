@@ -536,12 +536,15 @@ join_submit_once() {
         --data-binary "@${request_path}" --output "${response_file}" \
         --write-out '%{http_code}|%{content_type}' \
         "${JOIN_SEEDS[0]}/api/discovery/join" 2>/dev/null)" || transport_rc=$?
-    result="$("${JOIN_PYTHON}" - "${response_file}" "${meta}" "${transport_rc}" "${#JOIN_SEEDS[@]}" <<'PY'
+    # [PERMISSIONLESS-JOIN-HTTP-HONESTY 2026-09-24 by Codex] A plain HTTP
+    # response cannot authenticate the seed. Keep the one POST, but never
+    # promote its reported acceptance into confirmed Stage-A evidence.
+    result="$("${JOIN_PYTHON}" - "${response_file}" "${meta}" "${transport_rc}" "${#JOIN_SEEDS[@]}" "${JOIN_SEEDS[0]%%:*}" <<'PY'
 import json
 import re
 import sys
 
-path, meta, transport_raw, seed_count_raw = sys.argv[1:]
+path, meta, transport_raw, seed_count_raw, seed_scheme = sys.argv[1:]
 result = {
     "contract_version": "node_join.v1",
     "status": "pending",
@@ -565,6 +568,8 @@ def finish(reason, accepted=False):
     raise SystemExit(0 if accepted else 1)
 
 if transport_raw != "0":
+    if transport_raw == "60" and seed_scheme == "https":
+        finish("tls_auth_failed")
     finish("transport_ambiguous")
 status, separator, content_type = meta.partition("|")
 if not separator or not re.fullmatch(r"[0-9]{3}", status):
@@ -594,6 +599,8 @@ if body.get("economic_admission") != "reserved_future_eth_projection_not_enforce
 if body.get("accepted") is True and body.get("status") in (
     "candidate_admitted", "exact_replay"
 ):
+    if seed_scheme != "https":
+        finish("submission_unconfirmed")
     finish("stage_a_candidate_admitted", True)
 finish("admission_rejected")
 PY
