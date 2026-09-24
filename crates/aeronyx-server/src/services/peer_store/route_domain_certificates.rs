@@ -741,6 +741,7 @@ mod tests {
         // evidence inserted after its clear.
         let now = 1_700_030_000;
         let subject = IdentityKeyPair::generate();
+        let subject_id = subject.public_key_bytes();
         let old_attestor_a = IdentityKeyPair::generate();
         let old_attestor_b = IdentityKeyPair::generate();
         let new_attestor_a = IdentityKeyPair::generate();
@@ -764,7 +765,7 @@ mod tests {
         let mut store = PeerStore::new();
         store
             .configure_route_domain_attestor_policy(
-                &[(subject.public_key_bytes(), route_domain)],
+                &[(subject_id, route_domain)],
                 &old_allowed,
                 2,
                 true,
@@ -789,7 +790,7 @@ mod tests {
         let rotate_store = Arc::clone(&store);
         let rotation_thread = std::thread::spawn(move || {
             rotate_store.configure_route_domain_attestor_policy(
-                &[(subject.public_key_bytes(), route_domain)],
+                &[(subject_id, route_domain)],
                 &new_allowed,
                 2,
                 true,
@@ -799,7 +800,7 @@ mod tests {
 
         assert!(import_thread.join().unwrap().is_ok());
         rotation_thread.join().unwrap().unwrap();
-        assert!(!store.route_domain_certificate_allows_multi_hop(&subject.public_key_bytes(), now,));
+        assert!(!store.route_domain_certificate_allows_multi_hop(&subject_id, now));
         assert!(store
             .export_route_domain_attestation_certificates(now)
             .is_empty());
