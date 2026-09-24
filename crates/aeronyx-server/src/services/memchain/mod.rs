@@ -111,6 +111,9 @@ pub mod storage_crypto;
 // feedback persistence behind one focused extension module.
 mod storage_feedback;
 pub mod storage_ops;
+// [CUSTODY-WITNESS-VAULT-MODULE 2026-09-24 by Codex] Keep signed receipt
+// admission, bounded SQLite retention, and restart readiness in one domain.
+mod storage_witness_receipts;
 // v2.4.0+Search: Cognitive graph CRUD (split from storage_ops.rs)
 pub mod storage_graph;
 // v2.4.0+Search: Miner step support + entity timeline (split from storage_ops.rs)
