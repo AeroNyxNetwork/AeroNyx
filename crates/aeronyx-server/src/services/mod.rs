@@ -315,6 +315,9 @@ pub(crate) mod discovery_endpoint_quarantine_observation;
 // [PERMISSIONLESS-ENDPOINT-QUARANTINE-REVOCATION 2026-09-24 by Codex]
 // Negative evidence and policy epochs remain isolated from routeable state.
 pub(crate) mod discovery_endpoint_quarantine_revocation;
+// [PERMISSIONLESS-ENDPOINT-PROMOTION-MATERIAL 2026-09-24 by Codex] Resolve one
+// exact private descriptor only after current quarantine readiness revalidation.
+pub(crate) mod discovery_endpoint_promotion_material;
 mod discovery_endpoint_verification;
 pub mod dns_proxy;
 pub mod handshake;

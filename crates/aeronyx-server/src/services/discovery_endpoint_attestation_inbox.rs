@@ -548,6 +548,115 @@ impl SqliteDiscoveryEndpointAttestationInbox {
         }
         Ok(facts)
     }
+
+    /// Confirms that one exact descriptor tuple still has a canonical, fresh
+    /// attestation. This deliberately accepts no prefix, range, or page input
+    /// and returns no observer or endpoint material.
+    // [PERMISSIONLESS-ENDPOINT-PROMOTION-MATERIAL 2026-09-24 by Codex]
+    // Re-verify the retained signed frame instead of trusting denormalized SQL
+    // columns when resolving authority-bearing private material.
+    pub(crate) fn contains_exact_candidate_at(
+        &self,
+        subject_node_id: [u8; 32],
+        descriptor_sequence: u64,
+        descriptor_hash: [u8; 32],
+        endpoint_commitment: [u8; 32],
+        expected_group_commitment: [u8; 32],
+        now: u64,
+    ) -> Result<bool, DiscoveryEndpointAttestationInboxError> {
+        if now == 0
+            || descriptor_sequence == 0
+            || subject_node_id.iter().all(|byte| *byte == 0)
+            || descriptor_hash.iter().all(|byte| *byte == 0)
+            || endpoint_commitment.iter().all(|byte| *byte == 0)
+            || expected_group_commitment.iter().all(|byte| *byte == 0)
+            || candidate_group_commitment(
+                &subject_node_id,
+                descriptor_sequence,
+                &descriptor_hash,
+                &endpoint_commitment,
+            ) != expected_group_commitment
+        {
+            return Ok(false);
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+        let retained = tx
+            .query_row(
+                "SELECT attestation_commitment,LENGTH(frame)
+                 FROM discovery_endpoint_attestation_inbox_v1
+                 WHERE subject_node_id=?1 AND descriptor_sequence=?2
+                   AND descriptor_hash=?3 AND endpoint_commitment=?4
+                   AND observed_at<=?5 AND retained_expires_at>=?5
+                 ORDER BY attestation_commitment LIMIT 1",
+                params![
+                    &subject_node_id[..],
+                    as_i64(descriptor_sequence)?,
+                    &descriptor_hash[..],
+                    &endpoint_commitment[..],
+                    as_i64(now)?,
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+        let Some((stored_commitment, frame_len)) = retained else {
+            tx.commit()
+                .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+            return Ok(false);
+        };
+        let stored_commitment = array32(stored_commitment)?;
+        if usize::try_from(frame_len)
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?
+            != DISCOVERY_ENDPOINT_ATTESTATION_FRAME_BYTES_V1
+        {
+            return Err(DiscoveryEndpointAttestationInboxError::Corrupt);
+        }
+        let frame = tx
+            .query_row(
+                "SELECT frame FROM discovery_endpoint_attestation_inbox_v1
+                 WHERE attestation_commitment=?1 AND LENGTH(frame)=?2",
+                params![
+                    &stored_commitment[..],
+                    i64::try_from(DISCOVERY_ENDPOINT_ATTESTATION_FRAME_BYTES_V1)
+                        .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?,
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?
+            .ok_or(DiscoveryEndpointAttestationInboxError::Corrupt)?;
+        let value = DiscoveryEndpointEvidenceAttestationV1::decode(&frame)
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?;
+        let descriptor = DirectoryDescriptorCommitmentV1 {
+            node_id: subject_node_id,
+            sequence: descriptor_sequence,
+            descriptor_hash,
+        };
+        value
+            .verify_at(
+                now,
+                &value.observer_node_id(),
+                &descriptor,
+                &endpoint_commitment,
+                &value.evidence_commitment(),
+                &value.context(),
+                DiscoveryEndpointAttestationPurposeV1::EndpointPossessionObservation,
+            )
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?;
+        if value.commitment() != stored_commitment || value.encode() != frame {
+            return Err(DiscoveryEndpointAttestationInboxError::Corrupt);
+        }
+        tx.commit()
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+        drop(connection);
+        Ok(true)
+    }
 }
 
 fn validate_config(
