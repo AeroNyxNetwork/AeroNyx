@@ -314,8 +314,9 @@ pub(super) use super::storage_checkpoint_evidence::{
 // implementation and its transaction-scoped validation helpers.
 pub(super) use super::storage_coordinator_authority::{
     acquire_commitment_coordinator_fence, commitment_coordinator_fence_path,
-    read_record_coordinator_handover_history_transaction, record_commitment_authority_at_height,
-    verify_record_commitment_proposer_history_transaction, WitnessLeaseCommitObservation,
+    commitment_witness_lease_clock_path, read_record_coordinator_handover_history_transaction,
+    record_commitment_authority_at_height, verify_record_commitment_proposer_history_transaction,
+    WitnessLeaseCommitObservation,
 };
 pub use super::storage_coordinator_authority::{
     RecordCommitmentAuthorityState, RecordCoordinatorHandoverPage,

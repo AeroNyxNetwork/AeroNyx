@@ -20,8 +20,12 @@ use nix::fcntl::{openat, Flock, FlockArg, OFlag};
 use nix::sys::stat::Mode;
 use rusqlite::{params, OptionalExtension};
 
-use aeronyx_core::ledger::{RecordCoordinatorHandoverV1, AERONYX_MEMCHAIN_MAINNET_CHAIN_ID};
-use aeronyx_core::protocol::memchain::MAX_COORDINATOR_LEASE_TTL_SECS_V1;
+use aeronyx_core::ledger::{
+    RecordCoordinatorHandoverV1, AERONYX_MEMCHAIN_MAINNET_CHAIN_ID, GENESIS_PREV_HASH,
+};
+use aeronyx_core::protocol::memchain::{
+    MAX_COORDINATOR_LEASE_TTL_SECS_V1, MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+};
 
 use super::storage::{
     probe_storage_database_file_identity, MemoryStorage, RecordCommitmentWitnessLeaseClockRuntime,
@@ -445,21 +449,21 @@ pub(super) fn record_commitment_authority_at_height(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CoordinatorFenceAcquireError {
+pub(super) enum CoordinatorFenceAcquireError {
     Contended,
     UnsafeFile,
     Io,
 }
 
 impl CoordinatorFenceAcquireError {
-    const fn state(self) -> &'static str {
+    pub(super) const fn state(self) -> &'static str {
         match self {
             Self::Contended => "contended",
             Self::UnsafeFile | Self::Io => "failed",
         }
     }
 
-    const fn message(self) -> &'static str {
+    pub(super) const fn message(self) -> &'static str {
         match self {
             Self::Contended => {
                 "commitment coordinator production fence is held by another local process"
@@ -484,7 +488,9 @@ const WITNESS_LEASE_CLOCK_DIRECTORY: &str = "/private/tmp";
 #[cfg(not(target_os = "macos"))]
 const WITNESS_LEASE_CLOCK_DIRECTORY: &str = "/tmp";
 
-fn commitment_witness_lease_clock_path(identity: StorageDatabaseFileIdentity) -> PathBuf {
+pub(super) fn commitment_witness_lease_clock_path(
+    identity: StorageDatabaseFileIdentity,
+) -> PathBuf {
     // [MEMCHAIN-WITNESS-DB-IDENTITY 2026-09-05 by Codex] A fixed host-local
     // namespace plus device/inode makes every safe spelling of one repository
     // contend on the same advisory lock. No database path enters the artifact.
@@ -1026,7 +1032,7 @@ impl MemoryStorage {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn grant_record_commitment_coordinator_lease_at(
+    pub(super) async fn grant_record_commitment_coordinator_lease_at(
         &self,
         chain_id: &[u8; 32],
         coordinator: &[u8; 32],
@@ -1508,7 +1514,7 @@ impl MemoryStorage {
 
     /// Preserves the historical incident error while distinguishing a
     /// recoverable lease outage for callers and existing operational checks.
-    fn local_record_commitment_production_error(&self) -> Option<&'static str> {
+    pub(super) fn local_record_commitment_production_error(&self) -> Option<&'static str> {
         if self.record_commitment_production_halted() {
             Some("local commitment production halted by trusted witness security incident")
         } else if !self.record_commitment_production_permitted() {
