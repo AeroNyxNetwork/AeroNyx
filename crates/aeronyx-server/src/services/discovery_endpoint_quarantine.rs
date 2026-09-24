@@ -83,6 +83,40 @@ pub(crate) struct DiscoveryEndpointQuarantineSnapshot {
     pub(crate) maximum_valid_until: Option<u64>,
 }
 
+/// Fresh, opaque capability issued only by the durable quarantine registry.
+// [PERMISSIONLESS-ENDPOINT-QUARANTINE-OBSERVATION 2026-09-24 by Codex] The
+// observation policy receives no candidate identity, descriptor, or endpoint.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiscoveryEndpointFreshQuarantineAdmission {
+    admission_commitment: [u8; 32],
+    policy_version: u64,
+    valid_until: u64,
+}
+
+impl DiscoveryEndpointFreshQuarantineAdmission {
+    pub(crate) const fn admission_commitment(&self) -> [u8; 32] {
+        self.admission_commitment
+    }
+
+    pub(crate) const fn policy_version(&self) -> u64 {
+        self.policy_version
+    }
+
+    pub(crate) const fn valid_until(&self) -> u64 {
+        self.valid_until
+    }
+}
+
+impl fmt::Debug for DiscoveryEndpointFreshQuarantineAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryEndpointFreshQuarantineAdmission")
+            .field("policy_version", &self.policy_version)
+            .field("valid_until", &self.valid_until)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Dedicated private registry with no routeability projection.
 pub(crate) struct SqliteDiscoveryEndpointQuarantineRegistry {
     config: DiscoveryEndpointQuarantineConfig,
@@ -254,6 +288,60 @@ impl SqliteDiscoveryEndpointQuarantineRegistry {
             maximum_valid_until: maximum.map(as_u64).transpose()?,
         })
     }
+
+    /// Resolves one opaque commitment into a fresh typed capability.
+    ///
+    /// This is deliberately an exact lookup: it cannot enumerate candidates,
+    /// reveal candidate identities, or project routeable peer state.
+    pub(crate) fn fresh_admission_at(
+        &self,
+        exact_commitment: [u8; 32],
+        now: u64,
+    ) -> Result<Option<DiscoveryEndpointFreshQuarantineAdmission>, DiscoveryEndpointQuarantineError>
+    {
+        if now == 0 || exact_commitment.iter().all(|byte| *byte == 0) {
+            return Err(DiscoveryEndpointQuarantineError::Rejected);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| DiscoveryEndpointQuarantineError::Unavailable)?;
+        let row = connection
+            .query_row(
+                "SELECT group_commitment,policy_version,valid_until
+                 FROM discovery_endpoint_quarantine_v1 WHERE admission_commitment=?1",
+                params![&exact_commitment[..]],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| DiscoveryEndpointQuarantineError::Unavailable)?;
+        let Some((group, policy_version, valid_until)) = row else {
+            return Ok(None);
+        };
+        let group = array32(group)?;
+        let policy_version = as_u64(policy_version)?;
+        let valid_until = as_u64(valid_until)?;
+        if group.iter().all(|byte| *byte == 0)
+            || policy_version == 0
+            || exact_commitment != admission_commitment(&group, policy_version, valid_until)
+        {
+            return Err(DiscoveryEndpointQuarantineError::Corrupt);
+        }
+        if valid_until < now {
+            return Ok(None);
+        }
+        Ok(Some(DiscoveryEndpointFreshQuarantineAdmission {
+            admission_commitment: exact_commitment,
+            policy_version,
+            valid_until,
+        }))
+    }
 }
 
 fn validate_config(
@@ -378,6 +466,17 @@ fn admission_commitment(group: &[u8; 32], policy_version: u64, valid_until: u64)
     hash.update(policy_version.to_be_bytes());
     hash.update(valid_until.to_be_bytes());
     hash.finalize().into()
+}
+
+/// Computes the opaque lookup key for an evaluator-minted admission.
+pub(crate) fn quarantine_admission_commitment(
+    admission: &DiscoveryEndpointQuarantineAdmission,
+) -> [u8; 32] {
+    admission_commitment(
+        &admission.group_commitment(),
+        admission.policy_version(),
+        admission.valid_until(),
+    )
 }
 
 fn admission_exists(

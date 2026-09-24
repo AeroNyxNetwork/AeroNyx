@@ -309,6 +309,9 @@ pub(crate) mod discovery_endpoint_eligibility;
 // [PERMISSIONLESS-ENDPOINT-QUARANTINE-ADMISSION 2026-09-24 by Codex] Durable
 // quarantine remains isolated from PeerStore and every routeable projection.
 pub(crate) mod discovery_endpoint_quarantine;
+// [PERMISSIONLESS-ENDPOINT-QUARANTINE-OBSERVATION 2026-09-24 by Codex]
+// Evidence satisfaction remains isolated state with no routeability authority.
+pub(crate) mod discovery_endpoint_quarantine_observation;
 mod discovery_endpoint_verification;
 pub mod dns_proxy;
 pub mod handshake;
