@@ -68,6 +68,9 @@ const CURSOR_VERSION: u8 = 1;
 const CURSOR_BODY_BYTES: usize = 1 + 8 + 8 + 8;
 const CURSOR_TAG_BYTES: usize = 32;
 const CURSOR_BYTES: usize = CURSOR_BODY_BYTES + CURSOR_TAG_BYTES;
+// [ANONYMOUS-MAILBOX-PULL-BOUNDS 2026-09-24 by Codex] The V3 SQLite CHECK
+// literals in fresh and migration DDL are frozen to these protocol ceilings.
+const _: () = assert!(MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES == 162_816 && CURSOR_BYTES == 57);
 const CURSOR_TTL_SECS: u64 = 5 * 60;
 const PULL_REPLAY_RETENTION_SECS: u64 = 24 * 60 * 60;
 const ACK_TOMBSTONE_RETENTION_SECS: u64 = 24 * 60 * 60;
@@ -376,6 +379,93 @@ struct StoreTotals {
 struct PullReplayTotals {
     rows: u64,
     bytes: u64,
+}
+
+// [ANONYMOUS-MAILBOX-PULL-BOUNDS 2026-09-24 by Codex] SQLite length/typeof
+// metadata is checked before any durable replay BLOB is materialized.
+struct PullReplayBlobShape {
+    kind: String,
+    length: Option<i64>,
+}
+
+impl PullReplayBlobShape {
+    fn from_row(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Self> {
+        Ok(Self {
+            kind: row.get(first)?,
+            length: row.get(first + 1)?,
+        })
+    }
+
+    fn is_null(&self) -> bool {
+        self.kind == "null" && self.length.is_none()
+    }
+
+    fn is_exact_blob(&self, expected: usize) -> bool {
+        self.kind == "blob" && self.length == i64::try_from(expected).ok()
+    }
+
+    fn bounded_blob_length(&self, max: usize) -> Option<u64> {
+        let length = u64::try_from(self.length?).ok()?;
+        (self.kind == "blob" && length > 0 && length <= u64::try_from(max).ok()?).then_some(length)
+    }
+}
+
+struct PullReplayShape {
+    request: PullReplayBlobShape,
+    item_id: PullReplayBlobShape,
+    commitment: PullReplayBlobShape,
+    envelope: PullReplayBlobShape,
+    cursor: PullReplayBlobShape,
+}
+
+impl PullReplayShape {
+    fn from_row(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Self> {
+        Ok(Self {
+            request: PullReplayBlobShape::from_row(row, first)?,
+            item_id: PullReplayBlobShape::from_row(row, first + 2)?,
+            commitment: PullReplayBlobShape::from_row(row, first + 4)?,
+            envelope: PullReplayBlobShape::from_row(row, first + 6)?,
+            cursor: PullReplayBlobShape::from_row(row, first + 8)?,
+        })
+    }
+
+    fn checked_envelope_bytes(&self, outcome: i64) -> Result<u64, AnonymousMailboxStoreError> {
+        if !self.request.is_exact_blob(32) {
+            return Err(AnonymousMailboxStoreError::Corrupt);
+        }
+        match outcome {
+            0 if self.item_id.is_null()
+                && self.commitment.is_null()
+                && self.envelope.is_null()
+                && self.cursor.is_null() =>
+            {
+                Ok(0)
+            }
+            1 if self.item_id.is_exact_blob(16)
+                && self.commitment.is_exact_blob(32)
+                && self.cursor.is_exact_blob(CURSOR_BYTES) =>
+            {
+                self.envelope
+                    .bounded_blob_length(MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES)
+                    .ok_or(AnonymousMailboxStoreError::Corrupt)
+            }
+            _ => Err(AnonymousMailboxStoreError::Corrupt),
+        }
+    }
+}
+
+fn validate_pull_replay_retention(
+    created_at: i64,
+    retain_until: i64,
+    lease_expires_at: Option<i64>,
+) -> Result<u64, AnonymousMailboxStoreError> {
+    let created_at = as_u64(created_at)?;
+    let retain_until = as_u64(retain_until)?;
+    let lease_expires_at = as_u64(lease_expires_at.ok_or(AnonymousMailboxStoreError::Corrupt)?)?;
+    if retain_until != lease_expires_at.min(created_at.saturating_add(PULL_REPLAY_RETENTION_SECS)) {
+        return Err(AnonymousMailboxStoreError::Corrupt);
+    }
+    Ok(retain_until)
 }
 
 enum StoredPullReplay {
@@ -1118,7 +1208,7 @@ impl AnonymousMailboxCustodyRepository for SqliteAnonymousMailboxStore {
         // [ANONYMOUS-MAILBOX-PULL-REPLAY 2026-09-24 by Codex] Resolve the
         // exact signed request before freshness and live-item lookup. This is
         // the durable authority for a response lost immediately before ACK.
-        if let Some(outcome) = load_pull_replay(&transaction, request, &request_commitment)? {
+        if let Some(outcome) = load_pull_replay(&transaction, request, &request_commitment, now)? {
             transaction
                 .commit()
                 .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
@@ -1756,7 +1846,7 @@ fn initialize_or_verify_schema(
                     item_id BLOB CHECK (item_id IS NULL OR length(item_id) = 16),
                     sealed_commitment BLOB CHECK (sealed_commitment IS NULL OR length(sealed_commitment) = 32),
                     sealed_envelope BLOB,
-                    cursor BLOB,
+                    cursor BLOB CHECK (cursor IS NULL OR (typeof(cursor) = 'blob' AND length(cursor) = 57)),
                     created_at INTEGER NOT NULL CHECK (created_at >= 0),
                     retain_until INTEGER NOT NULL CHECK (retain_until >= created_at),
                     PRIMARY KEY (mailbox_id, request_id),
@@ -1764,7 +1854,8 @@ fn initialize_or_verify_schema(
                     CHECK ((outcome = 0 AND item_id IS NULL AND sealed_commitment IS NULL
                             AND sealed_envelope IS NULL AND cursor IS NULL)
                         OR (outcome = 1 AND item_id IS NOT NULL AND sealed_commitment IS NOT NULL
-                            AND sealed_envelope IS NOT NULL AND length(sealed_envelope) > 0
+                            AND sealed_envelope IS NOT NULL AND typeof(sealed_envelope) = 'blob'
+                            AND length(sealed_envelope) BETWEEN 1 AND 162816
                             AND cursor IS NOT NULL))
                  );
                  CREATE INDEX anonymous_mailbox_lease_expiry
@@ -1822,7 +1913,7 @@ fn initialize_or_verify_schema(
                     item_id BLOB CHECK (item_id IS NULL OR length(item_id) = 16),
                     sealed_commitment BLOB CHECK (sealed_commitment IS NULL OR length(sealed_commitment) = 32),
                     sealed_envelope BLOB,
-                    cursor BLOB,
+                    cursor BLOB CHECK (cursor IS NULL OR (typeof(cursor) = 'blob' AND length(cursor) = 57)),
                     created_at INTEGER NOT NULL CHECK (created_at >= 0),
                     retain_until INTEGER NOT NULL CHECK (retain_until >= created_at),
                     PRIMARY KEY (mailbox_id, request_id),
@@ -1830,7 +1921,8 @@ fn initialize_or_verify_schema(
                     CHECK ((outcome = 0 AND item_id IS NULL AND sealed_commitment IS NULL
                             AND sealed_envelope IS NULL AND cursor IS NULL)
                         OR (outcome = 1 AND item_id IS NOT NULL AND sealed_commitment IS NOT NULL
-                            AND sealed_envelope IS NOT NULL AND length(sealed_envelope) > 0
+                            AND sealed_envelope IS NOT NULL AND typeof(sealed_envelope) = 'blob'
+                            AND length(sealed_envelope) BETWEEN 1 AND 162816
                             AND cursor IS NOT NULL))
                  );
                  CREATE INDEX anonymous_mailbox_pull_replay_expiry
@@ -1857,7 +1949,7 @@ fn initialize_or_verify_schema(
                     item_id BLOB CHECK (item_id IS NULL OR length(item_id) = 16),
                     sealed_commitment BLOB CHECK (sealed_commitment IS NULL OR length(sealed_commitment) = 32),
                     sealed_envelope BLOB,
-                    cursor BLOB,
+                    cursor BLOB CHECK (cursor IS NULL OR (typeof(cursor) = 'blob' AND length(cursor) = 57)),
                     created_at INTEGER NOT NULL CHECK (created_at >= 0),
                     retain_until INTEGER NOT NULL CHECK (retain_until >= created_at),
                     PRIMARY KEY (mailbox_id, request_id),
@@ -1865,7 +1957,8 @@ fn initialize_or_verify_schema(
                     CHECK ((outcome = 0 AND item_id IS NULL AND sealed_commitment IS NULL
                             AND sealed_envelope IS NULL AND cursor IS NULL)
                         OR (outcome = 1 AND item_id IS NOT NULL AND sealed_commitment IS NOT NULL
-                            AND sealed_envelope IS NOT NULL AND length(sealed_envelope) > 0
+                            AND sealed_envelope IS NOT NULL AND typeof(sealed_envelope) = 'blob'
+                            AND length(sealed_envelope) BETWEEN 1 AND 162816
                             AND cursor IS NOT NULL))
                  );
                  CREATE INDEX anonymous_mailbox_pull_replay_expiry
@@ -1970,44 +2063,75 @@ fn load_pull_replay(
     transaction: &Transaction<'_>,
     request: &AnonymousMailboxPullOneV1,
     request_commitment: &[u8; 32],
+    now: u64,
 ) -> Result<Option<AnonymousMailboxPullOutcome>, AnonymousMailboxStoreError> {
-    let row = transaction
+    let metadata = transaction
         .query_row(
-            "SELECT request_commitment, outcome, item_id, sealed_commitment,
-                    sealed_envelope, cursor
-             FROM anonymous_mailbox_pull_replays
-             WHERE mailbox_id = ?1 AND request_id = ?2",
+            "SELECT r.rowid, r.outcome, r.created_at, r.retain_until, l.expires_at,
+                    typeof(r.request_commitment), length(r.request_commitment),
+                    typeof(r.item_id), length(r.item_id),
+                    typeof(r.sealed_commitment), length(r.sealed_commitment),
+                    typeof(r.sealed_envelope), length(r.sealed_envelope),
+                    typeof(r.cursor), length(r.cursor)
+             FROM anonymous_mailbox_pull_replays r
+             LEFT JOIN anonymous_mailbox_leases l ON l.mailbox_id = r.mailbox_id
+             WHERE r.mailbox_id = ?1 AND r.request_id = ?2",
             params![&request.mailbox_id[..], &request.request_id[..]],
             |row| {
                 Ok((
-                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
-                    row.get::<_, Option<Vec<u8>>>(3)?,
-                    row.get::<_, Option<Vec<u8>>>(4)?,
-                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    PullReplayShape::from_row(row, 5)?,
                 ))
             },
         )
         .optional()
         .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
-    let Some((stored_request, outcome, item_id, commitment, envelope, cursor)) = row else {
+    let Some((rowid, outcome, created_at, retain_until, lease_expires_at, shape)) = metadata else {
         return Ok(None);
     };
+    if !shape.request.is_exact_blob(32) {
+        return Err(AnonymousMailboxStoreError::Corrupt);
+    }
+    let stored_request: Vec<u8> = transaction
+        .query_row(
+            "SELECT request_commitment FROM anonymous_mailbox_pull_replays WHERE rowid = ?1",
+            params![rowid],
+            |row| row.get(0),
+        )
+        .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
     if stored_request != request_commitment[..] {
         return Err(AnonymousMailboxStoreError::Rejected);
     }
-    let stored = match (outcome, item_id, commitment, envelope, cursor) {
-        (0, None, None, None, None) => StoredPullReplay::Empty,
-        (1, Some(item_id), Some(commitment), Some(envelope), Some(cursor)) => {
-            StoredPullReplay::Item {
-                item_id: fixed::<16>(&item_id)?,
-                sealed_commitment: fixed::<32>(&commitment)?,
-                sealed_envelope: envelope,
-                cursor,
-            }
+    shape.checked_envelope_bytes(outcome)?;
+    let retain_until = validate_pull_replay_retention(created_at, retain_until, lease_expires_at)?;
+    // [ANONYMOUS-MAILBOX-PULL-BOUNDS 2026-09-24 by Codex] Expired exact
+    // replays cannot outlive their lease or the 24-hour journal window merely
+    // because cleanup has not reached their row yet.
+    if now > retain_until {
+        return Err(AnonymousMailboxStoreError::Rejected);
+    }
+    let stored = if outcome == 0 {
+        StoredPullReplay::Empty
+    } else {
+        let (item_id, commitment, sealed_envelope, cursor): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) =
+            transaction
+                .query_row(
+                    "SELECT item_id, sealed_commitment, sealed_envelope, cursor
+                     FROM anonymous_mailbox_pull_replays WHERE rowid = ?1",
+                    params![rowid],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+        StoredPullReplay::Item {
+            item_id: fixed::<16>(&item_id)?,
+            sealed_commitment: fixed::<32>(&commitment)?,
+            sealed_envelope,
+            cursor,
         }
-        _ => return Err(AnonymousMailboxStoreError::Corrupt),
     };
     match stored {
         StoredPullReplay::Empty => Ok(Some(AnonymousMailboxPullOutcome::Empty)),
@@ -2530,49 +2654,45 @@ fn audit_pull_replays(
     validate_pull_replay_totals(stored, config)?;
     let mut statement = transaction
         .prepare(
-            "SELECT outcome, item_id, sealed_commitment, sealed_envelope, cursor
-             FROM anonymous_mailbox_pull_replays",
+            "SELECT r.rowid, r.outcome, r.created_at, r.retain_until, l.expires_at,
+                    typeof(r.request_commitment), length(r.request_commitment),
+                    typeof(r.item_id), length(r.item_id),
+                    typeof(r.sealed_commitment), length(r.sealed_commitment),
+                    typeof(r.sealed_envelope), length(r.sealed_envelope),
+                    typeof(r.cursor), length(r.cursor)
+             FROM anonymous_mailbox_pull_replays r
+             LEFT JOIN anonymous_mailbox_leases l ON l.mailbox_id = r.mailbox_id",
         )
         .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
     let mut rows = statement
         .query([])
         .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
     let mut observed = PullReplayTotals { rows: 0, bytes: 0 };
+    let mut item_rows = Vec::new();
     while let Some(row) = rows
         .next()
         .map_err(|_| AnonymousMailboxStoreError::Corrupt)?
     {
-        let outcome = row
+        let rowid = row
             .get::<_, i64>(0)
             .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
-        let item_id = row
-            .get::<_, Option<Vec<u8>>>(1)
+        let outcome = row
+            .get::<_, i64>(1)
             .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
-        let commitment = row
-            .get::<_, Option<Vec<u8>>>(2)
-            .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
-        let envelope = row
-            .get::<_, Option<Vec<u8>>>(3)
-            .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
-        let cursor = row
-            .get::<_, Option<Vec<u8>>>(4)
-            .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
-        let bytes = match (outcome, item_id, commitment, envelope, cursor) {
-            (0, None, None, None, None) => 0,
-            (1, Some(item_id), Some(commitment), Some(envelope), Some(cursor)) => {
-                fixed::<16>(&item_id)?;
-                let commitment = fixed::<32>(&commitment)?;
-                if envelope.is_empty()
-                    || envelope.len() > MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES
-                    || cursor.len() != CURSOR_BYTES
-                    || <[u8; 32]>::from(Sha256::digest(&envelope)) != commitment
-                {
-                    return Err(AnonymousMailboxStoreError::Corrupt);
-                }
-                u64::try_from(envelope.len()).map_err(|_| AnonymousMailboxStoreError::Corrupt)?
-            }
-            _ => return Err(AnonymousMailboxStoreError::Corrupt),
-        };
+        validate_pull_replay_retention(
+            row.get::<_, i64>(2)
+                .map_err(|_| AnonymousMailboxStoreError::Corrupt)?,
+            row.get::<_, i64>(3)
+                .map_err(|_| AnonymousMailboxStoreError::Corrupt)?,
+            row.get::<_, Option<i64>>(4)
+                .map_err(|_| AnonymousMailboxStoreError::Corrupt)?,
+        )?;
+        let bytes = PullReplayShape::from_row(row, 5)
+            .map_err(|_| AnonymousMailboxStoreError::Corrupt)?
+            .checked_envelope_bytes(outcome)?;
+        if outcome == 1 {
+            item_rows.push((rowid, bytes));
+        }
         observed.rows = observed
             .rows
             .checked_add(1)
@@ -2581,9 +2701,32 @@ fn audit_pull_replays(
             .bytes
             .checked_add(bytes)
             .ok_or(AnonymousMailboxStoreError::Corrupt)?;
+        if observed.rows > stored.rows || observed.bytes > stored.bytes {
+            return Err(AnonymousMailboxStoreError::Corrupt);
+        }
     }
+    drop(rows);
+    drop(statement);
     if observed != stored {
         return Err(AnonymousMailboxStoreError::Corrupt);
+    }
+    // The metadata scan admitted every BLOB length before the second pass.
+    // A transaction snapshot keeps these reads tied to the audited rows.
+    for (rowid, admitted_bytes) in item_rows {
+        let (commitment, envelope): (Vec<u8>, Vec<u8>) = transaction
+            .query_row(
+                "SELECT sealed_commitment, sealed_envelope
+                 FROM anonymous_mailbox_pull_replays WHERE rowid = ?1",
+                params![rowid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+        if u64::try_from(envelope.len()).map_err(|_| AnonymousMailboxStoreError::Corrupt)?
+            != admitted_bytes
+            || <[u8; 32]>::from(Sha256::digest(&envelope)) != fixed::<32>(&commitment)?
+        {
+            return Err(AnonymousMailboxStoreError::Corrupt);
+        }
     }
     Ok(())
 }
@@ -3458,6 +3601,72 @@ mod tests {
     }
 
     #[test]
+    fn pull_replay_retention_boundary_fails_closed_before_cleanup() {
+        let context = TestContext::new();
+        let item_mailbox = [0xE1; 32];
+        let empty_mailbox = [0xE2; 32];
+        let expires_at = NOW + 1_000;
+        let item_pull = context.pull(item_mailbox, Vec::new(), NOW);
+        let empty_pull = context.pull(empty_mailbox, Vec::new(), NOW);
+        let store = context.open();
+        store
+            .create(
+                &context.lease(item_mailbox, [0xE3; 16], 1, 32, expires_at),
+                NOW,
+            )
+            .unwrap();
+        store
+            .create(
+                &context.lease(empty_mailbox, [0xE4; 16], 1, 32, expires_at),
+                NOW,
+            )
+            .unwrap();
+        let put = context.put(item_mailbox, [0xE5; 16], b"opaque", expires_at);
+        store.put(&put, NOW).unwrap();
+        let first = store.pull_one(&item_pull, NOW).unwrap();
+        assert_eq!(
+            store.pull_one(&empty_pull, NOW).unwrap(),
+            AnonymousMailboxPullOutcome::Empty
+        );
+        let AnonymousMailboxPullOutcome::Item(item) = &first else {
+            panic!("item pull must return an opaque item")
+        };
+        let ack = AnonymousMailboxAckV1::new(
+            item_mailbox,
+            [0xE6; 16],
+            item.item_id,
+            item.sealed_commitment,
+            NOW + 1,
+            &context.reader,
+        )
+        .unwrap();
+        assert_eq!(
+            store.ack(&ack, NOW + 1).unwrap(),
+            AnonymousMailboxAckOutcome::Acknowledged
+        );
+        drop(store);
+
+        let reopened = context.open();
+        assert_eq!(reopened.pull_one(&item_pull, expires_at).unwrap(), first);
+        assert_eq!(
+            reopened.pull_one(&empty_pull, expires_at).unwrap(),
+            AnonymousMailboxPullOutcome::Empty
+        );
+        for pull in [&item_pull, &empty_pull] {
+            assert_eq!(
+                reopened.pull_one(pull, expires_at + 1),
+                Err(AnonymousMailboxStoreError::Rejected),
+                "retention must end even before cleanup removes the row"
+            );
+        }
+        let changed_same_id = context.pull(item_mailbox, Vec::new(), NOW + 1);
+        assert_eq!(
+            reopened.pull_one(&changed_same_id, expires_at),
+            Err(AnonymousMailboxStoreError::Rejected)
+        );
+    }
+
+    #[test]
     fn pull_replay_budget_and_cleanup_are_bounded() {
         let context = TestContext::new();
         let mailbox = [0xC7; 32];
@@ -3532,6 +3741,64 @@ mod tests {
             ),
             Err(AnonymousMailboxStoreError::Corrupt)
         ));
+    }
+
+    #[test]
+    fn oversized_replay_blobs_fail_closed_on_lookup_and_startup() {
+        for oversize_cursor in [false, true] {
+            let context = TestContext::new();
+            let mailbox = [0xE7; 32];
+            let pull = context.pull(mailbox, Vec::new(), NOW);
+            let store = context.open();
+            store
+                .create(&context.lease(mailbox, [0xE8; 16], 1, 32, NOW + 1_000), NOW)
+                .unwrap();
+            store
+                .put(&context.put(mailbox, [0xE9; 16], b"opaque", NOW + 900), NOW)
+                .unwrap();
+            assert!(matches!(
+                store.pull_one(&pull, NOW).unwrap(),
+                AnonymousMailboxPullOutcome::Item(_)
+            ));
+
+            let connection = Connection::open(&context.config.db_path).unwrap();
+            // Simulate a physically valid but corrupt older V3 file. Current
+            // fresh-schema CHECK constraints reject this normal write.
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .unwrap();
+            if oversize_cursor {
+                connection
+                    .execute(
+                        "UPDATE anonymous_mailbox_pull_replays SET cursor = zeroblob(?1)",
+                        params![i64::try_from(CURSOR_BYTES + 1).unwrap()],
+                    )
+                    .unwrap();
+            } else {
+                connection
+                    .execute(
+                        "UPDATE anonymous_mailbox_pull_replays
+                         SET sealed_envelope = zeroblob(?1)",
+                        params![i64::try_from(MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES + 1)
+                            .unwrap()],
+                    )
+                    .unwrap();
+            }
+            drop(connection);
+            assert_eq!(
+                store.pull_one(&pull, NOW + 1),
+                Err(AnonymousMailboxStoreError::Corrupt)
+            );
+            drop(store);
+            assert!(matches!(
+                SqliteAnonymousMailboxStore::open(
+                    context.config.clone(),
+                    context.target.public_key_bytes(),
+                    CURSOR_SECRET,
+                ),
+                Err(AnonymousMailboxStoreError::Corrupt)
+            ));
+        }
     }
 
     #[test]
