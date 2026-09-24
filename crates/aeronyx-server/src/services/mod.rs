@@ -319,6 +319,9 @@ pub(crate) mod discovery_endpoint_quarantine_revocation;
 // exact private descriptor only after current quarantine readiness revalidation.
 pub(crate) mod discovery_endpoint_promotion_material;
 mod discovery_endpoint_verification;
+// [PERMISSIONLESS-DISCOVERY-SAMPLING 2026-09-24 by Codex] Private, bounded
+// gossip and receipt-proven chat selection; runtime wiring remains separate.
+pub(crate) mod discovery_peer_sampling;
 pub mod dns_proxy;
 pub mod handshake;
 pub mod handshake_limiter;
