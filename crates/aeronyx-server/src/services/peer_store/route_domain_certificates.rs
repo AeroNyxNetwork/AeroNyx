@@ -8,6 +8,8 @@
 //! rotation together without changing PeerStore's public API or wire surface.
 
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::{Arc, Barrier};
 
 use aeronyx_core::protocol::discovery::{
     RouteDomainAttestationCertificateV1, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
@@ -186,7 +188,17 @@ impl PeerStore {
         certificate: RouteDomainAttestationCertificateV1,
         now: u64,
     ) -> Result<bool, RouteDomainCertificateImportError> {
-        let policy = self.route_domain_attestor_policy.read().clone();
+        // [ROUTE-DOMAIN-POLICY-ROTATION 2026-09-25 by Codex] Hold the policy
+        // read lock through certificate replacement. Rotation acquires these
+        // locks in the same policy -> certificate order, so a certificate
+        // verified under an old policy cannot reappear after rotation clears
+        // the cache and installs the new policy.
+        let policy = self.route_domain_attestor_policy.read();
+        #[cfg(test)]
+        if let Some(gate) = self.route_domain_import_test_gate.as_ref() {
+            gate.policy_read.wait();
+            gate.continue_after_policy.wait();
+        }
         let expected_domain = policy
             .pinned_route_domains
             .get(&certificate.subject_node_id)
@@ -364,6 +376,12 @@ impl PeerStore {
                         .is_ok()
             })
     }
+}
+
+#[cfg(test)]
+pub(super) struct RouteDomainImportTestGate {
+    pub(super) policy_read: Arc<Barrier>,
+    pub(super) continue_after_policy: Arc<Barrier>,
 }
 
 #[cfg(test)]
@@ -712,6 +730,78 @@ mod tests {
 
         assert!(source
             .export_route_domain_attestation_certificates(now + 600)
+            .is_empty());
+    }
+
+    #[test]
+    fn test_policy_rotation_cannot_restore_certificate_verified_under_old_policy() {
+        // [ROUTE-DOMAIN-POLICY-ROTATION 2026-09-25 by Codex] The barriers
+        // force import to hold the old policy read lock while rotation waits;
+        // the final cache must reflect the rotated policy, never stale
+        // evidence inserted after its clear.
+        let now = 1_700_030_000;
+        let subject = IdentityKeyPair::generate();
+        let old_attestor_a = IdentityKeyPair::generate();
+        let old_attestor_b = IdentityKeyPair::generate();
+        let new_attestor_a = IdentityKeyPair::generate();
+        let new_attestor_b = IdentityKeyPair::generate();
+        let route_domain = [0x61; 16];
+        let old_allowed = [
+            old_attestor_a.public_key_bytes(),
+            old_attestor_b.public_key_bytes(),
+        ];
+        let new_allowed = [
+            new_attestor_a.public_key_bytes(),
+            new_attestor_b.public_key_bytes(),
+        ];
+        let old_certificate = route_domain_certificate_for(
+            subject.public_key_bytes(),
+            route_domain,
+            now - 2,
+            now + 900,
+            &[&old_attestor_a, &old_attestor_b],
+        );
+        let mut store = PeerStore::new();
+        store
+            .configure_route_domain_attestor_policy(
+                &[(subject.public_key_bytes(), route_domain)],
+                &old_allowed,
+                2,
+                true,
+            )
+            .unwrap();
+        assert!(store
+            .import_route_domain_attestation_certificate(old_certificate.clone(), now)
+            .unwrap());
+
+        let gate = Arc::new(RouteDomainImportTestGate {
+            policy_read: Arc::new(Barrier::new(2)),
+            continue_after_policy: Arc::new(Barrier::new(2)),
+        });
+        store.route_domain_import_test_gate = Some(Arc::clone(&gate));
+        let store = Arc::new(store);
+        let import_store = Arc::clone(&store);
+        let import_thread = std::thread::spawn(move || {
+            import_store.import_route_domain_attestation_certificate(old_certificate, now)
+        });
+
+        gate.policy_read.wait();
+        let rotate_store = Arc::clone(&store);
+        let rotation_thread = std::thread::spawn(move || {
+            rotate_store.configure_route_domain_attestor_policy(
+                &[(subject.public_key_bytes(), route_domain)],
+                &new_allowed,
+                2,
+                true,
+            )
+        });
+        gate.continue_after_policy.wait();
+
+        assert!(import_thread.join().unwrap().is_ok());
+        rotation_thread.join().unwrap().unwrap();
+        assert!(!store.route_domain_certificate_allows_multi_hop(&subject.public_key_bytes(), now,));
+        assert!(store
+            .export_route_domain_attestation_certificates(now)
             .is_empty());
     }
 }

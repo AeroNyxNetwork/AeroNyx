@@ -411,7 +411,6 @@ pub(crate) const AUTHENTICATED_CHAT_TERMINAL_FANOUT_LIMIT: usize = 3;
 /// Maximum middle-hop candidates inspected for each authenticated terminal.
 pub(crate) const AUTHENTICATED_CHAT_MIDDLE_CANDIDATE_LIMIT: usize = 8;
 const TWO_HOP_PATH_POLICY_NETWORK_DIVERSE: &str = "distinct_node_and_network_prefix";
-const MAX_ROUTE_DOMAIN_CERTIFICATES: usize = ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES;
 /// Stage-A hard ceiling for self-signed descriptors that have not completed a
 /// separate endpoint-possession proof. This is intentionally independent of
 /// the verified-live peer capacity.
@@ -2879,6 +2878,9 @@ pub struct PeerStore {
         RwLock<HashMap<[u8; 32], PurposeBoundDeliveryReceiptEvidence>>,
     route_domain_attestor_policy: RwLock<PeerStoreRouteDomainAttestorPolicy>,
     route_domain_certificates: RwLock<HashMap<[u8; 32], RouteDomainAttestationCertificateV1>>,
+    #[cfg(test)]
+    route_domain_import_test_gate:
+        Option<Arc<route_domain_certificates::RouteDomainImportTestGate>>,
     max_peers: RwLock<Option<usize>>,
     counters: PeerStoreCounters,
     audit_events: RwLock<VecDeque<PeerStoreAuditEvent>>,
@@ -2909,6 +2911,8 @@ impl PeerStore {
             purpose_bound_delivery_receipt_capability: RwLock::new(HashMap::new()),
             route_domain_attestor_policy: RwLock::new(PeerStoreRouteDomainAttestorPolicy::default()),
             route_domain_certificates: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            route_domain_import_test_gate: None,
             max_peers: RwLock::new(None),
             counters: PeerStoreCounters::new(),
             audit_events: RwLock::new(VecDeque::with_capacity(MAX_AUDIT_EVENTS)),
