@@ -490,7 +490,7 @@ mod tests {
         let mut response = compact_ack(false);
         response.success_receipt = Some(BlindRelaySuccessReceipt::terminal(
             &request.envelope,
-            0,
+            response.ttl_remaining,
             response.reason.as_deref(),
             None,
             response

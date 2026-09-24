@@ -1051,7 +1051,9 @@ mod tests {
                 .display()
                 .to_string(),
             max_leases_total: 4,
-            max_items_total: 8,
+            max_items_total: usize::from(
+                aeronyx_core::protocol::anonymous_mailbox::MAX_ANONYMOUS_MAILBOX_ITEMS_PER_LEASE,
+            ),
             max_bytes_total: 64 * 1024,
             max_in_flight: 2,
             cleanup_batch_size: 8,
