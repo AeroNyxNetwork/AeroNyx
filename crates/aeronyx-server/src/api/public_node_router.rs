@@ -403,14 +403,70 @@ mod tests {
     use super::*;
 
     use crate::services::DiscoveryEndpointEvidenceStoreConfig;
+    use aeronyx_core::ledger::{AERONYX_MEMCHAIN_MAINNET_CHAIN_ID, GENESIS_PREV_HASH};
     use aeronyx_core::protocol::discovery::{DirectoryDescriptorCommitmentV1, NodeDescriptor};
+    use aeronyx_core::protocol::discovery::{NodeCapability, NodeDiscoveryMessage};
     use aeronyx_core::protocol::discovery_endpoint_proof::{
         DiscoveryEndpointAuthenticatedTransportV1, DiscoveryEndpointProofV1,
     };
+    use aeronyx_core::protocol::memchain::{
+        encode_memchain, record_coordinator_lease_request_signing_bytes, MemChainMessage,
+        MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+    };
     use axum::body::to_bytes;
+    use axum::http::header;
+    use std::time::Duration;
 
     fn key(seed: u8) -> IdentityKeyPair {
         IdentityKeyPair::from_bytes(&[seed; 32]).expect("fixed key")
+    }
+
+    fn admit_control_peer(peer_store: &PeerStore, identity: &IdentityKeyPair, now: u64) {
+        let mut descriptor = NodeDescriptor::new(
+            identity.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now.saturating_add(600),
+            "public-router-control-test",
+        );
+        descriptor.capabilities = vec![NodeCapability::EncryptedStorage];
+        let descriptor = SignedNodeDescriptor::sign(descriptor, identity).expect("descriptor");
+        let outcome = peer_store.apply_discovery_message(
+            &NodeDiscoveryMessage::DescriptorAnnounce { descriptor },
+            now,
+        );
+        assert_eq!(outcome.inserted, 1);
+    }
+
+    fn coordinator_lease_frame(
+        coordinator: &IdentityKeyPair,
+        request_id: [u8; 16],
+        request_timestamp: u64,
+    ) -> Vec<u8> {
+        let instance_id = [0x41; 32];
+        let coordinator_id = coordinator.public_key_bytes();
+        let signing_bytes = record_coordinator_lease_request_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            &coordinator_id,
+            &instance_id,
+            0,
+            &GENESIS_PREV_HASH,
+            MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            &request_id,
+            request_timestamp,
+        );
+        encode_memchain(&MemChainMessage::RecordCoordinatorLeaseRequestV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            coordinator: coordinator_id,
+            instance_id,
+            known_tip_height: 0,
+            known_tip_hash: GENESIS_PREV_HASH,
+            requested_ttl_secs: MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            request_id,
+            request_timestamp,
+            signature: coordinator.sign(&signing_bytes),
+        })
+        .expect("lease frame")
     }
 
     fn descriptor(
@@ -603,6 +659,112 @@ mod tests {
             .find("let chat_blob_router =")
             .expect("local listener composition");
         assert!(public_branch < builder && builder < local_branch);
+    }
+
+    #[tokio::test]
+    async fn public_router_control_route_auth_is_coarse_and_rejects_without_mutation() {
+        // [CONTROL-ROUTE-BOUNDARY-TEST 2026-09-25 by Codex] Exercise the
+        // actual public composition root, not only the peer router. An
+        // authenticated but unknown coordinator must be rejected before the
+        // lease write; the same exact signed frame succeeds after admission.
+        let now = unix_now_secs();
+        let coordinator = key(0x31);
+        let witness = Arc::new(key(0x32));
+        let peer_store = Arc::new(PeerStore::new());
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).expect("storage"));
+        storage
+            .audit_record_commitment_chain()
+            .await
+            .expect("genesis audit");
+        let udp = Arc::new(
+            UdpTransport::bind("127.0.0.1:0")
+                .await
+                .expect("loopback udp"),
+        );
+        let deps = PublicNodeRouterDependencies {
+            peer_store: Arc::clone(&peer_store),
+            discovery_api_policy: DiscoveryApiPolicy::default(),
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(8, Duration::from_secs(30))),
+            udp,
+            node_identity: Arc::clone(&witness),
+            peer_http_client: Arc::new(reqwest::Client::new()),
+            local_capability_status: DiscoveryLocalCapabilityStatus::default(),
+            directory_chain_store: None,
+            directory_replica_store: None,
+            directory_replica_sync_runtime: Arc::new(DirectoryReplicaSyncRuntime::default()),
+            directory_chain_sync_peer_ids: Vec::new(),
+            directory_observation_witness_min_verified: 0,
+            directory_observation_witness_maturity_delay_secs: 0,
+            directory_full_node_mirror_enabled: false,
+            directory_full_node_mirror_max_producers: 0,
+            commitment_storage: Some(Arc::clone(&storage)),
+            commitment_lease_authorized_coordinator: Some(coordinator.public_key_bytes()),
+            commitment_sync_tip_notifier: None,
+            blind_vault: None,
+            blind_vault_public_api_enabled: false,
+            blind_vault_admission: Arc::new(BlindVaultApiAdmissionRuntime::default()),
+            anonymous_mailbox: None,
+            endpoint_proof_enabled: false,
+            endpoint_proof_max_entries: 1,
+            endpoint_proof_ttl_secs: 1,
+            endpoint_evidence: None,
+            endpoint_attestation_inbox: None,
+        };
+        let router = build_public_node_router(deps);
+        let malformed = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/coordinator-lease")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(vec![0u8; 1]))
+                    .expect("malformed request"),
+            )
+            .await
+            .expect("malformed response");
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        let malformed_body = to_bytes(malformed.into_body(), 1024)
+            .await
+            .expect("malformed coarse body");
+        assert!(malformed_body.len() <= 128);
+
+        let frame = coordinator_lease_frame(&coordinator, [0x51; 16], now);
+        let rejected = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/coordinator-lease")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(frame.clone()))
+                    .expect("unknown coordinator request"),
+            )
+            .await
+            .expect("unknown coordinator response");
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        let rejected_body = to_bytes(rejected.into_body(), 1024)
+            .await
+            .expect("coarse body");
+        assert!(rejected_body.len() <= 128);
+        assert!(!String::from_utf8_lossy(&rejected_body).contains("31"));
+
+        // The exact signed request must still be usable after the peer is
+        // admitted, proving the rejection above did not consume lease state.
+        admit_control_peer(&peer_store, &coordinator, now);
+        let admitted = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/coordinator-lease")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(frame))
+                    .expect("admitted coordinator request"),
+            )
+            .await
+            .expect("admitted coordinator response");
+        assert_eq!(admitted.status(), StatusCode::OK);
     }
 
     #[tokio::test]
