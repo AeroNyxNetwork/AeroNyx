@@ -707,6 +707,7 @@ pub(super) fn read_record_commitment_tip_transaction(
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecordCommitmentTipAnchorV1 {
     contract_version: String,
