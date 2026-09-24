@@ -95,6 +95,8 @@
 //! - [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] Copies the bounded
 //!   receipt rows under one SQLite snapshot, then verifies them after releasing
 //!   the connection lock on read-only audit and readiness paths.
+//! - [CUSTODY-WITNESS-FULL-DURABILITY 2026-09-24 by Codex] Requires verified
+//!   SQLite FULL-or-stronger durability before acknowledging a new receipt.
 //! - [ANCHOR-WORKER-PRIVACY 2026-07-30 by Codex] Runs signed local-anchor
 //!   writes through one privacy-safe blocking worker boundary.
 //!
@@ -211,6 +213,8 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! [CUSTODY-WITNESS-FULL-DURABILITY 2026-09-24 by Codex] Refuse receipt
+//! acknowledgement until the shared SQLite connection verifies FULL commits.
 //! v2.8.65-CustodyWitnessReceiptImport - Reused one atomic vault transaction
 //! for live receipts and explicitly time-bounded operator imports.
 //! v2.8.64-CustodyWitnessReceiptVault - Persisted and re-audited exact signed
@@ -3114,6 +3118,42 @@ fn insert_trusted_checkpoint_divergence_incident(
 const LIVE_CUSTODY_WITNESS_RECEIPT_MAX_DELAY_SECS: u64 = 60;
 const MAX_OPERATOR_CUSTODY_WITNESS_RECEIPT_IMPORT_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 const CUSTODY_WITNESS_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 60;
+
+// [CUSTODY-WITNESS-FULL-DURABILITY 2026-09-24 by Codex] The commitment
+// coordinator and receipt vault share one SQLite connection and must interpret
+// its effective synchronous mode identically. An unknown mode is never proof
+// that an acknowledged transaction survives host power loss.
+fn read_sqlite_durability(
+    connection: &rusqlite::Connection,
+) -> Result<(i64, &'static str), String> {
+    let level: i64 = connection
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .map_err(|error| format!("read SQLite durability: {error}"))?;
+    match level {
+        0 => Ok((level, "off")),
+        1 => Ok((level, "normal")),
+        2 => Ok((level, "full")),
+        3 => Ok((level, "extra")),
+        _ => Err(format!("unsupported SQLite synchronous level {level}")),
+    }
+}
+
+fn ensure_full_sqlite_durability(
+    connection: &rusqlite::Connection,
+) -> Result<(i64, &'static str), String> {
+    if read_sqlite_durability(connection)?.0 < 2 {
+        connection
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(|error| format!("set SQLite FULL durability: {error}"))?;
+    }
+    let (level, mode) = read_sqlite_durability(connection)?;
+    if level < 2 {
+        return Err(format!(
+            "SQLite FULL durability is required; effective mode is {mode}"
+        ));
+    }
+    Ok((level, mode))
+}
 const CUSTODY_WITNESS_RECEIPT_ADMISSION_LIVE: i64 = 0;
 const CUSTODY_WITNESS_RECEIPT_ADMISSION_OPERATOR_IMPORT: i64 = 1;
 
@@ -3766,6 +3806,14 @@ impl MemoryStorage {
         )?;
 
         let mut conn = self.conn.lock().await;
+        // [CUSTODY-WITNESS-FULL-DURABILITY 2026-09-24 by Codex] A follower's
+        // default WAL/NORMAL mode can lose an acknowledged receipt on power
+        // failure. SQLite forbids changing synchronous inside a transaction,
+        // so upgrade and read back under this same connection lock before
+        // BEGIN IMMEDIATE. No other production path lowers it before commit.
+        let (durability_level, _) = ensure_full_sqlite_durability(&conn)?;
+        self.commitment_durability
+            .store(durability_level as u64, Ordering::Release);
         let transaction = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("begin custody witness receipt transaction: {error}"))?;
@@ -6298,8 +6346,8 @@ impl MemoryStorage {
     /// acknowledged transaction after host power failure. The single-writer
     /// coordinator therefore upgrades the shared connection to `FULL` and
     /// refuses startup unless `SQLite` reports FULL-or-stronger. Followers keep
-    /// the existing mode to avoid imposing coordinator write latency on every
-    /// verifier. This setting contains no chain or user data.
+    /// the existing mode until a receipt-vault write requires FULL durability.
+    /// This setting contains no chain or user data.
     ///
     /// # Errors
     ///
@@ -6313,28 +6361,16 @@ impl MemoryStorage {
         let coordinator_fence_state =
             self.configure_record_commitment_coordinator_fence(coordinator)?;
         let conn = self.conn.lock().await;
-        if coordinator {
-            conn.pragma_update(None, "synchronous", "FULL")
-                .map_err(|error| format!("set coordinator SQLite durability: {error}"))?;
-        }
-        let level: i64 = conn
-            .query_row("PRAGMA synchronous", [], |row| row.get(0))
-            .map_err(|error| format!("read SQLite durability: {error}"))?;
-        drop(conn);
-        let (mode, durability_level) = match level {
-            0 => ("off", 0),
-            1 => ("normal", 1),
-            2 => ("full", 2),
-            3 => ("extra", 3),
-            _ => return Err(format!("unsupported SQLite synchronous level {level}")),
+        // [CUSTODY-WITNESS-FULL-DURABILITY 2026-09-24 by Codex] The coordinator
+        // and receipt vault use one effective-mode parser and FULL readback.
+        let (level, mode) = if coordinator {
+            ensure_full_sqlite_durability(&conn)?
+        } else {
+            read_sqlite_durability(&conn)?
         };
-        if coordinator && level < 2 {
-            return Err(format!(
-                "commitment coordinator requires SQLite FULL durability; effective mode is {mode}"
-            ));
-        }
+        drop(conn);
         self.commitment_durability
-            .store(durability_level, Ordering::Release);
+            .store(level as u64, Ordering::Release);
         info!(
             role = if coordinator {
                 "coordinator"
@@ -10343,6 +10379,110 @@ mod tests {
             .await
             .unwrap_err()
             .contains("reserved by adverse evidence"));
+    }
+
+    #[tokio::test]
+    async fn custody_witness_receipt_ack_requires_full_sqlite_durability() {
+        // [CUSTODY-WITNESS-FULL-DURABILITY 2026-09-24 by Codex] A file-backed
+        // non-coordinator starts in WAL/NORMAL. Its first acknowledged receipt
+        // must upgrade the same connection before commit, and a reopened vault
+        // must still audit the exact opaque signed evidence.
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("custody-receipt-durability.db");
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+        assert_eq!(
+            storage
+                .configure_record_commitment_durability(false)
+                .await
+                .unwrap(),
+            "normal"
+        );
+        let producer = IdentityKeyPair::from_bytes(&[0x91; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0x92; 32]).unwrap();
+        let producer_id = producer.public_key_bytes();
+        let frame_sha256 = [0x93; 32];
+        let observed_at = 1_700_830_000;
+        let receipt = CustodyAuditWitnessReceiptV1::signed(
+            producer_id,
+            1,
+            frame_sha256,
+            observed_at,
+            1,
+            frame_sha256,
+            CUSTODY_AUDIT_WITNESS_ADVANCED_V1,
+            &witness,
+        )
+        .unwrap();
+        assert_eq!(
+            storage
+                .persist_custody_audit_witness_receipt(
+                    &receipt,
+                    &producer_id,
+                    1,
+                    &frame_sha256,
+                    observed_at,
+                )
+                .await
+                .unwrap(),
+            CustodyAuditWitnessReceiptPersistOutcome::Inserted
+        );
+        let level: i64 = {
+            let conn = storage.conn_lock().await;
+            conn.query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert!(level >= 2);
+        assert_eq!(
+            storage
+                .record_commitment_chain_integrity_status()
+                .durability_mode,
+            "full"
+        );
+        drop(storage);
+
+        let reopened = MemoryStorage::open(&db_path, None).unwrap();
+        assert_eq!(
+            reopened
+                .audit_custody_audit_witness_receipt_evidence()
+                .await
+                .unwrap()
+                .records,
+            1
+        );
+        assert_eq!(
+            reopened
+                .persist_custody_audit_witness_receipt(
+                    &receipt,
+                    &producer_id,
+                    1,
+                    &frame_sha256,
+                    observed_at + 1,
+                )
+                .await
+                .unwrap(),
+            CustodyAuditWitnessReceiptPersistOutcome::AlreadyPresent
+        );
+        let conn = reopened.conn_lock().await;
+        assert!(read_sqlite_durability(&conn).unwrap().0 >= 2);
+    }
+
+    #[test]
+    fn custody_witness_receipt_durability_upgrade_fails_inside_transaction() {
+        // [CUSTODY-WITNESS-FULL-DURABILITY 2026-09-24 by Codex] This is the
+        // deterministic SQLite failure boundary: a synchronous change after
+        // BEGIN is forbidden, so the shared helper must never certify NORMAL
+        // or allow the caller to report an inserted receipt.
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("PRAGMA synchronous=NORMAL; BEGIN IMMEDIATE;")
+            .unwrap();
+        assert!(ensure_full_sqlite_durability(&connection).is_err());
+        assert_eq!(read_sqlite_durability(&connection).unwrap().0, 1);
+        let changes: i64 = connection
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(changes, 0);
+        connection.execute_batch("ROLLBACK;").unwrap();
     }
 
     #[tokio::test]
