@@ -431,9 +431,16 @@ mod tests {
         );
         descriptor.capabilities = vec![NodeCapability::EncryptedStorage];
         let descriptor = SignedNodeDescriptor::sign(descriptor, identity).expect("descriptor");
-        let outcome = peer_store.apply_discovery_message(
-            &NodeDiscoveryMessage::DescriptorAnnounce { descriptor },
+        // [CONTROL-ROUTE-FIXTURE 2026-09-25 by Codex] The public discovery
+        // router enables permissionless candidate mode, so a self-signed
+        // DescriptorAnnounce is intentionally retained as a candidate rather
+        // than promoted to live peers. This helper models the independently
+        // trusted admission that the control-route test needs without
+        // weakening the production discovery gate.
+        let outcome = peer_store.apply_verified_descriptor_from_source(
+            descriptor,
             now,
+            "test_control_admission",
         );
         assert_eq!(outcome.inserted, 1);
     }
