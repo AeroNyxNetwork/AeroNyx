@@ -9,6 +9,9 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+# - [PERMISSIONLESS-JOIN-COMMIT-PIN 2026-09-24 by Codex] Expose an exact
+#   full-commit source pin for operator join; branch-only installs remain
+#   explicitly unpinned.
 # - [PERMISSIONLESS-NODE-JOIN 2026-09-24 by Codex] Add one command to prepare
 #   operator-selected discovery seeds, install without nodeboard registration,
 #   and submit the node's canonical signed descriptor for Stage-A admission.
@@ -271,7 +274,7 @@ Commands:
 Common options:
   --repo-dir PATH          Repository path. Default: /opt/aeronyx/AeroNyx
   --branch NAME            Git branch/ref. Default: main
-  --commit SHA             Upgrade from this exact 40-hex commit in isolation.
+  --commit SHA             Exact full 40-hex source pin for upgrade or join.
   --config PATH            Config path for upgrade/health/status.
   --service NAME           systemd service name. Default: aeronyx-server
   --registration-code CODE Registration code for install.
@@ -287,6 +290,7 @@ Common options:
   --dry-run                Preview actions where the delegated script supports it.
 
   join:
+    --commit SHA           Build/verify this exact origin-reachable commit before start/POST.
     --seed URL             Add an operator-selected public bootstrap seed (repeatable).
     --public-endpoint URL  This node's externally reachable discovery API base URL.
     --join-timeout S       Bounded local descriptor wait, 1-600 seconds (default 180).

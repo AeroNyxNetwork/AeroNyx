@@ -12,6 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODE_SCRIPT="${SCRIPT_DIR}/../aeronyx-node.sh"
+INSTALL_SCRIPT="${SCRIPT_DIR}/../install.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aeronyx-join-test.XXXXXX")"
 trap 'rm -rf -- "${TEST_ROOT}"' EXIT
 
@@ -34,6 +35,7 @@ assert_fails() {
 
 JOIN_PUBLIC_ENDPOINT="https://9.9.9.9:8422"
 JOIN_SEEDS=("https://8.8.8.8:8422")
+SOURCE_COMMIT=""
 JOIN_TIMEOUT=1
 JSON=1
 CONFIG_FILE="${TEST_ROOT}/server.toml"
@@ -398,5 +400,263 @@ assert_fails "service activation during identical install blocks POST" run_join
 [[ "$(wc -l <"${TEST_ROOT}/post_calls")" -eq "${post_count_before}" ]] \
     || fail "same-config service race sent a join request"
 pass "same-config active-service race remains fail-closed"
+
+# [PERMISSIONLESS-JOIN-COMMIT-PIN 2026-09-24 by Codex] A tiny file:// origin
+# proves first-install and existing-repo pins without a socket, package
+# install, systemd service, or release build. Advancing the remote branch
+# after the one fetch/clone must never move the selected build commit.
+PIN_ORIGIN="${TEST_ROOT}/pin-origin.git"
+PIN_SOURCE="${TEST_ROOT}/pin-source"
+command git init -q --bare "${PIN_ORIGIN}"
+command git init -q "${PIN_SOURCE}"
+command git -C "${PIN_SOURCE}" checkout -q -b main
+printf '[package]\nname = "pin-fixture"\nversion = "0.1.0"\n' >"${PIN_SOURCE}/Cargo.toml"
+mkdir -p "${PIN_SOURCE}/src"
+printf 'pub fn pinned_source() -> u8 { 1 }\n' >"${PIN_SOURCE}/src/lib.rs"
+printf 'unchanged tracked source\n' >"${PIN_SOURCE}/README.md"
+printf 'target/\n' >"${PIN_SOURCE}/.gitignore"
+command git -C "${PIN_SOURCE}" add -- Cargo.toml README.md .gitignore src/lib.rs
+command git -C "${PIN_SOURCE}" -c user.name=Fixture -c user.email=fixture@example.invalid \
+    commit -q -m initial
+PIN_COMMIT="$(command git -C "${PIN_SOURCE}" rev-parse HEAD)"
+command git -C "${PIN_SOURCE}" remote add origin "file://${PIN_ORIGIN}"
+command git -C "${PIN_SOURCE}" push -q -u origin main
+pin_push_next() {
+    printf '[package]\nname = "pin-fixture"\nversion = "0.%s.0"\n' "$1" \
+        >"${PIN_SOURCE}/Cargo.toml"
+    command git -C "${PIN_SOURCE}" add -- Cargo.toml
+    command git -C "${PIN_SOURCE}" -c user.name=Fixture -c user.email=fixture@example.invalid \
+        commit -q -m "advance-$1"
+    command git -C "${PIN_SOURCE}" push -q origin main
+}
+pin_push_next 2
+
+(
+    set --
+    source "${INSTALL_SCRIPT}"
+    REPO_URL="file://${PIN_ORIGIN}"
+    REPO_DIR="${TEST_ROOT}/pin-first"
+    BRANCH=main
+    SOURCE_COMMIT="${PIN_COMMIT}"
+    DRY_RUN=0
+    validate_option_combinations
+    run() {
+        "$@" >/dev/null
+        if [ "$1" = git ] && [ "$2" = clone ]; then
+            pin_push_next 3
+        fi
+    }
+    prepare_repo
+    [ "$(command git -C "${REPO_DIR}" rev-parse HEAD)" = "${PIN_COMMIT}" ]
+    [ "$(resolve_build_git_commit)" = "${PIN_COMMIT}" ]
+) || fail "first-install pin followed an advancing branch"
+pass "first install keeps exact source and full embedded commit after branch advance"
+
+command git clone -q --branch main "file://${PIN_ORIGIN}" "${TEST_ROOT}/pin-existing"
+(
+    set --
+    source "${INSTALL_SCRIPT}"
+    REPO_URL="file://${PIN_ORIGIN}"
+    REPO_DIR="${TEST_ROOT}/pin-existing"
+    BRANCH=main
+    SOURCE_COMMIT="${PIN_COMMIT}"
+    DRY_RUN=0
+    run() {
+        "$@" >/dev/null
+        if [ "$1" = git ] && [ "${4:-}" = fetch ]; then
+            pin_push_next 4
+        fi
+    }
+    prepare_repo
+    [ "$(command git -C "${REPO_DIR}" rev-parse HEAD)" = "${PIN_COMMIT}" ]
+    [ "$(resolve_build_git_commit)" = "${PIN_COMMIT}" ]
+) || fail "existing-repo pin followed an advancing branch"
+pass "existing repo fetches once and builds exact pin despite branch advance"
+
+command git clone -q --branch main "file://${PIN_ORIGIN}" "${TEST_ROOT}/pin-race"
+if (
+    set --
+    source "${INSTALL_SCRIPT}"
+    REPO_URL="file://${PIN_ORIGIN}"
+    REPO_DIR="${TEST_ROOT}/pin-race"
+    BRANCH=main
+    SOURCE_COMMIT="${PIN_COMMIT}"
+    DRY_RUN=0
+    git() {
+        command git "$@"
+        local rc=$?
+        if [ "${3:-}" = checkout ]; then
+            command git -C "${REPO_DIR}" update-ref \
+                refs/remotes/origin/main "${PIN_COMMIT}"
+        fi
+        return "${rc}"
+    }
+    prepare_repo >/dev/null 2>&1
+); then
+    fail "concurrent fetched-ref drift was accepted"
+fi
+pass "local fetched-ref race fails before pinned build"
+
+command git clone -q --branch main "file://${PIN_ORIGIN}" "${TEST_ROOT}/pin-dirty"
+if (
+    set --
+    source "${INSTALL_SCRIPT}"
+    REPO_URL="file://${PIN_ORIGIN}"
+    REPO_DIR="${TEST_ROOT}/pin-dirty"
+    BRANCH=main
+    SOURCE_COMMIT="${PIN_COMMIT}"
+    DRY_RUN=0
+    git() {
+        command git "$@"
+        local rc=$?
+        if [ "${3:-}" = checkout ]; then
+            printf 'post-checkout tracked edit\n' >>"${REPO_DIR}/README.md"
+        fi
+        return "${rc}"
+    }
+    prepare_repo >/dev/null 2>&1
+); then
+    fail "tracked edit introduced after detach was accepted"
+fi
+pass "post-detach tracked edit fails before build"
+
+command git -C "${TEST_ROOT}/pin-dirty" restore -- README.md
+printf 'pub fn unexpected_change() -> u8 { 2 }\n' \
+    >>"${TEST_ROOT}/pin-dirty/src/lib.rs"
+[ "$(command git -C "${TEST_ROOT}/pin-dirty" rev-parse HEAD)" = "${PIN_COMMIT}" ] \
+    || fail "dirty-source fixture is not at pinned HEAD"
+if command git -C "${TEST_ROOT}/pin-dirty" diff --quiet -- src/lib.rs; then
+    fail "dirty Rust source fixture was not tracked and modified"
+fi
+
+if (
+    set --
+    source "${INSTALL_SCRIPT}"
+    SOURCE_COMMIT="${PIN_COMMIT}"
+    ALLOW_DIRTY=1
+    validate_option_combinations >/dev/null 2>&1
+); then
+    fail "pinned install accepted --allow-dirty"
+fi
+pass "pin rejects allow-dirty before any repository mutation"
+
+rm -f -- "${TEST_ROOT}/systemctl_calls"
+rm -f -- "${TEST_ROOT}/build_calls"
+post_count_before="$(wc -l <"${TEST_ROOT}/post_calls")"
+if (
+    SOURCE_COMMIT="${PIN_COMMIT}"
+    REPO_DIR="${TEST_ROOT}/pin-dirty"
+    SERVICE_ACTIVE=0
+    unset ACTIVATE_DURING_INSTALL
+    run_installer() {
+        (
+            set --
+            source "${INSTALL_SCRIPT}"
+            REPO_URL="file://${PIN_ORIGIN}"
+            REPO_DIR="${TEST_ROOT}/pin-dirty"
+            BRANCH=main
+            SOURCE_COMMIT="${PIN_COMMIT}"
+            DRY_RUN=0
+            prepare_repo
+            printf 'build\n' >"${TEST_ROOT}/build_calls"
+        )
+    }
+    run_join >/dev/null 2>&1
+); then
+    fail "dirty pinned join continued after installer rejection"
+fi
+[ ! -e "${TEST_ROOT}/systemctl_calls" ] \
+    || fail "dirty pinned join started the service"
+[ ! -e "${TEST_ROOT}/build_calls" ] \
+    || fail "dirty pinned join reached the build"
+[[ "$(wc -l <"${TEST_ROOT}/post_calls")" -eq "${post_count_before}" ]] \
+    || fail "dirty pinned join sent a POST"
+pass "same-HEAD dirty tracked Rust source causes zero build, start, or POST"
+
+if (
+    set --
+    source "${INSTALL_SCRIPT}"
+    REPO_URL="file://${PIN_ORIGIN}"
+    REPO_DIR="${TEST_ROOT}/pin-existing"
+    BRANCH=main
+    SOURCE_COMMIT="$(printf 'f%.0s' {1..40})"
+    DRY_RUN=0
+    prepare_repo >/dev/null 2>&1
+); then
+    fail "origin-unreachable commit was accepted"
+fi
+pass "origin-unreachable full commit fails closed"
+
+if (
+    set --
+    source "${INSTALL_SCRIPT}"
+    REPO_URL="https://untrusted.example.invalid/repo.git"
+    REPO_DIR="${TEST_ROOT}/pin-existing"
+    BRANCH=main
+    SOURCE_COMMIT="${PIN_COMMIT}"
+    DRY_RUN=0
+    prepare_repo >/dev/null 2>&1
+); then
+    fail "untrusted existing origin was accepted"
+fi
+pass "pinned install rejects untrusted existing origin"
+
+# The join wrapper must fail before service start or POST when the installer's
+# resulting source or binary does not prove the requested pin.
+SOURCE_COMMIT="${PIN_COMMIT}"
+REPO_DIR="${TEST_ROOT}/pin-existing"
+SERVICE_ACTIVE=0
+unset ACTIVATE_DURING_INSTALL
+rm -f -- "${TEST_ROOT}/systemctl_calls"
+post_count_before="$(wc -l <"${TEST_ROOT}/post_calls")"
+assert_fails "pinned join rejects missing binary before start" run_join
+[ ! -e "${TEST_ROOT}/systemctl_calls" ] \
+    || fail "pinned join started service after binary mismatch"
+[[ "$(wc -l <"${TEST_ROOT}/post_calls")" -eq "${post_count_before}" ]] \
+    || fail "pinned join posted after binary mismatch"
+mkdir -p "${REPO_DIR}/target/release"
+printf '#!/bin/sh\n# %s\n' "${PIN_COMMIT}" \
+    >"${REPO_DIR}/target/release/aeronyx-server"
+chmod 755 "${REPO_DIR}/target/release/aeronyx-server"
+result="$(run_join)" || fail "pinned join rejected exact source and binary fixture"
+[[ "${result}" == *'"status":"accepted"'* ]] \
+    || fail "pinned join lost Stage-A response"
+command grep -q -- "${PIN_COMMIT}" "${TEST_ROOT}/installer_args" \
+    || fail "join did not pass the full pin to installer"
+(
+    set --
+    source "${INSTALL_SCRIPT}"
+    REPO_DIR="${TEST_ROOT}/pin-existing"
+    SOURCE_COMMIT="${PIN_COMMIT}"
+    verify_pinned_release
+) || fail "installer prestart release check rejected exact binary fixture"
+pass "join forwards full pin and starts only after matching source and binary"
+
+rm -f -- "${TEST_ROOT}/systemctl_calls"
+post_count_before="$(wc -l <"${TEST_ROOT}/post_calls")"
+printf '#!/bin/sh\n# wrong binary marker\n' \
+    >"${REPO_DIR}/target/release/aeronyx-server"
+assert_fails "pinned join rejects mismatched embedded runtime" run_join
+[ ! -e "${TEST_ROOT}/systemctl_calls" ] \
+    || fail "mismatched binary started service"
+[[ "$(wc -l <"${TEST_ROOT}/post_calls")" -eq "${post_count_before}" ]] \
+    || fail "mismatched binary sent POST"
+pass "binary runtime mismatch prevents service start and POST"
+
+printf '#!/bin/sh\n# %s\n' "${PIN_COMMIT}" \
+    >"${REPO_DIR}/target/release/aeronyx-server"
+command git -C "${REPO_DIR}" checkout -q --detach \
+    "refs/remotes/origin/main"
+assert_fails "pinned join rejects checkout drift" run_join
+[ ! -e "${TEST_ROOT}/systemctl_calls" ] \
+    || fail "checkout drift started service"
+[[ "$(wc -l <"${TEST_ROOT}/post_calls")" -eq "${post_count_before}" ]] \
+    || fail "checkout drift sent POST"
+command git -C "${REPO_DIR}" checkout -q --detach "${PIN_COMMIT}"
+pass "source checkout drift prevents service start and POST"
+
+SOURCE_COMMIT=short
+assert_fails "join rejects abbreviated commit" validate_join_options
+unset SOURCE_COMMIT SERVICE_ACTIVE
 
 printf 'PASS: all join fixtures\n'

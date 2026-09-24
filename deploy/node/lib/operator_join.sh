@@ -27,6 +27,15 @@ validate_join_options() {
     [[ "${JOIN_TIMEOUT}" =~ ^[0-9]+$ ]] \
         && [ "${JOIN_TIMEOUT}" -ge 1 ] && [ "${JOIN_TIMEOUT}" -le 600 ] \
         || die "join timeout must be 1-600 seconds"
+    # [PERMISSIONLESS-JOIN-COMMIT-PIN 2026-09-24 by Codex] Never silently
+    # ignore a requested release pin on this install-and-submit path.
+    if [ -n "${SOURCE_COMMIT}" ]; then
+        [[ "${SOURCE_COMMIT}" =~ ^[0-9A-Fa-f]{40}$ ]] \
+            || die "join --commit requires one full 40-hex Git commit"
+        SOURCE_COMMIT="$(printf '%s' "${SOURCE_COMMIT}" | tr 'A-F' 'a-f')"
+        [ "${JOIN_CHECK_ONLY}" -eq 0 ] \
+            || die "join --commit requires an install build, not --check-only"
+    fi
     select_join_python
     command -v curl >/dev/null 2>&1 || die "join requires curl"
     JOIN_PUBLIC_ENDPOINT="${JOIN_PUBLIC_ENDPOINT%/}"
@@ -616,6 +625,17 @@ validate_join_binary() {
     "${binary}" validate -c "${CONFIG_FILE}" >/dev/null 2>&1
 }
 
+verify_join_commit_pin() {
+    [ -n "${SOURCE_COMMIT}" ] || return 0
+    local binary="${REPO_DIR}/target/release/aeronyx-server" actual_head
+    actual_head="$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null)" \
+        || die "Pinned join source is unavailable"
+    [ "${actual_head}" = "${SOURCE_COMMIT}" ] \
+        || die "Pinned join source changed before service start"
+    [ -x "${binary}" ] && LC_ALL=C grep -aFq -- "${SOURCE_COMMIT}" "${binary}" \
+        || die "Pinned join binary does not embed the requested full commit"
+}
+
 run_join() {
     validate_join_options
     validate_service_name
@@ -631,9 +651,14 @@ run_join() {
         [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" -eq 0 ] \
             || die "join install requires root on Linux/systemd"
         command -v systemctl >/dev/null 2>&1 || die "join install requires systemd"
+        if [ -n "${SOURCE_COMMIT}" ] && systemctl is-active --quiet "${SERVICE_NAME}"; then
+            die "Pinned join refuses an already active service; no restart or POST attempted"
+        fi
     fi
 
     local config_result=0
+    local -a install_args=(--repo-dir "${REPO_DIR}" --branch "${BRANCH}")
+    [ -z "${SOURCE_COMMIT}" ] || install_args+=(--commit "${SOURCE_COMMIT}")
     join_config check || config_result=$?
     if [ "${config_result}" -eq 1 ]; then
         die "join config is unsafe or malformed"
@@ -647,27 +672,27 @@ run_join() {
         require_script "${INSTALL_SCRIPT}"
         # Build and install without starting, then make the discovery-only
         # config change. The installer receives no registration code.
-        AERONYX_START=0 run_installer --repo-dir "${REPO_DIR}" --branch "${BRANCH}" \
-            --no-enable \
+        AERONYX_START=0 run_installer "${install_args[@]}" --no-enable \
             >/dev/null 2>&1 || die "join install failed before service start"
         if systemctl is-active --quiet "${SERVICE_NAME}"; then
             die "service became active during install; no config edit or restart attempted"
         fi
         join_config write || die "join config edit failed closed"
         validate_join_binary || die "join config validation failed; service not started"
+        verify_join_commit_pin
         systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 \
             || die "join service enable failed"
         systemctl start "${SERVICE_NAME}" >/dev/null 2>&1 \
             || die "join service start failed"
     elif ! systemctl is-active --quiet "${SERVICE_NAME}"; then
         require_script "${INSTALL_SCRIPT}"
-        AERONYX_START=0 run_installer --repo-dir "${REPO_DIR}" --branch "${BRANCH}" \
-            --no-enable \
+        AERONYX_START=0 run_installer "${install_args[@]}" --no-enable \
             >/dev/null 2>&1 || die "join install failed before service start"
         if systemctl is-active --quiet "${SERVICE_NAME}"; then
             die "service became active during install; no enable, start, or join POST attempted"
         fi
         validate_join_binary || die "join config validation failed; service not started"
+        verify_join_commit_pin
         systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 \
             || die "join service enable failed"
         systemctl start "${SERVICE_NAME}" >/dev/null 2>&1 \

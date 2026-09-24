@@ -225,6 +225,7 @@ SCRIPT_VERSION="v1.30.0-node-deploy"
 
 REPO_URL="${AERONYX_REPO_URL:-${DEFAULT_REPO_URL}}"
 BRANCH="${AERONYX_BRANCH:-${DEFAULT_BRANCH}}"
+SOURCE_COMMIT=""
 REPO_DIR="${AERONYX_REPO_DIR:-${DEFAULT_REPO_DIR}}"
 REGISTRATION_CODE="${AERONYX_REGISTRATION_CODE:-}"
 unset AERONYX_REGISTRATION_CODE
@@ -428,6 +429,7 @@ Options:
   --repo-url URL          Git repository URL. Default: https://github.com/AeroNyxNetwork/AeroNyx.git
   --branch NAME           Git branch or ref. Default: main
   --repo-dir PATH         Install repository path. Default: /opt/aeronyx/AeroNyx
+  --commit SHA            Build an exact full 40-hex commit reachable from the trusted origin branch.
   --registration-code C   Register node after build.
   --registration-code-stdin
                           Read one bounded registration code line from stdin.
@@ -477,6 +479,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --repo-url) REPO_URL="${2:?missing value}"; shift 2 ;;
         --branch) BRANCH="${2:?missing value}"; shift 2 ;;
+        --commit) SOURCE_COMMIT="${2:?missing value}"; shift 2 ;;
         --repo-dir) REPO_DIR="${2:?missing value}"; shift 2 ;;
         --registration-code) REGISTRATION_CODE="${2:?missing value}"; DO_START=1; shift 2 ;;
         --registration-code-stdin) REGISTRATION_CODE_STDIN=1; DO_START=1; shift ;;
@@ -547,6 +550,18 @@ require_linux_systemd() {
 }
 
 validate_option_combinations() {
+    # [PERMISSIONLESS-JOIN-COMMIT-PIN 2026-09-24 by Codex] A pin is a release
+    # contract, not a hint to follow a branch or skip the binary build.
+    if [ -n "${SOURCE_COMMIT}" ]; then
+        [[ "${SOURCE_COMMIT}" =~ ^[0-9A-Fa-f]{40}$ ]] \
+            || die "--commit requires one full 40-hex Git commit"
+        SOURCE_COMMIT="$(printf '%s' "${SOURCE_COMMIT}" | tr 'A-F' 'a-f')"
+        [ "${DO_BUILD}" -eq 1 ] && [ "${CONFIG_ONLY}" -eq 0 ] \
+            && [ "${PREFLIGHT_ONLY}" -eq 0 ] && [ "${NETWORK_ONLY}" -eq 0 ] \
+            || die "--commit requires an exact-source release build"
+        [ "${ALLOW_DIRTY}" -eq 0 ] \
+            || die "--commit cannot be combined with --allow-dirty"
+    fi
     if [ "${NETWORK_ONLY}" -eq 1 ] && [ "${CONFIG_ONLY}" -eq 1 ]; then
         die "--network-only cannot be combined with --config-only."
     fi
@@ -610,6 +625,7 @@ print_install_plan() {
 AeroNyx node install plan
 repo_url=${REPO_URL}
 branch=${BRANCH}
+commit=$([ -n "${SOURCE_COMMIT}" ] && printf '%s' "${SOURCE_COMMIT}" || printf 'branch-tip-unpinned')
 repo_dir=${REPO_DIR}
 config_file=${CONFIG_FILE}
 service_name=${SERVICE_NAME}
@@ -1173,6 +1189,10 @@ is_git_worktree() {
 }
 
 prepare_repo() {
+    if [ -n "${SOURCE_COMMIT}" ]; then
+        prepare_pinned_repo
+        return
+    fi
     # [GIT-WORKTREE-COMPAT 2026-07-26 by Codex] In a linked worktree `.git`
     # is a pointer file, so filesystem shape is not valid repository evidence.
     if is_git_worktree; then
@@ -1188,6 +1208,54 @@ prepare_repo() {
     fi
 
     [ "${DRY_RUN}" -eq 1 ] || [ -f "${REPO_DIR}/Cargo.toml" ] || die "Cargo.toml not found in ${REPO_DIR}"
+}
+
+prepare_pinned_repo() {
+    local actual_origin fetched_tip actual_head current_tip
+    # [PERMISSIONLESS-JOIN-COMMIT-PIN 2026-09-24 by Codex] Existing checkouts
+    # must fetch the operator's trusted origin, never an unnoticed replacement.
+    git check-ref-format --branch "${BRANCH}" >/dev/null 2>&1 \
+        || die "Pinned install requires a valid branch name"
+    if is_git_worktree; then
+        ensure_tracked_worktree_clean
+        [ -z "$(git -C "${REPO_DIR}" status --porcelain --untracked-files=normal)" ] \
+            || die "Pinned install checkout contains untracked source files"
+        if [ "${DRY_RUN}" -eq 0 ]; then
+            actual_origin="$(git -C "${REPO_DIR}" remote get-url origin 2>/dev/null)" \
+                || die "Pinned install origin is unavailable"
+            [ "${actual_origin}" = "${REPO_URL}" ] \
+                || die "Pinned install origin differs from configured trusted source"
+        fi
+        run git -C "${REPO_DIR}" fetch --no-tags origin \
+            "refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
+    else
+        run mkdir -p "$(dirname "${REPO_DIR}")"
+        run git clone --no-tags --single-branch --branch "${BRANCH}" \
+            "${REPO_URL}" "${REPO_DIR}"
+    fi
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] verify origin/%s contains commit %s; detach exact commit before build\n' \
+            "${BRANCH}" "${SOURCE_COMMIT}"
+        return
+    fi
+    actual_origin="$(git -C "${REPO_DIR}" remote get-url origin 2>/dev/null)" \
+        || die "Pinned install origin is unavailable after clone or fetch"
+    [ "${actual_origin}" = "${REPO_URL}" ] \
+        || die "Pinned install origin differs from configured trusted source"
+    fetched_tip="$(git -C "${REPO_DIR}" rev-parse "refs/remotes/origin/${BRANCH}^{commit}" 2>/dev/null)" \
+        || die "Pinned install branch ref is unavailable"
+    git -C "${REPO_DIR}" merge-base --is-ancestor "${SOURCE_COMMIT}" "${fetched_tip}" \
+        || die "Requested commit is not reachable from the fetched origin branch"
+    git -C "${REPO_DIR}" checkout --detach "${SOURCE_COMMIT}" >/dev/null \
+        || die "Pinned checkout failed"
+    [ -z "$(git -C "${REPO_DIR}" status --porcelain --untracked-files=normal)" ] \
+        || die "Pinned checkout retained local source changes"
+    actual_head="$(git -C "${REPO_DIR}" rev-parse HEAD)"
+    current_tip="$(git -C "${REPO_DIR}" rev-parse "refs/remotes/origin/${BRANCH}^{commit}")"
+    [ "${actual_head}" = "${SOURCE_COMMIT}" ] \
+        && [ "${current_tip}" = "${fetched_tip}" ] \
+        || die "Pinned checkout or fetched branch changed during preparation"
+    [ -f "${REPO_DIR}/Cargo.toml" ] || die "Cargo.toml not found in pinned source"
 }
 
 prepare_directories() {
@@ -1355,7 +1423,23 @@ install_network_restore_service() {
 }
 
 resolve_build_git_commit() {
+    if [ -n "${SOURCE_COMMIT}" ]; then
+        printf '%s\n' "${SOURCE_COMMIT}"
+        return
+    fi
     git -C "${REPO_DIR}" rev-parse --short=12 HEAD 2>/dev/null || printf 'unknown'
+}
+
+verify_pinned_release() {
+    [ -n "${SOURCE_COMMIT}" ] || return 0
+    local stable_binary="${REPO_DIR}/target/release/aeronyx-server"
+    [ "$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null)" = "${SOURCE_COMMIT}" ] \
+        || die "Pinned source changed before service start"
+    [ -z "$(git -C "${REPO_DIR}" status --porcelain --untracked-files=normal)" ] \
+        || die "Pinned source tree changed before service start"
+    [ -x "${stable_binary}" ] \
+        && LC_ALL=C grep -aFq -- "${SOURCE_COMMIT}" "${stable_binary}" \
+        || die "Pinned stable binary does not embed the requested full commit"
 }
 
 build_binary() {
@@ -1375,11 +1459,24 @@ build_binary() {
             || die "Tracked Cargo.lock is required for reproducible node builds."
         (
             cd "${REPO_DIR}"
+            if [ -n "${SOURCE_COMMIT}" ]; then
+                [ "$(git rev-parse HEAD)" = "${SOURCE_COMMIT}" ] \
+                    && [ -z "$(git status --porcelain --untracked-files=normal)" ] \
+                    || die "Pinned source changed before Cargo build"
+            fi
             export AERONYX_GIT_COMMIT="${build_git_commit}"
             export CARGO_TARGET_DIR="${BUILD_TARGET_DIR}"
             run_pinned_cargo build --locked -p aeronyx-server --release
         )
         [ -x "${BUILD_BINARY}" ] || die "Isolated release binary not found: ${BUILD_BINARY}"
+        if [ -n "${SOURCE_COMMIT}" ]; then
+            [ "$(git -C "${REPO_DIR}" rev-parse HEAD)" = "${SOURCE_COMMIT}" ] \
+                || die "Pinned source changed before binary promotion"
+            [ -z "$(git -C "${REPO_DIR}" status --porcelain --untracked-files=normal)" ] \
+                || die "Pinned source tree changed before binary promotion"
+            LC_ALL=C grep -aFq -- "${SOURCE_COMMIT}" "${BUILD_BINARY}" \
+                || die "Built binary does not embed the requested full commit"
+        fi
         "${BUILD_BINARY}" validate -c "${CONFIG_FILE}"
     fi
 
@@ -1752,11 +1849,13 @@ main() {
     configure_network
     set_install_step "build" "Building AeroNyx Rust release binary."
     build_binary
+    [ "${DRY_RUN}" -eq 1 ] || verify_pinned_release
     set_install_step "systemd" "Installing and verifying systemd service."
     install_service
     set_install_step "register" "Registering node with nodeboard."
     register_node
     set_install_step "start" "Starting or verifying AeroNyx service."
+    [ "${DRY_RUN}" -eq 1 ] || verify_pinned_release
     start_service
     set_install_step "admission" "Verifying Rust health, management heartbeat, signed discovery, and public visibility."
     verify_node_admission
@@ -1764,4 +1863,6 @@ main() {
     trap - ERR
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

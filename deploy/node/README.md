@@ -543,6 +543,7 @@ DNS names are rejected for this admission path to avoid rebinding.
 
 ```bash
 sudo ./deploy/node/aeronyx-node.sh join \
+  --branch main --commit "FULL_40_HEX_RELEASE_COMMIT" \
   --seed "https://SEED_PUBLIC_IP:8422" \
   --public-endpoint "https://YOUR_PUBLIC_IP:8422" \
   --join-timeout 180 --json
@@ -556,11 +557,26 @@ six exact `[discovery]` values in the private config, validates that config,
 and starts an inactive service. It waits for the local service's current
 signed self descriptor, encodes the canonical binary wire form, then sends
 one `POST /api/discovery/join` to the first selected seed. It never restarts
-an active service; an identical rerun while it remains active skips
-installation, and the seed can return idempotent `exact_replay` while it
-retains the candidate. `--check-only` validates local readiness without a
+an active service; without `--commit`, an identical rerun while it remains
+active skips installation, and the seed can return idempotent `exact_replay`
+while it retains the candidate. `--check-only` validates local readiness without a
 POST. Before an attempted config replacement, the command creates a private
 backup beside `server.toml` for operator review.
+
+[PERMISSIONLESS-JOIN-COMMIT-PIN 2026-09-24 by Codex] For a release-controlled
+join, supply the full 40-hex `--commit` and the trusted `--branch`. The
+installer fetches that origin branch once (or clones it on first install),
+requires the commit to be reachable from the fetched branch, checks out the
+exact commit detached, and embeds the full SHA in the release binary. The
+join gate checks source HEAD and that binary marker before service start or
+POST. A moving branch tip cannot silently replace the requested commit; a
+changed checkout, missing marker, untrusted existing origin, or already
+active service fails closed without restarting it. `join --commit --check-only`
+is rejected because it does not build. Omitting `--commit` while leaving
+`AERONYX_COMMIT` unset retains the existing branch-following behavior and
+must not be described as pinned. The embedded-SHA marker scan is a local
+consistency check, not cryptographic binary attestation; a concurrent
+same-root actor can still mutate source or binaries between checks.
 
 The repository-local entrypoint sources `lib/operator_join.sh` from its own
 directory; copy or deploy that sibling module with `aeronyx-node.sh`. Sourcing
