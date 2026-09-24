@@ -16,6 +16,8 @@
 //! the future composition root.
 //!
 //! ## Last modified
+//! v1.3.1-PreWriteTicketRejection — Distinguish no-effect target/PoW rejection
+//! from ambiguous repository errors for signed terminal completion.
 //! v1.3.0-PullItemExpiry — Bind durable Item replay to the signed item's
 //! expiry; migrate V3 without inventing expiry for already-ACKed ciphertext.
 //! v1.2.0-PullReplayJournal — Persist bounded exact PullOne results so a lost
@@ -267,6 +269,10 @@ pub enum AnonymousMailboxTicketIssueOutcome {
     Conflict,
     /// The global ticket count or fixed issue window is full.
     AtCapacity,
+    /// [ANONYMOUS-MAILBOX-POLICY-TERMINAL 2026-09-24 by Codex] The exact
+    /// replay lookup missed and target/PoW validation rejected before the
+    /// first SQL write. This is the only safe signed no-effect rejection.
+    PreWriteRejected,
 }
 
 impl fmt::Debug for AnonymousMailboxTicketIssueOutcome {
@@ -281,6 +287,9 @@ impl fmt::Debug for AnonymousMailboxTicketIssueOutcome {
             Self::Conflict => formatter.write_str("AnonymousMailboxTicketIssueOutcome::Conflict"),
             Self::AtCapacity => {
                 formatter.write_str("AnonymousMailboxTicketIssueOutcome::AtCapacity")
+            }
+            Self::PreWriteRejected => {
+                formatter.write_str("AnonymousMailboxTicketIssueOutcome::PreWriteRejected")
             }
         }
     }
@@ -766,13 +775,20 @@ impl AnonymousMailboxCustodyRepository for SqliteAnonymousMailboxStore {
             return Ok(AnonymousMailboxTicketIssueOutcome::Conflict);
         }
 
-        request
+        // [ANONYMOUS-MAILBOX-POLICY-TERMINAL 2026-09-24 by Codex] This
+        // classification is valid only after exact replay lookup and before
+        // purge/meta/issuance writes. A later error (including Rejected) has
+        // no such provenance and remains an ambiguous repository failure.
+        if request
             .verify_for_target(
                 &self.target_node_id,
                 now,
                 self.config.ticket_issue_work_bits,
             )
-            .map_err(|_| AnonymousMailboxStoreError::Rejected)?;
+            .is_err()
+        {
+            return Ok(AnonymousMailboxTicketIssueOutcome::PreWriteRejected);
+        }
         let issuer = self
             .ticket_issuer
             .as_ref()
@@ -4144,11 +4160,20 @@ mod tests {
             })
             .expect("invalid one-bit proof");
         let store = context.open_with_ticket_issuer();
+        let before_changes: i64 = store
+            .connection
+            .lock()
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .expect("pre-validation changes");
         assert!(matches!(
             store.issue_ticket(&invalid, NOW),
-            Err(AnonymousMailboxStoreError::Rejected)
+            Ok(AnonymousMailboxTicketIssueOutcome::PreWriteRejected)
         ));
         let connection = store.connection.lock();
+        let after_changes: i64 = connection
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .expect("post-validation changes");
+        assert_eq!(before_changes, after_changes, "zero SQL writes");
         assert_eq!(
             connection
                 .query_row(

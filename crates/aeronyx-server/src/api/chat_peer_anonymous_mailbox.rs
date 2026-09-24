@@ -8,6 +8,7 @@
 //! content-key, or plaintext fields.
 //!
 //! ## Last Modified
+//! v1.0.7-PolicyRejectionTerminal — Sign only typed pre-write ticket rejection.
 //! v1.0.6-ItemExpiryTerminal — Prove exact terminal Pull expiry after ACK.
 //! v1.0.5-LostPullReplay — Prove source retry after ACK and target restart.
 //! v1.0.4-NoSocketSmtr — Prove exact pinned-target S/M/T/R retries and restart.
@@ -340,6 +341,12 @@ fn map_ticket_issue(
         }
         AnonymousMailboxTicketIssueOutcome::AtCapacity => {
             Ok((AnonymousMailboxOutcomeV1::AtCapacity, None))
+        }
+        // [ANONYMOUS-MAILBOX-POLICY-TERMINAL 2026-09-24 by Codex] Only the
+        // typed repository outcome proves rejection before any SQL write.
+        // Generic repository errors and post-effect sealing remain ambiguous.
+        AnonymousMailboxTicketIssueOutcome::PreWriteRejected => {
+            Ok((AnonymousMailboxOutcomeV1::Rejected, None))
         }
     }
 }
@@ -981,6 +988,191 @@ mod tests {
             Err(AnonymousMailboxTerminalFailure::Rejected)
         );
         assert_eq!(repository.issue_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn ticket_issue_typed_pre_write_rejection_is_signed_without_a_ticket() {
+        let target = IdentityKeyPair::from_bytes(&[0x83; 32]).expect("target");
+        let repository = Arc::new(TicketRepository::new([Ok(
+            AnonymousMailboxTicketIssueOutcome::PreWriteRejected,
+        )]));
+        let request = ticket_issue(&target, [0x84; 16]);
+        let response = execute_ticket(repository.clone(), &target, [0x85; 16], request);
+        assert_eq!(response.outcome, AnonymousMailboxOutcomeV1::Rejected);
+        assert!(response.ticket.is_none());
+        assert_eq!(repository.issue_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn pre_write_rejection_completes_source_and_releases_one_entry_quota() {
+        // [ANONYMOUS-MAILBOX-POLICY-TERMINAL 2026-09-24 by Codex] A canonical
+        // bad-PoW request can be Armed by the source. Its signed, no-effect
+        // terminal response must be verifiable and reclaimable; a tampered
+        // response must instead remain an unresolved safety fence.
+        const NOW: u64 = 1_800_000_000;
+        let directory = tempfile::tempdir().expect("private temporary directory");
+        let private_directory = std::fs::canonicalize(directory.path()).expect("canonical path");
+        let target = IdentityKeyPair::from_bytes(&[0x86; 32]).expect("target");
+        let store_config = AnonymousMailboxStoreConfig {
+            enabled: true,
+            db_path: private_directory
+                .join("policy-terminal.sqlite")
+                .display()
+                .to_string(),
+            max_leases_total: 4,
+            max_items_total: 8,
+            max_bytes_total: 64 * 1024,
+            max_in_flight: 2,
+            cleanup_batch_size: 8,
+            max_outstanding_tickets: 4,
+            max_ticket_issues_per_window: 4,
+            ticket_issuance_window_secs: 60,
+            ticket_issue_work_bits: 1,
+        };
+        let repository: Arc<dyn AnonymousMailboxCustodyRepository> = Arc::new(
+            SqliteAnonymousMailboxStore::open_with_ticket_issuer(
+                store_config.clone(),
+                target.clone(),
+                [0x87; 32],
+            )
+            .expect("target store"),
+        );
+        let descriptor = cross_entry_descriptor(&target);
+        let commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
+            .expect("descriptor commitment");
+        let resolver = Arc::new(CrossEntryExactResolver {
+            descriptor,
+            exact_calls: AtomicUsize::new(0),
+            wrong_target_calls: AtomicUsize::new(0),
+        });
+        let source_config = AnonymousMailboxSourceConfig {
+            enabled: true,
+            max_journal_entries: 1,
+            max_journal_bytes: 8 * 1024 * 1024,
+            ..AnonymousMailboxSourceConfig::default()
+        };
+        let journal = Arc::new(
+            SqliteAnonymousMailboxSourceJournal::new(
+                Connection::open_in_memory().expect("source journal"),
+                [0x88; 32],
+                &source_config,
+            )
+            .expect("source journal schema"),
+        );
+        let coordinator = AnonymousMailboxSourceCoordinator::new(
+            Arc::new(IdentityKeyPair::from_bytes(&[0x89; 32]).expect("source identity")),
+            resolver,
+            journal.clone(),
+        );
+        let transport = CrossEntryNoSocketTransport::new(&target);
+        let make_request = |id: u8, want_valid: bool| {
+            (0..u64::MAX)
+                .find_map(|nonce| {
+                    let request = AnonymousMailboxTicketIssueV1::new(
+                        [id; 16],
+                        [id.wrapping_add(1); 16],
+                        target.public_key_bytes(),
+                        [0x8a; 32],
+                        NOW,
+                        NOW + 300,
+                        nonce,
+                    )
+                    .expect("canonical ticket issue");
+                    let valid = request.proof_digest().expect("proof digest")[0] & 0x80 == 0;
+                    (valid == want_valid).then_some(request)
+                })
+                .expect("one-bit PoW fixture")
+        };
+
+        let rejected_request = make_request(0x8b, false);
+        let durable_before = durable_admission_state(&store_config.db_path);
+        let (_, rejected_sealed) = dispatch_cross_entry_terminal(
+            &coordinator,
+            &transport,
+            repository.clone(),
+            &target,
+            commitment,
+            [0x8c; 16],
+            AnonymousMailboxTerminalFrameV1::TicketIssue(rejected_request.clone()),
+        );
+        let AnonymousMailboxTerminalFrameV1::TicketIssueResponse(rejected) =
+            complete_cross_entry_response(&coordinator, [0x8c; 16], &rejected_sealed)
+        else {
+            panic!("signed ticket response");
+        };
+        rejected
+            .verify_for_request(&rejected_request, &target.public_key_bytes())
+            .expect("source-bound rejected response");
+        assert_eq!(rejected.outcome, AnonymousMailboxOutcomeV1::Rejected);
+        assert!(rejected.ticket.is_none());
+        assert_eq!(
+            durable_admission_state(&store_config.db_path),
+            durable_before
+        );
+
+        let valid_request = make_request(0x8d, true);
+        let valid_frame = encode_anonymous_mailbox_terminal_frame(
+            &AnonymousMailboxTerminalFrameV1::TicketIssue(valid_request.clone()),
+        )
+        .expect("valid frame");
+        let pin = ExactAnonymousMailboxTargetPin::new(target.public_key_bytes(), commitment);
+        assert!(matches!(
+            coordinator.prepare(pin, [0x8e; 16], valid_frame.clone(), NOW),
+            Err(AnonymousMailboxSourceError::Rejected)
+        ));
+        assert_eq!(
+            journal
+                .cleanup_terminal_records(i64::MAX as u64)
+                .expect("bounded terminal cleanup")
+                .rows_removed,
+            1
+        );
+        let (_, valid_sealed) = dispatch_cross_entry_terminal(
+            &coordinator,
+            &transport,
+            repository.clone(),
+            &target,
+            commitment,
+            [0x8e; 16],
+            AnonymousMailboxTerminalFrameV1::TicketIssue(valid_request.clone()),
+        );
+        let AnonymousMailboxTerminalFrameV1::TicketIssueResponse(accepted) =
+            complete_cross_entry_response(&coordinator, [0x8e; 16], &valid_sealed)
+        else {
+            panic!("accepted ticket response");
+        };
+        assert_eq!(accepted.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        assert!(accepted.ticket.is_some());
+
+        journal
+            .cleanup_terminal_records(i64::MAX as u64)
+            .expect("release accepted terminal row");
+        let tamper_request = make_request(0x8f, true);
+        let (_, mut tampered) = dispatch_cross_entry_terminal(
+            &coordinator,
+            &transport,
+            repository,
+            &target,
+            commitment,
+            [0x90; 16],
+            AnonymousMailboxTerminalFrameV1::TicketIssue(tamper_request),
+        );
+        tampered[0] ^= 0x01;
+        assert!(matches!(
+            coordinator.open_response([0x90; 16], &tampered),
+            Err(AnonymousMailboxSourceError::Ambiguous)
+        ));
+        assert!(matches!(
+            coordinator.result([0x90; 16]),
+            Ok(AnonymousMailboxSourceResult::Ambiguous)
+        ));
+        assert_eq!(
+            journal
+                .cleanup_terminal_records(i64::MAX as u64)
+                .expect("unresolved row is retained")
+                .rows_removed,
+            0
+        );
     }
 
     #[test]
