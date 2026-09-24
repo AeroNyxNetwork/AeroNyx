@@ -1096,6 +1096,9 @@ use crate::services::chat_relay_mailbox::{
     AnonymousMailboxCleanupReport, AnonymousMailboxCustodyRepository, AnonymousMailboxStoreError,
     SqliteAnonymousMailboxStore,
 };
+use crate::services::discovery_endpoint_promotion_coordinator::{
+    build_endpoint_possession_responder, PermissionlessPromotionCoordinator,
+};
 use crate::services::discovery_peer_sampling::sample_public_gossip_peers;
 use crate::services::memchain::derive_rawlog_key;
 use crate::services::memchain::derive_record_key;
@@ -6329,6 +6332,37 @@ impl Server {
             chat_relay_runtime_ready,
         );
         let node_identity = Arc::new(self.identity.clone());
+        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Open every
+        // private evidence gate before any public route or task is exposed.
+        // Disabled mode allocates no DB, key, responder, or scheduler.
+        let promotion_runtime = if self
+            .config
+            .discovery
+            .permissionless_endpoint_promotion_enabled
+        {
+            let prefix = self
+                .config
+                .discovery
+                .permissionless_endpoint_promotion_db_prefix
+                .clone();
+            let inbox = endpoint_attestation_inbox.clone().ok_or_else(|| {
+                ServerError::startup_failed("Endpoint promotion requires attestation inbox")
+            })?;
+            let store = Arc::clone(&peer_store);
+            let identity = Arc::clone(&node_identity);
+            Some(Arc::new(
+                tokio::task::spawn_blocking(move || {
+                    PermissionlessPromotionCoordinator::open(&prefix, store, inbox, identity)
+                })
+                .await
+                .map_err(|_| ServerError::startup_failed("Endpoint promotion unavailable"))?
+                .map_err(|_| ServerError::startup_failed("Endpoint promotion unavailable"))?,
+            ))
+        } else {
+            None
+        };
+        let public_promotion_runtime = promotion_runtime.clone();
+        let mut promotion_shutdown = self.shutdown_tx.subscribe();
         let peer_http_client = Arc::clone(&peer_http_clients.control);
         let smoke_peer_store = Arc::clone(&peer_store);
         let smoke_node_identity = Arc::clone(&node_identity);
@@ -6418,7 +6452,7 @@ impl Server {
             // a detached task that the process cannot observe.
             let mut listener_tasks = JoinSet::new();
             if let Some((public_addr, public_listener)) = public_api_listener {
-                let public_app = build_public_node_router(PublicNodeRouterDependencies {
+                let mut public_app = build_public_node_router(PublicNodeRouterDependencies {
                     peer_store: Arc::clone(&peer_store),
                     discovery_api_policy: discovery_api_policy.clone(),
                     chat_relay: chat_relay.clone(),
@@ -6451,6 +6485,57 @@ impl Server {
                     endpoint_evidence,
                     endpoint_attestation_inbox: endpoint_attestation_inbox.clone(),
                 });
+                if let Some(runtime) = public_promotion_runtime {
+                    public_app = public_app.merge(build_endpoint_possession_responder(Arc::clone(
+                        &node_identity,
+                    )));
+                    let probe_store = Arc::clone(&peer_store);
+                    let probe_identity = Arc::clone(&node_identity);
+                    let probe_http = Arc::clone(&peer_http_client);
+                    // One supervised, bounded candidate per cadence. The
+                    // coordinator performs all SQLite work in blocking cells;
+                    // errors remain coarse and never disclose node or path.
+                    listener_tasks.spawn(async move {
+                        let mut interval = tokio::time::interval(Duration::from_secs(15));
+                        loop {
+                            tokio::select! {
+                                _ = promotion_shutdown.recv() => break,
+                                _ = interval.tick() => {
+                                    match runtime.advance_one().await {
+                                        Ok(Some(descriptor)) => {
+                                            // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex]
+                                            // Promotion is not route readiness. Only an existing
+                                            // signed blind-relay control probe can open the gate.
+                                            // An identity already in route quarantine cannot
+                                            // use descriptor rotation to accelerate recovery.
+                                            let now = unix_now_secs();
+                                            if probe_store.is_route_quarantined_now(&descriptor.node_id(), now) {
+                                                continue;
+                                            }
+                                            let self_id = probe_identity.public_key_bytes();
+                                            Self::probe_blind_relay_candidate_descriptor(
+                                                probe_http.as_ref(), probe_store.as_ref(),
+                                                probe_identity.as_ref(), &self_id, descriptor, now,
+                                                true,
+                                            ).await;
+                                        }
+                                        Ok(None) => {}
+                                        Err(reason) => debug!(reason = %reason,
+                                            "[DISCOVERY] Permissionless promotion deferred"),
+                                    }
+                                }
+                            }
+                        }
+                        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex]
+                        // Share the required-listener JoinSet so a premature
+                        // worker exit remains observable by the supervisor.
+                        RequiredApiListenerExit {
+                            role: "permissionless_endpoint_promotion",
+                            address: public_addr,
+                            result: Ok(()),
+                        }
+                    });
+                }
                 listener_tasks.spawn(async move {
                     Self::serve_public_discovery_api(
                         public_addr,
@@ -11073,6 +11158,7 @@ impl Server {
                 self_node_id,
                 candidate,
                 now,
+                false,
             )
         });
         futures::future::join_all(probes).await;
@@ -11086,6 +11172,7 @@ impl Server {
         self_node_id: &[u8; 32],
         candidate: SignedNodeDescriptor,
         now: u64,
+        require_signed_terminal_receipt: bool,
     ) {
         let next_hop = candidate.node_id();
         let Some(endpoint) = candidate.descriptor.public_endpoint.as_deref() else {
@@ -11107,15 +11194,23 @@ impl Server {
             return;
         };
 
+        let promotion_route_id = if require_signed_terminal_receipt {
+            let mut route_id = [0u8; 16];
+            if rand::rngs::OsRng.try_fill_bytes(&mut route_id).is_err() {
+                peer_store.record_blind_relay_probe_result(now, false, "nonce_unavailable");
+                return;
+            }
+            Some(route_id)
+        } else {
+            None
+        };
         let preparation_identity = (*identity).clone();
         let preparation_self_node_id = *self_node_id;
         let request = match prepare_peer_blind_relay_http_request_with(move || {
             let envelope = BlindRelayEnvelope {
-                route_id: Self::blind_relay_probe_route_id(
-                    now,
-                    &preparation_self_node_id,
-                    &next_hop,
-                ),
+                route_id: promotion_route_id.unwrap_or_else(|| {
+                    Self::blind_relay_probe_route_id(now, &preparation_self_node_id, &next_hop)
+                }),
                 next_hop,
                 ttl: 1,
                 encrypted_blob: Self::blind_relay_probe_blob(
@@ -11129,17 +11224,17 @@ impl Server {
             .sign_with(&preparation_identity);
             Ok::<_, std::convert::Infallible>((
                 PeerBlindRelayRequest {
-                    envelope,
+                    envelope: envelope.clone(),
                     previous_hop_node_id: preparation_self_node_id,
                     onward_envelope: None,
                     onward_descriptor_hint: None,
                 },
-                (),
+                envelope,
             ))
         })
         .await
         {
-            Ok((request, ())) => request,
+            Ok((request, envelope)) => (request, envelope),
             Err(BlindRelayRequestPreparationError::Build(never)) => match never {},
             Err(BlindRelayRequestPreparationError::Local(error)) => {
                 // [OUTBOUND-BLIND-REQUEST-PREPARATION 2026-08-31 by Codex]
@@ -11149,6 +11244,7 @@ impl Server {
                 return;
             }
         };
+        let (request, probe_envelope) = request;
 
         match client
             .post(url)
@@ -11157,37 +11253,67 @@ impl Server {
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => match decode_bounded_json_response::<
-                PeerBlindRelayResponse,
-            >(
-                response,
-                PEER_ACK_RESPONSE_MAX_BYTES,
-            )
-            .await
-            {
-                Ok(ack) if ack.accepted => {
-                    peer_store.record_blind_relay_probe_result(now, true, "accepted");
-                    let _ = peer_store.record_route_forward_success_for_descriptor(&candidate, now);
+            Ok(response) if response.status().is_success() => {
+                match decode_bounded_json_response::<PeerBlindRelayResponse>(
+                    response,
+                    PEER_ACK_RESPONSE_MAX_BYTES,
+                )
+                .await
+                {
+                    Ok(ack)
+                        if !require_signed_terminal_receipt && ack.accepted
+                            || require_signed_terminal_receipt
+                                && Self::permissionless_promotion_probe_ack_valid(
+                                    &probe_envelope,
+                                    &ack,
+                                    &next_hop,
+                                    now,
+                                    unix_now_secs(),
+                                ) =>
+                    {
+                        if require_signed_terminal_receipt {
+                            // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex]
+                            // Generic route-health writes never open a promoted
+                            // candidate. Only this verified control transition can.
+                            let recorded = peer_store
+                                .record_permissionless_promotion_probe_verified(&candidate, now);
+                            peer_store.record_blind_relay_probe_result(
+                                now,
+                                recorded,
+                                if recorded {
+                                    "accepted"
+                                } else {
+                                    "stale_promotion"
+                                },
+                            );
+                        } else {
+                            peer_store.record_blind_relay_probe_result(now, true, "accepted");
+                            let _ = peer_store
+                                .record_route_forward_success_for_descriptor(&candidate, now);
+                        }
+                    }
+                    Ok(_ack) => {
+                        let reason = if require_signed_terminal_receipt {
+                            "signed_ack_rejected"
+                        } else {
+                            "ack_rejected"
+                        };
+                        peer_store.record_blind_relay_probe_result(now, false, reason);
+                        let _ = peer_store
+                            .record_route_forward_failure_for_descriptor(&candidate, now, reason);
+                    }
+                    Err(error) => {
+                        debug!(
+                            reason = error.as_str(),
+                            "[DISCOVERY] Blind relay probe ACK rejected"
+                        );
+                        let reason = format!("ack_{}", error.as_str());
+                        peer_store.record_blind_relay_probe_result(now, false, &reason);
+                        let _ = peer_store
+                            .record_route_forward_failure_for_descriptor(&candidate, now, &reason);
+                    }
                 }
-                Ok(_ack) => {
-                    peer_store.record_blind_relay_probe_result(now, false, "ack_rejected");
-                    let _ = peer_store.record_route_forward_failure_for_descriptor(
-                        &candidate,
-                        now,
-                        "ack_rejected",
-                    );
-                }
-                Err(error) => {
-                    debug!(
-                        reason = error.as_str(),
-                        "[DISCOVERY] Blind relay probe ACK rejected"
-                    );
-                    let reason = format!("ack_{}", error.as_str());
-                    peer_store.record_blind_relay_probe_result(now, false, &reason);
-                    let _ = peer_store
-                        .record_route_forward_failure_for_descriptor(&candidate, now, &reason);
-                }
-            },
+            }
             Ok(response) => {
                 let reason = format!("http_{}", response.status().as_u16());
                 peer_store.record_blind_relay_probe_result(now, false, &reason);
@@ -11205,6 +11331,53 @@ impl Server {
                     peer_store.record_route_forward_failure_for_descriptor(&candidate, now, reason);
             }
         }
+    }
+
+    /// An unsigned JSON boolean is not route authority for a newly promoted
+    /// permissionless peer. Require the exact target's signed terminal proof
+    /// over this fresh, nonce-bound control envelope and response shape.
+    // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Legacy warmup
+    // keeps its prior behavior; only this new authority transition is strict.
+    fn permissionless_promotion_probe_ack_valid(
+        envelope: &BlindRelayEnvelope,
+        ack: &PeerBlindRelayResponse,
+        target_node_id: &[u8; 32],
+        sent_at: u64,
+        observed_at: u64,
+    ) -> bool {
+        if !ack.accepted
+            || !ack.terminal
+            || ack.forwarded
+            || ack.ttl_remaining != envelope.ttl
+            || ack.reason.as_deref() != Some("terminal_next_hop")
+            || ack.delivery_receipt.is_some()
+            || ack.failure_receipt.is_some()
+            || ack.opaque_terminal_response_b64.is_some()
+            || envelope.next_hop != *target_node_id
+        {
+            return false;
+        }
+        let Some(receipt) = ack.success_receipt.as_ref() else {
+            return false;
+        };
+        if receipt.accepted_at < sent_at.saturating_sub(30)
+            || receipt.accepted_at > observed_at.saturating_add(30)
+            || observed_at > receipt.accepted_at.saturating_add(30)
+        {
+            return false;
+        }
+        receipt
+            .verify_expected(
+                envelope,
+                true,
+                false,
+                ack.ttl_remaining,
+                ack.reason.as_deref(),
+                None,
+                None,
+                target_node_id,
+            )
+            .is_ok()
     }
 
     async fn probe_two_hop_blind_relay_path(
@@ -22249,6 +22422,113 @@ mod tests {
         assert_eq!(candidates[0].node_id(), unproven_id);
         assert_eq!(candidates[1].node_id(), proven_id);
         assert_eq!(candidates[2].node_id(), quarantined_id);
+    }
+
+    #[test]
+    fn permissionless_probe_requires_fresh_exact_target_signed_terminal_receipt() {
+        use aeronyx_core::protocol::chat::{BlindRelayEnvelope, BlindRelaySuccessReceipt};
+
+        let now = 1_800_100_000;
+        let source = IdentityKeyPair::generate();
+        let target = IdentityKeyPair::generate();
+        let other = IdentityKeyPair::generate();
+        let envelope = BlindRelayEnvelope {
+            route_id: [0x41; 16],
+            next_hop: target.public_key_bytes(),
+            ttl: 1,
+            encrypted_blob: vec![0x51; 32],
+            timestamp: now,
+            signature: [0; 64],
+        }
+        .sign_with(&source);
+        let mut ack = PeerBlindRelayResponse {
+            accepted: true,
+            terminal: true,
+            forwarded: false,
+            ttl_remaining: 1,
+            reason: Some("terminal_next_hop".to_string()),
+            delivery_receipt: None,
+            success_receipt: None,
+            failure_receipt: None,
+            opaque_terminal_response_b64: None,
+        };
+        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Unsigned
+        // `accepted=true` remains legacy-compatible but cannot grant new
+        // permissionless route authority.
+        assert!(!Server::permissionless_promotion_probe_ack_valid(
+            &envelope,
+            &ack,
+            &target.public_key_bytes(),
+            now,
+            now,
+        ));
+        ack.success_receipt = Some(BlindRelaySuccessReceipt::terminal(
+            &envelope,
+            1,
+            ack.reason.as_deref(),
+            None,
+            None,
+            now,
+            &other,
+        ));
+        assert!(!Server::permissionless_promotion_probe_ack_valid(
+            &envelope,
+            &ack,
+            &target.public_key_bytes(),
+            now,
+            now,
+        ));
+        ack.success_receipt = Some(BlindRelaySuccessReceipt::terminal(
+            &envelope,
+            1,
+            ack.reason.as_deref(),
+            None,
+            None,
+            now - 60,
+            &target,
+        ));
+        assert!(!Server::permissionless_promotion_probe_ack_valid(
+            &envelope,
+            &ack,
+            &target.public_key_bytes(),
+            now,
+            now,
+        ));
+        ack.success_receipt = Some(BlindRelaySuccessReceipt::terminal(
+            &envelope,
+            1,
+            ack.reason.as_deref(),
+            None,
+            None,
+            now,
+            &target,
+        ));
+        let mut other_envelope = envelope.clone();
+        other_envelope.route_id = [0x42; 16];
+        assert!(!Server::permissionless_promotion_probe_ack_valid(
+            &other_envelope,
+            &ack,
+            &target.public_key_bytes(),
+            now,
+            now,
+        ));
+        let mut forwarded = ack.clone();
+        forwarded.terminal = false;
+        forwarded.forwarded = true;
+        assert!(!Server::permissionless_promotion_probe_ack_valid(
+            &envelope,
+            &forwarded,
+            &target.public_key_bytes(),
+            now,
+            now,
+        ));
+        assert!(Server::permissionless_promotion_probe_ack_valid(
+            &envelope,
+            &ack,
+            &target.public_key_bytes(),
+            now,
+            now,
+        ));
     }
 
     #[tokio::test]

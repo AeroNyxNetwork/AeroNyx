@@ -514,6 +514,14 @@ pub struct DiscoveryConfig {
     /// Maximum expired rows removed by one admission.
     #[serde(default = "DiscoveryConfig::default_endpoint_attestation_inbox_cleanup_batch")]
     pub permissionless_endpoint_attestation_inbox_cleanup_batch: usize,
+    // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] This separate
+    // opt-in never upgrades a self-signed Stage-A descriptor by itself.
+    /// Enables bounded, evidence-backed candidate promotion on the public node listener.
+    #[serde(default)]
+    pub permissionless_endpoint_promotion_enabled: bool,
+    /// Private SQLite path prefix for quarantine, observation, and revocation.
+    #[serde(default)]
+    pub permissionless_endpoint_promotion_db_prefix: String,
     /// Optional region label for nodeboard and future peer selection.
     #[serde(default)]
     pub region: Option<String>,
@@ -1303,6 +1311,41 @@ impl DiscoveryConfig {
                 ));
             }
         }
+        if self.permissionless_endpoint_promotion_enabled {
+            if !self.enabled
+                || self.public_api_listen_addr.is_none()
+                || !self.permissionless_endpoint_proof_enabled
+                || !self.permissionless_endpoint_evidence_enabled
+                || !self.permissionless_endpoint_attestation_inbox_enabled
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.permissionless_endpoint_promotion_enabled",
+                    "requires public discovery, endpoint proof, evidence and attestation inbox",
+                ));
+            }
+            if self
+                .permissionless_endpoint_promotion_db_prefix
+                .trim()
+                .is_empty()
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.permissionless_endpoint_promotion_db_prefix",
+                    "must be configured when endpoint promotion is enabled",
+                ));
+            }
+            // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] A
+            // syntactically valid one-row inbox cannot satisfy the mandatory
+            // two-observer gate; reject that permanently-unready deployment.
+            if self.permissionless_endpoint_attestation_inbox_max_entries < 2
+                || self.permissionless_endpoint_attestation_inbox_max_bytes < 2 * 289
+                || self.permissionless_endpoint_attestation_inbox_ttl_secs < 120
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.permissionless_endpoint_promotion_enabled",
+                    "requires capacity and retention for two current attestations",
+                ));
+            }
+        }
 
         for peer_id in self
             .allowed_peer_ids
@@ -1755,6 +1798,8 @@ impl Default for DiscoveryConfig {
                 Self::default_endpoint_attestation_inbox_ttl_secs(),
             permissionless_endpoint_attestation_inbox_cleanup_batch:
                 Self::default_endpoint_attestation_inbox_cleanup_batch(),
+            permissionless_endpoint_promotion_enabled: false,
+            permissionless_endpoint_promotion_db_prefix: String::new(),
             region: None,
             descriptor_ttl_secs: Self::default_descriptor_ttl_secs(),
             public_discovery: Self::default_public_discovery(),
@@ -3001,6 +3046,39 @@ permissionless_endpoint_attestation_inbox_cleanup_batch = 16
             "[discovery]\npermissionless_endpoint_attestation_inbox_max_bytes = 67108865\n",
             "[discovery]\npermissionless_endpoint_attestation_inbox_ttl_secs = 604801\n",
             "[discovery]\npermissionless_endpoint_attestation_inbox_cleanup_batch = 4097\n",
+        ] {
+            assert!(ServerConfig::from_str(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn test_permissionless_promotion_is_additive_default_off_and_requires_private_gates() {
+        let legacy = ServerConfig::from_str("[discovery]\nenabled = true\n")
+            .expect("legacy discovery config");
+        assert!(!legacy.discovery.permissionless_endpoint_promotion_enabled);
+        assert!(legacy
+            .discovery
+            .permissionless_endpoint_promotion_db_prefix
+            .is_empty());
+        let enabled = r#"
+[discovery]
+enabled = true
+public_api_listen_addr = "0.0.0.0:8422"
+permissionless_endpoint_proof_enabled = true
+permissionless_endpoint_evidence_enabled = true
+permissionless_endpoint_evidence_db_path = "/var/lib/aeronyx/evidence.sqlite3"
+permissionless_endpoint_attestation_inbox_enabled = true
+permissionless_endpoint_attestation_inbox_db_path = "/var/lib/aeronyx/inbox.sqlite3"
+permissionless_endpoint_promotion_enabled = true
+permissionless_endpoint_promotion_db_prefix = "/var/lib/aeronyx/promotion"
+"#;
+        assert!(ServerConfig::from_str(enabled).is_ok());
+        let undersized =
+            format!("{enabled}\npermissionless_endpoint_attestation_inbox_max_entries = 1\n");
+        for invalid in [
+            "[discovery]\npermissionless_endpoint_promotion_enabled = true\n",
+            "[discovery]\nenabled = true\npublic_api_listen_addr = \"0.0.0.0:8422\"\npermissionless_endpoint_promotion_enabled = true\n",
+            undersized.as_str(),
         ] {
             assert!(ServerConfig::from_str(invalid).is_err());
         }

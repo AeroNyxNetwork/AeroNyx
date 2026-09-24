@@ -12,6 +12,7 @@
 use aeronyx_core::protocol::discovery::{
     DirectoryDescriptorCommitmentV1, SignedNodeDescriptor, MAX_SIGNED_NODE_DESCRIPTOR_BYTES,
 };
+use aeronyx_core::protocol::discovery_endpoint_attestation::canonical_attested_public_endpoint_socket_v1;
 use aeronyx_core::protocol::discovery_endpoint_proof::canonical_public_endpoint_commitment;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -299,8 +300,14 @@ impl PreparedProbation {
             .public_endpoint
             .as_deref()
             .ok_or(DiscoveryEndpointPromotionProbationError::Rejected)?;
-        let endpoint_commitment = canonical_public_endpoint_commitment(endpoint)
+        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] ADAT and
+        // the direct dialer bind the signed HTTP(S) endpoint's canonical
+        // public socket, not its URL text. Keep the durable record identical.
+        let endpoint_socket = canonical_attested_public_endpoint_socket_v1(endpoint)
             .map_err(|_| DiscoveryEndpointPromotionProbationError::Rejected)?;
+        let endpoint_commitment =
+            canonical_public_endpoint_commitment(&endpoint_socket.to_string())
+                .map_err(|_| DiscoveryEndpointPromotionProbationError::Rejected)?;
         if descriptor_commitment != material.descriptor_commitment()
             || endpoint_commitment != material.endpoint_commitment()
             || material.group_commitment() != readiness.group_commitment
@@ -520,15 +527,18 @@ pub(super) fn startup_audit(
             material_valid_until,
             record_commitment,
         };
+        let endpoint_socket = canonical_attested_public_endpoint_socket_v1(endpoint)
+            .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Corrupt)?;
+        let canonical_endpoint_commitment =
+            canonical_public_endpoint_commitment(&endpoint_socket.to_string())
+                .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Corrupt)?;
         if commitment.node_id != node_id
             || commitment.sequence != descriptor_sequence
             || commitment.descriptor_hash != descriptor_hash
             || descriptor.descriptor.issued_at > material_resolved_at
             || descriptor.descriptor.expires_at < material_resolved_at
             || !descriptor.descriptor.policy.public_discovery
-            || canonical_public_endpoint_commitment(endpoint)
-                .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Corrupt)?
-                != endpoint_commitment
+            || canonical_endpoint_commitment != endpoint_commitment
             || !promotion_readiness_shape_is_valid_at(&readiness, material_resolved_at)
             || material_valid_until != readiness.valid_until.min(descriptor.descriptor.expires_at)
             || admitted_at < material_resolved_at
@@ -816,8 +826,11 @@ mod tests {
         let descriptor = SignedNodeDescriptor::sign(descriptor, target).expect("descriptor");
         let descriptor_pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
             .expect("descriptor commitment");
+        let endpoint_socket =
+            canonical_attested_public_endpoint_socket_v1(endpoint).expect("public socket");
         let endpoint_commitment =
-            canonical_public_endpoint_commitment(endpoint).expect("endpoint commitment");
+            canonical_public_endpoint_commitment(&endpoint_socket.to_string())
+                .expect("endpoint commitment");
         let inbox = SqliteDiscoveryEndpointAttestationInbox::open(
             DiscoveryEndpointAttestationInboxConfig {
                 db_path: directory
@@ -1128,6 +1141,55 @@ mod tests {
                 .expect("revoked exact retry"),
             DiscoveryEndpointPromotionProbationOutcome::Existing
         );
+    }
+
+    #[test]
+    fn signed_https_endpoint_probation_reopens_and_rejects_stored_socket_mismatch() {
+        let directory = tempdir();
+        let cfg = config(&directory, "https-probation.sqlite3", 4);
+        let registry =
+            SqliteDiscoveryEndpointQuarantineRevocationRegistry::open(cfg.clone()).expect("open");
+        let item = candidate(
+            &directory,
+            "https-candidate",
+            &key(0x91),
+            7,
+            "https://8.8.8.8:51820",
+            1,
+            0x91,
+            &registry,
+        );
+        assert_eq!(
+            registry
+                .retain_promotion_probation_at(&item.material, &item.readiness, NOW + 8)
+                .expect("retain signed HTTPS candidate"),
+            DiscoveryEndpointPromotionProbationOutcome::Inserted,
+        );
+        drop(registry);
+        let reopened =
+            SqliteDiscoveryEndpointQuarantineRevocationRegistry::open(cfg.clone()).expect("audit");
+        assert!(reopened
+            .contains_current_promotion_probation_at(&item.material, &item.readiness, NOW + 8)
+            .expect("reopened exact probation"));
+        drop(reopened);
+
+        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] The
+        // persisted commitment must still bind the literal signed host+port
+        // after restart; a same-length substitution is corruption.
+        let wrong_socket =
+            canonical_public_endpoint_commitment("8.8.8.8:51821").expect("different public port");
+        let connection = Connection::open(&cfg.db_path).expect("database");
+        connection
+            .execute(
+                "UPDATE discovery_endpoint_promotion_probation_v1 SET endpoint_commitment=?1",
+                params![&wrong_socket[..]],
+            )
+            .expect("tamper commitment");
+        drop(connection);
+        assert!(matches!(
+            SqliteDiscoveryEndpointQuarantineRevocationRegistry::open(cfg),
+            Err(DiscoveryEndpointQuarantineRevocationError::Corrupt)
+        ));
     }
 
     #[test]

@@ -11,6 +11,7 @@
 use aeronyx_core::protocol::discovery::{
     DirectoryDescriptorCommitmentV1, NodeCapability, NodeProtocolFeature, SignedNodeDescriptor,
 };
+use aeronyx_core::protocol::discovery_endpoint_attestation::canonical_attested_public_endpoint_socket_v1;
 use aeronyx_core::protocol::discovery_endpoint_proof::canonical_public_endpoint_commitment;
 
 use super::discovery_endpoint_attestation_inbox::{
@@ -79,6 +80,25 @@ pub(crate) struct VerifiedPromotionMaterial {
 }
 
 impl VerifiedPromotionMaterial {
+    #[cfg(test)]
+    pub(crate) fn test_only_from_descriptor(
+        descriptor: SignedNodeDescriptor,
+        resolved_at: u64,
+        valid_until: u64,
+    ) -> Option<Self> {
+        let descriptor_commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).ok()?;
+        Some(Self {
+            descriptor,
+            descriptor_commitment,
+            endpoint_commitment: [1; 32],
+            group_commitment: [2; 32],
+            readiness_commitment: [3; 32],
+            resolved_at,
+            valid_until,
+        })
+    }
+
     pub(crate) const fn descriptor(&self) -> &SignedNodeDescriptor {
         &self.descriptor
     }
@@ -163,7 +183,14 @@ impl<'a> DiscoveryEndpointPromotionMaterialResolver<'a> {
         let Some(endpoint) = descriptor.descriptor.public_endpoint.as_deref() else {
             return Ok(None);
         };
-        let Ok(endpoint_commitment) = canonical_public_endpoint_commitment(endpoint) else {
+        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Resolve
+        // the signed HTTP authority through the same canonical public socket
+        // as ADEA and the direct dialer, never by hashing URL text as a socket.
+        let Ok(socket) = canonical_attested_public_endpoint_socket_v1(endpoint) else {
+            return Ok(None);
+        };
+        let Ok(endpoint_commitment) = canonical_public_endpoint_commitment(&socket.to_string())
+        else {
             return Ok(None);
         };
         if descriptor_commitment.sequence != readiness.descriptor_sequence()
@@ -325,12 +352,16 @@ mod tests {
     }
 
     fn build_fixture(public_discovery: bool) -> Fixture {
+        build_fixture_with_endpoint(public_discovery, ENDPOINT)
+    }
+
+    fn build_fixture_with_endpoint(public_discovery: bool, endpoint_text: &str) -> Fixture {
         let directory = tempdir();
         let target = key(0x21);
         let mut descriptor =
             NodeDescriptor::new(target.public_key_bytes(), 7, NOW - 60, NOW + 600, "1.0.0")
                 .with_protocol_features([NodeProtocolFeature::AnonymousMailboxV1]);
-        descriptor.public_endpoint = Some(ENDPOINT.to_string());
+        descriptor.public_endpoint = Some(endpoint_text.to_string());
         descriptor.capabilities.push(NodeCapability::ChatRelay);
         descriptor.policy = NodePolicy {
             public_discovery,
@@ -339,8 +370,10 @@ mod tests {
         let descriptor = SignedNodeDescriptor::sign(descriptor, &target).expect("descriptor");
         let descriptor_pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
             .expect("descriptor commitment");
+        let socket = canonical_attested_public_endpoint_socket_v1(endpoint_text)
+            .expect("canonical endpoint");
         let endpoint_commitment =
-            canonical_public_endpoint_commitment(ENDPOINT).expect("endpoint commitment");
+            canonical_public_endpoint_commitment(&socket.to_string()).expect("endpoint commitment");
         let inbox_config = DiscoveryEndpointAttestationInboxConfig {
             db_path: directory.path().join("attestation.sqlite3"),
             max_entries: 8,
@@ -575,6 +608,35 @@ mod tests {
             .expect("restart resolution")
             .expect("restart material");
         assert_eq!(restarted.descriptor(), &descriptor);
+    }
+
+    #[test]
+    fn signed_https_descriptor_resolves_only_its_exact_public_socket() {
+        let fixture = build_fixture_with_endpoint(true, "https://8.8.8.8:51820");
+        let resolver =
+            DiscoveryEndpointPromotionMaterialResolver::new(&fixture.inbox, &fixture.revocations);
+        let material = resolver
+            .resolve_at(
+                &fixture.readiness,
+                &fixture.descriptor,
+                exact_features(),
+                NOW + 8,
+            )
+            .expect("resolve https descriptor")
+            .expect("exact material");
+        assert_eq!(
+            material.endpoint_commitment(),
+            canonical_public_endpoint_commitment("8.8.8.8:51820").expect("socket")
+        );
+        for endpoint in ["https://9.9.9.9:51820", "https://8.8.8.8:51821"] {
+            let mut body = fixture.descriptor.descriptor.clone();
+            body.public_endpoint = Some(endpoint.to_string());
+            let altered = SignedNodeDescriptor::sign(body, &key(0x21)).expect("signed alternate");
+            assert!(resolver
+                .resolve_at(&fixture.readiness, &altered, exact_features(), NOW + 8,)
+                .expect("alternate rejected")
+                .is_none());
+        }
     }
 
     #[test]

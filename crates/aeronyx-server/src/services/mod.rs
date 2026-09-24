@@ -318,6 +318,9 @@ pub(crate) mod discovery_endpoint_quarantine_revocation;
 // [PERMISSIONLESS-ENDPOINT-PROMOTION-MATERIAL 2026-09-24 by Codex] Resolve one
 // exact private descriptor only after current quarantine readiness revalidation.
 pub(crate) mod discovery_endpoint_promotion_material;
+// [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] The public
+// responder and private promotion coordinator share one bounded domain.
+pub(crate) mod discovery_endpoint_promotion_coordinator;
 mod discovery_endpoint_verification;
 // [PERMISSIONLESS-DISCOVERY-SAMPLING 2026-09-24 by Codex] Private, bounded
 // gossip and receipt-proven chat selection; runtime wiring remains separate.

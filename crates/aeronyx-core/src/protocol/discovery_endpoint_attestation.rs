@@ -5,6 +5,7 @@
 //! reputation, or economic authority.
 
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 
 use sha2::{Digest, Sha256};
 
@@ -33,6 +34,70 @@ pub const DISCOVERY_ENDPOINT_ATTESTATION_FRAME_BYTES_V1: usize = 289;
 pub const DISCOVERY_ENDPOINT_ATTESTATION_MAX_TTL_SECS: u64 = 24 * 60 * 60;
 /// Maximum accepted positive clock skew for the observation time.
 pub const DISCOVERY_ENDPOINT_ATTESTATION_FUTURE_SKEW_SECS: u64 = 30;
+
+/// Derives the exact public IP socket committed by a signed descriptor's
+/// endpoint. Bare canonical sockets and credential-free HTTP(S) authorities
+/// share one ADEA commitment; URL paths, queries, fragments, DNS, and
+/// noncanonical IP spellings never enter the signed evidence domain.
+///
+/// # Errors
+/// Returns a coarse malformed error for any ambiguous or non-public target.
+// [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Keep URL parsing
+// and the existing SocketAddr commitment distinct; the attestation wire and
+// domain transcript do not change.
+pub fn canonical_attested_public_endpoint_socket_v1(
+    endpoint: &str,
+) -> Result<SocketAddr, DiscoveryEndpointAttestationError> {
+    if endpoint.is_empty() || endpoint.len() > 80 || endpoint.trim() != endpoint {
+        return Err(DiscoveryEndpointAttestationError::Malformed);
+    }
+    let (authority, default_port) = if let Some(authority) = endpoint.strip_prefix("http://") {
+        (authority, Some(80))
+    } else if let Some(authority) = endpoint.strip_prefix("https://") {
+        (authority, Some(443))
+    } else {
+        (endpoint, None)
+    };
+    if authority.is_empty()
+        || authority
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@' | b'\\'))
+    {
+        return Err(DiscoveryEndpointAttestationError::Malformed);
+    }
+    let socket = if let Ok(socket) = authority.parse::<SocketAddr>() {
+        if socket.to_string() != authority {
+            return Err(DiscoveryEndpointAttestationError::Malformed);
+        }
+        socket
+    } else {
+        let Some(default_port) = default_port else {
+            return Err(DiscoveryEndpointAttestationError::Malformed);
+        };
+        let host = if let Some(inner) = authority
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        {
+            inner
+        } else {
+            authority
+        };
+        let ip: IpAddr = host
+            .parse()
+            .map_err(|_| DiscoveryEndpointAttestationError::Malformed)?;
+        let canonical_host = match ip {
+            IpAddr::V4(_) => ip.to_string(),
+            IpAddr::V6(_) => format!("[{ip}]"),
+        };
+        if canonical_host != authority {
+            return Err(DiscoveryEndpointAttestationError::Malformed);
+        }
+        SocketAddr::new(ip, default_port)
+    };
+    canonical_public_endpoint_commitment(&socket.to_string())
+        .map_err(|_| DiscoveryEndpointAttestationError::Malformed)?;
+    Ok(socket)
+}
 
 /// Closed purpose domain for endpoint evidence attestations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,8 +200,9 @@ impl DiscoveryEndpointEvidenceAttestationV1 {
             .public_endpoint
             .as_deref()
             .ok_or(DiscoveryEndpointAttestationError::Malformed)?;
+        let descriptor_socket = canonical_attested_public_endpoint_socket_v1(descriptor_endpoint)?;
         let descriptor_endpoint_commitment =
-            canonical_public_endpoint_commitment(descriptor_endpoint)
+            canonical_public_endpoint_commitment(&descriptor_socket.to_string())
                 .map_err(|_| DiscoveryEndpointAttestationError::Malformed)?;
         let observer_node_id = observer.public_key_bytes();
         if observer_node_id != challenge.challenger_node_id()
@@ -528,6 +594,125 @@ mod tests {
             &f.context,
             DiscoveryEndpointAttestationPurposeV1::EndpointPossessionObservation,
         )
+    }
+
+    #[test]
+    fn signed_bare_http_and_https_public_ip_descriptors_share_socket_commitment() {
+        let f = fixture();
+        let expected = canonical_public_endpoint_commitment("8.8.8.8:51820").unwrap();
+        for endpoint in [
+            "8.8.8.8:51820",
+            "http://8.8.8.8:51820",
+            "https://8.8.8.8:51820",
+        ] {
+            let socket = canonical_attested_public_endpoint_socket_v1(endpoint).unwrap();
+            assert_eq!(socket.to_string(), "8.8.8.8:51820");
+            let mut body = f.signed_descriptor.descriptor.clone();
+            body.public_endpoint = Some(endpoint.to_string());
+            let signed = SignedNodeDescriptor::sign(body, &f.subject).unwrap();
+            let pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&signed).unwrap();
+            let challenge = DiscoveryEndpointChallengeV1::issue(
+                f.subject.public_key_bytes(),
+                pin.descriptor_hash,
+                expected,
+                [0x57; 32],
+                f.context,
+                NOW,
+                NOW + 120,
+                &f.observer,
+            )
+            .unwrap();
+            let proof =
+                DiscoveryEndpointProofV1::respond(&challenge, &f.context, NOW + 1, &f.subject)
+                    .unwrap();
+            let attestation = DiscoveryEndpointEvidenceAttestationV1::issue_from_verified_proof(
+                &signed,
+                &challenge,
+                &proof,
+                f.context,
+                DiscoveryEndpointAttestationPurposeV1::EndpointPossessionObservation,
+                NOW + 1,
+                NOW + 120,
+                &f.observer,
+            )
+            .unwrap();
+            assert_eq!(attestation.endpoint_commitment(), expected);
+            assert!(attestation
+                .verify_at(
+                    NOW + 1,
+                    &f.observer.public_key_bytes(),
+                    &pin,
+                    &expected,
+                    &discovery_endpoint_evidence_commitment_v1(&challenge, &proof),
+                    &f.context,
+                    DiscoveryEndpointAttestationPurposeV1::EndpointPossessionObservation,
+                )
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn descriptor_endpoint_parser_rejects_ambiguous_or_substituted_targets() {
+        for endpoint in [
+            "http://example.com:51820",
+            "http://127.0.0.1:51820",
+            "https://user@8.8.8.8:51820",
+            "https://8.8.8.8:51820/path",
+            "https://8.8.8.8:51820?x=1",
+            "https://8.8.8.8:51820#x",
+            "https://8.8.8.8:051820",
+            "HTTP://8.8.8.8:51820",
+            "https://8.8.8.8:51820/",
+            "8.8.8.8:0",
+        ] {
+            assert_eq!(
+                canonical_attested_public_endpoint_socket_v1(endpoint),
+                Err(DiscoveryEndpointAttestationError::Malformed)
+            );
+        }
+        assert_eq!(
+            canonical_attested_public_endpoint_socket_v1("http://8.8.8.8")
+                .unwrap()
+                .port(),
+            80
+        );
+        assert_eq!(
+            canonical_attested_public_endpoint_socket_v1("https://8.8.8.8")
+                .unwrap()
+                .port(),
+            443
+        );
+        let f = fixture();
+        let mut body = f.signed_descriptor.descriptor.clone();
+        body.public_endpoint = Some("https://9.9.9.9:51820".to_string());
+        let signed = SignedNodeDescriptor::sign(body, &f.subject).unwrap();
+        let pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&signed).unwrap();
+        let challenge = DiscoveryEndpointChallengeV1::issue(
+            f.subject.public_key_bytes(),
+            pin.descriptor_hash,
+            f.endpoint,
+            [0x58; 32],
+            f.context,
+            NOW,
+            NOW + 120,
+            &f.observer,
+        )
+        .unwrap();
+        let proof =
+            DiscoveryEndpointProofV1::respond(&challenge, &f.context, NOW + 1, &f.subject).unwrap();
+        assert_eq!(
+            DiscoveryEndpointEvidenceAttestationV1::issue_from_verified_proof(
+                &signed,
+                &challenge,
+                &proof,
+                f.context,
+                DiscoveryEndpointAttestationPurposeV1::EndpointPossessionObservation,
+                NOW + 1,
+                NOW + 120,
+                &f.observer,
+            ),
+            Err(DiscoveryEndpointAttestationError::ContextMismatch)
+        );
     }
 
     #[test]

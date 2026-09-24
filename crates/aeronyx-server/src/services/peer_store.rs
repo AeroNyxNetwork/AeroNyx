@@ -349,13 +349,16 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aeronyx_core::protocol::discovery::{
-    NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage, NodeProtocolFeature,
-    RouteDomainAttestationCertificateV1, SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+    DirectoryDescriptorCommitmentV1, NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage,
+    NodeProtocolFeature, RouteDomainAttestationCertificateV1, SignedNodeDescriptor,
+    AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
+
+use super::discovery_endpoint_promotion_material::VerifiedPromotionMaterial;
 
 const DISCOVERY_GOSSIP_STALE_AFTER_SECS: u64 = 900;
 const DISCOVERY_GOSSIP_FAILURE_ATTENTION_THRESHOLD: u64 = 3;
@@ -416,6 +419,24 @@ const UNTRUSTED_DISCOVERY_MAX_FUTURE_SKEW_SECS: u64 = 300;
 /// Bounded exact-replay memory after an expired candidate releases its slot.
 const UNTRUSTED_DISCOVERY_TOMBSTONE_TTL_SECS: u64 = 900;
 const UNTRUSTED_DISCOVERY_TOMBSTONE_CAPACITY: usize = UNTRUSTED_DISCOVERY_CANDIDATE_CAPACITY;
+
+// [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] A promoted Stage-A
+// descriptor stays isolated until its exact durable proof binding and a fresh
+// route probe are both current. Pending/invalidated entries remain deny gates.
+#[derive(Clone, Copy)]
+struct PermissionlessPromotionGate {
+    descriptor_hash: [u8; 32],
+    valid_until: u64,
+    active: bool,
+    verified_control_probe: bool,
+    generation: u64,
+}
+
+// [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Historic gates
+// must not grow with an unbounded sequence of public Stage-A identities.
+// Saturation fails closed; a later lifecycle pass may reclaim a gate only
+// together with its matching live descriptor, never by deleting the deny bit.
+const MAX_PERMISSIONLESS_PROMOTION_GATES: usize = 4_096;
 
 /// Privacy-safe result of applying authenticated client relay path policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2936,6 +2957,9 @@ pub struct PeerStore {
     // routing capacity.
     untrusted_discovery_candidates: RwLock<UntrustedDiscoveryCandidateState>,
     untrusted_discovery_candidate_mode: AtomicBool,
+    permissionless_promotions: RwLock<HashMap<[u8; 32], PermissionlessPromotionGate>>,
+    permissionless_promotion_generation: AtomicU64,
+    permissionless_candidate_round: AtomicU64,
     verified_delivery_witness_requesters: RwLock<HashSet<[u8; 32]>>,
     custody_audit_witness_requesters: RwLock<HashSet<[u8; 32]>>,
     peer_runtime: RwLock<HashMap<[u8; 32], PeerRuntimeMetadata>>,
@@ -2964,6 +2988,9 @@ impl PeerStore {
             peers: RwLock::new(HashMap::new()),
             untrusted_discovery_candidates: RwLock::new(UntrustedDiscoveryCandidateState::default()),
             untrusted_discovery_candidate_mode: AtomicBool::new(false),
+            permissionless_promotions: RwLock::new(HashMap::new()),
+            permissionless_promotion_generation: AtomicU64::new(0),
+            permissionless_candidate_round: AtomicU64::new(0),
             verified_delivery_witness_requesters: RwLock::new(HashSet::new()),
             custody_audit_witness_requesters: RwLock::new(HashSet::new()),
             peer_runtime: RwLock::new(HashMap::new()),
@@ -3202,6 +3229,11 @@ impl PeerStore {
         }
 
         state.tombstones.remove(&node_id);
+        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] A newer
+        // candidate invalidates any old promotion before it can be selected.
+        if let Some(gate) = self.permissionless_promotions.write().get_mut(&node_id) {
+            gate.active = false;
+        }
         state.candidates.insert(
             node_id,
             UntrustedDiscoveryCandidate {
@@ -3212,6 +3244,228 @@ impl PeerStore {
         drop(state);
         drop(peers);
         CandidateAdmissionOutcome::Candidate
+    }
+
+    /// Returns a small, exact, still-untrusted batch for bounded verification.
+    /// The result never enters the live peer view or public API by itself.
+    pub(crate) fn permissionless_candidate_batch(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> Vec<SignedNodeDescriptor> {
+        let state = self.untrusted_discovery_candidates.read();
+        let mut candidates = state
+            .candidates
+            .values()
+            .filter(|candidate| {
+                Self::untrusted_candidate_is_within_limits(&candidate.descriptor, now)
+            })
+            .map(|candidate| candidate.descriptor.clone())
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|descriptor| (descriptor.node_id(), descriptor.sequence()));
+        if !candidates.is_empty() {
+            let round = self
+                .permissionless_candidate_round
+                .fetch_add(1, Ordering::Relaxed);
+            let start = (round as usize) % candidates.len();
+            candidates.rotate_left(start);
+        }
+        candidates.truncate(limit.min(UNTRUSTED_DISCOVERY_CANDIDATE_CAPACITY));
+        candidates
+    }
+
+    pub(crate) fn prepare_permissionless_promotion_capacity_for(
+        &self,
+        node_id: &[u8; 32],
+        now: u64,
+    ) -> bool {
+        if now == 0 {
+            return false;
+        }
+        if self.permissionless_promotions.read().len() >= MAX_PERMISSIONLESS_PROMOTION_GATES {
+            self.prune_expired_permissionless_promotions(now);
+        }
+        let gates = self.permissionless_promotions.read();
+        gates.contains_key(node_id) || gates.len() < MAX_PERMISSIONLESS_PROMOTION_GATES
+    }
+
+    fn prune_expired_permissionless_promotions(&self, now: u64) -> usize {
+        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Never drop
+        // a deny gate while its exact live descriptor remains in the peer
+        // map: that would turn expiry into route authority on clock rollback.
+        // Lock peers before gates, matching read-side lock order.
+        let mut peers = self.peers.write();
+        let mut gates = self.permissionless_promotions.write();
+        let expired = gates
+            .iter()
+            .filter(|(_, gate)| gate.valid_until < now)
+            .map(|(node_id, gate)| (*node_id, gate.descriptor_hash))
+            .collect::<Vec<_>>();
+        let mut removed_live = false;
+        for (node_id, descriptor_hash) in &expired {
+            let matching_peer = peers.get(node_id).is_some_and(|descriptor| {
+                DirectoryDescriptorCommitmentV1::from_signed_descriptor(descriptor)
+                    .is_ok_and(|pin| pin.descriptor_hash == *descriptor_hash)
+            });
+            if matching_peer {
+                peers.remove(node_id);
+                removed_live = true;
+            }
+            gates.remove(node_id);
+        }
+        drop(gates);
+        drop(peers);
+        if removed_live {
+            self.mark_peer_cache_dirty();
+        }
+        expired.len()
+    }
+
+    /// Accepts only exact resolver-minted material for a still-current Stage-A
+    /// candidate. The deny gate is installed before the live descriptor write;
+    /// a concurrent candidate rotation leaves it closed.
+    pub(crate) fn promote_permissionless_candidate(
+        &self,
+        material: &VerifiedPromotionMaterial,
+        now: u64,
+    ) -> Result<bool, PeerStoreError> {
+        let descriptor = material.descriptor();
+        let node_id = descriptor.node_id();
+        let pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(descriptor)
+            .map_err(|_| PeerStoreError::VerificationFailed)?;
+        if now == 0 || material.valid_until() < now || pin != material.descriptor_commitment() {
+            return Err(PeerStoreError::VerificationFailed);
+        }
+        if !self.prepare_permissionless_promotion_capacity_for(&node_id, now) {
+            return Err(PeerStoreError::CapacityExceeded {
+                max_peers: MAX_PERMISSIONLESS_PROMOTION_GATES,
+            });
+        }
+        let candidate_is_exact = |state: &UntrustedDiscoveryCandidateState| {
+            state.candidates.get(&node_id).is_some_and(|candidate| {
+                candidate.descriptor == *descriptor
+                    && Self::untrusted_candidate_commitment(descriptor)
+                        == Some(candidate.commitment)
+            })
+        };
+        if !candidate_is_exact(&self.untrusted_discovery_candidates.read()) {
+            return Err(PeerStoreError::VerificationFailed);
+        }
+        let mut gates = self.permissionless_promotions.write();
+        if !gates.contains_key(&node_id) && gates.len() >= MAX_PERMISSIONLESS_PROMOTION_GATES {
+            return Err(PeerStoreError::CapacityExceeded {
+                max_peers: MAX_PERMISSIONLESS_PROMOTION_GATES,
+            });
+        }
+        let generation = self
+            .permissionless_promotion_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let previous = gates.insert(
+            node_id,
+            PermissionlessPromotionGate {
+                descriptor_hash: pin.descriptor_hash,
+                valid_until: material.valid_until(),
+                active: false,
+                verified_control_probe: false,
+                generation,
+            },
+        );
+        drop(gates);
+        let changed = match self.upsert_verified_from_source(
+            descriptor.clone(),
+            now,
+            "permissionless_promotion",
+        ) {
+            Ok(changed) => changed,
+            Err(error) => {
+                let mut gates = self.permissionless_promotions.write();
+                if gates
+                    .get(&node_id)
+                    .is_some_and(|gate| gate.generation == generation)
+                {
+                    if let Some(previous) = previous {
+                        gates.insert(node_id, previous);
+                    } else {
+                        gates.remove(&node_id);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let candidates = self.untrusted_discovery_candidates.read();
+        if !candidate_is_exact(&candidates) {
+            return Err(PeerStoreError::VerificationFailed);
+        }
+        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Generic
+        // route success is not promotion authority. Keep the candidate read
+        // lock through activation so rotation cannot reopen the old gate.
+        if let Some(gate) = self.permissionless_promotions.write().get_mut(&node_id) {
+            if gate.descriptor_hash == pin.descriptor_hash {
+                gate.active = true;
+            }
+        }
+        drop(candidates);
+        Ok(changed)
+    }
+
+    /// Records the server's exact target-signed terminal control probe after
+    /// its separate receipt verifier has accepted the immutable request and
+    /// response. Ordinary route observations cannot call this transition.
+    pub(crate) fn record_permissionless_promotion_probe_verified(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+    ) -> bool {
+        let node_id = descriptor.node_id();
+        let Ok(pin) = DirectoryDescriptorCommitmentV1::from_signed_descriptor(descriptor) else {
+            return false;
+        };
+        let current = self.permissionless_promotions.read().get(&node_id).copied();
+        if current.is_none_or(|gate| {
+            !gate.active || gate.valid_until < now || gate.descriptor_hash != pin.descriptor_hash
+        }) {
+            return false;
+        }
+        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] A new
+        // signed descriptor and successful control ACK cannot shorten this
+        // identity's existing route quarantine. The quarantine check and
+        // success mutation share one route-health write lock.
+        if !self.record_route_forward_success_with_quarantine_policy(descriptor, now, false) {
+            return false;
+        }
+        let mut gates = self.permissionless_promotions.write();
+        let Some(gate) = gates.get_mut(&node_id) else {
+            return false;
+        };
+        if !gate.active || gate.valid_until < now || gate.descriptor_hash != pin.descriptor_hash {
+            return false;
+        }
+        gate.verified_control_probe = true;
+        true
+    }
+
+    fn permissionless_gate_allows(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+        require_route_probe: bool,
+    ) -> bool {
+        let node_id = descriptor.node_id();
+        let gate = self.permissionless_promotions.read().get(&node_id).copied();
+        let Some(gate) = gate else { return true };
+        if !gate.active
+            || gate.valid_until < now
+            || DirectoryDescriptorCommitmentV1::from_signed_descriptor(descriptor)
+                .map_or(true, |pin| pin.descriptor_hash != gate.descriptor_hash)
+        {
+            return false;
+        }
+        !require_route_probe || {
+            let health = self.route_health.read();
+            gate.verified_control_probe
+                && Self::routeability_state_and_ready(health.get(&node_id), now).1
+        }
     }
 
     /// Admits one canonical self-signed descriptor into the bounded Stage-A
@@ -6065,6 +6319,15 @@ impl PeerStore {
         descriptor: &SignedNodeDescriptor,
         now: u64,
     ) -> bool {
+        self.record_route_forward_success_with_quarantine_policy(descriptor, now, true)
+    }
+
+    fn record_route_forward_success_with_quarantine_policy(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+        allow_active_quarantine: bool,
+    ) -> bool {
         let node_id = descriptor.node_id();
         let result = self.with_current_verified_route_surface(
             descriptor,
@@ -6072,16 +6335,22 @@ impl PeerStore {
             |observed_node_id, route_fingerprint| {
                 let mut route_health = self.route_health.write();
                 let health = route_health.entry(observed_node_id).or_default();
+                if !allow_active_quarantine
+                    && Self::route_quarantine_remaining_seconds(health, now).is_some()
+                {
+                    return None;
+                }
                 let cleared_quarantine = health.quarantine_until.take().is_some();
                 health.success_count = health.success_count.saturating_add(1);
                 health.consecutive_failures = 0;
                 health.last_success_at = Some(now);
                 health.last_success_route_fingerprint_sha256 = Some(route_fingerprint);
-                cleared_quarantine
+                Some(cleared_quarantine)
             },
         );
         let cleared_quarantine = match result {
-            Ok(cleared_quarantine) => cleared_quarantine,
+            Ok(Some(cleared_quarantine)) => cleared_quarantine,
+            Ok(None) => return false,
             Err(reason) => {
                 self.record_audit_event(
                     now,
@@ -6905,6 +7174,7 @@ impl PeerStore {
             .read()
             .values()
             .filter(|descriptor| descriptor.verify_at(now).is_ok())
+            .filter(|descriptor| self.permissionless_gate_allows(descriptor, now, true))
             .filter(|descriptor| !public_only || descriptor.descriptor.policy.public_discovery)
             .cloned()
             .collect();
@@ -6947,6 +7217,7 @@ impl PeerStore {
         let mut descriptors: Vec<SignedNodeDescriptor> = peers
             .values()
             .filter(|descriptor| descriptor.verify_at(generated_at).is_ok())
+            .filter(|descriptor| self.permissionless_gate_allows(descriptor, generated_at, true))
             .cloned()
             .collect();
         drop(peers);
@@ -7005,6 +7276,15 @@ impl PeerStore {
             .read()
             .values()
             .filter(|descriptor| descriptor.verify_signature().is_ok())
+            // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] The
+            // descriptor-only legacy cache cannot persist promotion authority.
+            // On restart the node must rejoin Stage-A and revalidate probation.
+            .filter(|descriptor| {
+                !self
+                    .permissionless_promotions
+                    .read()
+                    .contains_key(&descriptor.node_id())
+            })
             .inspect(|descriptor| {
                 if descriptor.descriptor.is_valid_at(generated_at) {
                     valid += 1;
@@ -7619,7 +7899,6 @@ impl PeerStore {
         generated_at: u64,
     ) -> Vec<PeerStoreRouteabilityCacheEvidence> {
         let peers = self.peers.read();
-        let route_health = self.route_health.read();
         let mut evidence = Vec::new();
 
         for (node_id, descriptor) in peers.iter() {
@@ -7627,6 +7906,7 @@ impl PeerStore {
                 break;
             }
             if descriptor.verify_at(generated_at).is_err()
+                || !self.permissionless_gate_allows(descriptor, generated_at, true)
                 || descriptor
                     .descriptor
                     .public_endpoint
@@ -7636,6 +7916,7 @@ impl PeerStore {
             {
                 continue;
             }
+            let route_health = self.route_health.read();
             let Some(health) = route_health.get(node_id) else {
                 continue;
             };
@@ -7669,7 +7950,6 @@ impl PeerStore {
                 evidence_kind: ROUTEABILITY_EVIDENCE_KIND_ROUTE_SURFACE.to_string(),
             });
         }
-        drop(route_health);
         drop(peers);
 
         evidence.sort_by(|left, right| left.node_id_hex.cmp(&right.node_id_hex));
@@ -8167,6 +8447,7 @@ impl PeerStore {
             .read()
             .get(node_id)
             .filter(|descriptor| descriptor.verify_at(now).is_ok())
+            .filter(|descriptor| self.permissionless_gate_allows(descriptor, now, true))
             .cloned()
     }
 
@@ -8209,6 +8490,7 @@ impl PeerStore {
             .read()
             .values()
             .filter(|descriptor| descriptor.verify_at(now).is_ok())
+            .filter(|descriptor| self.permissionless_gate_allows(descriptor, now, true))
             .filter(|descriptor| descriptor.descriptor.policy.public_discovery)
             .cloned()
             .collect::<Vec<_>>();
@@ -8231,6 +8513,7 @@ impl PeerStore {
             .read()
             .values()
             .filter(|descriptor| descriptor.verify_at(now).is_ok())
+            .filter(|descriptor| self.permissionless_gate_allows(descriptor, now, true))
             .filter(|descriptor| descriptor.descriptor.policy.public_discovery)
             .filter_map(|descriptor| {
                 descriptor
@@ -8255,6 +8538,7 @@ impl PeerStore {
             .read()
             .values()
             .filter(|descriptor| descriptor.verify_at(now).is_ok())
+            .filter(|descriptor| self.permissionless_gate_allows(descriptor, now, true))
             .filter(|descriptor| descriptor.descriptor.capabilities.contains(&capability))
             .cloned()
             .collect()
@@ -8684,11 +8968,12 @@ impl PeerStore {
 
     /// Downgrades descriptors that are no longer valid at `now`.
     ///
-    /// Expired peers are retained as signed, non-routeable local history so a
-    /// node does not forget known peers during cleanup or restart. Validity
-    /// gates elsewhere (`verify_at(now)`, route candidates, gossip export)
-    /// still prevent expired descriptors from being counted as live peers.
+    /// Ordinary expired peers are retained as signed, non-routeable local
+    /// history. Permissionless promotions are different: their expiring deny
+    /// gate and exact live descriptor are removed together, so dropping the
+    /// gate can never reveal an otherwise routeable historic descriptor.
     pub fn cleanup_expired(&self, now: u64) -> usize {
+        let promotion_removed = self.prune_expired_permissionless_promotions(now);
         let expired_candidates = {
             let mut candidates = self.untrusted_discovery_candidates.write();
             let before = candidates.candidates.len();
@@ -8725,7 +9010,7 @@ impl PeerStore {
         }
 
         let degraded_count = newly_degraded.len();
-        if degraded_count > 0 || expired_candidates > 0 {
+        if degraded_count > 0 || expired_candidates > 0 || promotion_removed > 0 {
             self.counters
                 .expired_degraded
                 .fetch_add(degraded_count as u64, Ordering::Relaxed);
@@ -8746,12 +9031,14 @@ impl PeerStore {
                 "expired_peer_cleanup",
                 "accepted",
                 format!(
-                    "degraded={degraded_count} candidate_released={expired_candidates} retained_total={} removed=0",
+                    "degraded={degraded_count} candidate_released={expired_candidates} retained_total={} removed={promotion_removed}",
                     self.peers.read().len()
                 ),
             );
         }
-        degraded_count.saturating_add(expired_candidates)
+        degraded_count
+            .saturating_add(expired_candidates)
+            .saturating_add(promotion_removed)
     }
 
     /// Returns a monitoring snapshot.
@@ -9751,6 +10038,14 @@ impl PeerStore {
     /// are sent only to nodes with fresh successful probe/forward evidence.
     #[must_use]
     pub fn is_routeable_now(&self, node_id: &[u8; 32], now: u64) -> bool {
+        if self
+            .peers
+            .read()
+            .get(node_id)
+            .is_none_or(|descriptor| !self.permissionless_gate_allows(descriptor, now, true))
+        {
+            return false;
+        }
         let route_health = self.route_health.read();
         let (_, ready) = Self::routeability_state_and_ready(route_health.get(node_id), now);
         ready
@@ -9816,12 +10111,12 @@ impl PeerStore {
     ) -> Vec<ScoredPeerRouteCandidate> {
         let peers = self.peers.read();
         let metadata = self.peer_runtime.read();
-        let route_health = self.route_health.read();
         let capability_label = Self::capability_label(capability).to_string();
         let mut candidates = Vec::new();
 
         for (node_id, descriptor) in peers.iter() {
             if descriptor.verify_at(now).is_err()
+                || !self.permissionless_gate_allows(descriptor, now, !include_route_quarantined)
                 || !descriptor.descriptor.capabilities.contains(&capability)
                 || descriptor.descriptor.public_endpoint.is_none()
             {
@@ -9839,6 +10134,7 @@ impl PeerStore {
             if health == "expired" {
                 continue;
             }
+            let route_health = self.route_health.read();
             let route_health_entry = route_health.get(node_id);
             let (route_health_bucket, route_health_score) =
                 Self::route_health_bucket_and_score(route_health_entry, now);
@@ -13049,6 +13345,195 @@ mod tests {
     }
 
     #[test]
+    fn permissionless_gate_rejects_pre_promotion_route_success_and_cache_export() {
+        let now = 1_780_000_000;
+        let identity = IdentityKeyPair::generate();
+        let descriptor = permissionless_descriptor_for(&identity, 7, now, "https://8.8.8.8:8422");
+        let store = PeerStore::new();
+        assert!(store.upsert_verified(descriptor.clone(), now).unwrap());
+        assert!(store.record_route_forward_success_for_descriptor(&descriptor, now + 1));
+        let pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).unwrap();
+        store.permissionless_promotions.write().insert(
+            descriptor.node_id(),
+            PermissionlessPromotionGate {
+                descriptor_hash: pin.descriptor_hash,
+                valid_until: now + 90,
+                active: true,
+                verified_control_probe: false,
+                generation: 0,
+            },
+        );
+        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] A fresh
+        // descriptor cannot inherit an earlier successful route as promotion
+        // authority, nor escape via heartbeat or descriptor-only restart cache.
+        assert!(store.get_valid(&descriptor.node_id(), now + 2).is_none());
+        assert!(store
+            .export_bootstrap_snapshot(now + 2, now + 2, true, None)
+            .peers
+            .is_empty());
+        assert!(store
+            .export_signed_peer_records_for_heartbeat(now + 2, None)
+            .records
+            .peers
+            .is_empty());
+        assert!(store.export_peer_cache_snapshot(now + 2).peers.is_empty());
+        assert!(store.record_route_forward_success_for_descriptor(&descriptor, now + 3));
+        assert!(store.get_valid(&descriptor.node_id(), now + 3).is_none());
+        assert!(store.record_permissionless_promotion_probe_verified(&descriptor, now + 4));
+        assert_eq!(
+            store.get_valid(&descriptor.node_id(), now + 4),
+            Some(descriptor)
+        );
+    }
+
+    #[test]
+    fn permissionless_probe_cannot_clear_identity_quarantine_after_sequence_rotation() {
+        let now = 1_780_100_000;
+        let identity = IdentityKeyPair::from_bytes(&[0x51; 32]).unwrap();
+        let first = permissionless_descriptor_for(&identity, 7, now, "https://8.8.8.8:8422");
+        let store = PeerStore::new();
+        store
+            .upsert_verified(first.clone(), now)
+            .expect("first descriptor");
+        for offset in 1..=PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD {
+            assert!(store.record_route_forward_failure_for_descriptor(
+                &first,
+                now + u64::from(offset),
+                "request_failed",
+            ));
+        }
+        let quarantined_at = now + u64::from(PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD);
+        assert!(store.is_route_quarantined_now(&first.node_id(), quarantined_at + 1));
+        let rotated =
+            permissionless_descriptor_for(&identity, 8, quarantined_at + 1, "https://8.8.8.8:8422");
+        store
+            .upsert_verified(rotated.clone(), quarantined_at + 1)
+            .expect("rotated descriptor");
+        let pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&rotated).unwrap();
+        store.permissionless_promotions.write().insert(
+            rotated.node_id(),
+            PermissionlessPromotionGate {
+                descriptor_hash: pin.descriptor_hash,
+                valid_until: quarantined_at + PEER_ROUTE_FAILURE_QUARANTINE_SECS + 60,
+                active: true,
+                verified_control_probe: false,
+                generation: 0,
+            },
+        );
+        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Even a
+        // correctly signed control ACK cannot bypass the identity-level
+        // isolation window through a higher descriptor sequence.
+        assert!(!store.record_permissionless_promotion_probe_verified(
+            &rotated,
+            quarantined_at + PEER_ROUTE_RECOVERY_PROBE_AFTER_SECS,
+        ));
+        assert!(store.is_route_quarantined_now(
+            &rotated.node_id(),
+            quarantined_at + PEER_ROUTE_RECOVERY_PROBE_AFTER_SECS,
+        ));
+        assert!(store
+            .get_valid(
+                &rotated.node_id(),
+                quarantined_at + PEER_ROUTE_RECOVERY_PROBE_AFTER_SECS
+            )
+            .is_none());
+        let recovered_at = quarantined_at + PEER_ROUTE_FAILURE_QUARANTINE_SECS + 1;
+        assert!(store.record_permissionless_promotion_probe_verified(&rotated, recovered_at));
+        assert_eq!(
+            store.get_valid(&rotated.node_id(), recovered_at),
+            Some(rotated)
+        );
+    }
+
+    #[test]
+    fn permissionless_gate_capacity_and_failed_upsert_leave_no_unbounded_residue() {
+        let now = 1_780_200_000;
+        let identity = IdentityKeyPair::from_bytes(&[0x52; 32]).unwrap();
+        let descriptor = permissionless_descriptor_for(&identity, 7, now, "https://8.8.8.8:8422");
+        let material =
+            VerifiedPromotionMaterial::test_only_from_descriptor(descriptor.clone(), now, now + 90)
+                .expect("test material");
+        let full_peer_store = PeerStore::with_max_peers(0);
+        full_peer_store.enable_untrusted_discovery_candidate_mode();
+        assert_eq!(
+            full_peer_store.admit_permissionless_descriptor(descriptor.clone(), now),
+            PermissionlessNodeAdmissionOutcome::Admitted,
+        );
+        assert!(matches!(
+            full_peer_store.promote_permissionless_candidate(&material, now),
+            Err(PeerStoreError::CapacityExceeded { .. })
+        ));
+        assert!(full_peer_store.permissionless_promotions.read().is_empty());
+
+        let store = PeerStore::new();
+        store.enable_untrusted_discovery_candidate_mode();
+        assert_eq!(
+            store.admit_permissionless_descriptor(descriptor.clone(), now),
+            PermissionlessNodeAdmissionOutcome::Admitted,
+        );
+        {
+            let mut gates = store.permissionless_promotions.write();
+            for index in 0..MAX_PERMISSIONLESS_PROMOTION_GATES {
+                let mut node_id = [0u8; 32];
+                node_id[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                gates.insert(
+                    node_id,
+                    PermissionlessPromotionGate {
+                        descriptor_hash: [4; 32],
+                        valid_until: now + 90,
+                        active: false,
+                        verified_control_probe: false,
+                        generation: 0,
+                    },
+                );
+            }
+        }
+        assert!(!store.prepare_permissionless_promotion_capacity_for(&descriptor.node_id(), now));
+        assert!(matches!(
+            store.promote_permissionless_candidate(&material, now),
+            Err(PeerStoreError::CapacityExceeded { .. })
+        ));
+        assert_eq!(
+            store.permissionless_promotions.read().len(),
+            MAX_PERMISSIONLESS_PROMOTION_GATES
+        );
+        assert!(store.get_valid(&descriptor.node_id(), now).is_none());
+        assert_eq!(
+            store.cleanup_expired(now + 91),
+            MAX_PERMISSIONLESS_PROMOTION_GATES
+        );
+        assert!(store.permissionless_promotions.read().is_empty());
+        assert!(
+            store.prepare_permissionless_promotion_capacity_for(&descriptor.node_id(), now + 91)
+        );
+    }
+
+    #[test]
+    fn expired_promotion_prunes_exact_peer_and_cannot_reopen_on_clock_rollback() {
+        let now = 1_780_300_000;
+        let identity = IdentityKeyPair::from_bytes(&[0x53; 32]).unwrap();
+        let descriptor = permissionless_descriptor_for(&identity, 7, now, "https://8.8.8.8:8422");
+        let material =
+            VerifiedPromotionMaterial::test_only_from_descriptor(descriptor.clone(), now, now + 90)
+                .expect("test material");
+        let store = PeerStore::new();
+        store.enable_untrusted_discovery_candidate_mode();
+        assert_eq!(
+            store.admit_permissionless_descriptor(descriptor.clone(), now),
+            PermissionlessNodeAdmissionOutcome::Admitted,
+        );
+        assert!(store
+            .promote_permissionless_candidate(&material, now)
+            .is_ok());
+        assert_eq!(store.permissionless_promotions.read().len(), 1);
+        assert!(store.get_valid(&descriptor.node_id(), now).is_none());
+        assert_eq!(store.cleanup_expired(now + 91), 1);
+        assert!(store.permissionless_promotions.read().is_empty());
+        assert!(!store.peers.read().contains_key(&descriptor.node_id()));
+        assert!(store.get_valid(&descriptor.node_id(), now).is_none());
+    }
+
+    #[test]
     fn permissionless_admission_is_exact_replay_safe_and_live_sequence_fenced() {
         let now = 1_780_000_000;
         let identity = IdentityKeyPair::generate();
@@ -14234,11 +14719,7 @@ mod tests {
         store.upsert_verified(quarantined, now).unwrap();
         store.record_route_forward_success(&routeable_node_id, now + 1);
         for observed_at in [now + 2, now + 3, now + 4] {
-            store.record_route_forward_failure(
-                &quarantined_node_id,
-                observed_at,
-                "request_failed",
-            );
+            store.record_route_forward_failure(&quarantined_node_id, observed_at, "request_failed");
         }
         for offset in 5..=7 {
             store.record_blind_relay_two_hop_probe_result_with_context(
@@ -14275,10 +14756,7 @@ mod tests {
         );
         assert!(store.take_peer_cache_dirty());
 
-        store.clear_restored_peer_cache_readiness_evidence(
-            now + 9,
-            "external_witness_rollback",
-        );
+        store.clear_restored_peer_cache_readiness_evidence(now + 9, "external_witness_rollback");
         let after = store.status(now + 10);
         assert_eq!(after.snapshot.valid_peers, 2);
         assert!(store.get_valid(&routeable_node_id, now + 10).is_some());
@@ -14301,17 +14779,11 @@ mod tests {
             Some("rejected")
         );
         assert_eq!(
-            after
-                .bootstrap
-                .last_three_hop_proof_cache_status
-                .as_deref(),
+            after.bootstrap.last_three_hop_proof_cache_status.as_deref(),
             Some("rejected")
         );
         assert_eq!(
-            after
-                .bootstrap
-                .last_client_delivery_cache_status
-                .as_deref(),
+            after.bootstrap.last_client_delivery_cache_status.as_deref(),
             Some("rejected")
         );
         assert!(after.recent_audit_events.iter().any(|event| {

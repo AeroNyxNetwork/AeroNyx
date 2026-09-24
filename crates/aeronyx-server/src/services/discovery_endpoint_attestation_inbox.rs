@@ -40,6 +40,13 @@ const MAX_RETENTION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_CLEANUP_BATCH: usize = 4_096;
 const SLOT_DOMAIN: &[u8] = b"AeroNyx/DiscoveryEndpointAttestationSlotV1\0";
 const CANDIDATE_GROUP_DOMAIN: &[u8] = b"AeroNyx/DiscoveryEndpointAttestationCandidateGroupV1\0";
+const EXACT_CANDIDATE_FACTS_SQL: &str = "SELECT COUNT(DISTINCT observer_node_id),MAX(observed_at),
+            MIN(retained_expires_at),MAX(retained_expires_at)
+     FROM discovery_endpoint_attestation_inbox_v1
+     WHERE subject_node_id=?1 AND descriptor_sequence=?2
+       AND descriptor_hash=?3 AND endpoint_commitment=?4
+       AND observed_at>=?5 AND observed_at<=?6
+       AND retained_expires_at>=?6";
 
 /// Bounded policy for one dedicated attestation inbox.
 #[derive(Clone, PartialEq, Eq)]
@@ -204,7 +211,7 @@ impl VerifiedDiscoveryEndpointAttestationV1 {
         self.value.commitment()
     }
 
-    fn slot_commitment(&self) -> [u8; 32] {
+    pub(crate) fn slot_commitment(&self) -> [u8; 32] {
         slot_commitment(&self.value)
     }
 }
@@ -547,6 +554,144 @@ impl SqliteDiscoveryEndpointAttestationInbox {
             });
         }
         Ok(facts)
+    }
+
+    /// Reads one exact candidate group through the existing four-field index.
+    /// Unlike the aggregate list, this admission path cannot scan unrelated
+    /// subjects or starve a candidate behind a sorted LIMIT.
+    // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Keep this
+    // projection private; it still grants no route or promotion authority.
+    pub(crate) fn candidate_facts_for_exact_at(
+        &self,
+        subject_node_id: [u8; 32],
+        descriptor_sequence: u64,
+        descriptor_hash: [u8; 32],
+        endpoint_commitment: [u8; 32],
+        now: u64,
+        maximum_evidence_age_secs: u64,
+    ) -> Result<Option<DiscoveryEndpointCandidateFacts>, DiscoveryEndpointAttestationInboxError>
+    {
+        if now == 0
+            || descriptor_sequence == 0
+            || maximum_evidence_age_secs == 0
+            || maximum_evidence_age_secs > MAX_RETENTION_TTL_SECS
+            || subject_node_id.iter().all(|byte| *byte == 0)
+            || descriptor_hash.iter().all(|byte| *byte == 0)
+            || endpoint_commitment.iter().all(|byte| *byte == 0)
+        {
+            return Err(DiscoveryEndpointAttestationInboxError::Rejected);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+        let (observers, newest, oldest_expiry, newest_expiry): (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = connection
+            .query_row(
+                EXACT_CANDIDATE_FACTS_SQL,
+                params![
+                    &subject_node_id[..],
+                    as_i64(descriptor_sequence)?,
+                    &descriptor_hash[..],
+                    &endpoint_commitment[..],
+                    as_i64(now.saturating_sub(maximum_evidence_age_secs))?,
+                    as_i64(now)?,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+        if observers == 0 {
+            return Ok(None);
+        }
+        let newest = as_u64(newest.ok_or(DiscoveryEndpointAttestationInboxError::Corrupt)?)?;
+        Ok(Some(DiscoveryEndpointCandidateFacts {
+            group_commitment: candidate_group_commitment(
+                &subject_node_id,
+                descriptor_sequence,
+                &descriptor_hash,
+                &endpoint_commitment,
+            ),
+            descriptor_sequence,
+            distinct_observers: usize::try_from(observers)
+                .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?,
+            overlap_started_at: newest,
+            overlap_expires_at: as_u64(
+                oldest_expiry.ok_or(DiscoveryEndpointAttestationInboxError::Corrupt)?,
+            )?,
+            newest_observed_at: newest,
+            newest_expires_at: as_u64(
+                newest_expiry.ok_or(DiscoveryEndpointAttestationInboxError::Corrupt)?,
+            )?,
+        }))
+    }
+
+    /// Returns only the already-verified canonical frame for one exact
+    /// observer/subject slot. This permits loss-tolerant re-gossip without
+    /// minting a conflicting attestation inside the existing retention window.
+    // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Length admission
+    // precedes BLOB materialization; the signed frame is reverified on read.
+    pub(crate) fn exact_frame_for_slot_at(
+        &self,
+        slot: [u8; 32],
+        expected_context: [u8; 32],
+        now: u64,
+    ) -> Result<Option<Vec<u8>>, DiscoveryEndpointAttestationInboxError> {
+        if now == 0 || slot.iter().all(|byte| *byte == 0) {
+            return Err(DiscoveryEndpointAttestationInboxError::Rejected);
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+        let row = tx.query_row(
+            "SELECT attestation_commitment,LENGTH(frame) FROM discovery_endpoint_attestation_inbox_v1
+             WHERE slot_commitment=?1 AND retained_expires_at>=?2",
+            params![&slot[..], as_i64(now)?],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        ).optional().map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+        let Some((stored_commitment, frame_len)) = row else {
+            tx.commit()
+                .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+            return Ok(None);
+        };
+        if usize::try_from(frame_len)
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?
+            != DISCOVERY_ENDPOINT_ATTESTATION_FRAME_BYTES_V1
+        {
+            return Err(DiscoveryEndpointAttestationInboxError::Corrupt);
+        }
+        let frame = tx
+            .query_row(
+                "SELECT frame FROM discovery_endpoint_attestation_inbox_v1
+             WHERE slot_commitment=?1 AND LENGTH(frame)=?2",
+                params![
+                    &slot[..],
+                    i64::try_from(DISCOVERY_ENDPOINT_ATTESTATION_FRAME_BYTES_V1)
+                        .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?
+            .ok_or(DiscoveryEndpointAttestationInboxError::Corrupt)?;
+        let verified =
+            VerifiedDiscoveryEndpointAttestationV1::verify(&frame, now, expected_context)
+                .map_err(|_| DiscoveryEndpointAttestationInboxError::Corrupt)?;
+        if verified.slot_commitment() != slot
+            || verified.commitment() != array32(stored_commitment)?
+        {
+            return Err(DiscoveryEndpointAttestationInboxError::Corrupt);
+        }
+        tx.commit()
+            .map_err(|_| DiscoveryEndpointAttestationInboxError::Unavailable)?;
+        Ok(Some(frame))
     }
 
     /// Confirms that one exact descriptor tuple still has a canonical, fresh
@@ -1125,6 +1270,124 @@ mod tests {
             retention_ttl_secs: 120,
             cleanup_batch_size: 8,
         }
+    }
+
+    #[test]
+    fn exact_candidate_facts_use_group_index_and_ignore_unrelated_subjects() {
+        let dir = tempdir();
+        let cfg = config(&dir, 64, 64 * 289);
+        let store = SqliteDiscoveryEndpointAttestationInbox::open(cfg.clone()).expect("open");
+        let first = fixture(3, 9, 1, 7, NOW, NOW + 60, 4);
+        let second = fixture(4, 9, 2, 8, NOW + 1, NOW + 61, 4);
+        for item in [&first, &second] {
+            store
+                .record_verified_at(&item.verified, item.verified.value.observed_at())
+                .expect("record exact subject");
+        }
+        for seed in 10..42 {
+            let other = fixture(3, seed, seed, seed, NOW, NOW + 60, 4);
+            store
+                .record_verified_at(&other.verified, NOW)
+                .expect("record unrelated subject");
+        }
+        let value = &first.verified.value;
+        let exact = store
+            .candidate_facts_for_exact_at(
+                value.subject_node_id(),
+                value.descriptor_sequence(),
+                value.descriptor_hash(),
+                value.endpoint_commitment(),
+                NOW + 2,
+                30,
+            )
+            .expect("exact facts")
+            .expect("retained exact candidate");
+        assert_eq!(exact.distinct_observers, 2);
+        assert_eq!(exact.overlap_started_at, NOW + 1);
+        assert!(store
+            .candidate_facts_for_exact_at(
+                [0x55; 32],
+                value.descriptor_sequence(),
+                value.descriptor_hash(),
+                value.endpoint_commitment(),
+                NOW + 2,
+                30,
+            )
+            .expect("absent exact facts")
+            .is_none());
+        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] The
+        // planner must seek by the exact four-field prefix, never scan the
+        // 16k-row default inbox merely to evaluate one Stage-A candidate.
+        let connection =
+            Connection::open_with_flags(&cfg.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("read-only query plan");
+        let sql = format!("EXPLAIN QUERY PLAN {EXACT_CANDIDATE_FACTS_SQL}");
+        let mut statement = connection.prepare(&sql).expect("plan statement");
+        let details = statement
+            .query_map(
+                params![
+                    &value.subject_node_id()[..],
+                    as_i64(value.descriptor_sequence()).expect("sequence"),
+                    &value.descriptor_hash()[..],
+                    &value.endpoint_commitment()[..],
+                    as_i64(NOW - 28).expect("cutoff"),
+                    as_i64(NOW + 2).expect("now"),
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("query plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("plan rows");
+        assert!(details
+            .iter()
+            .any(|detail| detail.contains("USING INDEX discovery_endpoint_attestation_group_v1")));
+        assert!(!details
+            .iter()
+            .any(|detail| detail.starts_with("SCAN discovery_endpoint_attestation_inbox_v1")));
+    }
+
+    #[test]
+    fn exact_slot_replay_is_canonical_and_expired_rows_cannot_poison_eligibility() {
+        let dir = tempdir();
+        let store =
+            SqliteDiscoveryEndpointAttestationInbox::open(config(&dir, 8, 8192)).expect("open");
+        let expired = fixture(3, 9, 1, 7, NOW, NOW + 10, 4);
+        let current = fixture(4, 9, 2, 8, NOW + 1, NOW + 60, 4);
+        store
+            .record_verified_at(&expired.verified, NOW)
+            .expect("expired row");
+        store
+            .record_verified_at(&current.verified, NOW + 1)
+            .expect("current row");
+        let slot = current.verified.slot_commitment();
+        assert_eq!(
+            store
+                .exact_frame_for_slot_at(slot, [8; 32], NOW + 20)
+                .expect("exact slot"),
+            Some(current.verified.frame.clone())
+        );
+        assert_eq!(
+            store.exact_frame_for_slot_at(slot, [7; 32], NOW + 20),
+            Err(DiscoveryEndpointAttestationInboxError::Corrupt)
+        );
+        assert!(store
+            .exact_frame_for_slot_at(expired.verified.slot_commitment(), [7; 32], NOW + 20)
+            .expect("expired slot")
+            .is_none());
+        let value = &current.verified.value;
+        let facts = store
+            .candidate_facts_for_exact_at(
+                value.subject_node_id(),
+                value.descriptor_sequence(),
+                value.descriptor_hash(),
+                value.endpoint_commitment(),
+                NOW + 20,
+                30,
+            )
+            .expect("exact facts")
+            .expect("one fresh observer");
+        assert_eq!(facts.distinct_observers, 1);
+        assert_eq!(facts.overlap_expires_at, NOW + 60);
     }
 
     #[test]
