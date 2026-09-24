@@ -2880,7 +2880,7 @@ pub struct PeerStore {
     route_domain_certificates: RwLock<HashMap<[u8; 32], RouteDomainAttestationCertificateV1>>,
     #[cfg(test)]
     route_domain_import_test_gate:
-        Option<Arc<route_domain_certificates::RouteDomainImportTestGate>>,
+        Option<std::sync::Arc<route_domain_certificates::RouteDomainImportTestGate>>,
     max_peers: RwLock<Option<usize>>,
     counters: PeerStoreCounters,
     audit_events: RwLock<VecDeque<PeerStoreAuditEvent>>,
