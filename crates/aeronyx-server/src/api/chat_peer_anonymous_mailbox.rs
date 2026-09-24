@@ -8,6 +8,7 @@
 //! content-key, or plaintext fields.
 //!
 //! ## Last Modified
+//! v1.0.5-LostPullReplay — Prove source retry after ACK and target restart.
 //! v1.0.4-NoSocketSmtr — Prove exact pinned-target S/M/T/R retries and restart.
 //! v1.0.3-LeaseReplay — Preserve durable exact lease-create replay after
 //! admission-ticket freshness expires.
@@ -1815,31 +1816,24 @@ mod tests {
         )
         .expect("pull request");
         let pull_route = [0xc2; 16];
-        let (_, sealed_pull) = dispatch_cross_entry_terminal(
+        // [ANONYMOUS-MAILBOX-LOST-PULL-REPLAY 2026-09-24 by Codex] The
+        // first Pull response is lost after T commits its result. A holder of
+        // the same read capability ACKs the known opaque item before R retries
+        // the exact armed Pull across a T restart.
+        let (_, _lost_sealed_pull) = dispatch_cross_entry_terminal(
             &entry_r,
             &transport,
             restarted.clone(),
             &target,
             descriptor_commitment,
             pull_route,
-            AnonymousMailboxTerminalFrameV1::PullOne(pull),
+            AnonymousMailboxTerminalFrameV1::PullOne(pull.clone()),
         );
-        let AnonymousMailboxTerminalFrameV1::PullOneResponse(pull_response) =
-            complete_cross_entry_response(&entry_r, pull_route, &sealed_pull)
-        else {
-            panic!("pull response kind");
-        };
-        let pulled = AnonymousMailboxPullResultV1::decode(&pull_response.sealed_payload)
-            .expect("pull result");
-        assert_eq!(pulled.item_id, put.item_id);
-        assert_eq!(pulled.sealed_commitment, put.sealed_commitment());
-        assert_eq!(pulled.sealed_item, opaque_item);
-
         let ack = AnonymousMailboxAckV1::new(
             mailbox_id,
             [0xc3; 16],
-            pulled.item_id,
-            pulled.sealed_commitment,
+            put.item_id,
+            put.sealed_commitment(),
             1_800_000_002,
             &reader,
         )
@@ -1883,6 +1877,57 @@ mod tests {
             .expect("restart target after exact Ack replay"),
         );
 
+        let pull_replay = entry_r
+            .begin_dispatch(pull_route, 1_800_000_003)
+            .expect("lost Pull replays the exact armed source request");
+        let sealed_pull_replay =
+            transport.deliver(&pull_replay, restarted_after_ack.clone(), 1_800_000_003);
+        let AnonymousMailboxTerminalFrameV1::PullOneResponse(pull_response) =
+            complete_cross_entry_response(&entry_r, pull_route, &sealed_pull_replay)
+        else {
+            panic!("replayed Pull response kind");
+        };
+        pull_response
+            .verify_for_request(
+                AnonymousMailboxOperationV1::PullOne,
+                &pull.request_id,
+                &pull.request_commitment().expect("exact Pull commitment"),
+                &target.public_key_bytes(),
+            )
+            .expect("replayed Pull response remains request-bound");
+        let pulled = AnonymousMailboxPullResultV1::decode(&pull_response.sealed_payload)
+            .expect("replayed exact Pull result");
+        assert_eq!(pulled.item_id, put.item_id);
+        assert_eq!(pulled.sealed_commitment, put.sealed_commitment());
+        assert_eq!(pulled.sealed_item, opaque_item);
+        assert_eq!(
+            durable_item_state(&store_config.db_path),
+            (0, 0, 0, Vec::new())
+        );
+
+        let changed_pull = AnonymousMailboxPullOneV1::new(
+            mailbox_id,
+            pull.request_id,
+            Vec::new(),
+            1_800_000_004,
+            &reader,
+        )
+        .expect("same-id different-commitment Pull");
+        assert!(matches!(
+            execute_terminal_result_at(
+                restarted_after_ack.clone(),
+                &target,
+                [0x27; 16],
+                AnonymousMailboxTerminalFrameV1::PullOne(changed_pull),
+                1_800_000_004,
+            ),
+            Err(AnonymousMailboxTerminalFailure::Rejected)
+        ));
+        assert_eq!(
+            durable_item_state(&store_config.db_path),
+            (0, 0, 0, Vec::new())
+        );
+
         let empty_pull = AnonymousMailboxPullOneV1::new(
             mailbox_id,
             [0xc5; 16],
@@ -1915,10 +1960,10 @@ mod tests {
 
         assert_eq!(m_resolver.wrong_target_calls.load(Ordering::Relaxed), 1);
         assert_eq!(r_resolver.wrong_target_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(transport.exact_calls.load(Ordering::Relaxed), 9);
+        assert_eq!(transport.exact_calls.load(Ordering::Relaxed), 10);
         assert_eq!(transport.alternate_calls.load(Ordering::Relaxed), 0);
         assert_eq!(m_resolver.exact_calls.load(Ordering::Relaxed), 10);
-        assert_eq!(r_resolver.exact_calls.load(Ordering::Relaxed), 7);
+        assert_eq!(r_resolver.exact_calls.load(Ordering::Relaxed), 8);
     }
 
     #[test]
