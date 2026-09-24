@@ -56,6 +56,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::StatusCode;
 
 use super::chat_peer::{PeerBlindRelayRequest, PeerBlindRelayResponse};
+#[cfg(test)]
+use super::chat_peer_retry::BlindRelayRetryDomain;
 use super::chat_peer_retry::{
     BlindRelayDownstreamFailure, BlindRelayRetryAction, BlindRelayRetryContext,
     BlindRelayRetryPolicy,
@@ -160,6 +162,48 @@ impl BlindRelayResponsePolicy for BlindRelayResponseDomain {
                 evaluate_transport_failure(failure, &context)
             }
         }
+    }
+}
+
+/// Runs the production response policy for the deterministic M13 no-socket
+/// acceptance harness. This is test-only glue: it exercises the same success
+/// receipt, source-sealed AMSR, and no-clear-receipt gates used by the HTTP
+/// orchestrator without opening a socket or changing production wiring.
+#[cfg(test)]
+pub(crate) fn evaluate_m13_source_sealed_terminal_response(
+    request: &PeerBlindRelayRequest,
+    response: PeerBlindRelayResponse,
+    next_hop: [u8; 32],
+    observed_at: u64,
+) -> Result<PeerBlindRelayResponse, &'static str> {
+    // [M13-FUNCTIONAL-GATE 2026-09-25 by Codex] Keep the harness on the real
+    // response policy; the fixed retry context is only test scheduling data.
+    let retry_policy = BlindRelayRetryDomain::default();
+    let retry_context = BlindRelayRetryContext::new(request.envelope.route_id, next_hop, 1)
+        .ok_or("m13_retry_context_invalid")?;
+    let context = BlindRelayResponseContext {
+        request,
+        next_hop,
+        observed_at,
+        failure_receipt_required: false,
+        success_receipt_required: true,
+        source_sealed_terminal_proof_allowed: true,
+        large_pull_response_allowed: false,
+        retry_context,
+        retry_policy: &retry_policy,
+    };
+    match BlindRelayResponseDomain.evaluate(
+        BlindRelayTransportOutcome::SuccessStatus {
+            response: Ok(Box::new(response)),
+        },
+        context,
+    ) {
+        BlindRelayResponseDecision::Accepted(response) => Ok(*response),
+        BlindRelayResponseDecision::InvalidResponse { diagnostic, .. } => Err(diagnostic),
+        BlindRelayResponseDecision::PeerDeclaredFailure { .. }
+        | BlindRelayResponseDecision::RetryAfter { .. }
+        | BlindRelayResponseDecision::Reject(_)
+        | BlindRelayResponseDecision::Exhausted { .. } => Err("m13_response_policy_rejected"),
     }
 }
 
@@ -340,7 +384,9 @@ mod tests {
     use aeronyx_core::protocol::anonymous_mailbox::{
         AnonymousMailboxSourceSealSessionV1, AnonymousMailboxSourceSealedResponseV1,
     };
-    use aeronyx_core::protocol::chat::BlindRelayDeliveryReceipt;
+    use aeronyx_core::protocol::chat::{
+        BlindRelayDeliveryReceipt, BlindRelayEnvelope, BlindRelaySuccessReceipt,
+    };
 
     fn compact_ack(delivery_receipt: bool) -> PeerBlindRelayResponse {
         let terminal = IdentityKeyPair::from_bytes(&[0x51; 32]).expect("terminal identity");
@@ -416,6 +462,73 @@ mod tests {
         let mut ack = compact_ack(false);
         ack.opaque_terminal_response_b64 = None;
         assert!(validate_opaque_terminal_response(&ack, false, false).is_ok());
+    }
+
+    #[test]
+    fn m13_middle_gate_binds_source_sealed_bytes_to_immediate_success_receipt() {
+        // [M13-FUNCTIONAL-GATE 2026-09-25 by Codex] The middle gate sees only
+        // the signed opaque envelope and AMSR bytes; changing one byte after
+        // the target signs the receipt must fail before source delivery.
+        let source = IdentityKeyPair::from_bytes(&[0x61; 32]).expect("source");
+        let target = IdentityKeyPair::from_bytes(&[0x62; 32]).expect("target");
+        let route_id = [0x63; 16];
+        let mut envelope = BlindRelayEnvelope {
+            route_id,
+            next_hop: target.public_key_bytes(),
+            ttl: 1,
+            encrypted_blob: vec![0x64; 32],
+            timestamp: 1_800_000_000,
+            signature: [0; 64],
+        };
+        envelope = envelope.sign_with(&source);
+        let request = PeerBlindRelayRequest {
+            envelope,
+            previous_hop_node_id: source.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        let mut response = compact_ack(false);
+        response.success_receipt = Some(BlindRelaySuccessReceipt::terminal(
+            &request.envelope,
+            0,
+            response.reason.as_deref(),
+            None,
+            response
+                .opaque_terminal_response_b64
+                .as_deref()
+                .map(str::as_bytes),
+            1_800_000_000,
+            &target,
+        ));
+        assert!(evaluate_m13_source_sealed_terminal_response(
+            &request,
+            response.clone(),
+            target.public_key_bytes(),
+            1_800_000_000,
+        )
+        .is_ok());
+        let mut tampered = response;
+        let encoded = tampered
+            .opaque_terminal_response_b64
+            .as_mut()
+            .expect("opaque response");
+        encoded.replace_range(
+            0..1,
+            if encoded.as_bytes().first() == Some(&b'A') {
+                "B"
+            } else {
+                "A"
+            },
+        );
+        assert_eq!(
+            evaluate_m13_source_sealed_terminal_response(
+                &request,
+                tampered,
+                target.public_key_bytes(),
+                1_800_000_000,
+            ),
+            Err("success_receipt_binding_invalid")
+        );
     }
 }
 

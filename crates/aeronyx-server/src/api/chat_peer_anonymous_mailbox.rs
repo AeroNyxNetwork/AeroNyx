@@ -361,6 +361,8 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::api::chat_peer::PeerBlindRelayResponse;
+    use crate::api::chat_peer_response::evaluate_m13_source_sealed_terminal_response;
     use crate::config_chat_relay::{AnonymousMailboxSourceConfig, AnonymousMailboxStoreConfig};
     use crate::services::chat_relay_anonymous_mailbox_source::{
         AnonymousMailboxSourceCoordinator, AnonymousMailboxSourceError,
@@ -383,7 +385,7 @@ mod tests {
     use aeronyx_core::protocol::anonymous_mailbox_recipient_seal::{
         AnonymousMailboxRecipientSealKeyHandleV1, AnonymousMailboxRecipientSealPublicV1,
     };
-    use aeronyx_core::protocol::chat::{ChatContentType, ChatEnvelope};
+    use aeronyx_core::protocol::chat::{BlindRelaySuccessReceipt, ChatContentType, ChatEnvelope};
     use aeronyx_core::protocol::discovery::{
         DirectoryDescriptorCommitmentV1, NodeCapability, NodeDescriptor, NodeProtocolFeature,
         SignedNodeDescriptor,
@@ -451,7 +453,35 @@ mod tests {
             .expect("target decodes source carrier")
             .execute(repository, Arc::new(self.target.clone()), now)
             .expect("target executes terminal request");
-            BASE64.decode(sealed).expect("source-sealed response")
+            let response = PeerBlindRelayResponse {
+                accepted: true,
+                terminal: true,
+                forwarded: false,
+                ttl_remaining: 0,
+                reason: Some("onion_terminal_delivered".to_string()),
+                delivery_receipt: None,
+                success_receipt: Some(BlindRelaySuccessReceipt::terminal(
+                    &outbound.request().envelope,
+                    0,
+                    Some("onion_terminal_delivered"),
+                    None,
+                    Some(sealed.as_bytes()),
+                    now,
+                    &self.target,
+                )),
+                failure_receipt: None,
+                opaque_terminal_response_b64: Some(sealed),
+            };
+            let gated = evaluate_m13_source_sealed_terminal_response(
+                outbound.request(),
+                response,
+                self.target.public_key_bytes(),
+                now,
+            )
+            .expect("middle blind-relay response gate");
+            BASE64
+                .decode(gated.opaque_terminal_response_b64.expect("opaque response"))
+                .expect("source-sealed response after middle gate")
         }
     }
 
