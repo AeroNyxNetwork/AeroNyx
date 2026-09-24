@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [PERMISSIONLESS-NODE-JOIN 2026-09-24 by Codex] Document one-command
+  operator-selected seed install and fail-closed aggregate join evidence,
+  separate from central registration and relay route authority.
 - [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Document bounded,
   CPU-aware previous-hop signature verification and unsigned pre-auth failures.
 - [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] Document
@@ -529,6 +532,52 @@ installation, network setup, release build, systemd verification, node
 registration, service start, and bounded network admission verification. It
 fails when no registration code is provided, so an operator does not mistake
 an unregistered node for a live commercial node.
+
+### Permissionless discovery join (no nodeboard registration)
+
+`join` is a separate one-command path for a new external discovery node. Supply
+one to eight **operator-selected, public IP** seed APIs and this node's public
+discovery API base URL; do not rely on the historical example seed list in the
+template. The example below contains placeholders, not live node addresses:
+DNS names are rejected for this admission path to avoid rebinding.
+
+```bash
+sudo ./deploy/node/aeronyx-node.sh join \
+  --seed "http://SEED_PUBLIC_IP:8422" \
+  --public-endpoint "http://YOUR_PUBLIC_IP:8422" \
+  --join-timeout 180 --json
+```
+
+Repeat `--seed` for independent seeds; the first must run the Stage-A join
+API. The command requires Linux/systemd, curl, and Python 3.11+ (or Python
+with `tomli`). It installs through the
+existing installer **without a registration code**, atomically updates only
+six exact `[discovery]` values in the private config, validates that config,
+and starts an inactive service. It waits for the local service's current
+signed self descriptor, encodes the canonical binary wire form, then sends
+one `POST /api/discovery/join` to the first selected seed. It never restarts
+an active service; an identical rerun while it remains active skips
+installation, and the seed can return idempotent `exact_replay` while it
+retains the candidate. `--check-only` validates local readiness without a
+POST. Before an attempted config replacement, the command creates a private
+backup beside `server.toml` for operator review.
+
+Success requires the local Rust service to publish its current public-key-
+matched, unexpired, signed descriptor and the chosen seed API to return HTTP
+200 with `accepted=true`, `route_authority=false`, and status
+`candidate_admitted` or `exact_replay`. Output is aggregate JSON only:
+Stage-A acceptance, readiness hints, seed counts, and a fixed reason code.
+It never prints node identities, seed URLs, routes, messages, payloads, or
+keys. Signature/TTL, HTTP rejection, and malformed responses fail closed.
+Transport timeout is ambiguous after bytes may have been sent, so the command
+does not automatically retry or fall through to another seed.
+
+This API grants only a **bounded, non-routeable Stage-A candidate**. It is not
+proof of endpoint possession, routeability, terminal delivery, economic
+admission, or any central registration requirement. The HTTP response is not
+a seed-signed receipt; use HTTPS with a valid IP certificate where available.
+Plain HTTP seed IPs retain on-path spoofing risk. Commercial VPN registration
+remains the separate `quickstart` workflow above.
 
 ### Post-start admission gate
 
