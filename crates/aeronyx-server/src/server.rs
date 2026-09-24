@@ -1096,6 +1096,7 @@ use crate::services::chat_relay_mailbox::{
     AnonymousMailboxCleanupReport, AnonymousMailboxCustodyRepository, AnonymousMailboxStoreError,
     SqliteAnonymousMailboxStore,
 };
+use crate::services::discovery_peer_sampling::sample_public_gossip_peers;
 use crate::services::memchain::derive_rawlog_key;
 use crate::services::memchain::derive_record_key;
 use crate::services::memchain::EmbedEngine;
@@ -1882,6 +1883,18 @@ struct DiscoveryGossipExecution<'a> {
     now: u64,
     snapshot_limit: u16,
     peer_timeout: Duration,
+}
+
+/// Immutable selection input for the verified public-peer portion of one
+/// gossip round. It carries no receiver, session, or message identity.
+// [PERMISSIONLESS-GOSSIP-RUNTIME 2026-09-24 by Codex] Keep the sampling
+// boundary typed and independent of mutable seed/URL deduplication state.
+struct DiscoveryGossipSampleRequest<'a> {
+    now: u64,
+    round_nonce: [u8; 32],
+    round_peer_limit: usize,
+    self_node_id: &'a [u8; 32],
+    self_gossip_url: Option<&'a str>,
 }
 
 /// Complete result of one outbound peer gossip attempt.
@@ -7550,6 +7563,17 @@ impl Server {
         .await
     }
 
+    /// Installs the untrusted-gossip admission boundary before any startup
+    /// cache read, network await, or outbound gossip task can import a frame.
+    fn new_discovery_peer_store() -> Arc<PeerStore> {
+        // [PERMISSIONLESS-DISCOVERY-STARTUP-GATE 2026-09-24 by Codex] Router
+        // construction repeats this idempotent switch later, but may occur
+        // after an immediate outbound gossip snapshot response.
+        let peer_store = Arc::new(PeerStore::new());
+        peer_store.enable_untrusted_discovery_candidate_mode();
+        peer_store
+    }
+
     /// Initializes discovery with explicitly observed storage readiness.
     ///
     /// The compatibility wrapper above remains for focused tests and embedded
@@ -7561,7 +7585,7 @@ impl Server {
         anonymous_mailbox_runtime_ready: bool,
         control_http_client: &reqwest::Client,
     ) -> Result<Arc<PeerStore>> {
-        let peer_store = Arc::new(PeerStore::new());
+        let peer_store = Self::new_discovery_peer_store();
         peer_store.set_max_peers(Some(self.config.discovery.max_peers));
         peer_store.configure_verified_delivery_witness_requesters(
             &self
@@ -10274,34 +10298,31 @@ impl Server {
                         gossip_peer_identity_hints.observe_verified(url, peer_node_id);
                     }
 
-                    let snapshot = peer_store.export_bootstrap_snapshot(
-                        now,
-                        now,
-                        true,
-                        Some(round_peer_limit),
-                    );
-
-                    for peer in snapshot.peers {
-                        if peer.node_id() == self_node_id {
-                            continue;
-                        }
-                        let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
-                            continue;
-                        };
-                        let Some(url) = Self::discovered_peer_gossip_url(endpoint) else {
-                            continue;
-                        };
-                        if self_gossip_url.as_deref() == Some(url.as_str()) {
-                            continue;
-                        }
-                        if seen_urls.contains(&url) {
-                            continue;
-                        }
-                        if gossip_urls.len() >= round_peer_limit {
-                            continue;
-                        }
-                        seen_urls.insert(url.clone());
-                        gossip_urls.push(url);
+                    // [PERMISSIONLESS-GOSSIP-RUNTIME 2026-09-24 by Codex]
+                    // The bootstrap export is sorted and truncated before
+                    // transport selection, so low node IDs can monopolize
+                    // every round. Sample the complete verified public view
+                    // with fresh private entropy, preserving seed priority and
+                    // the complete identity-hint collision check above.
+                    let mut round_nonce = [0u8; 32];
+                    if rand::rngs::OsRng.try_fill_bytes(&mut round_nonce).is_ok() {
+                        Self::append_sampled_discovered_peer_gossip_urls(
+                            &peer_store,
+                            &DiscoveryGossipSampleRequest {
+                                now,
+                                round_nonce,
+                                round_peer_limit,
+                                self_node_id: &self_node_id,
+                                self_gossip_url: self_gossip_url.as_deref(),
+                            },
+                            &mut seen_urls,
+                            &mut gossip_urls,
+                        );
+                    } else {
+                        // [PERMISSIONLESS-GOSSIP-RUNTIME 2026-09-24 by Codex]
+                        // Failed entropy cannot become a predictable peer
+                        // rank. Operator seeds still retain this round.
+                        warn!("[DISCOVERY] Skipping sampled peers; entropy unavailable");
                     }
                 }
 
@@ -12583,6 +12604,43 @@ impl Server {
     /// and therefore require a public IP literal before any outbound request.
     fn discovered_peer_gossip_url(endpoint: &str) -> Option<String> {
         peer_endpoint_is_public_ip(endpoint).then(|| Self::discovery_gossip_url(endpoint))?
+    }
+
+    /// Adds only current, signed public peers after operator seeds have taken
+    /// their reserved places. The deterministic nonce seam keeps the runtime
+    /// selection independently testable without opening a network socket.
+    fn append_sampled_discovered_peer_gossip_urls(
+        peer_store: &PeerStore,
+        selection: &DiscoveryGossipSampleRequest<'_>,
+        seen_urls: &mut HashSet<String>,
+        gossip_urls: &mut Vec<String>,
+    ) {
+        let remaining = selection.round_peer_limit.saturating_sub(gossip_urls.len());
+        if remaining == 0 {
+            return;
+        }
+        // [PERMISSIONLESS-GOSSIP-RUNTIME 2026-09-24 by Codex] The sampler
+        // sees only the live verified PeerStore, never Stage-A candidates.
+        // Filter seed/self URLs before ranking so duplicates do not consume
+        // the bounded non-seed budget.
+        let sampled = sample_public_gossip_peers(
+            peer_store,
+            selection.now,
+            selection.round_nonce,
+            remaining,
+            &[*selection.self_node_id],
+            |endpoint| {
+                let url = Self::discovered_peer_gossip_url(endpoint)?;
+                (selection.self_gossip_url != Some(url.as_str()) && !seen_urls.contains(&url))
+                    .then_some(url)
+            },
+        );
+        for peer in sampled {
+            let url = peer.canonical_endpoint;
+            if seen_urls.insert(url.clone()) {
+                gossip_urls.push(url);
+            }
+        }
     }
 
     /// Attempts authenticated client traffic over receipt-capable two-hop
@@ -16668,11 +16726,11 @@ mod tests {
         DirectPeerRelayAckFailure, DirectoryChainStore, DirectoryProofGossipOutcome,
         DirectoryProofGossipPeerState, DirectoryProofGossipResult, DiscoveryGossipExecution,
         DiscoveryGossipFailure, DiscoveryGossipFailureKind, DiscoveryGossipPhase,
-        DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport, DiscoveryPeerIdentityHints,
-        HandshakeRejectionClass, MemChainDispatchGateError, MemChainStorageRequirement,
-        PeerHttpClients, PeerStoreCacheDocument, PeerStoreCachePersistOutcome,
-        PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryAnchorState,
-        PeerStoreVerifiedClientDeliveryCacheEvidence,
+        DiscoveryGossipRoundAccumulator, DiscoveryGossipSampleRequest, DiscoveryPeerGossipReport,
+        DiscoveryPeerIdentityHints, HandshakeRejectionClass, MemChainDispatchGateError,
+        MemChainStorageRequirement, PeerHttpClients, PeerStoreCacheDocument,
+        PeerStoreCachePersistOutcome, PeerStoreVerifiedClientDeliveryAnchor,
+        PeerStoreVerifiedClientDeliveryAnchorState, PeerStoreVerifiedClientDeliveryCacheEvidence,
         PeerStoreVerifiedClientDeliveryExternalWitnessDecision, RequiredApiListenerExit,
         RuntimeTaskRegistry, RuntimeTaskShutdownOutcome, RuntimeTaskShutdownReport, Server,
         SystemdNotifier, TargetBoundPeerRelayFailure, BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
@@ -24093,6 +24151,127 @@ mod tests {
 
         hints.observe_verified(url.clone(), first_node_id);
         assert_eq!(hints.unique_node_id(&url), None);
+    }
+
+    #[test]
+    fn runtime_gossip_sample_is_not_monopolized_by_low_id_clique() {
+        // [PERMISSIONLESS-GOSSIP-RUNTIME 2026-09-24 by Codex] The old
+        // bootstrap-export prefix would always select the first two IDs,
+        // both assigned here to one /24. Runtime selection must instead
+        // admit a diverse verified peer in every bounded round.
+        let now = 1_800_000_000;
+        let store = PeerStore::new();
+        let mut identities = (1..=5u8)
+            .map(|seed| {
+                IdentityKeyPair::from_bytes(&[seed; 32])
+                    .unwrap_or_else(|_| panic!("test identity must be valid"))
+            })
+            .collect::<Vec<_>>();
+        identities.sort_by_key(IdentityKeyPair::public_key_bytes);
+        let endpoints = [
+            "https://8.8.8.1",
+            "https://8.8.8.2",
+            "https://9.9.9.1",
+            "https://11.11.11.1",
+            "https://12.12.12.1",
+        ];
+        for (identity, endpoint) in identities.iter().zip(endpoints) {
+            let mut descriptor = NodeDescriptor::new(
+                identity.public_key_bytes(),
+                1,
+                now - 10,
+                now + 300,
+                "gossip-sample-test",
+            );
+            descriptor.public_endpoint = Some(endpoint.to_string());
+            descriptor.policy.public_discovery = true;
+            let Ok(signed) = SignedNodeDescriptor::sign(descriptor, identity) else {
+                panic!("test descriptor must sign");
+            };
+            assert!(store.upsert_verified(signed, now).is_ok());
+        }
+
+        for seed in 1..=16u8 {
+            let mut seen_urls = std::collections::HashSet::new();
+            let mut gossip_urls = Vec::new();
+            Server::append_sampled_discovered_peer_gossip_urls(
+                &store,
+                &DiscoveryGossipSampleRequest {
+                    now,
+                    round_nonce: [seed; 32],
+                    round_peer_limit: 2,
+                    self_node_id: &[0xFF; 32],
+                    self_gossip_url: None,
+                },
+                &mut seen_urls,
+                &mut gossip_urls,
+            );
+            assert_eq!(gossip_urls.len(), 2);
+            assert_eq!(seen_urls.len(), 2);
+            assert!(gossip_urls
+                .iter()
+                .any(|url| { !url.starts_with("https://8.8.8.") }));
+        }
+    }
+
+    #[test]
+    fn startup_peer_store_keeps_pre_router_snapshot_candidate_only() {
+        // [PERMISSIONLESS-DISCOVERY-STARTUP-GATE 2026-09-24 by Codex]
+        // Simulate the response that an immediate gossip task can import
+        // before any API router is constructed. Only an independently
+        // established peer may remain live or enter the sampled URL set.
+        let now = 1_800_000_000;
+        let store = Server::new_discovery_peer_store();
+        let signed_public_peer = |seed: u8, endpoint: &str| {
+            let identity = IdentityKeyPair::from_bytes(&[seed; 32])
+                .unwrap_or_else(|_| panic!("test identity must be valid"));
+            let mut descriptor = NodeDescriptor::new(
+                identity.public_key_bytes(),
+                1,
+                now - 10,
+                now + 300,
+                "startup-candidate-test",
+            );
+            descriptor.public_endpoint = Some(endpoint.to_string());
+            descriptor.policy.public_discovery = true;
+            descriptor.capabilities = vec![NodeCapability::ChatRelay];
+            SignedNodeDescriptor::sign(descriptor, &identity)
+                .unwrap_or_else(|_| panic!("test descriptor must sign"))
+        };
+        let established = signed_public_peer(0xA1, "https://9.9.9.9");
+        assert!(store.upsert_verified(established.clone(), now).is_ok());
+        let untrusted = signed_public_peer(0xA2, "https://8.8.8.8");
+        let report = store.apply_discovery_message(
+            &NodeDiscoveryMessage::SnapshotResponse {
+                snapshot: NodeBootstrapSnapshot::new(now, vec![untrusted.clone()]),
+            },
+            now,
+        );
+        assert_eq!(report.inserted, 0);
+        assert_eq!(report.candidates, 1);
+        assert_eq!(store.snapshot(now).valid_peers, 1);
+        assert!(store.get_valid(&untrusted.node_id(), now).is_none());
+        assert!(store.get_valid(&established.node_id(), now).is_some());
+
+        let seed_url = "https://1.1.1.1/api/discovery/gossip".to_string();
+        let mut seen_urls = std::collections::HashSet::from([seed_url.clone()]);
+        let mut gossip_urls = vec![seed_url.clone()];
+        Server::append_sampled_discovered_peer_gossip_urls(
+            &store,
+            &DiscoveryGossipSampleRequest {
+                now,
+                round_nonce: [0xA3; 32],
+                round_peer_limit: 3,
+                self_node_id: &[0xA4; 32],
+                self_gossip_url: None,
+            },
+            &mut seen_urls,
+            &mut gossip_urls,
+        );
+        assert_eq!(gossip_urls[0], seed_url);
+        assert_eq!(gossip_urls.len(), 2);
+        assert!(gossip_urls[1].starts_with("https://9.9.9.9/"));
+        assert!(!gossip_urls.iter().any(|url| url.contains("8.8.8.8")));
     }
 
     #[tokio::test]
