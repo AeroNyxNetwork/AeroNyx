@@ -16,6 +16,8 @@
 //! the future composition root.
 //!
 //! ## Last modified
+//! v1.3.0-PullItemExpiry — Bind durable Item replay to the signed item's
+//! expiry; migrate V3 without inventing expiry for already-ACKed ciphertext.
 //! v1.2.0-PullReplayJournal — Persist bounded exact PullOne results so a lost
 //! response remains byte-stable across ACK and process restart.
 //! v1.1.2-OwnerStorageRestartGuard — Cover capacity release through
@@ -62,13 +64,13 @@ use super::chat_relay_backup_sqlite::{
     configure_full_durability, restrict_private_sqlite_permissions,
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MINIMUM_SYNCHRONOUS_LEVEL: i64 = 2;
 const CURSOR_VERSION: u8 = 1;
 const CURSOR_BODY_BYTES: usize = 1 + 8 + 8 + 8;
 const CURSOR_TAG_BYTES: usize = 32;
 const CURSOR_BYTES: usize = CURSOR_BODY_BYTES + CURSOR_TAG_BYTES;
-// [ANONYMOUS-MAILBOX-PULL-BOUNDS 2026-09-24 by Codex] The V3 SQLite CHECK
+// [ANONYMOUS-MAILBOX-PULL-BOUNDS 2026-09-24 by Codex] The V4 SQLite CHECK
 // literals in fresh and migration DDL are frozen to these protocol ceilings.
 const _: () = assert!(MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES == 162_816 && CURSOR_BYTES == 57);
 const CURSOR_TTL_SECS: u64 = 5 * 60;
@@ -458,14 +460,32 @@ fn validate_pull_replay_retention(
     created_at: i64,
     retain_until: i64,
     lease_expires_at: Option<i64>,
-) -> Result<u64, AnonymousMailboxStoreError> {
+    outcome: i64,
+    item_expires_at: Option<i64>,
+) -> Result<Option<u64>, AnonymousMailboxStoreError> {
     let created_at = as_u64(created_at)?;
     let retain_until = as_u64(retain_until)?;
     let lease_expires_at = as_u64(lease_expires_at.ok_or(AnonymousMailboxStoreError::Corrupt)?)?;
-    if retain_until != lease_expires_at.min(created_at.saturating_add(PULL_REPLAY_RETENTION_SECS)) {
-        return Err(AnonymousMailboxStoreError::Corrupt);
+    let maximum = lease_expires_at.min(created_at.saturating_add(PULL_REPLAY_RETENTION_SECS));
+    match (outcome, item_expires_at) {
+        (0, None) if retain_until == maximum => Ok(Some(retain_until)),
+        (1, Some(item_expires_at)) => {
+            let item_expires_at = as_u64(item_expires_at)?;
+            if item_expires_at < created_at
+                || item_expires_at > lease_expires_at
+                || retain_until != maximum.min(item_expires_at)
+            {
+                return Err(AnonymousMailboxStoreError::Corrupt);
+            }
+            Ok(Some(retain_until))
+        }
+        // [ANONYMOUS-MAILBOX-ITEM-EXPIRY 2026-09-24 by Codex] V3 could
+        // retain an Item after ACK removed its source row. Its signed expiry
+        // cannot be reconstructed, so keep the bounded row for cleanup but
+        // never authorize replay of its opaque ciphertext.
+        (1, None) if retain_until == maximum => Ok(None),
+        _ => Err(AnonymousMailboxStoreError::Corrupt),
     }
-    Ok(retain_until)
 }
 
 enum StoredPullReplay {
@@ -475,6 +495,7 @@ enum StoredPullReplay {
         sealed_commitment: [u8; 32],
         sealed_envelope: Vec<u8>,
         cursor: Vec<u8>,
+        item_expires_at: u64,
     },
 }
 
@@ -1275,7 +1296,8 @@ impl AnonymousMailboxCustodyRepository for SqliteAnonymousMailboxStore {
             )
             .optional()
             .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
-        let Some((item_id_bytes, sequence_raw, commitment_bytes, length, _, _)) = row else {
+        let Some((item_id_bytes, sequence_raw, commitment_bytes, length, _, item_expires_at)) = row
+        else {
             insert_pull_replay(
                 &transaction,
                 &self.config,
@@ -1291,6 +1313,11 @@ impl AnonymousMailboxCustodyRepository for SqliteAnonymousMailboxStore {
             return Ok(AnonymousMailboxPullOutcome::Empty);
         };
         let sequence = as_u64(sequence_raw)?;
+        let item_expires_at = as_u64(item_expires_at)?;
+        // [ANONYMOUS-MAILBOX-ITEM-EXPIRY 2026-09-24 by Codex] An exact
+        // retry is not an authority to serve ciphertext past its signed item
+        // expiry, even after the source item has been ACKed away.
+        let item_replay_retain_until = replay_retain_until.min(item_expires_at);
         let admitted_length =
             usize::try_from(length).map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
         if admitted_length == 0 || admitted_length > MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES {
@@ -1337,9 +1364,10 @@ impl AnonymousMailboxCustodyRepository for SqliteAnonymousMailboxStore {
                 sealed_commitment,
                 sealed_envelope: sealed_envelope.clone(),
                 cursor: cursor.clone(),
+                item_expires_at,
             },
             now,
-            replay_retain_until,
+            item_replay_retain_until,
         )?;
         transaction
             .commit()
@@ -1778,7 +1806,7 @@ fn initialize_or_verify_schema(
                     pull_replay_rows INTEGER NOT NULL CHECK (pull_replay_rows >= 0),
                     pull_replay_bytes INTEGER NOT NULL CHECK (pull_replay_bytes >= 0)
                  );
-                 INSERT INTO anonymous_mailbox_meta VALUES (1, 3, 0, 0, 0, 0, 0, 0, 0, 0);
+                 INSERT INTO anonymous_mailbox_meta VALUES (1, 4, 0, 0, 0, 0, 0, 0, 0, 0);
                  CREATE TABLE anonymous_mailbox_tickets (
                     ticket_id BLOB PRIMARY KEY CHECK (length(ticket_id) = 16),
                     ticket_commitment BLOB NOT NULL CHECK (length(ticket_commitment) = 32),
@@ -1849,6 +1877,7 @@ fn initialize_or_verify_schema(
                     cursor BLOB CHECK (cursor IS NULL OR (typeof(cursor) = 'blob' AND length(cursor) = 57)),
                     created_at INTEGER NOT NULL CHECK (created_at >= 0),
                     retain_until INTEGER NOT NULL CHECK (retain_until >= created_at),
+                    item_expires_at INTEGER,
                     PRIMARY KEY (mailbox_id, request_id),
                     FOREIGN KEY (mailbox_id) REFERENCES anonymous_mailbox_leases(mailbox_id) ON DELETE CASCADE,
                     CHECK ((outcome = 0 AND item_id IS NULL AND sealed_commitment IS NULL
@@ -1870,7 +1899,7 @@ fn initialize_or_verify_schema(
                     ON anonymous_mailbox_issued_tickets(expires_at, request_id);
                  CREATE INDEX anonymous_mailbox_pull_replay_expiry
                     ON anonymous_mailbox_pull_replays(retain_until, mailbox_id, request_id);
-                 PRAGMA user_version = 3;",
+                 PRAGMA user_version = 4;",
             )
             .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
     } else if user_version == 1 {
@@ -1916,6 +1945,7 @@ fn initialize_or_verify_schema(
                     cursor BLOB CHECK (cursor IS NULL OR (typeof(cursor) = 'blob' AND length(cursor) = 57)),
                     created_at INTEGER NOT NULL CHECK (created_at >= 0),
                     retain_until INTEGER NOT NULL CHECK (retain_until >= created_at),
+                    item_expires_at INTEGER,
                     PRIMARY KEY (mailbox_id, request_id),
                     FOREIGN KEY (mailbox_id) REFERENCES anonymous_mailbox_leases(mailbox_id) ON DELETE CASCADE,
                     CHECK ((outcome = 0 AND item_id IS NULL AND sealed_commitment IS NULL
@@ -1927,8 +1957,8 @@ fn initialize_or_verify_schema(
                  );
                  CREATE INDEX anonymous_mailbox_pull_replay_expiry
                     ON anonymous_mailbox_pull_replays(retain_until, mailbox_id, request_id);
-                 UPDATE anonymous_mailbox_meta SET schema_version = 3 WHERE singleton = 1;
-                 PRAGMA user_version = 3;",
+                 UPDATE anonymous_mailbox_meta SET schema_version = 4 WHERE singleton = 1;
+                 PRAGMA user_version = 4;",
             )
             .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
     } else if user_version == 2 {
@@ -1952,6 +1982,7 @@ fn initialize_or_verify_schema(
                     cursor BLOB CHECK (cursor IS NULL OR (typeof(cursor) = 'blob' AND length(cursor) = 57)),
                     created_at INTEGER NOT NULL CHECK (created_at >= 0),
                     retain_until INTEGER NOT NULL CHECK (retain_until >= created_at),
+                    item_expires_at INTEGER,
                     PRIMARY KEY (mailbox_id, request_id),
                     FOREIGN KEY (mailbox_id) REFERENCES anonymous_mailbox_leases(mailbox_id) ON DELETE CASCADE,
                     CHECK ((outcome = 0 AND item_id IS NULL AND sealed_commitment IS NULL
@@ -1963,8 +1994,21 @@ fn initialize_or_verify_schema(
                  );
                  CREATE INDEX anonymous_mailbox_pull_replay_expiry
                     ON anonymous_mailbox_pull_replays(retain_until, mailbox_id, request_id);
-                 UPDATE anonymous_mailbox_meta SET schema_version = 3 WHERE singleton = 1;
-                 PRAGMA user_version = 3;",
+                 UPDATE anonymous_mailbox_meta SET schema_version = 4 WHERE singleton = 1;
+                 PRAGMA user_version = 4;",
+            )
+            .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+    } else if user_version == 3 {
+        // [ANONYMOUS-MAILBOX-ITEM-EXPIRY 2026-09-24 by Codex] Add only the
+        // missing expiry column under the same IMMEDIATE transaction. An old
+        // Item with no expiry stays unreadable even if its source item still
+        // exists; ACK may have deleted that source before this migration.
+        transaction
+            .execute_batch(
+                "ALTER TABLE anonymous_mailbox_pull_replays
+                    ADD COLUMN item_expires_at INTEGER;
+                 UPDATE anonymous_mailbox_meta SET schema_version = 4 WHERE singleton = 1;
+                 PRAGMA user_version = 4;",
             )
             .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
     } else if user_version != SCHEMA_VERSION {
@@ -2068,6 +2112,7 @@ fn load_pull_replay(
     let metadata = transaction
         .query_row(
             "SELECT r.rowid, r.outcome, r.created_at, r.retain_until, l.expires_at,
+                    r.item_expires_at,
                     typeof(r.request_commitment), length(r.request_commitment),
                     typeof(r.item_id), length(r.item_id),
                     typeof(r.sealed_commitment), length(r.sealed_commitment),
@@ -2084,13 +2129,16 @@ fn load_pull_replay(
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, Option<i64>>(4)?,
-                    PullReplayShape::from_row(row, 5)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    PullReplayShape::from_row(row, 6)?,
                 ))
             },
         )
         .optional()
         .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
-    let Some((rowid, outcome, created_at, retain_until, lease_expires_at, shape)) = metadata else {
+    let Some((rowid, outcome, created_at, retain_until, lease_expires_at, item_expires_at, shape)) =
+        metadata
+    else {
         return Ok(None);
     };
     if !shape.request.is_exact_blob(32) {
@@ -2107,7 +2155,14 @@ fn load_pull_replay(
         return Err(AnonymousMailboxStoreError::Rejected);
     }
     shape.checked_envelope_bytes(outcome)?;
-    let retain_until = validate_pull_replay_retention(created_at, retain_until, lease_expires_at)?;
+    let retain_until = validate_pull_replay_retention(
+        created_at,
+        retain_until,
+        lease_expires_at,
+        outcome,
+        item_expires_at,
+    )?
+    .ok_or(AnonymousMailboxStoreError::Rejected)?;
     // [ANONYMOUS-MAILBOX-PULL-BOUNDS 2026-09-24 by Codex] Expired exact
     // replays cannot outlive their lease or the 24-hour journal window merely
     // because cleanup has not reached their row yet.
@@ -2131,6 +2186,7 @@ fn load_pull_replay(
             sealed_commitment: fixed::<32>(&commitment)?,
             sealed_envelope,
             cursor,
+            item_expires_at: as_u64(item_expires_at.ok_or(AnonymousMailboxStoreError::Corrupt)?)?,
         }
     };
     match stored {
@@ -2140,6 +2196,7 @@ fn load_pull_replay(
             sealed_commitment,
             sealed_envelope,
             cursor,
+            item_expires_at: _,
         } => {
             if sealed_envelope.is_empty()
                 || sealed_envelope.len() > MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES
@@ -2196,29 +2253,47 @@ fn insert_pull_replay(
     if validate_pull_replay_totals(new, config).is_err() {
         return Err(AnonymousMailboxStoreError::Busy);
     }
-    let (outcome, item_id, commitment, envelope, cursor) = match stored {
-        StoredPullReplay::Empty => (0_i64, None, None, None, None),
+    let (outcome, item_id, commitment, envelope, cursor, item_expires_at) = match stored {
+        StoredPullReplay::Empty => (0_i64, None, None, None, None, None),
         StoredPullReplay::Item {
             item_id,
             sealed_commitment,
             sealed_envelope,
             cursor,
+            item_expires_at,
         } => (
             1_i64,
             Some(item_id.to_vec()),
             Some(sealed_commitment.to_vec()),
             Some(sealed_envelope),
             Some(cursor),
+            Some(as_i64(item_expires_at)?),
         ),
     };
+    let lease_expires_at: i64 = transaction
+        .query_row(
+            "SELECT expires_at FROM anonymous_mailbox_leases WHERE mailbox_id = ?1",
+            params![&request.mailbox_id[..]],
+            |row| row.get(0),
+        )
+        .map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+    validate_pull_replay_retention(
+        as_i64(now)?,
+        as_i64(retain_until)?,
+        Some(lease_expires_at),
+        outcome,
+        item_expires_at,
+    )?
+    .ok_or(AnonymousMailboxStoreError::Corrupt)?;
     execute_exactly_one(
         transaction,
         transaction
             .execute(
                 "INSERT INTO anonymous_mailbox_pull_replays
                  (mailbox_id, request_id, request_commitment, outcome, item_id,
-                  sealed_commitment, sealed_envelope, cursor, created_at, retain_until)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  sealed_commitment, sealed_envelope, cursor, created_at, retain_until,
+                  item_expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     &request.mailbox_id[..],
                     &request.request_id[..],
@@ -2230,6 +2305,7 @@ fn insert_pull_replay(
                     cursor,
                     as_i64(now)?,
                     as_i64(retain_until)?,
+                    item_expires_at,
                 ],
             )
             .map_err(|_| AnonymousMailboxStoreError::Unavailable)?,
@@ -2655,6 +2731,7 @@ fn audit_pull_replays(
     let mut statement = transaction
         .prepare(
             "SELECT r.rowid, r.outcome, r.created_at, r.retain_until, l.expires_at,
+                    r.item_expires_at,
                     typeof(r.request_commitment), length(r.request_commitment),
                     typeof(r.item_id), length(r.item_id),
                     typeof(r.sealed_commitment), length(r.sealed_commitment),
@@ -2686,8 +2763,11 @@ fn audit_pull_replays(
                 .map_err(|_| AnonymousMailboxStoreError::Corrupt)?,
             row.get::<_, Option<i64>>(4)
                 .map_err(|_| AnonymousMailboxStoreError::Corrupt)?,
+            outcome,
+            row.get::<_, Option<i64>>(5)
+                .map_err(|_| AnonymousMailboxStoreError::Corrupt)?,
         )?;
-        let bytes = PullReplayShape::from_row(row, 5)
+        let bytes = PullReplayShape::from_row(row, 6)
             .map_err(|_| AnonymousMailboxStoreError::Corrupt)?
             .checked_envelope_bytes(outcome)?;
         if outcome == 1 {
@@ -3667,6 +3747,79 @@ mod tests {
     }
 
     #[test]
+    fn item_expiry_bounds_exact_replay_after_ack_and_restart_without_changing_empty() {
+        let context = TestContext::new();
+        let item_mailbox = [0xA1; 32];
+        let empty_mailbox = [0xA2; 32];
+        let item_expires_at = NOW + 10;
+        let lease_expires_at = NOW + 1_000;
+        let item_pull = context.pull(item_mailbox, Vec::new(), NOW);
+        let empty_pull = context.pull(empty_mailbox, Vec::new(), NOW);
+        let store = context.open();
+        store
+            .create(
+                &context.lease(item_mailbox, [0xA3; 16], 1, 32, lease_expires_at),
+                NOW,
+            )
+            .unwrap();
+        store
+            .create(
+                &context.lease(empty_mailbox, [0xA4; 16], 1, 32, lease_expires_at),
+                NOW,
+            )
+            .unwrap();
+        store
+            .put(
+                &context.put(item_mailbox, [0xA5; 16], b"opaque", item_expires_at),
+                NOW,
+            )
+            .unwrap();
+        let first = store.pull_one(&item_pull, NOW).unwrap();
+        assert_eq!(
+            store.pull_one(&empty_pull, NOW).unwrap(),
+            AnonymousMailboxPullOutcome::Empty
+        );
+        let AnonymousMailboxPullOutcome::Item(item) = &first else {
+            panic!("item pull must return opaque ciphertext")
+        };
+        let ack = AnonymousMailboxAckV1::new(
+            item_mailbox,
+            [0xA6; 16],
+            item.item_id,
+            item.sealed_commitment,
+            NOW + 1,
+            &context.reader,
+        )
+        .unwrap();
+        assert_eq!(
+            store.ack(&ack, NOW + 1).unwrap(),
+            AnonymousMailboxAckOutcome::Acknowledged
+        );
+        drop(store);
+
+        let reopened = context.open();
+        assert_eq!(
+            reopened.pull_one(&item_pull, item_expires_at).unwrap(),
+            first
+        );
+        let changed_same_id = context.pull(item_mailbox, Vec::new(), NOW + 1);
+        assert_eq!(
+            reopened.pull_one(&changed_same_id, item_expires_at + 1),
+            Err(AnonymousMailboxStoreError::Rejected),
+            "same id with different signed content remains a conflict first"
+        );
+        assert_eq!(
+            reopened.pull_one(&item_pull, item_expires_at + 1),
+            Err(AnonymousMailboxStoreError::Rejected)
+        );
+        assert_eq!(
+            reopened.pull_one(&empty_pull, item_expires_at + 1).unwrap(),
+            AnonymousMailboxPullOutcome::Empty,
+            "an Empty result has no item expiry to inherit"
+        );
+    }
+
+    #[test]
     fn pull_replay_budget_and_cleanup_are_bounded() {
         let context = TestContext::new();
         let mailbox = [0xC7; 32];
@@ -4032,7 +4185,7 @@ mod tests {
 
         let reopened = context.open_with_ticket_issuer();
         let connection = reopened.connection.lock();
-        assert_eq!(schema_user_version(&connection), 3);
+        assert_eq!(schema_user_version(&connection), 4);
         assert_eq!(
             connection
                 .query_row(
@@ -4041,7 +4194,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(
             connection
@@ -4082,7 +4235,7 @@ mod tests {
 
         let reopened = context.open();
         let connection = reopened.connection.lock();
-        assert_eq!(schema_user_version(&connection), 3);
+        assert_eq!(schema_user_version(&connection), 4);
         assert_eq!(
             connection
                 .query_row(
@@ -4093,6 +4246,76 @@ mod tests {
                 )
                 .unwrap(),
             b"opaque-v2"
+        );
+    }
+
+    #[test]
+    fn v3_unknown_acked_item_expiry_migrates_without_serving_ciphertext() {
+        let context = TestContext::new();
+        let mailbox = [0xA7; 32];
+        let expires_at = NOW + 1_000;
+        let pull = context.pull(mailbox, Vec::new(), NOW);
+        let store = context.open();
+        store
+            .create(&context.lease(mailbox, [0xA8; 16], 1, 32, expires_at), NOW)
+            .unwrap();
+        store
+            .put(
+                &context.put(mailbox, [0xA9; 16], b"opaque", expires_at),
+                NOW,
+            )
+            .unwrap();
+        let AnonymousMailboxPullOutcome::Item(item) = store.pull_one(&pull, NOW).unwrap() else {
+            panic!("item pull must return opaque ciphertext")
+        };
+        let ack = AnonymousMailboxAckV1::new(
+            mailbox,
+            [0xAA; 16],
+            item.item_id,
+            item.sealed_commitment,
+            NOW + 1,
+            &context.reader,
+        )
+        .unwrap();
+        store.ack(&ack, NOW + 1).unwrap();
+        drop(store);
+
+        // Reproduce the previous durable schema with an ACKed replay whose
+        // source item is already gone. The migration must not borrow an
+        // expiry from another row or extend its old serving authority.
+        let connection = Connection::open(&context.config.db_path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE anonymous_mailbox_pull_replays DROP COLUMN item_expires_at;
+                 UPDATE anonymous_mailbox_meta SET schema_version = 3 WHERE singleton = 1;
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let reopened = context.open();
+        let connection = reopened.connection.lock();
+        assert_eq!(schema_user_version(&connection), 4);
+        let preserved: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM anonymous_mailbox_acks),
+                        (SELECT COUNT(*) FROM anonymous_mailbox_pull_replays),
+                        (SELECT pull_replay_bytes FROM anonymous_mailbox_meta WHERE singleton = 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, (1, 1, 6));
+        drop(connection);
+        let changed_same_id = context.pull(mailbox, Vec::new(), NOW + 1);
+        assert_eq!(
+            reopened.pull_one(&changed_same_id, NOW + 2),
+            Err(AnonymousMailboxStoreError::Rejected)
+        );
+        assert_eq!(
+            reopened.pull_one(&pull, NOW + 2),
+            Err(AnonymousMailboxStoreError::Rejected),
+            "missing legacy item expiry cannot authorize ciphertext replay"
         );
     }
 
@@ -4162,12 +4385,18 @@ mod tests {
         drop(store);
 
         let reopened = context.open();
-        let second = reopened
-            .pull_one(
-                &context.pull(mailbox, first.cursor.clone(), NOW + 1),
-                NOW + 1,
-            )
-            .unwrap();
+        // [ANONYMOUS-MAILBOX-ITEM-EXPIRY 2026-09-24 by Codex] A changed
+        // cursor is a new signed Pull transcript, not an exact retry. Reusing
+        // TestContext::pull's fixed request id would test conflict instead.
+        let next_pull = AnonymousMailboxPullOneV1::new(
+            mailbox,
+            [0x52; 16],
+            first.cursor.clone(),
+            NOW + 1,
+            &context.reader,
+        )
+        .unwrap();
+        let second = reopened.pull_one(&next_pull, NOW + 1).unwrap();
         match second {
             AnonymousMailboxPullOutcome::Item(item) => assert_eq!(item.item_id, [2; 16]),
             other => panic!("unexpected pull outcome: {other:?}"),
@@ -4180,8 +4409,16 @@ mod tests {
             [0x5A; 32],
         )
         .unwrap();
+        let wrong_key_pull = AnonymousMailboxPullOneV1::new(
+            mailbox,
+            [0x53; 16],
+            first.cursor,
+            NOW + 1,
+            &context.reader,
+        )
+        .unwrap();
         assert_eq!(
-            wrong_key.pull_one(&context.pull(mailbox, first.cursor, NOW + 1), NOW + 1,),
+            wrong_key.pull_one(&wrong_key_pull, NOW + 1),
             Err(AnonymousMailboxStoreError::Rejected)
         );
     }
