@@ -33,7 +33,15 @@ use super::discovery_endpoint_quarantine_observation::{
     satisfied_quarantine_evidence_commitment, DiscoveryEndpointSatisfiedQuarantineEvidence,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+mod probation;
+
+#[allow(unused_imports)]
+pub(crate) use probation::{
+    DiscoveryEndpointPromotionProbationError, DiscoveryEndpointPromotionProbationOutcome,
+    DiscoveryEndpointPromotionProbationSnapshot,
+};
+
+const SCHEMA_VERSION: i64 = 2;
 const MINIMUM_SYNCHRONOUS_LEVEL: i64 = 2;
 const MAX_STATES: usize = 65_536;
 const MAX_NEGATIVE_PER_STATE: usize = 64;
@@ -620,24 +628,6 @@ impl SqliteDiscoveryEndpointQuarantineRevocationRegistry {
         readiness: &DiscoveryEndpointPromotionReadiness,
         now: u64,
     ) -> Result<bool, DiscoveryEndpointQuarantineRevocationError> {
-        if now == 0
-            || readiness.evaluated_at == 0
-            || readiness.policy_epoch == 0
-            || readiness.admission_commitment.iter().all(|byte| *byte == 0)
-            || readiness.positive_commitment.iter().all(|byte| *byte == 0)
-            || readiness.challenge_id.iter().all(|byte| *byte == 0)
-            || readiness.group_commitment.iter().all(|byte| *byte == 0)
-            || readiness.evaluated_at > now
-            || readiness.valid_until < readiness.evaluated_at
-            || readiness.valid_until < now
-            || readiness.valid_until
-                > readiness
-                    .evaluated_at
-                    .saturating_add(PROMOTION_READINESS_TTL_SECS)
-            || readiness.readiness_commitment != promotion_readiness_commitment(readiness)
-        {
-            return Ok(false);
-        }
         let mut connection = self
             .connection
             .lock()
@@ -645,19 +635,7 @@ impl SqliteDiscoveryEndpointQuarantineRevocationRegistry {
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Unavailable)?;
-        let (_, _, current_epoch) = load_meta(&tx)?;
-        let state = load_state(&tx, &readiness.admission_commitment)?;
-        let valid = current_epoch == readiness.policy_epoch
-            && matches!(
-                state,
-                Some(stored)
-                    if stored.state == DiscoveryEndpointQuarantinePolicyState::Positive
-                        && stored.positive_commitment == readiness.positive_commitment
-                        && stored.challenge_id == readiness.challenge_id
-                        && stored.policy_epoch == readiness.policy_epoch
-                        && stored.valid_until >= now
-            )
-            && negative_count(&tx, &readiness.admission_commitment)? == 0;
+        let valid = promotion_readiness_is_current_tx(&tx, readiness, now)?;
         tx.commit()
             .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Unavailable)?;
         drop(connection);
@@ -795,6 +773,53 @@ fn promotion_readiness_commitment(readiness: &DiscoveryEndpointPromotionReadines
     hash.finalize().into()
 }
 
+fn promotion_readiness_shape_is_valid_at(
+    readiness: &DiscoveryEndpointPromotionReadiness,
+    now: u64,
+) -> bool {
+    now != 0
+        && readiness.evaluated_at != 0
+        && readiness.policy_epoch != 0
+        && !readiness.admission_commitment.iter().all(|byte| *byte == 0)
+        && !readiness.positive_commitment.iter().all(|byte| *byte == 0)
+        && !readiness.challenge_id.iter().all(|byte| *byte == 0)
+        && !readiness.group_commitment.iter().all(|byte| *byte == 0)
+        && readiness.evaluated_at <= now
+        && readiness.valid_until >= readiness.evaluated_at
+        && readiness.valid_until >= now
+        && readiness.valid_until
+            <= readiness
+                .evaluated_at
+                .saturating_add(PROMOTION_READINESS_TTL_SECS)
+        && readiness.readiness_commitment == promotion_readiness_commitment(readiness)
+}
+
+// [PERMISSIONLESS-ENDPOINT-PROMOTION-PROBATION 2026-09-24 by Codex] Keep
+// mutable readiness validation in the caller's SQLite transaction so a
+// probation write cannot race a revocation or policy-epoch advance.
+fn promotion_readiness_is_current_tx(
+    tx: &Transaction<'_>,
+    readiness: &DiscoveryEndpointPromotionReadiness,
+    now: u64,
+) -> Result<bool, DiscoveryEndpointQuarantineRevocationError> {
+    if !promotion_readiness_shape_is_valid_at(readiness, now) {
+        return Ok(false);
+    }
+    let (_, _, current_epoch) = load_meta(tx)?;
+    let state = load_state(tx, &readiness.admission_commitment)?;
+    Ok(current_epoch == readiness.policy_epoch
+        && matches!(
+            state,
+            Some(stored)
+                if stored.state == DiscoveryEndpointQuarantinePolicyState::Positive
+                    && stored.positive_commitment == readiness.positive_commitment
+                    && stored.challenge_id == readiness.challenge_id
+                    && stored.policy_epoch == readiness.policy_epoch
+                    && stored.valid_until >= now
+        )
+        && negative_count(tx, &readiness.admission_commitment)? == 0)
+}
+
 fn preflight_negative(
     tx: &Transaction<'_>,
     request: &DiscoveryEndpointNegativeObservationRequest,
@@ -898,10 +923,16 @@ fn initialize_schema(
                FOREIGN KEY(admission_commitment) REFERENCES discovery_endpoint_quarantine_policy_state_v1(admission_commitment) ON DELETE CASCADE
              );
              CREATE INDEX discovery_endpoint_quarantine_negative_expiry_v1
-               ON discovery_endpoint_quarantine_negative_v1(expires_at,evidence_id);
-             PRAGMA user_version=1;",
+               ON discovery_endpoint_quarantine_negative_v1(expires_at,evidence_id);",
         )
         .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Unavailable)?;
+        probation::initialize_schema_tx(&tx)?;
+        tx.execute_batch("PRAGMA user_version=2;")
+            .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Unavailable)?;
+    } else if version == 1 {
+        probation::initialize_schema_tx(&tx)?;
+        tx.execute_batch("PRAGMA user_version=2;")
+            .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Unavailable)?;
     } else if version != SCHEMA_VERSION {
         return Err(DiscoveryEndpointQuarantineRevocationError::UnsupportedSchema);
     }
@@ -1075,6 +1106,7 @@ fn startup_audit(
             return Err(DiscoveryEndpointQuarantineRevocationError::Corrupt);
         }
     }
+    probation::startup_audit(connection, config)?;
     Ok(())
 }
 
