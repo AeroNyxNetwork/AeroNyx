@@ -4,6 +4,8 @@
 // Version: 1.0.0-Membership
 //
 // Modification Reason:
+//   [CHAT-PULL-ROUTE-AUTHORITY 2026-10-01 by Codex] Preserves signed
+//   cross-identity Pull queries without granting portable route authority.
 //   [WITNESS-SAFETY-RUNTIME-SPLIT 2026-09-25 by Codex] Separates Chat Relay
 //   custody witness renewal from MemChain commitment witness coordination.
 //   [PEER-CACHE-RUNTIME 2026-09-25 by Codex] Extracts signed local peer
@@ -5929,9 +5931,14 @@ impl Server {
                 if verify_result.is_err() {
                     return;
                 }
-                relay
-                    .wallet_routes
-                    .announce(&wallet, session.id.clone(), session.endpoint());
+                // [CHAT-PULL-ROUTE-AUTHORITY 2026-10-01 by Codex] Pull signs
+                // query claims, not this session. Preserve delegated retrieval;
+                // delegated route changes require session-bound register/presence.
+                if wallet == session.client_public_key.to_bytes() {
+                    relay
+                        .wallet_routes
+                        .announce(&wallet, session.id.clone(), session.endpoint());
+                }
                 match relay.pull_pending(&wallet, after_timestamp, &cursor, limit) {
                     Ok((messages, message_has_more)) => {
                         let envelopes: Vec<_> = messages.into_iter().map(|m| m.envelope).collect();
@@ -6015,9 +6022,14 @@ impl Server {
                     );
                     return;
                 }
-                relay
-                    .wallet_routes
-                    .announce(&wallet, session.id.clone(), session.endpoint());
+                // [CHAT-PULL-ROUTE-AUTHORITY 2026-10-01 by Codex] A bounded
+                // cursor does not bind the signed query to its carrying session.
+                // Only the matching transport identity may refresh this route.
+                if wallet == session.client_public_key.to_bytes() {
+                    relay
+                        .wallet_routes
+                        .announce(&wallet, session.id.clone(), session.endpoint());
+                }
                 match relay.pull_pending_v2(&wallet, after_timestamp, &cursor, limit) {
                     Ok(page) => {
                         let envelopes: Vec<_> = page
@@ -7688,6 +7700,272 @@ mod tests {
             .expect("response must bind exact verified submit");
         assert_eq!(response.result, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1);
         assert_eq!(relay.peer_status().verified_submit.total, 1);
+    }
+
+    // [CHAT-PULL-ROUTE-AUTHORITY 2026-10-01 by Codex] Exercise operation
+    // authorization through the real dispatcher and encrypted UDP replies.
+    // Sessions are fixtures, not a claim to exercise the handshake here.
+    struct PullRouteFixture {
+        relay: Arc<ChatRelayService>,
+        wallet: IdentityKeyPair,
+        node: IdentityKeyPair,
+        session: Arc<crate::services::Session>,
+        sessions: Arc<SessionManager>,
+        client: Arc<UdpTransport>,
+        server: Arc<UdpTransport>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl PullRouteFixture {
+        async fn new(same_identity: bool) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let relay = test_chat_relay_service(&directory.path().join("pull.sqlite3"), [0x67; 32]);
+            let wallet = IdentityKeyPair::generate();
+            let transport = if same_identity {
+                wallet.clone()
+            } else {
+                IdentityKeyPair::generate()
+            };
+            let client = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+            let server = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+            let sessions = Arc::new(SessionManager::new(4, Duration::from_secs(60)));
+            let session = sessions
+                .create(
+                    aeronyx_common::types::SessionId::generate(),
+                    transport.public_key(),
+                    aeronyx_core::crypto::SessionKey::from_bytes([0x68; 32]),
+                    Ipv4Addr::new(100, 64, 0, 86),
+                    client.local_addr().unwrap(),
+                )
+                .unwrap();
+            Self {
+                relay,
+                wallet,
+                node: IdentityKeyPair::generate(),
+                session,
+                sessions,
+                client,
+                server,
+                _directory: directory,
+            }
+        }
+
+        fn pull(&self, v2: bool) -> MemChainMessage {
+            use aeronyx_core::protocol::auth::{
+                signed_message_digest, DOMAIN_CHAT_PULL, DOMAIN_CHAT_PULL_V2,
+            };
+            let wallet = self.wallet.public_key_bytes();
+            let now = unix_now_secs();
+            let after = 0u64.to_le_bytes();
+            let limit = 1u32.to_le_bytes();
+            let timestamp = now.to_le_bytes();
+            if v2 {
+                let cursor_len = 0u16.to_le_bytes();
+                let signature = self.wallet.sign(&signed_message_digest(
+                    DOMAIN_CHAT_PULL_V2,
+                    &[&wallet, &after, &cursor_len, &[], &limit, &timestamp],
+                ));
+                MemChainMessage::ChatPullV2 {
+                    wallet,
+                    after_timestamp: 0,
+                    cursor: Vec::new(),
+                    limit: 1,
+                    request_timestamp: now,
+                    signature,
+                }
+            } else {
+                let cursor = [0; 16];
+                let signature = self.wallet.sign(&signed_message_digest(
+                    DOMAIN_CHAT_PULL,
+                    &[&wallet, &after, &cursor, &limit, &timestamp],
+                ));
+                MemChainMessage::ChatPull {
+                    wallet,
+                    after_timestamp: 0,
+                    cursor,
+                    limit: 1,
+                    request_timestamp: now,
+                    signature,
+                }
+            }
+        }
+
+        async fn dispatch(&self, message: MemChainMessage) {
+            let mut config = MemChainConfig::default();
+            config.mode = MemChainMode::Off;
+            Server::handle_memchain_message(
+                message,
+                None,
+                None,
+                &None,
+                &None,
+                &config,
+                "unused",
+                &self.session,
+                &self.server,
+                &DefaultTransportCrypto::new(),
+                &self.sessions,
+                &Some(Arc::clone(&self.relay)),
+                &Arc::new(PeerStore::new()),
+                &self.node.public_key_bytes(),
+                &self.node,
+                None,
+            )
+            .await;
+        }
+
+        async fn receive_pull(&self, v2: bool) -> Vec<ChatEnvelope> {
+            let mut datagram = vec![0; 65_535];
+            let (len, _) =
+                tokio::time::timeout(Duration::from_secs(2), self.client.recv(&mut datagram))
+                    .await
+                    .expect("bounded pull response")
+                    .unwrap();
+            let packet =
+                aeronyx_core::protocol::codec::decode_data_packet(&datagram[..len]).unwrap();
+            assert_eq!(packet.session_id, *self.session.id.as_bytes());
+            let mut clear = vec![0; packet.encrypted_payload.len()];
+            let len = DefaultTransportCrypto::new()
+                .decrypt(
+                    &self.session.session_key,
+                    packet.counter,
+                    self.session.id.as_bytes(),
+                    &packet.encrypted_payload,
+                    &mut clear,
+                )
+                .unwrap();
+            let response =
+                aeronyx_core::protocol::memchain::decode_memchain(&clear[1..len]).unwrap();
+            match response {
+                MemChainMessage::ChatPullResponse { envelopes, .. } if !v2 => envelopes,
+                MemChainMessage::ChatPullResponseV2 { envelopes, .. } if v2 => envelopes,
+                _ => panic!("unexpected pull response kind"),
+            }
+        }
+    }
+
+    async fn assert_cross_identity_pull_route_authority(v2: bool, existing: bool) {
+        let fixture = PullRouteFixture::new(false).await;
+        let wallet = fixture.wallet.public_key_bytes();
+        let sender = IdentityKeyPair::generate();
+        let mut envelope =
+            test_verified_submit_request(&sender, [0x71; 16], [0x72; 16], unix_now_secs(), 0x73)
+                .envelope;
+        envelope.receiver = wallet;
+        envelope.signature = sender.sign(&envelope.sign_data());
+        fixture.relay.store_pending(&envelope).unwrap();
+        if existing {
+            // An existing delegated route must not have its endpoint rewritten
+            // by a portable Pull signature. announce also refreshes its TTL.
+            assert!(fixture.relay.wallet_routes.announce(
+                &wallet,
+                fixture.session.id.clone(),
+                "127.0.0.1:9".parse().unwrap()
+            ));
+        }
+        let before = fixture.relay.wallet_routes.lookup(&wallet);
+        fixture.dispatch(fixture.pull(v2)).await;
+        let received = fixture.receive_pull(v2).await;
+        assert_eq!(
+            received.len(),
+            1,
+            "cross-identity signed query remains available"
+        );
+        assert!(encode_envelope(&received[0]).unwrap() == encode_envelope(&envelope).unwrap());
+        assert!(
+            fixture.relay.wallet_routes.lookup(&wallet) == before,
+            "portable Pull signature must not create or refresh a cross-identity route"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_pull_route_authority_v1_cannot_create() {
+        assert_cross_identity_pull_route_authority(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn chat_pull_route_authority_v2_cannot_create() {
+        assert_cross_identity_pull_route_authority(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn chat_pull_route_authority_v1_cannot_refresh() {
+        assert_cross_identity_pull_route_authority(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn chat_pull_route_authority_v2_cannot_refresh() {
+        assert_cross_identity_pull_route_authority(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn chat_pull_route_authority_same_identity_and_invalid_signature() {
+        for v2 in [false, true] {
+            let fixture = PullRouteFixture::new(true).await;
+            let wallet = fixture.wallet.public_key_bytes();
+            let mut invalid = fixture.pull(v2);
+            match &mut invalid {
+                MemChainMessage::ChatPull { signature, .. }
+                | MemChainMessage::ChatPullV2 { signature, .. } => signature[0] ^= 1,
+                _ => unreachable!(),
+            }
+            fixture.dispatch(invalid).await;
+            assert!(fixture.relay.wallet_routes.lookup(&wallet).is_empty());
+            fixture.dispatch(fixture.pull(v2)).await;
+            assert!(fixture.receive_pull(v2).await.is_empty());
+            assert!(
+                fixture.relay.wallet_routes.lookup(&wallet)
+                    == vec![(fixture.session.id.clone(), fixture.session.endpoint())]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_pull_route_authority_session_bound_delegation_still_works() {
+        use aeronyx_core::protocol::auth::{
+            signed_message_digest, DOMAIN_DEVICE_REGISTER, DOMAIN_WALLET_PRESENCE,
+        };
+        let fixture = PullRouteFixture::new(false).await;
+        let wallet = fixture.wallet.public_key_bytes();
+        let timestamp = unix_now_secs();
+        let ts = timestamp.to_le_bytes();
+        let device_id = [0x74; 16];
+        let signature = fixture.wallet.sign(&signed_message_digest(
+            DOMAIN_DEVICE_REGISTER,
+            &[fixture.session.id.as_bytes(), &device_id, &wallet, &ts],
+        ));
+        fixture
+            .dispatch(MemChainMessage::DeviceRegister {
+                device_id,
+                device_name: String::new(),
+                wallet_pubkey: wallet,
+                timestamp,
+                signature,
+            })
+            .await;
+        assert!(
+            fixture.relay.wallet_routes.lookup(&wallet)
+                == vec![(fixture.session.id.clone(), fixture.session.endpoint())]
+        );
+        assert!(fixture
+            .relay
+            .wallet_routes
+            .remove_route(&wallet, &fixture.session.id));
+        let signature = fixture.wallet.sign(&signed_message_digest(
+            DOMAIN_WALLET_PRESENCE,
+            &[fixture.session.id.as_bytes(), &wallet, &ts],
+        ));
+        fixture
+            .dispatch(MemChainMessage::WalletPresence {
+                wallet_pubkey: wallet,
+                timestamp,
+                signature,
+            })
+            .await;
+        assert!(
+            fixture.relay.wallet_routes.lookup(&wallet)
+                == vec![(fixture.session.id.clone(), fixture.session.endpoint())]
+        );
     }
 
     /// Captures exact v3 ACK bodies and truncates the first one after custody.
