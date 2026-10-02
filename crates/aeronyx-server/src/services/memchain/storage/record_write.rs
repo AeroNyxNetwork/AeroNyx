@@ -28,6 +28,50 @@ impl SealedV2InsertOutcome {
     }
 }
 
+// [MEMORY-V2-OWNER-SLOT 2026-10-02 by Codex] The owner ceiling is checked
+// inside the same IMMEDIATE transaction as the first row for that owner.  All
+// lifecycle states count, so revocation cannot release a slot.
+fn enforce_owner_slot_tx(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &[u8; 32],
+    policy: OwnerSlotPolicy,
+) -> Result<(), OwnerSlotAdmissionError> {
+    if policy.max_remote_owners == 0 || *owner == policy.local_owner {
+        return Ok(());
+    }
+    let owner_exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM (
+                 SELECT owner FROM records
+                 UNION
+                 SELECT owner FROM memory_sealed_v2
+             ) WHERE owner = ?1)",
+            params![owner.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|_| OwnerSlotAdmissionError::StorageUnavailable)?;
+    if owner_exists {
+        return Ok(());
+    }
+    let remote_count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT owner FROM records
+                 UNION
+                 SELECT owner FROM memory_sealed_v2
+             ) WHERE owner != ?1",
+            params![policy.local_owner.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|_| OwnerSlotAdmissionError::StorageUnavailable)?;
+    let remote_count =
+        usize::try_from(remote_count).map_err(|_| OwnerSlotAdmissionError::StorageUnavailable)?;
+    if remote_count >= policy.max_remote_owners {
+        return Err(OwnerSlotAdmissionError::AtCapacity);
+    }
+    Ok(())
+}
+
 // [MEMORY-SEALED-V2 2026-10-02 by Codex] Classification is shared by the
 // read-only admission preflight and the insert transaction.  It scans every
 // lifecycle state so tombstones cannot be resurrected by an exact retry.
@@ -166,6 +210,63 @@ impl MemoryStorage {
             SealedV2InsertOutcome::Inserted
         };
         tx.commit().map_err(|e| format!("sealed v2 commit: {e}"))?;
+        Ok(outcome)
+    }
+
+    // [MEMORY-V2-OWNER-SLOT 2026-10-02 by Codex] Remote API insertion uses a
+    // separate typed entry point so local/replication callers retain their
+    // historical behavior.  Duplicate/conflict classification precedes the
+    // owner ceiling; only a genuinely new owner can consume a slot.
+    pub(crate) async fn insert_sealed_v2_with_owner_slot(
+        &self,
+        owner: &[u8; 32],
+        record_id: &[u8; 32],
+        created_at: u64,
+        envelope: &[u8],
+        signature: &[u8; 64],
+        policy: OwnerSlotPolicy,
+    ) -> Result<SealedV2InsertOutcome, OwnerSlotAdmissionError> {
+        if created_at > i64::MAX as u64
+            || !(MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES..=MEMORY_SEALED_V2_MAX_ENVELOPE_BYTES)
+                .contains(&envelope.len())
+            || MemorySealedV2Envelope::decode(envelope).is_err()
+        {
+            return Err(OwnerSlotAdmissionError::StorageUnavailable);
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| OwnerSlotAdmissionError::StorageUnavailable)?
+            .as_secs();
+        let now = i64::try_from(now).map_err(|_| OwnerSlotAdmissionError::StorageUnavailable)?;
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|_| OwnerSlotAdmissionError::StorageUnavailable)?;
+        let outcome =
+            match classify_sealed_v2_conn(&tx, record_id, owner, created_at, envelope, signature) {
+                Ok(Some(outcome)) => outcome,
+                Ok(None) => {
+                    enforce_owner_slot_tx(&tx, owner, policy)?;
+                    tx.execute(
+                        "INSERT INTO memory_sealed_v2
+                     (record_id, owner, created_at, envelope, signature, status, inserted_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+                        params![
+                            record_id.as_slice(),
+                            owner.as_slice(),
+                            created_at as i64,
+                            envelope,
+                            signature.as_slice(),
+                            now,
+                        ],
+                    )
+                    .map_err(|_| OwnerSlotAdmissionError::StorageUnavailable)?;
+                    SealedV2InsertOutcome::Inserted
+                }
+                Err(_) => return Err(OwnerSlotAdmissionError::StorageUnavailable),
+            };
+        tx.commit()
+            .map_err(|_| OwnerSlotAdmissionError::StorageUnavailable)?;
         Ok(outcome)
     }
 
@@ -485,6 +586,102 @@ impl MemoryStorage {
         }
     }
 
+    // [MEMORY-V2-OWNER-SLOT 2026-10-02 by Codex] This bounded path is used by
+    // remote V1 writers.  Owner discovery, the all-status ceiling check, and
+    // the INSERT share one IMMEDIATE transaction; cache/counters advance only
+    // after commit.  The legacy unbounded `insert` above remains compatible
+    // for local and replication callers until API wiring is integrated.
+    pub(crate) async fn insert_with_owner_slot(
+        &self,
+        record: &MemoryRecord,
+        embedding_model: &str,
+        policy: OwnerSlotPolicy,
+    ) -> Result<bool, OwnerSlotAdmissionError> {
+        if !record.verify_id() {
+            self.total_rejected.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let tags_json =
+            serde_json::to_string(&record.topic_tags).unwrap_or_else(|_| "[]".to_string());
+        let embedding_blob: Option<Vec<u8>> = if record.has_embedding() {
+            Some(embedding_to_bytes(&record.embedding))
+        } else {
+            None
+        };
+        let embedding_dim = record.embedding_dim() as i64;
+        let conflict_with_blob: Option<Vec<u8>> = record.conflict_with.map(|c| c.to_vec());
+        let stored_content: Vec<u8> = if record.blind {
+            record.encrypted_content.clone()
+        } else if let Some(ref key) = self.record_key {
+            let key: &[u8; 32] = &**key;
+            if record.encrypted_content.is_empty() {
+                record.encrypted_content.clone()
+            } else {
+                match encrypt_record_content(key, &record.encrypted_content) {
+                    Ok(ct) => ct,
+                    Err(_) => {
+                        self.total_rejected.fetch_add(1, Ordering::Relaxed);
+                        return Ok(false);
+                    }
+                }
+            }
+        } else {
+            record.encrypted_content.clone()
+        };
+
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|_| OwnerSlotAdmissionError::StorageUnavailable)?;
+        enforce_owner_slot_tx(&tx, &record.owner, policy)?;
+        let changes = tx
+            .execute(
+                "INSERT OR IGNORE INTO records (
+                    record_id, owner, timestamp, layer, topic_tags, source_ai,
+                    status, supersedes, encrypted_content, embedding,
+                    embedding_model, embedding_dim, signature, access_count, created_at,
+                    positive_feedback, negative_feedback, conflict_with, blind
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                params![
+                    record.record_id.as_slice(),
+                    record.owner.as_slice(),
+                    record.timestamp as i64,
+                    record.layer as u8 as i64,
+                    tags_json,
+                    record.source_ai,
+                    record.status as u8 as i64,
+                    record.supersedes.as_ref().map(|s| s.as_slice()),
+                    stored_content.as_slice(),
+                    embedding_blob.as_deref(),
+                    embedding_model,
+                    embedding_dim,
+                    record.signature.as_slice(),
+                    record.access_count as i64,
+                    now,
+                    record.positive_feedback as i64,
+                    record.negative_feedback as i64,
+                    conflict_with_blob.as_deref(),
+                    record.blind as i64,
+                ],
+            )
+            .map_err(|_| OwnerSlotAdmissionError::StorageUnavailable)?;
+        tx.commit()
+            .map_err(|_| OwnerSlotAdmissionError::StorageUnavailable)?;
+
+        if changes > 0 {
+            self.total_inserted.fetch_add(1, Ordering::Relaxed);
+            self.cache.write().put(record.clone());
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Store a node-blind record received from a peer as a **verbatim replica**
     /// (replication receive path, Brick 4). The content is opaque to this node,
     /// so it is stored exactly as received — the node **never** re-encrypts it
@@ -593,6 +790,192 @@ mod sealed_v2_tests {
         bytes[17..21].copy_from_slice(&(16u32).to_be_bytes());
         assert!(MemorySealedV2Envelope::decode(&bytes).is_ok());
         bytes
+    }
+
+    fn frame_with_marker(marker: u8) -> Vec<u8> {
+        let mut bytes = frame();
+        bytes[21] = marker;
+        bytes
+    }
+
+    fn v1_record(owner: [u8; 32], marker: u8) -> MemoryRecord {
+        MemoryRecord::new(
+            owner,
+            u64::from(marker),
+            MemoryLayer::Knowledge,
+            Vec::new(),
+            String::new(),
+            vec![marker],
+            Vec::new(),
+        )
+    }
+
+    fn signed_v2(key: &IdentityKeyPair, marker: u8) -> ([u8; 32], u64, Vec<u8>, [u8; 64]) {
+        let owner = key.public_key_bytes();
+        let created_at = u64::from(marker);
+        let envelope = frame_with_marker(marker);
+        let record_id = memory_sealed_v2_record_id(&owner, created_at, &envelope);
+        let signature = key.sign(&memory_sealed_v2_signature_transcript(
+            &owner, &record_id, created_at, &envelope,
+        ));
+        (record_id, created_at, envelope, signature)
+    }
+
+    #[tokio::test]
+    async fn owner_slot_mixed_v1_v2_first_writes_admit_exactly_one() {
+        // [MEMORY-V2-OWNER-SLOT 2026-10-02 by Codex] This is the deterministic
+        // race regression: two distinct first owners enter together, but the
+        // immediate transaction admits only one aggregate remote slot.
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let local = [0xE0; 32];
+        let policy = OwnerSlotPolicy {
+            local_owner: local,
+            max_remote_owners: 1,
+        };
+        let key_v1 = IdentityKeyPair::from_bytes(&[0xA1; 32]).unwrap();
+        let key_v2 = IdentityKeyPair::from_bytes(&[0xA2; 32]).unwrap();
+        let (record_id, created_at, envelope, signature) = signed_v2(&key_v2, 2);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let v1_storage = Arc::clone(&storage);
+        let v1_barrier = Arc::clone(&barrier);
+        let v1 = tokio::spawn(async move {
+            let record = v1_record(key_v1.public_key_bytes(), 1);
+            v1_barrier.wait().await;
+            v1_storage.insert_with_owner_slot(&record, "", policy).await
+        });
+        let v2_storage = Arc::clone(&storage);
+        let v2_barrier = Arc::clone(&barrier);
+        let v2 = tokio::spawn(async move {
+            v2_barrier.wait().await;
+            v2_storage
+                .insert_sealed_v2_with_owner_slot(
+                    &key_v2.public_key_bytes(),
+                    &record_id,
+                    created_at,
+                    &envelope,
+                    &signature,
+                    policy,
+                )
+                .await
+        });
+        barrier.wait().await;
+        let v1 = v1.await.unwrap();
+        let v2 = v2.await.unwrap();
+        let v1_inserted = matches!(v1, Ok(true));
+        let v2_inserted = matches!(v2, Ok(SealedV2InsertOutcome::Inserted));
+        assert_ne!(v1_inserted, v2_inserted);
+        assert!(
+            matches!(
+                (v1, v2),
+                (Ok(true), Err(error)) if error.is_at_capacity()
+            ) || matches!(
+                (v1, v2),
+                (Err(error), Ok(SealedV2InsertOutcome::Inserted)) if error.is_at_capacity()
+            )
+        );
+        assert_eq!(storage.count_distinct_owners().await, 1);
+    }
+
+    #[tokio::test]
+    async fn owner_slot_handles_local_bypass_tombstone_exact_retry_and_unlimited() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let local = [0xE1; 32];
+        let policy = OwnerSlotPolicy {
+            local_owner: local,
+            max_remote_owners: 1,
+        };
+        let remote_key = IdentityKeyPair::from_bytes(&[0xB1; 32]).unwrap();
+        let (remote_id, created_at, envelope, signature) = signed_v2(&remote_key, 11);
+        assert_eq!(
+            storage
+                .insert_sealed_v2_with_owner_slot(
+                    &remote_key.public_key_bytes(),
+                    &remote_id,
+                    created_at,
+                    &envelope,
+                    &signature,
+                    policy,
+                )
+                .await
+                .unwrap(),
+            SealedV2InsertOutcome::Inserted
+        );
+        assert_eq!(
+            storage
+                .insert_sealed_v2_with_owner_slot(
+                    &remote_key.public_key_bytes(),
+                    &remote_id,
+                    created_at,
+                    &envelope,
+                    &signature,
+                    policy,
+                )
+                .await
+                .unwrap(),
+            SealedV2InsertOutcome::ExactDuplicate
+        );
+        assert!(
+            storage
+                .revoke_sealed_v2(&remote_key.public_key_bytes(), &remote_id)
+                .await
+        );
+        let rejected = storage
+            .insert_with_owner_slot(&v1_record([0xB2; 32], 12), "", policy)
+            .await
+            .unwrap_err();
+        assert!(rejected.is_at_capacity());
+        assert!(storage
+            .insert_with_owner_slot(&v1_record(local, 13), "", policy)
+            .await
+            .unwrap());
+
+        let unlimited = MemoryStorage::open(":memory:", None).unwrap();
+        assert!(unlimited
+            .insert_with_owner_slot(
+                &v1_record([0xB3; 32], 14),
+                "",
+                OwnerSlotPolicy {
+                    local_owner: [0xEF; 32],
+                    max_remote_owners: 0,
+                },
+            )
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn owner_slot_failed_insert_rolls_back_without_cache_or_slot() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let policy = OwnerSlotPolicy {
+            local_owner: [0xE2; 32],
+            max_remote_owners: 1,
+        };
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute_batch(
+                "CREATE TRIGGER reject_owner_slot_insert
+                 BEFORE INSERT ON records
+                 BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        }
+        let failed = storage
+            .insert_with_owner_slot(&v1_record([0xC1; 32], 21), "", policy)
+            .await
+            .unwrap_err();
+        assert!(!failed.is_at_capacity());
+        assert_eq!(storage.total_inserted(), 0);
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute("DROP TRIGGER reject_owner_slot_insert", [])
+                .unwrap();
+        }
+        assert!(storage
+            .insert_with_owner_slot(&v1_record([0xC1; 32], 22), "", policy)
+            .await
+            .unwrap());
+        assert_eq!(storage.total_inserted(), 1);
+        assert_eq!(storage.count_distinct_owners().await, 1);
     }
 
     #[tokio::test]

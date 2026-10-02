@@ -343,6 +343,33 @@ pub(crate) enum StorageGrowthError {
     VolumeUnavailable,
 }
 
+// [MEMORY-V2-OWNER-SLOT 2026-10-02 by Codex] Remote-owner admission is a
+// durable row invariant, distinct from byte-growth admission.  The error is
+// deliberately coarse so callers cannot turn quota or SQLite state into an
+// owner/database oracle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum OwnerSlotAdmissionError {
+    #[error("remote owner capacity reached")]
+    AtCapacity,
+    #[error("remote owner admission unavailable")]
+    StorageUnavailable,
+}
+
+impl OwnerSlotAdmissionError {
+    pub(crate) const fn is_at_capacity(self) -> bool {
+        matches!(self, Self::AtCapacity)
+    }
+}
+
+// [MEMORY-V2-OWNER-SLOT 2026-10-02 by Codex] This policy is copied into one
+// SQLite transaction and contains only the local public owner and configured
+// aggregate ceiling; no request body or endpoint data crosses the storage API.
+#[derive(Clone, Copy)]
+pub(crate) struct OwnerSlotPolicy {
+    pub(crate) local_owner: [u8; 32],
+    pub(crate) max_remote_owners: usize,
+}
+
 impl StorageGrowthError {
     pub(crate) const fn code(self) -> &'static str {
         match self {
