@@ -12,6 +12,8 @@
 // changing production behavior or seeding target custody through storage APIs.
 // [CHAT-V1-COALESCING 2026-10-03 by Codex] Cover byte-target prefixes,
 // single-envelope compatibility and 51-item multi-page custody acceptance.
+// [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] Exercise byte-aware snapshot
+// continuation, ACK/reopen, oversized single items and local write failure.
 // Last Modified: 2026-10-03. Originally split from server.rs `mod tests`.
 use super::*;
 // [CHAT-V1-COALESCING 2026-10-03 by Codex] Import the production AEAD size explicitly.
@@ -316,7 +318,87 @@ struct CustodyAcceptanceClient {
     udp: Arc<UdpTransport>,
 }
 
+// [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] No Debug: signed envelopes and
+// opaque cursor bytes must not be dumped by generic assertion diagnostics.
+struct CustodySnapshotPage {
+    envelopes: Vec<ChatEnvelope>,
+    next_cursor: Vec<u8>,
+    has_more: bool,
+    datagram_bytes: usize,
+}
+
 impl CustodyAcceptanceClient {
+    // [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] A fresh signed request for
+    // exactly the prior cursor; no retry-generated ceiling or cursor replacement.
+    fn snapshot_request(&self, cursor: Vec<u8>, limit: u32) -> MemChainMessage {
+        use aeronyx_core::protocol::auth::{signed_message_digest, DOMAIN_CHAT_PULL_V2};
+        let wallet = self.identity.public_key_bytes();
+        let now = unix_now_secs();
+        let cursor_length = u16::try_from(cursor.len()).unwrap();
+        let signature = self.identity.sign(&signed_message_digest(
+            DOMAIN_CHAT_PULL_V2,
+            &[
+                &wallet,
+                &0u64.to_le_bytes(),
+                &cursor_length.to_le_bytes(),
+                &cursor,
+                &limit.to_le_bytes(),
+                &now.to_le_bytes(),
+            ],
+        ));
+        MemChainMessage::ChatPullV2 {
+            wallet,
+            after_timestamp: 0,
+            cursor,
+            limit,
+            request_timestamp: now,
+            signature,
+        }
+    }
+
+    async fn snapshot_page(
+        &self,
+        node: &CustodyAcceptanceNode,
+        cursor: Vec<u8>,
+    ) -> CustodySnapshotPage {
+        node.dispatch(self, self.snapshot_request(cursor, 50), None)
+            .await;
+        let mut bytes = vec![0; 65_535];
+        let (datagram_bytes, _) =
+            tokio::time::timeout(Duration::from_secs(2), self.udp.recv(&mut bytes))
+                .await
+                .expect("bounded snapshot response")
+                .unwrap();
+        let packet =
+            aeronyx_core::protocol::codec::decode_data_packet(&bytes[..datagram_bytes]).unwrap();
+        assert!(packet.session_id == *self.session.id.as_bytes());
+        let mut clear = vec![0; packet.encrypted_payload.len()];
+        let size = DefaultTransportCrypto::new()
+            .decrypt(
+                &self.session.session_key,
+                packet.counter,
+                self.session.id.as_bytes(),
+                &packet.encrypted_payload,
+                &mut clear,
+            )
+            .unwrap();
+        assert_eq!(clear[0], aeronyx_core::protocol::memchain::MEMCHAIN_MAGIC);
+        let MemChainMessage::ChatPullResponseV2 {
+            envelopes,
+            next_cursor,
+            has_more,
+        } = aeronyx_core::protocol::decode_memchain(&clear[1..size]).unwrap()
+        else {
+            panic!("unexpected snapshot response kind")
+        };
+        CustodySnapshotPage {
+            envelopes,
+            next_cursor,
+            has_more,
+            datagram_bytes,
+        }
+    }
+
     async fn pull(&self, node: &CustodyAcceptanceNode) -> Vec<ChatEnvelope> {
         use aeronyx_core::protocol::auth::{signed_message_digest, DOMAIN_CHAT_PULL_V2};
         let wallet = self.identity.public_key_bytes();
@@ -856,6 +938,134 @@ async fn chat_custody_invalid_acks_preserve_item_until_valid_ack() {
 #[tokio::test]
 async fn chat_custody_failed_v1_write_preserves_item_until_ack() {
     run_custody_acceptance(CustodyAcceptanceCase::LegacyWriteFailure).await;
+}
+
+// [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] Focused post-auth dispatcher
+// fixtures seed signed custody rows; they do not claim sender-admission/E2E proof.
+fn v2_byte_custody_fixture(
+    node: &CustodyAcceptanceNode,
+    receiver: &[u8; 32],
+    id: u8,
+    size: usize,
+) -> ChatEnvelope {
+    let signer = IdentityKeyPair::generate();
+    let mut envelope = coalescing_envelope(id, size);
+    envelope.sender = signer.public_key_bytes();
+    envelope.receiver = *receiver;
+    envelope.timestamp = unix_now_secs();
+    envelope.signature = signer.sign(&envelope.sign_data());
+    node.relay.store_pending(&envelope).unwrap();
+    envelope
+}
+
+#[tokio::test]
+async fn chat_pull_v2_byte_pages_ack_reopen_preserve_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("snapshot.sqlite3");
+    let mut node =
+        CustodyAcceptanceNode::open(&path, [0x93; 32], IdentityKeyPair::generate()).await;
+    let receiver = IdentityKeyPair::generate();
+    for id in 1..=6 {
+        v2_byte_custody_fixture(&node, &receiver.public_key_bytes(), id, 400);
+    }
+    let mut client = node.client(receiver.clone()).await;
+    let first = client.snapshot_page(&node, Vec::new()).await;
+    assert_eq!(first.envelopes.len(), 1);
+    assert!(first.envelopes[0].message_id == [1; 16]);
+    assert!(first.has_more && first.datagram_bytes <= Server::CHAT_PULL_V2_COALESCING_TARGET);
+    v2_byte_custody_fixture(&node, &receiver.public_key_bytes(), 7, 400);
+    node.dispatch(&client, client.ack([1; 16]), None).await;
+    let mut cursor = first.next_cursor;
+    drop(client);
+    node = node.reopen(&path, [0x93; 32]).await;
+    client = node.client(receiver).await;
+    for id in 2..=6 {
+        let page = client.snapshot_page(&node, cursor).await;
+        assert_eq!(page.envelopes.len(), 1);
+        assert!(page.envelopes[0].message_id == [id; 16]);
+        assert!(page.envelopes[0].verify_signature().is_ok());
+        assert!(page.envelopes[0].ciphertext == vec![0; 400]);
+        assert_eq!(page.has_more, id < 6);
+        assert!(page.datagram_bytes <= Server::CHAT_PULL_V2_COALESCING_TARGET);
+        cursor = page.next_cursor;
+        node.dispatch(&client, client.ack([id; 16]), None).await;
+    }
+    let fresh = client.snapshot_page(&node, Vec::new()).await;
+    assert_eq!(fresh.envelopes.len(), 1);
+    assert!(fresh.envelopes[0].message_id == [7; 16]);
+    assert!(!fresh.has_more);
+    node.dispatch(&client, client.ack([7; 16]), None).await;
+    assert_eq!(node.relay.storage_usage().unwrap().pending_messages, 0);
+}
+
+#[tokio::test]
+async fn chat_pull_v2_write_failure_keeps_unsent_prefix_after_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("snapshot.sqlite3");
+    let mut node =
+        CustodyAcceptanceNode::open(&path, [0x93; 32], IdentityKeyPair::generate()).await;
+    let receiver = IdentityKeyPair::generate();
+    for id in 1..=2 {
+        v2_byte_custody_fixture(&node, &receiver.public_key_bytes(), id, 400);
+    }
+    let mut client = node.client(receiver.clone()).await;
+    node.udp.shutdown().await.unwrap();
+    let prepared = node
+        .relay
+        .pull_pending_v2_coalesced(&receiver.public_key_bytes(), 0, &[], 50, 1200)
+        .unwrap();
+    let response = MemChainMessage::ChatPullResponseV2 {
+        envelopes: prepared
+            .messages
+            .into_iter()
+            .map(|message| message.envelope)
+            .collect(),
+        next_cursor: prepared.next_cursor,
+        has_more: prepared.has_more,
+    };
+    assert!(
+        !Server::send_to_session(
+            &response,
+            &client.session,
+            &node.udp,
+            &DefaultTransportCrypto::new(),
+        )
+        .await
+    );
+    node.dispatch(&client, client.snapshot_request(Vec::new(), 50), None)
+        .await;
+    assert_eq!(node.relay.storage_usage().unwrap().pending_messages, 2);
+    drop(client);
+    node = node.reopen(&path, [0x93; 32]).await;
+    client = node.client(receiver).await;
+    let retry = client.snapshot_page(&node, Vec::new()).await;
+    assert_eq!(retry.envelopes.len(), 1);
+    assert!(retry.envelopes[0].message_id == [1; 16] && retry.has_more);
+    node.dispatch(&client, client.ack([1; 16]), None).await;
+    let tail = client.snapshot_page(&node, retry.next_cursor).await;
+    assert_eq!(tail.envelopes.len(), 1);
+    assert!(tail.envelopes[0].message_id == [2; 16] && !tail.has_more);
+    assert_eq!(node.relay.storage_usage().unwrap().pending_messages, 1);
+}
+
+#[tokio::test]
+async fn chat_pull_v2_single_above_target_stays_whole_on_wire() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("snapshot.sqlite3");
+    let node = CustodyAcceptanceNode::open(&path, [0x93; 32], IdentityKeyPair::generate()).await;
+    let receiver = IdentityKeyPair::generate();
+    let expected = v2_byte_custody_fixture(&node, &receiver.public_key_bytes(), 1, 2048);
+    v2_byte_custody_fixture(&node, &receiver.public_key_bytes(), 2, 1);
+    let client = node.client(receiver).await;
+    let first = client.snapshot_page(&node, Vec::new()).await;
+    assert_eq!(first.envelopes.len(), 1);
+    assert!(first.envelopes[0].ciphertext == expected.ciphertext);
+    assert!(first.envelopes[0].verify_signature().is_ok());
+    assert!(first.has_more);
+    assert_eq!(first.datagram_bytes, 2355);
+    assert_eq!(node.relay.storage_usage().unwrap().pending_messages, 2);
+    let last = client.snapshot_page(&node, first.next_cursor).await;
+    assert!(last.envelopes[0].message_id == [2; 16] && !last.has_more);
 }
 
 // [CHAT-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] Private composition of the

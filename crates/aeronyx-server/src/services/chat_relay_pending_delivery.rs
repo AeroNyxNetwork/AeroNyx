@@ -1,13 +1,15 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_pending_delivery.rs
 // ============================================
-// Version: 1.1.0-PendingContractDependency
+// Version: 1.2.0-ByteAwareSnapshotPaging
 //
 // Creation Reason:
 //   [CHAT-PENDING-DELIVERY-DOMAIN 2026-08-28 by Codex] Extract complete legacy
 //   and snapshot pull use cases from the oversized relay orchestration service.
 //
 // Modification Reason:
+//   [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] Select a whole-envelope byte
+//   prefix before protecting its cursor; preserve the public count-only path.
 //   [CHAT-PENDING-CONTRACT-DOMAIN 2026-08-28 by Codex] Depend directly on the
 //   pending delivery contract instead of the central relay orchestrator.
 //
@@ -40,6 +42,7 @@
 //   - Keep final pagination outside the connection-lock scope.
 //
 // Last Modified:
+//   v1.2.0-ByteAwareSnapshotPaging - 2026-10-03, select prefix before cursor
 //   v1.1.0-PendingContractDependency - Removed orchestrator dependency
 //   v1.0.0-PendingDeliveryDomain - Initial pull use-case composition
 // ============================================
@@ -49,10 +52,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
-use super::chat_relay_error::ChatRelayResult;
+use aeronyx_core::crypto::transport::ENCRYPTION_OVERHEAD;
+use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
+use aeronyx_core::protocol::messages::DATA_PACKET_HEADER_SIZE;
+
+use super::chat_relay_error::{ChatRelayError, ChatRelayResult};
 use super::chat_relay_pending_contract::{PendingMessage, PendingMessagePageV2};
 use super::chat_relay_pending_pull::PendingMessagePullDomain;
-use super::chat_relay_pull_cursor::{ChatPullCursorCodec, PullCursorV2};
+use super::chat_relay_pull_cursor::{ChatPullCursorCodec, PullCursorV2, ENCODED_CURSOR_BYTES};
 use super::chat_relay_quarantine::{
     CorruptDurableRow, DurableQuarantineDomain, QuarantineReplaceOutcome, QuarantineRowTarget,
 };
@@ -92,6 +99,88 @@ pub(crate) struct LegacyPendingDeliveryPage {
 pub(crate) struct SnapshotPendingDeliveryPage {
     pub(crate) page: PendingMessagePageV2,
     pub(crate) quarantine: PendingPullQuarantineSummary,
+}
+
+// [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] Transport policy is internal:
+// neither an admission ceiling nor a promise that an oversized first item fits.
+#[derive(Clone, Copy)]
+pub(crate) enum SnapshotPageBudget {
+    CountOnly,
+    UdpCoalescing { target_bytes: usize },
+}
+
+impl SnapshotPageBudget {
+    fn select_prefix(
+        self,
+        messages: &[(u64, PendingMessage)],
+        page_limit: usize,
+    ) -> ChatRelayResult<(usize, Option<usize>)> {
+        let Self::UdpCoalescing { target_bytes } = self else {
+            return Ok((messages.len().min(page_limit), None));
+        };
+        // Measure the actual empty response, including the frozen opaque cursor
+        // and outer transport framing. The final encode below checks composition.
+        let mut bytes = snapshot_datagram_bytes(&[], &[0; ENCODED_CURSOR_BYTES])?;
+        let mut selected = 0;
+        for (_, message) in messages.iter().take(page_limit) {
+            let item_bytes = usize::try_from(bincode::serialized_size(&message.envelope)?)
+                .map_err(|_| snapshot_size_error())?;
+            let next = checked_page_bytes(bytes, item_bytes)?;
+            if selected != 0 && next > target_bytes {
+                break;
+            }
+            bytes = next;
+            selected += 1;
+            if bytes > target_bytes {
+                break;
+            }
+        }
+        Ok((selected, Some(bytes)))
+    }
+
+    fn validate(
+        self,
+        page: &PendingMessagePageV2,
+        expected_bytes: Option<usize>,
+    ) -> ChatRelayResult<()> {
+        let Self::UdpCoalescing { target_bytes } = self else {
+            return Ok(());
+        };
+        let actual = snapshot_datagram_bytes(&page.messages, &page.next_cursor)?;
+        if Some(actual) != expected_bytes || (actual > target_bytes && page.messages.len() != 1) {
+            return Err(snapshot_size_error());
+        }
+        Ok(())
+    }
+}
+
+fn snapshot_size_error() -> ChatRelayError {
+    ChatRelayError::Serialize(Box::new(bincode::ErrorKind::Custom(
+        "snapshot_page_size".into(),
+    )))
+}
+
+fn checked_page_bytes(current: usize, additional: usize) -> ChatRelayResult<usize> {
+    current
+        .checked_add(additional)
+        .ok_or_else(snapshot_size_error)
+}
+
+fn snapshot_datagram_bytes(messages: &[PendingMessage], cursor: &[u8]) -> ChatRelayResult<usize> {
+    let response = MemChainMessage::ChatPullResponseV2 {
+        envelopes: messages
+            .iter()
+            .map(|message| message.envelope.clone())
+            .collect(),
+        next_cursor: cursor.to_vec(),
+        // Both canonical bool values occupy one byte.
+        has_more: false,
+    };
+    let clear = encode_memchain(&response).map_err(|_| snapshot_size_error())?;
+    checked_page_bytes(
+        checked_page_bytes(clear.len(), DATA_PACKET_HEADER_SIZE)?,
+        ENCRYPTION_OVERHEAD,
+    )
 }
 
 /// Composed pending-message delivery use cases.
@@ -161,6 +250,30 @@ impl PendingMessageDeliveryDomain {
         encoded_cursor: &[u8],
         limit: u32,
     ) -> ChatRelayResult<SnapshotPendingDeliveryPage> {
+        self.pull_snapshot_budgeted(
+            connection,
+            quarantine,
+            receiver,
+            after_timestamp,
+            encoded_cursor,
+            limit,
+            SnapshotPageBudget::CountOnly,
+        )
+    }
+
+    // [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] Read the same bounded rows;
+    // never perform a second query or recapture the ceiling to shorten a page.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pull_snapshot_budgeted(
+        &self,
+        connection: &Mutex<Connection>,
+        quarantine: &DurableQuarantineDomain,
+        receiver: &[u8; 32],
+        after_timestamp: u64,
+        encoded_cursor: &[u8],
+        limit: u32,
+        budget: SnapshotPageBudget,
+    ) -> ChatRelayResult<SnapshotPendingDeliveryPage> {
         let page_limit = bounded_page_limit(limit);
         let decoded_cursor = if encoded_cursor.is_empty() {
             None
@@ -197,11 +310,12 @@ impl PendingMessageDeliveryDomain {
         };
 
         let mut valid_messages = page.messages;
-        let valid_overflow = valid_messages.len() > page_limit;
+        let (selected, expected_bytes) = budget.select_prefix(&valid_messages, page_limit)?;
+        let valid_overflow = valid_messages.len() > selected;
         let has_more = page.raw_has_more || valid_overflow;
         let next_position = if valid_overflow {
             valid_messages
-                .get(page_limit.saturating_sub(1))
+                .get(selected.saturating_sub(1))
                 .map(|(sequence, _)| *sequence)
                 .unwrap_or(cursor.position)
         } else if has_more {
@@ -209,7 +323,7 @@ impl PendingMessageDeliveryDomain {
         } else {
             cursor.ceiling
         };
-        valid_messages.truncate(page_limit);
+        valid_messages.truncate(selected);
         let messages = valid_messages
             .into_iter()
             .map(|(_, message)| message)
@@ -223,14 +337,13 @@ impl PendingMessageDeliveryDomain {
             },
         )?;
 
-        Ok(SnapshotPendingDeliveryPage {
-            page: PendingMessagePageV2 {
-                messages,
-                next_cursor,
-                has_more,
-            },
-            quarantine,
-        })
+        let page = PendingMessagePageV2 {
+            messages,
+            next_cursor,
+            has_more,
+        };
+        budget.validate(&page, expected_bytes)?;
+        Ok(SnapshotPendingDeliveryPage { page, quarantine })
     }
 
     fn quarantine_corrupt_rows(
@@ -265,4 +378,98 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+// [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] Codec-only selection tests;
+// repository authentication and durable cursor semantics are tested in the facade.
+#[cfg(test)]
+mod byte_paging_tests {
+    use super::*;
+    use aeronyx_core::protocol::chat::{ChatContentType, ChatEnvelope};
+
+    fn message(sequence: u8, bytes: usize) -> (u64, PendingMessage) {
+        let envelope = ChatEnvelope {
+            message_id: [sequence; 16],
+            sender: [0; 32],
+            receiver: [0; 32],
+            timestamp: 0,
+            ciphertext: vec![0; bytes],
+            nonce: [0; 24],
+            content_type: ChatContentType::Text,
+            signature: [0; 64],
+        };
+        (
+            u64::from(sequence),
+            PendingMessage {
+                message_id: envelope.message_id,
+                envelope,
+            },
+        )
+    }
+
+    #[test]
+    fn v2_byte_prefix_exact_boundary_plus_one_does_not_skip() {
+        let budget = SnapshotPageBudget::UdpCoalescing { target_bytes: 1200 };
+        // Full frame: 119 + (188 + 352) + (188 + 353) = 1200.
+        let exact = vec![message(1, 352), message(2, 353)];
+        assert_eq!(budget.select_prefix(&exact, 50).unwrap(), (2, Some(1200)));
+        let over = vec![message(1, 352), message(2, 354), message(3, 1)];
+        assert_eq!(budget.select_prefix(&over, 50).unwrap(), (1, Some(659)));
+        assert_eq!(
+            SnapshotPageBudget::CountOnly
+                .select_prefix(&over, 2)
+                .unwrap(),
+            (2, None)
+        );
+    }
+
+    #[test]
+    fn v2_byte_prefix_single_oversized_and_empty_are_preserved() {
+        let budget = SnapshotPageBudget::UdpCoalescing { target_bytes: 1200 };
+        let messages = vec![message(1, 2048), message(2, 1)];
+        assert_eq!(
+            budget.select_prefix(&messages, 50).unwrap(),
+            (1, Some(2355))
+        );
+        assert_eq!(budget.select_prefix(&[], 50).unwrap(), (0, Some(119)));
+        let page = PendingMessagePageV2 {
+            messages: vec![message(1, 2048).1],
+            next_cursor: vec![0; ENCODED_CURSOR_BYTES],
+            has_more: true,
+        };
+        assert!(budget.validate(&page, Some(2355)).is_ok());
+        let maximum = vec![message(1, 65_536), message(2, 1)];
+        assert_eq!(
+            budget.select_prefix(&maximum, 50).unwrap(),
+            (1, Some(65_843))
+        );
+        let maximum_page = PendingMessagePageV2 {
+            messages: vec![message(1, 65_536).1],
+            next_cursor: vec![0; ENCODED_CURSOR_BYTES],
+            has_more: true,
+        };
+        assert!(budget.validate(&maximum_page, Some(65_843)).is_ok());
+    }
+
+    #[test]
+    fn v2_byte_prefix_checked_overflow_fails_closed() {
+        assert!(checked_page_bytes(usize::MAX, 1).is_err());
+        assert_eq!(checked_page_bytes(usize::MAX - 1, 1).unwrap(), usize::MAX);
+    }
+
+    #[test]
+    fn v2_byte_prefix_actual_encoder_guard_rejects_drift() {
+        let budget = SnapshotPageBudget::UdpCoalescing { target_bytes: 1200 };
+        let mut page = PendingMessagePageV2 {
+            messages: vec![message(1, 352).1, message(2, 353).1],
+            next_cursor: vec![0; ENCODED_CURSOR_BYTES],
+            has_more: true,
+        };
+        assert!(budget.validate(&page, Some(1200)).is_ok());
+        assert!(budget.validate(&page, Some(1199)).is_err());
+        page.next_cursor.push(0);
+        assert!(budget.validate(&page, Some(1200)).is_err());
+        // Even an accurate oversized estimate cannot admit a multi-item frame.
+        assert!(budget.validate(&page, Some(1201)).is_err());
+    }
 }

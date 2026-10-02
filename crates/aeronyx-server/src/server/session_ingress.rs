@@ -6,6 +6,8 @@
 // [ARCH-SPLIT 2026-10-02] Private items remain pub(super) for parent composition.
 // [CHAT-V1-COALESCING 2026-10-03 by Codex] Bound multi-envelope coalescing,
 // preserving the existing single-envelope send path above the target.
+// [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] Budget V2 before cursor creation;
+// retain single-item compatibility and observe local write failure without ACK.
 // Last Modified: 2026-10-03.
 use super::*;
 
@@ -13,6 +15,10 @@ impl Server {
     // [CHAT-V1-COALESCING 2026-10-03 by Codex] Full UDP payload target,
     // NOT a hard admission ceiling, socket capacity, or Internet PMTU promise.
     pub(super) const LEGACY_CHAT_PULL_COALESCING_TARGET: usize = 1200;
+
+    // [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] Full UDP coalescing target,
+    // not an admission limit or PMTU assertion; oversized first items stay whole.
+    pub(super) const CHAT_PULL_V2_COALESCING_TARGET: usize = 1200;
 
     // Keep an ordered, whole-envelope prefix. A first envelope above the target
     // is sent alone for single-message compatibility, even if the old transport
@@ -612,7 +618,15 @@ impl Server {
                         .wallet_routes
                         .announce(&wallet, session.id.clone(), session.endpoint());
                 }
-                match relay.pull_pending_v2(&wallet, after_timestamp, &cursor, limit) {
+                // [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] The domain must
+                // shorten the page before sealing its continuation cursor.
+                match relay.pull_pending_v2_coalesced(
+                    &wallet,
+                    after_timestamp,
+                    &cursor,
+                    limit,
+                    Self::CHAT_PULL_V2_COALESCING_TARGET,
+                ) {
                     Ok(page) => {
                         let envelopes: Vec<_> = page
                             .messages
@@ -644,7 +658,12 @@ impl Server {
                             next_cursor: page.next_cursor,
                             has_more,
                         };
-                        Self::send_to_session(&response, session, udp, crypto).await;
+                        if !Self::send_to_session(&response, session, udp, crypto).await {
+                            debug!(
+                                reason = "response_write_failed",
+                                "[CHAT_RELAY] Snapshot pull not written"
+                            );
+                        }
                     }
                     Err(e) => {
                         warn!(
