@@ -3,6 +3,9 @@
 // ============================================
 //! # Storage Operations — Core MemoryStorage Methods
 //!
+//! [CHILD-SELECTION-GUARD 2026-10-02 by Codex] Successful test workers must
+//! prove one named test ran; crash exit/barrier checks remain independent.
+//!
 //! ## Creation Reason
 //! Extracted from storage.rs to reduce file size. Contains all extended
 //! operations that are NOT core CRUD: rawlog ops, feedback ops, chain state,
@@ -1108,6 +1111,9 @@ mod tests {
             .arg("--ignored")
             .arg("--nocapture")
             .arg("--test-threads=1")
+            // [CHILD-SELECTION-GUARD 2026-10-02 by Codex] Freeze parsed output.
+            .arg("--format=pretty")
+            .arg("--color=never")
             .env(WITNESS_LEASE_PROCESS_STAGE_ENV, stage)
             .env(WITNESS_LEASE_PROCESS_DB_ENV, db_path)
             .stdin(Stdio::null())
@@ -1162,12 +1168,131 @@ mod tests {
 
     fn assert_witness_lease_child_succeeded(stage: &str, output: &WitnessLeaseChildOutput) {
         assert!(
-            output.status.success(),
+            output.status.success() && witness_lease_selected_one_worker(&output.stdout),
             "witness child {stage} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
             output.status.code(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    // [CHILD-SELECTION-GUARD 2026-10-02 by Codex] An exit-zero libtest
+    // process may have selected no tests. Check the named result and exact
+    // counts on NORMAL completion only; crash phases deliberately lack them.
+    // This bounds parsing, not the pre-existing child output capture.
+    fn witness_lease_selected_one_worker(bytes: &[u8]) -> bool {
+        if bytes.len() > 64 * 1024 {
+            return false;
+        }
+        let Ok(output) = std::str::from_utf8(bytes) else {
+            return false;
+        };
+        if output
+            .lines()
+            .filter(|line| *line == "running 1 test")
+            .count()
+            != 1
+        {
+            return false;
+        }
+        let expected = format!("test {} ... ok", WITNESS_LEASE_PROCESS_WORKER);
+        let mut results = output
+            .lines()
+            .filter(|line| line.starts_with("test ") && !line.starts_with("test result:"));
+        if results.next() != Some(expected.as_str()) || results.next().is_some() {
+            return false;
+        }
+        let mut summaries = output
+            .lines()
+            .filter(|line| line.starts_with("test result:"));
+        let Some(summary) = summaries.next() else {
+            return false;
+        };
+        if summaries.next().is_some() {
+            return false;
+        }
+        let Some(tail) =
+            summary.strip_prefix("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; ")
+        else {
+            return false;
+        };
+        let Some((filtered, elapsed)) = tail.split_once(" filtered out; finished in ") else {
+            return false;
+        };
+        filtered.parse::<u64>().is_ok()
+            && elapsed
+                .strip_suffix('s')
+                .and_then(|value| value.parse::<f64>().ok())
+                .is_some_and(|value| value.is_finite() && value >= 0.0)
+    }
+
+    #[test]
+    fn successful_child_selection_requires_one_named_test() {
+        let valid = format!(
+            "\nrunning 1 test\ntest {} ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2170 filtered out; finished in 0.01s\n",
+            WITNESS_LEASE_PROCESS_WORKER,
+        );
+        assert!(witness_lease_selected_one_worker(valid.as_bytes()));
+        assert!(witness_lease_selected_one_worker(
+            valid.replace("2170 filtered", "0 filtered").as_bytes()
+        ));
+        for invalid in [
+            valid.replace(WITNESS_LEASE_PROCESS_WORKER, "wrong::worker"),
+            valid.replace("1 passed", "0 passed"),
+            valid.replace("1 passed", "11 passed"),
+            valid.replace("0 failed", "1 failed"),
+            valid.replace("0 ignored", "1 ignored"),
+            valid.replace("running 1 test", "running 0 tests"),
+            valid.replace(" ... ok", " ... ignored"),
+            valid.replace("test result: ok.", "test result: FAILED."),
+            valid.replace("0.01s", "NaNs"),
+            valid.replace("2170 filtered", "not-a-count filtered"),
+            format!("{valid}{valid}"),
+            "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2171 filtered out; finished in 0.00s\n".into(),
+            "Usage: test-binary [OPTIONS]\n".into(),
+            format!("{}: test\n1 test, 0 benchmarks\n", WITNESS_LEASE_PROCESS_WORKER),
+            format!("running 1 test\ntest {} ... ok\n", WITNESS_LEASE_PROCESS_WORKER),
+        ] {
+            assert!(!witness_lease_selected_one_worker(invalid.as_bytes()));
+        }
+        assert!(!witness_lease_selected_one_worker(&[0xff]));
+        assert!(!witness_lease_selected_one_worker(&vec![
+            b' ';
+            64 * 1024 + 1
+        ]));
+    }
+
+    #[tokio::test]
+    async fn successful_child_selection_rejects_real_zero_test_exit() {
+        // [CHILD-SELECTION-GUARD 2026-10-02 by Codex] Calibrate the gate
+        // with an actual exit-zero child that runs no worker, not --list.
+        let mut child = crate::isolated_child_command(
+            std::env::current_exe().expect("resolve child selection test binary"),
+        );
+        child
+            .arg("__aeronyx_intentionally_missing_worker_selection_guard__")
+            .arg("--exact")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .arg("--format=pretty")
+            .arg("--color=never")
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(20), child.output())
+            .await
+            .expect("zero-test child exceeded bounded deadline")
+            .expect("start zero-test child");
+        assert!(output.status.success(), "negative fixture must exit zero");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("running 0 tests"));
+        let output = WitnessLeaseChildOutput {
+            status: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        };
+        assert!(std::panic::catch_unwind(|| {
+            assert_witness_lease_child_succeeded("known zero-test negative", &output);
+        })
+        .is_err());
     }
 
     async fn commitment_audit_fixture() -> (MemoryStorage, RecordCommitmentBlockV1) {
