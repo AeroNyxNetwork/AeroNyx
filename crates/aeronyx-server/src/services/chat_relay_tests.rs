@@ -6335,13 +6335,15 @@ fn test_malformed_expiry_notification_isolated_without_blocking_valid_rows() {
 #[test]
 fn expired_notifications_are_wired_to_authenticated_chat_pull() {
     let source = include_str!("../server.rs");
+    // [ARCH-SPLIT-VERIFY 2026-10-02 by Codex] Pull delivery now lives in the ingress child.
+    let ingress = include_str!("../server/session_ingress.rs");
     // [SERVER-BACKGROUND-TASKS-SPLIT 2026-09-25 by Codex] The cleanup worker
     // and management reporter live in separate owned runtime modules.
     let background = include_str!("../server/background_tasks.rs");
     let api_runtime = include_str!("../server/api_runtime.rs");
-    assert!(source.contains("relay.pull_pending_notifications(&wallet)"));
-    assert!(source.contains("Self::push_expired_notifications("));
-    assert!(source.contains("has_more |= notification_has_more || !delivery_complete"));
+    assert!(ingress.contains("relay.pull_pending_notifications(&wallet)"));
+    assert!(ingress.contains("Self::push_expired_notifications("));
+    assert!(ingress.contains("has_more |= notification_has_more || !delivery_complete"));
     assert!(source.contains("self.spawn_chat_relay_cleanup_task(Arc::clone(relay))"));
     assert!(background.contains("tokio::task::spawn_blocking(move || cleanup_relay.run_cleanup())"));
     assert!(background.contains("tokio::time::MissedTickBehavior::Skip"));
