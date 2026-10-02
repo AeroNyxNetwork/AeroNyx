@@ -839,12 +839,21 @@ mod tests {
     }
 
     fn signed_envelope(kp: &IdentityKeyPair, receiver: [u8; 32]) -> ChatEnvelope {
+        signed_envelope_with_id(kp, receiver, [0x51; 16], 32)
+    }
+
+    fn signed_envelope_with_id(
+        kp: &IdentityKeyPair,
+        receiver: [u8; 32],
+        message_id: [u8; 16],
+        ciphertext_len: usize,
+    ) -> ChatEnvelope {
         let mut envelope = ChatEnvelope {
-            message_id: [0x51; 16],
+            message_id,
             sender: kp.public_key_bytes(),
             receiver,
             timestamp: unix_now_secs(),
-            ciphertext: vec![0xA5; 32],
+            ciphertext: vec![message_id[0]; ciphertext_len],
             nonce: [0x33; 24],
             content_type: aeronyx_core::protocol::chat::ChatContentType::Text,
             signature: [0; 64],
@@ -854,9 +863,17 @@ mod tests {
     }
 
     fn encode_pull_request(kp: &IdentityKeyPair, receiver: [u8; 32], cursor: Vec<u8>) -> Vec<u8> {
+        encode_pull_request_with_limit(kp, receiver, cursor, 10)
+    }
+
+    fn encode_pull_request_with_limit(
+        kp: &IdentityKeyPair,
+        receiver: [u8; 32],
+        cursor: Vec<u8>,
+        limit: u32,
+    ) -> Vec<u8> {
         let request_timestamp = unix_now_secs();
         let after_timestamp = 0u64;
-        let limit = 10u32;
         let cursor_len = u16::try_from(cursor.len()).expect("test cursor length");
         let version = [CHAT_PULL_HTTP_VERSION];
         let signature = kp.sign(&signed_message_digest(
@@ -886,8 +903,20 @@ mod tests {
     }
 
     fn encode_ack_request(kp: &IdentityKeyPair, receiver: [u8; 32], id: [u8; 16]) -> Vec<u8> {
+        encode_ack_request_with_ids(kp, receiver, vec![id])
+    }
+
+    fn encode_ack_request_with_ids(
+        kp: &IdentityKeyPair,
+        receiver: [u8; 32],
+        message_ids: Vec<[u8; 16]>,
+    ) -> Vec<u8> {
         let ack_timestamp = unix_now_secs();
-        let ids_hash: [u8; 32] = Sha256::digest(id).into();
+        let mut ids_hasher = Sha256::new();
+        for id in &message_ids {
+            ids_hasher.update(id);
+        }
+        let ids_hash: [u8; 32] = ids_hasher.finalize().into();
         let version = [CHAT_ACK_HTTP_VERSION];
         let signature = kp.sign(&signed_message_digest(
             CHAT_ACK_HTTP_DOMAIN,
@@ -898,7 +927,7 @@ mod tests {
             .serialize(&ChatAckHttpRequestV1 {
                 version: CHAT_ACK_HTTP_VERSION,
                 wallet: receiver,
-                message_ids: vec![id],
+                message_ids,
                 ack_timestamp,
                 signature: signature.to_vec(),
             })
@@ -1007,6 +1036,110 @@ mod tests {
         )
         .unwrap();
         assert_eq!(duplicate_json["deleted"], 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_http_pull_pages_100_legal_64k_rows_across_restart() {
+        // [CHAT-HTTP-RELIABLE-PULL 2026-10-03 by Codex] Exercise the actual
+        // HTTP handler, not only its byte-budget domain: legal 64 KiB rows
+        // must traverse 31/31/31/7 pages, ACK numerically, and resume after
+        // reopening the same SQLite custody database.
+        let dir = tempfile::tempdir().expect("temp custody directory");
+        let path = dir.path().join("custody.sqlite3");
+        let wallet = IdentityKeyPair::generate();
+        let receiver = wallet.public_key_bytes();
+        let relay = make_relay_with_config(ChatRelayConfig {
+            db_path: path.to_string_lossy().into_owned(),
+            ..test_config()
+        });
+        for id in 1u8..=100 {
+            relay
+                .store_pending(&signed_envelope_with_id(
+                    &wallet, receiver, [id; 16], 65_536,
+                ))
+                .expect("store legal 64 KiB envelope");
+        }
+
+        let expected_page_lengths = [31usize, 31, 31, 7];
+        let mut cursor = Vec::new();
+        let mut relay = relay;
+        for (page_index, expected_len) in expected_page_lengths.into_iter().enumerate() {
+            let app = build_chat_pull_http_router(Arc::clone(&relay))
+                .layer(Extension(AuthenticatedOwner::Local { owner: receiver }));
+            let pull = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(CHAT_PULL_HTTP_PATH)
+                        .body(Body::from(encode_pull_request_with_limit(
+                            &wallet,
+                            receiver,
+                            cursor.clone(),
+                            100,
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .expect("HTTP pull response");
+            assert_eq!(pull.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(pull.into_body(), CHAT_HTTP_RESPONSE_MAX_BYTES)
+                .await
+                .expect("bounded HTTP pull body");
+            assert!(body.len() <= CHAT_HTTP_RESPONSE_MAX_BYTES);
+            let decoded = aeronyx_core::protocol::decode_memchain(&body[1..])
+                .expect("canonical MemChain response");
+            let (envelopes, next_cursor, has_more) = match decoded {
+                MemChainMessage::ChatPullResponseV2 {
+                    envelopes,
+                    next_cursor,
+                    has_more,
+                } => (envelopes, next_cursor, has_more),
+                other => panic!("unexpected HTTP response variant: {other:?}"),
+            };
+            assert_eq!(envelopes.len(), expected_len);
+            assert_eq!(has_more, page_index + 1 < expected_page_lengths.len());
+            assert!(envelopes
+                .iter()
+                .all(|envelope| envelope.ciphertext.len() == 65_536));
+            let ids: Vec<_> = envelopes
+                .iter()
+                .map(|envelope| envelope.message_id)
+                .collect();
+            let ack = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(CHAT_ACK_HTTP_PATH)
+                        .body(Body::from(encode_ack_request_with_ids(
+                            &wallet, receiver, ids,
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .expect("HTTP ACK response");
+            assert_eq!(ack.status(), StatusCode::OK);
+            let ack_json: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(ack.into_body(), CHAT_HTTP_REQUEST_MAX_BYTES)
+                    .await
+                    .expect("bounded HTTP ACK body"),
+            )
+            .expect("numeric ACK JSON");
+            assert_eq!(ack_json["deleted"], expected_len);
+            cursor = next_cursor;
+
+            if page_index == 0 {
+                drop(app);
+                drop(relay);
+                relay = make_relay_with_config(ChatRelayConfig {
+                    db_path: path.to_string_lossy().into_owned(),
+                    ..test_config()
+                });
+                assert_eq!(relay.storage_usage().unwrap().pending_messages, 69);
+            }
+        }
+        assert_eq!(relay.storage_usage().unwrap().pending_messages, 0);
     }
 
     #[tokio::test]
@@ -1124,17 +1257,28 @@ mod tests {
             timeout: Duration::from_millis(1),
         };
         let admission = Arc::clone(&state.admission);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let result = run_chat_blocking(&state, move || {
+            started_tx.send(()).expect("worker started");
             release_rx.recv().expect("release blocking worker");
+            finished_tx.send(()).expect("worker finished");
             Ok::<_, ()>(())
         })
         .await;
+        started_rx.await.expect("observe blocking worker start");
         assert!(matches!(result, Err(ChatHttpFailure::Unavailable)));
         assert!(admission.clone().try_acquire_owned().is_err());
         release_tx.send(()).expect("release worker");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(admission.try_acquire_owned().is_ok());
+        finished_rx
+            .await
+            .expect("observe blocking worker completion");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), admission.acquire_owned())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1146,6 +1290,75 @@ mod tests {
         };
         let result = run_chat_blocking(&state, || Err::<usize, ()>(())).await;
         assert!(matches!(result, Err(ChatHttpFailure::Unavailable)));
+    }
+
+    #[tokio::test]
+    async fn authenticated_http_ack_busy_database_returns_503_without_deleting() {
+        // [CHAT-HTTP-RELIABLE-PULL 2026-10-03 by Codex] Hold a real SQLite
+        // writer lock so the ACK transaction fails before DELETE; the handler
+        // must expose only coarse 503 and the pending envelope must remain.
+        let dir = tempfile::tempdir().expect("temp custody directory");
+        let path = dir.path().join("custody.sqlite3");
+        let wallet = IdentityKeyPair::generate();
+        let receiver = wallet.public_key_bytes();
+        let relay = make_relay_with_config(ChatRelayConfig {
+            db_path: path.to_string_lossy().into_owned(),
+            ..test_config()
+        });
+        let envelope = signed_envelope(&wallet, receiver);
+        let message_id = envelope.message_id;
+        relay
+            .store_pending(&envelope)
+            .expect("store pending envelope");
+        let blocker = rusqlite::Connection::open(&path).expect("open lock connection");
+        blocker
+            .execute_batch("BEGIN EXCLUSIVE;")
+            .expect("hold exclusive SQLite lock");
+
+        let app = build_chat_pull_http_router(Arc::clone(&relay))
+            .layer(Extension(AuthenticatedOwner::Local { owner: receiver }));
+        let ack = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(CHAT_ACK_HTTP_PATH)
+                    .body(Body::from(encode_ack_request(
+                        &wallet, receiver, message_id,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .expect("HTTP ACK response");
+        assert_eq!(ack.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(ack);
+        blocker
+            .execute_batch("ROLLBACK;")
+            .expect("release exclusive SQLite lock");
+
+        let pull = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(CHAT_PULL_HTTP_PATH)
+                    .body(Body::from(encode_pull_request(
+                        &wallet,
+                        receiver,
+                        Vec::new(),
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .expect("HTTP pull after failed ACK");
+        assert_eq!(pull.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(pull.into_body(), CHAT_HTTP_RESPONSE_MAX_BYTES)
+            .await
+            .expect("bounded HTTP pull body");
+        assert!(matches!(
+            aeronyx_core::protocol::decode_memchain(&body[1..]).expect("canonical pull response"),
+            MemChainMessage::ChatPullResponseV2 { envelopes, .. }
+                if envelopes.len() == 1 && envelopes[0].message_id == message_id
+        ));
     }
 
     #[test]

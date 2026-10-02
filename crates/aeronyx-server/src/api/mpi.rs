@@ -619,8 +619,88 @@ mod session_embedding_cache_tests {
 mod reliable_chat_http_route_tests {
     use super::*;
     use axum::{body::Body, http::Request, routing::post, Router};
+    use bincode::Options;
     use sha2::{Digest, Sha256};
     use tower::ServiceExt;
+
+    #[derive(Serialize)]
+    struct SaasPullRequest {
+        version: u8,
+        wallet: [u8; 32],
+        after_timestamp: u64,
+        cursor: Vec<u8>,
+        limit: u32,
+        request_timestamp: u64,
+        signature: Vec<u8>,
+    }
+
+    fn signed_saas_pull_body(wallet: &IdentityKeyPair) -> Vec<u8> {
+        let receiver = wallet.public_key_bytes();
+        let after_timestamp = 0u64;
+        let cursor = Vec::new();
+        let limit = 10u32;
+        let request_timestamp = now_secs();
+        let signature = wallet.sign(&aeronyx_core::protocol::auth::signed_message_digest(
+            "AeroNyx-ChatPull-v2-http",
+            &[
+                &[1],
+                &receiver,
+                &after_timestamp.to_le_bytes(),
+                &0u16.to_le_bytes(),
+                &cursor,
+                &limit.to_le_bytes(),
+                &request_timestamp.to_le_bytes(),
+            ],
+        ));
+        bincode::options()
+            .with_fixint_encoding()
+            .serialize(&SaasPullRequest {
+                version: 1,
+                wallet: receiver,
+                after_timestamp,
+                cursor,
+                limit,
+                request_timestamp,
+                signature: signature.to_vec(),
+            })
+            .expect("encode SaaS pull request")
+    }
+
+    fn saas_state(jwt_secret: &str) -> Arc<MpiState> {
+        Arc::new(MpiState {
+            mode: Mode::Saas,
+            storage: None,
+            vector_index: None,
+            identity: IdentityKeyPair::generate(),
+            identity_cache: RwLock::new(HashMap::new()),
+            index_ready: AtomicBool::new(true),
+            user_weights: Arc::new(RwLock::new(HashMap::new())),
+            mvf_alpha: 0.0,
+            mvf_enabled: false,
+            session_embeddings: RwLock::new(SessionEmbeddingCache::default()),
+            mvf_baseline: RwLock::new(None),
+            owner_key: [0; 32],
+            api_secret: None,
+            embed_engine: None,
+            allow_remote_storage: false,
+            blind_storage_enabled: false,
+            max_remote_owners: 0,
+            ner_engine: None,
+            graph_enabled: false,
+            entropy_filter_enabled: false,
+            reranker_engine: None,
+            rawlog_key: None,
+            llm_router: None,
+            storage_pool: None,
+            vector_pool: None,
+            volume_router: None,
+            system_db: None,
+            jwt_secret: Some(jwt_secret.to_owned()),
+            token_ttl_secs: 3600,
+            pool_max_connections: 0,
+            pool_idle_timeout_secs: 0,
+        })
+    }
 
     fn local_state(allow_remote_storage: bool) -> (Arc<MpiState>, IdentityKeyPair) {
         let storage = Arc::new(MemoryStorage::open(":memory:", None).expect("storage"));
@@ -716,6 +796,90 @@ mod reliable_chat_http_route_tests {
             .await
             .expect("node route response");
         assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn reliable_chat_http_saas_jwt_owner_mismatch_is_rejected() {
+        let secret = "test-jwt-secret-that-is-at-least-32-bytes-long";
+        let owner = IdentityKeyPair::generate();
+        let wrong_wallet = IdentityKeyPair::generate();
+        let now = now_secs();
+        let token = crate::api::auth::issue_jwt(
+            &hex::encode(owner.public_key_bytes()),
+            now,
+            now + 3600,
+            secret,
+        )
+        .expect("issue test JWT");
+        let relay = Arc::new(
+            crate::services::chat_relay::ChatRelayService::new(
+                crate::config::ChatRelayConfig {
+                    enabled: true,
+                    db_path: ":memory:".to_owned(),
+                    ..Default::default()
+                },
+                [0x42; 32],
+            )
+            .expect("relay"),
+        );
+        let app = build_mpi_router_with_source(
+            saas_state(secret),
+            crate::api::chat_handlers::build_chat_pull_http_router(relay),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(CHAT_PULL_HTTP_PATH)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(signed_saas_pull_body(&wrong_wallet)))
+                    .unwrap(),
+            )
+            .await
+            .expect("SaaS mismatch response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn reliable_chat_http_saas_jwt_and_wallet_signature_succeed_without_provisioning() {
+        let secret = "test-jwt-secret-that-is-at-least-32-bytes-long";
+        let owner = IdentityKeyPair::generate();
+        let now = now_secs();
+        let token = crate::api::auth::issue_jwt(
+            &hex::encode(owner.public_key_bytes()),
+            now,
+            now + 3600,
+            secret,
+        )
+        .expect("issue test JWT");
+        let relay = Arc::new(
+            crate::services::chat_relay::ChatRelayService::new(
+                crate::config::ChatRelayConfig {
+                    enabled: true,
+                    db_path: ":memory:".to_owned(),
+                    ..Default::default()
+                },
+                [0x42; 32],
+            )
+            .expect("relay"),
+        );
+        let app = build_mpi_router_with_source(
+            saas_state(secret),
+            crate::api::chat_handlers::build_chat_pull_http_router(relay),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(CHAT_PULL_HTTP_PATH)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(signed_saas_pull_body(&owner)))
+                    .unwrap(),
+            )
+            .await
+            .expect("SaaS success response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("content-type").is_some());
     }
 }
 
