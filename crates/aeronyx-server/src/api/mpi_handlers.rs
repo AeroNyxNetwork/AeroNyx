@@ -109,7 +109,9 @@ use aeronyx_core::ledger::record::{
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 use sha2::{Digest, Sha256};
 
-use crate::services::memchain::storage::StorageGrowthError;
+use crate::services::memchain::storage::{
+    OwnerSlotAdmissionError, OwnerSlotPolicy, StorageGrowthError,
+};
 use crate::services::memchain::LlmRouter;
 use crate::services::memchain::{MemoryStorage, VectorIndex};
 
@@ -138,6 +140,36 @@ fn growth_failure_response(error: StorageGrowthError) -> Response {
         )
     };
     (status, Json(serde_json::json!({"error": message}))).into_response()
+}
+
+// [MEMORY-V2-OWNER-SLOT-WIRING 2026-10-03 by Codex] Remote MPI writes use
+// the storage transaction's owner-slot admission after byte-growth admission.
+// Responses remain coarse and contain no owner, record, or database detail.
+fn owner_slot_failure_response(error: OwnerSlotAdmissionError) -> Response {
+    debug!(
+        kind = if error.is_at_capacity() {
+            "at_capacity"
+        } else {
+            "storage_unavailable"
+        },
+        "[MPI_STORAGE] Owner-slot admission rejected"
+    );
+    let (status, message) = if error.is_at_capacity() {
+        (StatusCode::INSUFFICIENT_STORAGE, "storage capacity reached")
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage capacity temporarily unavailable",
+        )
+    };
+    (status, Json(serde_json::json!({"error": message}))).into_response()
+}
+
+fn owner_slot_policy(state: &MpiState) -> OwnerSlotPolicy {
+    OwnerSlotPolicy {
+        local_owner: state.owner_key,
+        max_remote_owners: state.max_remote_owners,
+    }
 }
 
 fn minimum_growth_bytes(body_len: usize) -> u64 {
@@ -264,12 +296,22 @@ pub async fn mpi_remember(
         Err(error) => return growth_failure_response(error),
     };
 
-    if !storage.insert(&record, &rb.embedding_model).await {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error":"exists","record_id":rid_hex})),
-        )
-            .into_response();
+    // [MEMORY-V2-OWNER-SLOT-WIRING 2026-10-03 by Codex] The durable owner
+    // ceiling is checked in the same IMMEDIATE transaction as this insert;
+    // the local owner bypasses the remote slot count.
+    match storage
+        .insert_with_owner_slot(&record, &rb.embedding_model, owner_slot_policy(&state))
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error":"exists","record_id":rid_hex})),
+            )
+                .into_response();
+        }
+        Err(error) => return owner_slot_failure_response(error),
     }
 
     if !rb.embedding.is_empty() {
@@ -564,8 +606,18 @@ async fn handle_remember_sealed_v2(
             }
         }
     };
+    // [MEMORY-V2-OWNER-SLOT-WIRING 2026-10-03 by Codex] Keep V2 owner-slot
+    // admission inside the same transaction as the durable insert so two
+    // concurrent remote identities cannot both pass a stale precheck.
     let result = storage
-        .insert_sealed_v2(&owner, &expected_id, req.created_at, &envelope, &signature)
+        .insert_sealed_v2_with_owner_slot(
+            &owner,
+            &expected_id,
+            req.created_at,
+            &envelope,
+            &signature,
+            owner_slot_policy(&state),
+        )
         .await;
     drop(permit);
     match result {
@@ -590,6 +642,7 @@ async fn handle_remember_sealed_v2(
             Json(serde_json::json!({"error":"sealed v2 record conflict"})),
         )
             .into_response(),
+        Err(error) if error.is_at_capacity() => owner_slot_failure_response(error),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error":"sealed v2 storage unavailable"})),
@@ -747,12 +800,21 @@ pub async fn mpi_remember_sealed(
         Ok(permit) => permit,
         Err(error) => return growth_failure_response(error),
     };
-    if !storage.insert(&record, &rb.embedding_model).await {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error":"exists","record_id":rid_hex})),
-        )
-            .into_response();
+    // [MEMORY-V2-OWNER-SLOT-WIRING 2026-10-03 by Codex] Legacy blind V1
+    // storage shares the bounded transaction path with V2 and exact retries.
+    match storage
+        .insert_with_owner_slot(&record, &rb.embedding_model, owner_slot_policy(&state))
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error":"exists","record_id":rid_hex})),
+            )
+                .into_response();
+        }
+        Err(error) => return owner_slot_failure_response(error),
     }
 
     // Index the client-supplied embedding so blind records are vector-searchable.
@@ -2336,6 +2398,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sealed_v2_handler_owner_slot_race_and_storage_failure_are_coarse() {
+        // [MEMORY-V2-OWNER-SLOT-WIRING 2026-10-03 by Codex] Exercise the
+        // handler-level transaction gate, not only the earlier auth snapshot:
+        // one of two distinct remote owners may consume a one-slot ceiling,
+        // while a missing table returns a bounded 503 without owner material.
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let (mut state, _local_auth, _vector_index) =
+            make_test_state_with_storage(Arc::clone(&storage));
+        {
+            let state_mut = Arc::get_mut(&mut state).unwrap();
+            state_mut.blind_storage_enabled = true;
+            state_mut.max_remote_owners = 1;
+        }
+        let key_a = IdentityKeyPair::generate();
+        let key_b = IdentityKeyPair::generate();
+        let (body_a, _id_a, _envelope_a, _signature_a) = sealed_v2_body(&key_a, 31);
+        let (body_b, _id_b, _envelope_b, _signature_b) = sealed_v2_body(&key_b, 32);
+        let auth_a = AuthenticatedOwner::Remote {
+            owner: key_a.public_key_bytes(),
+            owner_hex: hex::encode(key_a.public_key_bytes()),
+        };
+        let auth_b = AuthenticatedOwner::Remote {
+            owner: key_b.public_key_bytes(),
+            owner_hex: hex::encode(key_b.public_key_bytes()),
+        };
+        let request_a = Request::builder()
+            .method("POST")
+            .uri("/remember_sealed_v2")
+            .body(Body::from(body_a))
+            .unwrap();
+        let request_b = Request::builder()
+            .method("POST")
+            .uri("/remember_sealed_v2")
+            .body(Body::from(body_b))
+            .unwrap();
+        let (response_a, response_b) = tokio::join!(
+            mpi_remember_sealed_v2(
+                State(Arc::clone(&state)),
+                Extension(auth_a),
+                Extension(Arc::clone(&storage)),
+                request_a,
+            ),
+            mpi_remember_sealed_v2(
+                State(Arc::clone(&state)),
+                Extension(auth_b),
+                Extension(Arc::clone(&storage)),
+                request_b,
+            ),
+        );
+        let statuses = [response_a.status(), response_b.status()];
+        assert!(statuses.contains(&StatusCode::CREATED));
+        assert!(statuses.contains(&StatusCode::INSUFFICIENT_STORAGE));
+
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute("DROP TABLE memory_sealed_v2", []).unwrap();
+        }
+        let (body, _id, _envelope, _signature) = sealed_v2_body(&key_b, 33);
+        let response = mpi_remember_sealed_v2(
+            State(state),
+            Extension(AuthenticatedOwner::Remote {
+                owner: key_b.public_key_bytes(),
+                owner_hex: hex::encode(key_b.public_key_bytes()),
+            }),
+            Extension(storage),
+            Request::builder()
+                .method("POST")
+                .uri("/remember_sealed_v2")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_text.contains("sealed v2 storage unavailable"));
+        assert!(!body_text.contains(&hex::encode(key_b.public_key_bytes())));
+    }
+
+    #[tokio::test]
     async fn sealed_v2_router_enforces_remote_owner_quota_without_barring_local_identity() {
         // [MEMORY-SEALED-V2 2026-10-02 by Codex] Exercise the real unified
         // auth/router path: remote quota limits new owners, revoked rows keep
@@ -2377,6 +2521,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains(&hex::encode(key_b.public_key_bytes())));
 
         let response = app
             .clone()
