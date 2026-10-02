@@ -1116,6 +1116,120 @@ mod tests {
         }
     }
 
+    #[test]
+    fn http_malformed_requests_and_fresh_signature_lengths_fail_closed() {
+        // [HTTP-AUTH-MALFORMED 2026-10-03 by Codex] Keep structural decode
+        // failures separate from fresh semantic authorization failures: all
+        // 63/65-byte signatures below carry a current timestamp and a valid
+        // otherwise request, so rejection must come from fixed_signature.
+        let kp = IdentityKeyPair::generate();
+        let wallet = kp.public_key_bytes();
+        let pull_body = encode_pull_request(&kp, wallet, Vec::new());
+        let message_id = [0x42; 16];
+        let ack_body = encode_ack_request(&kp, wallet, message_id);
+        let assert_bad_pull = |label: &str, body: &[u8]| {
+            assert!(
+                matches!(
+                    decode_canonical_http::<ChatPullHttpRequestV1>(body),
+                    Err(ChatHttpFailure::BadRequest)
+                ),
+                "{label}"
+            );
+        };
+        let assert_bad_ack = |label: &str, body: &[u8]| {
+            assert!(
+                matches!(
+                    decode_canonical_http::<ChatAckHttpRequestV1>(body),
+                    Err(ChatHttpFailure::BadRequest)
+                ),
+                "{label}"
+            );
+        };
+        let assert_fresh_pull_unauthorized = |body: &[u8]| {
+            let request: ChatPullHttpRequestV1 =
+                decode_canonical_http(body).expect("fresh signature-length body decodes");
+            assert!(matches!(
+                validate_pull_http_request(&request, wallet),
+                Err(ChatHttpFailure::Unauthorized)
+            ));
+        };
+        let assert_fresh_ack_unauthorized = |body: &[u8]| {
+            let request: ChatAckHttpRequestV1 =
+                decode_canonical_http(body).expect("fresh signature-length body decodes");
+            assert!(matches!(
+                validate_ack_http_request(&request, wallet),
+                Err(ChatHttpFailure::Unauthorized)
+            ));
+        };
+
+        let mut truncated_pull = pull_body.clone();
+        truncated_pull.pop();
+        assert_bad_pull("truncated_pull", &truncated_pull);
+        let mut truncated_ack = ack_body.clone();
+        truncated_ack.pop();
+        assert_bad_ack("truncated_ack", &truncated_ack);
+
+        let mut hostile_ids = ack_body.clone();
+        hostile_ids[33..41].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_bad_ack("hostile_ack_ids_length", &hostile_ids);
+        let mut hostile_pull_signature = pull_body.clone();
+        hostile_pull_signature[61..69].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_bad_pull("hostile_pull_signature_length", &hostile_pull_signature);
+        let mut hostile_ack_signature = ack_body.clone();
+        hostile_ack_signature[65..73].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_bad_ack("hostile_ack_signature_length", &hostile_ack_signature);
+
+        assert_bad_pull("missing_pull_signature_field", &pull_body[..61]);
+        assert_bad_ack("missing_ack_signature_field", &ack_body[..73]);
+        let mut missing_pull_prefix = pull_body.clone();
+        missing_pull_prefix.drain(61..69);
+        assert_bad_pull("missing_pull_signature_prefix", &missing_pull_prefix);
+        let mut missing_ack_prefix = ack_body.clone();
+        missing_ack_prefix.drain(65..73);
+        assert_bad_ack("missing_ack_signature_prefix", &missing_ack_prefix);
+
+        let mut wrapped_pull = vec![MEMCHAIN_MAGIC];
+        wrapped_pull.extend_from_slice(&pull_body);
+        assert_bad_pull("pull_memchain_wrapper", &wrapped_pull);
+        let mut wrapped_ack = vec![MEMCHAIN_MAGIC];
+        wrapped_ack.extend_from_slice(&ack_body);
+        assert_bad_ack("ack_memchain_wrapper", &wrapped_ack);
+
+        for signature_len in [63usize, 65] {
+            let mut pull: ChatPullHttpRequestV1 =
+                decode_canonical_http(&pull_body).expect("fresh pull body");
+            pull.signature.resize(signature_len, 0);
+            let body = bincode::options()
+                .with_fixint_encoding()
+                .serialize(&pull)
+                .expect("canonical 63/65-byte pull signature body");
+            assert_eq!(
+                decode_canonical_http::<ChatPullHttpRequestV1>(&body)
+                    .expect("signature length remains structurally decodable")
+                    .signature
+                    .len(),
+                signature_len
+            );
+            assert_fresh_pull_unauthorized(&body);
+
+            let mut ack: ChatAckHttpRequestV1 =
+                decode_canonical_http(&ack_body).expect("fresh ACK body");
+            ack.signature.resize(signature_len, 0);
+            let body = bincode::options()
+                .with_fixint_encoding()
+                .serialize(&ack)
+                .expect("canonical 63/65-byte ACK signature body");
+            assert_eq!(
+                decode_canonical_http::<ChatAckHttpRequestV1>(&body)
+                    .expect("signature length remains structurally decodable")
+                    .signature
+                    .len(),
+                signature_len
+            );
+            assert_fresh_ack_unauthorized(&body);
+        }
+    }
+
     #[tokio::test]
     async fn authenticated_http_pull_and_idempotent_ack_are_receiver_bound() {
         let relay = make_relay();
