@@ -956,6 +956,99 @@ mod sealed_v2_tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owner_slot_independent_disk_connections_mixed_race_and_restart_preserve_cap() {
+        // [MEMORY-V2-OWNER-SLOT-CROSS-CONNECTION-TEST 2026-10-03 by Codex]
+        // The in-memory matrix above shares one MemoryStorage mutex. This
+        // exercise uses two independent WAL connections, treats SQLite busy
+        // as StorageUnavailable (not capacity), probes a fresh owner after
+        // contention, and proves the persisted union remains capped after
+        // reopen.
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("owner-slot-cross-connection.db");
+        let first_storage = Arc::new(MemoryStorage::open(&db_path, None).unwrap());
+        let second_storage = Arc::new(MemoryStorage::open(&db_path, None).unwrap());
+        let policy = OwnerSlotPolicy {
+            local_owner: [0xE3; 32],
+            max_remote_owners: 1,
+        };
+        let key_a = IdentityKeyPair::from_bytes(&[0xB1; 32]).unwrap();
+        let key_b = IdentityKeyPair::from_bytes(&[0xB2; 32]).unwrap();
+        let v1 = v1_record(key_a.public_key_bytes(), 71);
+        let (v2_id, v2_created_at, v2_envelope, v2_signature) = signed_v2(&key_b, 72);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let first_barrier = Arc::clone(&barrier);
+        let first_worker_storage = Arc::clone(&first_storage);
+        let first_task = tokio::spawn(async move {
+            first_barrier.wait().await;
+            first_worker_storage
+                .insert_with_owner_slot(&v1, "", policy)
+                .await
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second_worker_storage = Arc::clone(&second_storage);
+        let second_task = tokio::spawn(async move {
+            second_barrier.wait().await;
+            second_worker_storage
+                .insert_sealed_v2_with_owner_slot(
+                    &key_b.public_key_bytes(),
+                    &v2_id,
+                    v2_created_at,
+                    &v2_envelope,
+                    &v2_signature,
+                    policy,
+                )
+                .await
+                .map(|outcome| outcome == SealedV2InsertOutcome::Inserted)
+        });
+        let (first_outcome, second_outcome) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                barrier.wait().await;
+                (
+                    first_task.await.expect("V1 worker panicked"),
+                    second_task.await.expect("V2 worker panicked"),
+                )
+            })
+            .await
+            .expect("cross-connection owner-slot race timed out");
+        let outcomes = [first_outcome, second_outcome];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Ok(true)))
+                .count(),
+            1,
+            "independent connections must admit exactly one mixed writer"
+        );
+        let rejected = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                Err(error) => Some(error),
+                Ok(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rejected.len(), 1, "one mixed writer must be rejected");
+        assert!(matches!(
+            rejected[0],
+            &OwnerSlotAdmissionError::AtCapacity | &OwnerSlotAdmissionError::StorageUnavailable
+        ));
+
+        // With contention gone, a genuinely new owner must report capacity,
+        // not inherit a transient SQLITE_BUSY/StorageUnavailable result.
+        let third = second_storage
+            .insert_with_owner_slot(&v1_record([0xB3; 32], 73), "", policy)
+            .await;
+        assert!(matches!(
+            third,
+            Err(error) if error.is_at_capacity()
+        ));
+        drop(first_storage);
+        drop(second_storage);
+
+        let reopened = MemoryStorage::open(&db_path, None).unwrap();
+        assert_eq!(reopened.count_distinct_owners().await, 1);
+    }
+
     #[tokio::test]
     async fn owner_slot_handles_local_bypass_tombstone_exact_retry_and_unlimited() {
         let storage = MemoryStorage::open(":memory:", None).unwrap();
