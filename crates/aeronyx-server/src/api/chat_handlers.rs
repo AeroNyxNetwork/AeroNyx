@@ -958,6 +958,164 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn http_golden_vectors_use_real_codec_and_signature_layers() {
+        // [HTTP-AUTH-GOLDEN-CONSUMER 2026-10-03 by Codex] Consume the
+        // independently generated Pull/ACK literals in the actual private
+        // server decoder. Historical timestamps are intentionally used only
+        // for digest/signature checks; validators must still reject them, and
+        // the synthetic cursor must never reach storage.
+        const PULL_EMPTY_BODY: &str = "01d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a9cf053650000000000000000000000006400000000f15365000000004000000000000000b9ba63df3ad41719789b2c9780af8a250ba32559a912caeda9463a2f54a9c251d564355b004e34162c1aa1b5a516c3a7e9397f6731136f16921923821211fd0b";
+        const PULL_EMPTY_DIGEST: &str =
+            "619e7c711a4555f88ed4ac1995206a36c4da2e7ca14bd35aaae7c9b27b346d69";
+        const PULL_EMPTY_SIGNATURE: &str = "b9ba63df3ad41719789b2c9780af8a250ba32559a912caeda9463a2f54a9c251d564355b004e34162c1aa1b5a516c3a7e9397f6731136f16921923821211fd0b";
+        const PULL_CURSOR_BODY: &str = "01d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a9cf0536500000000390000000000000001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233343536376400000000f153650000000040000000000000004d2f7d3314016dd6ee1256173a9f92e1d1801fa512a9958a6922c6677bb3b313fb805c067a9219fd460085e76818bb048535ee530d46c6f430b37010c9f1580b";
+        const PULL_CURSOR_DIGEST: &str =
+            "256cda3aca755a4fdace8d306fa1e2da5af38d330a8e5c13822e7a18ba8b6dfb";
+        const PULL_CURSOR_SIGNATURE: &str = "4d2f7d3314016dd6ee1256173a9f92e1d1801fa512a9958a6922c6677bb3b313fb805c067a9219fd460085e76818bb048535ee530d46c6f430b37010c9f1580b";
+        const ACK_BODY: &str = "01d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a0200000000000000000102030405060708090a0b0c0d0e0ff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff00f1536500000000400000000000000029f0c98e67dbe82792ed66c2774aa8f727889dd07482a58ba611dc8c4c55aa40f46f58080f400a507210c5b924a770ba34745e25e3c83bcd8634eacf22c00a00";
+        const ACK_DIGEST: &str = "9758f272d243b1048759d38463cb5240516f3a8bba21980e820653b9d224693e";
+        const ACK_SIGNATURE: &str = "29f0c98e67dbe82792ed66c2774aa8f727889dd07482a58ba611dc8c4c55aa40f46f58080f400a507210c5b924a770ba34745e25e3c83bcd8634eacf22c00a00";
+
+        let pull_digest = |request: &ChatPullHttpRequestV1| {
+            let version = [request.version];
+            let after_timestamp = request.after_timestamp.to_le_bytes();
+            let cursor_len = (request.cursor.len() as u16).to_le_bytes();
+            let limit = request.limit.to_le_bytes();
+            let timestamp = request.request_timestamp.to_le_bytes();
+            signed_message_digest(
+                CHAT_PULL_HTTP_DOMAIN,
+                &[
+                    &version,
+                    &request.wallet,
+                    &after_timestamp,
+                    &cursor_len,
+                    &request.cursor,
+                    &limit,
+                    &timestamp,
+                ],
+            )
+        };
+        let ack_digest = |request: &ChatAckHttpRequestV1| {
+            let mut ids_hasher = Sha256::new();
+            for message_id in &request.message_ids {
+                ids_hasher.update(message_id);
+            }
+            let ids_hash: [u8; 32] = ids_hasher.finalize().into();
+            let version = [request.version];
+            let timestamp = request.ack_timestamp.to_le_bytes();
+            signed_message_digest(
+                CHAT_ACK_HTTP_DOMAIN,
+                &[&version, &request.wallet, &timestamp, &ids_hash],
+            )
+        };
+        let options = bincode::options()
+            .with_fixint_encoding()
+            .with_limit(CHAT_HTTP_REQUEST_MAX_BYTES as u64)
+            .reject_trailing_bytes();
+        let mut pulls = Vec::new();
+        for (body_hex, digest_hex, signature_hex) in [
+            (PULL_EMPTY_BODY, PULL_EMPTY_DIGEST, PULL_EMPTY_SIGNATURE),
+            (PULL_CURSOR_BODY, PULL_CURSOR_DIGEST, PULL_CURSOR_SIGNATURE),
+        ] {
+            let body = hex::decode(body_hex).expect("literal pull body");
+            let request: ChatPullHttpRequestV1 =
+                decode_canonical_http(&body).expect("actual pull decoder accepts golden");
+            assert_eq!(options.serialize(&request).unwrap(), body);
+            let signature: [u8; 64] = request.signature.as_slice().try_into().unwrap();
+            let digest = pull_digest(&request);
+            assert_eq!(hex::encode(digest), digest_hex);
+            assert_eq!(hex::encode(signature), signature_hex);
+            let key = IdentityPublicKey::from_bytes(&request.wallet).unwrap();
+            key.verify(&digest, &signature).unwrap();
+            let version = [request.version];
+            let after_timestamp = request.after_timestamp.to_le_bytes();
+            let cursor_len = (request.cursor.len() as u16).to_le_bytes();
+            let limit = request.limit.to_le_bytes();
+            let timestamp = request.request_timestamp.to_le_bytes();
+            let wrong_domain = signed_message_digest(
+                "AeroNyx-ChatPull-v2",
+                &[
+                    &version,
+                    &request.wallet,
+                    &after_timestamp,
+                    &cursor_len,
+                    &request.cursor,
+                    &limit,
+                    &timestamp,
+                ],
+            );
+            assert!(key.verify(&wrong_domain, &signature).is_err());
+            assert!(matches!(
+                validate_pull_http_request(&request, request.wallet),
+                Err(ChatHttpFailure::Unauthorized)
+            ));
+            pulls.push((body, request, signature));
+        }
+        assert!(pulls[0].1.cursor.is_empty());
+        assert_eq!(
+            pulls[1].1.cursor,
+            std::iter::once(1u8).chain(0u8..=55).collect::<Vec<_>>()
+        );
+        assert_eq!(pulls[1].1.cursor.len(), 57);
+
+        let ack_body = hex::decode(ACK_BODY).expect("literal ACK body");
+        let ack: ChatAckHttpRequestV1 =
+            decode_canonical_http(&ack_body).expect("actual ACK decoder accepts golden");
+        assert_eq!(options.serialize(&ack).unwrap(), ack_body);
+        assert_eq!(ack.message_ids[0], std::array::from_fn(|i| i as u8));
+        assert_eq!(ack.message_ids[1], std::array::from_fn(|i| 240 + i as u8));
+        let ack_signature: [u8; 64] = ack.signature.as_slice().try_into().unwrap();
+        let digest = ack_digest(&ack);
+        assert_eq!(hex::encode(digest), ACK_DIGEST);
+        assert_eq!(hex::encode(ack_signature), ACK_SIGNATURE);
+        let key = IdentityPublicKey::from_bytes(&ack.wallet).unwrap();
+        key.verify(&digest, &ack_signature).unwrap();
+        let mut ids_hasher = Sha256::new();
+        for message_id in &ack.message_ids {
+            ids_hasher.update(message_id);
+        }
+        let ids_hash: [u8; 32] = ids_hasher.finalize().into();
+        let ack_version = [ack.version];
+        let ack_timestamp = ack.ack_timestamp.to_le_bytes();
+        assert!(key
+            .verify(
+                &signed_message_digest(
+                    "AeroNyx-ChatAck-v1",
+                    &[&ack_version, &ack.wallet, &ack_timestamp, &ids_hash]
+                ),
+                &ack_signature
+            )
+            .is_err());
+        assert!(matches!(
+            validate_ack_http_request(&ack, ack.wallet),
+            Err(ChatHttpFailure::Unauthorized)
+        ));
+
+        for (body, request, signature) in pulls {
+            let mut tampered = request.clone();
+            tampered.limit ^= 1;
+            assert!(key_for_wallet(&tampered.wallet)
+                .verify(&pull_digest(&tampered), &signature)
+                .is_err());
+            let mut trailing = body;
+            trailing.push(0);
+            assert!(decode_canonical_http::<ChatPullHttpRequestV1>(&trailing).is_err());
+        }
+        let mut tampered_ack = ack.clone();
+        tampered_ack.message_ids[0][0] ^= 1;
+        assert!(key_for_wallet(&tampered_ack.wallet)
+            .verify(&ack_digest(&tampered_ack), &ack_signature)
+            .is_err());
+        let mut trailing_ack = ack_body;
+        trailing_ack.push(0);
+        assert!(decode_canonical_http::<ChatAckHttpRequestV1>(&trailing_ack).is_err());
+
+        fn key_for_wallet(wallet: &[u8; 32]) -> IdentityPublicKey {
+            IdentityPublicKey::from_bytes(wallet).expect("golden wallet key")
+        }
+    }
+
     #[tokio::test]
     async fn authenticated_http_pull_and_idempotent_ack_are_receiver_bound() {
         let relay = make_relay();
