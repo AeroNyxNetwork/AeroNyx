@@ -3,7 +3,8 @@
 // Dependencies: parent test helpers, production dispatcher/router, core crypto,
 // ephemeral loopback HTTP/UDP, and private temporary SQLite repositories.
 // Flow: signed sender ingress -> direct-v3 -> reopen -> signed PullV2/ACK;
-// the non-Linux transport fixture adds real V2 handshake and inbound AEAD/replay.
+// portable handler composition adds V2 handshake and inbound AEAD/replay;
+// a separate non-Linux fixture also exercises the production UDP dispatcher.
 // Boundary: sender ingress remains preauthenticated; orderly in-process reopen,
 // NOT Server::run, discovery gossip, process crash, failover, or Linux TUN proof.
 // [CHAT-CUSTODY-LIFECYCLE 2026-10-02 by Codex] Add composed acceptance without
@@ -359,6 +360,9 @@ enum CustodyAcceptanceCase {
     Ack,
     UnackedReopen,
     InvalidAck,
+    // [CHAT-PORTABLE-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] No TUN or
+    // platform gate: compose production handshake and packet services directly.
+    PortableHandshake,
     // [CHAT-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] Linux's production UDP
     // task requires a real TUN; this fixture never creates privileged devices.
     #[cfg(not(target_os = "linux"))]
@@ -477,8 +481,19 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
     target = target.reopen(&target_path, [0x93; 32]).await;
     // [CHAT-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] The receiver in this
     // branch has no injected Session and never calls the dispatcher directly.
-    #[cfg(not(target_os = "linux"))]
-    if matches!(case, CustodyAcceptanceCase::TransportHandshake) {
+    // [CHAT-PORTABLE-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] Both ingress
+    // variants share the wire client and the complete durable custody lifecycle.
+    let ingress = match case {
+        CustodyAcceptanceCase::PortableHandshake => {
+            Some(transport_acceptance::Ingress::PortableHandlers)
+        }
+        #[cfg(not(target_os = "linux"))]
+        CustodyAcceptanceCase::TransportHandshake => {
+            Some(transport_acceptance::Ingress::ProductionUdp)
+        }
+        _ => None,
+    };
+    if let Some(ingress) = ingress {
         transport_acceptance::run(
             target,
             &target_path,
@@ -486,6 +501,7 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
             &envelope,
             &receiver_e2e,
             plaintext,
+            ingress,
         )
         .await;
         return;
@@ -499,6 +515,9 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
     );
     match case {
         CustodyAcceptanceCase::Ack => {}
+        CustodyAcceptanceCase::PortableHandshake => {
+            unreachable!("handled before session injection")
+        }
         #[cfg(not(target_os = "linux"))]
         CustodyAcceptanceCase::TransportHandshake => {
             unreachable!("handled before session injection")
@@ -602,13 +621,14 @@ async fn chat_custody_invalid_acks_preserve_item_until_valid_ack() {
 }
 
 // [CHAT-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] Private composition of the
-// actual UDP ingress, not a substitute packet handler or preauthenticated
+// actual authentication services, not a substitute packet handler or preauthenticated
 // receiver. Server::new only creates in-memory shutdown/telemetry state here;
 // run/startup, management, API/discovery listeners, and TUN are never started.
-#[cfg(not(target_os = "linux"))]
 mod transport_acceptance {
     use super::*;
+    use crate::handlers::packet::DecryptedPayload;
     use crate::handlers::PacketHandler;
+    #[cfg(not(target_os = "linux"))]
     use crate::management::reporter::SessionEventSender;
     use crate::services::traffic_tracker::TrafficTracker;
     use crate::services::{DenyList, HandshakeService, NodePolicyRuntime};
@@ -618,9 +638,19 @@ mod transport_acceptance {
     use aeronyx_core::crypto::kdf::SessionKeys;
     use aeronyx_core::crypto::EphemeralKeyPair;
     use aeronyx_core::protocol::codec::{
-        decode_data_packet, decode_server_hello, encode_client_hello, encode_data_packet,
+        decode_client_hello, decode_data_packet, decode_server_hello, encode_client_hello,
+        encode_data_packet, encode_server_hello, ProtocolCodec,
     };
-    use aeronyx_core::protocol::{DataPacket, PROTOCOL_VERSION_V2};
+    use aeronyx_core::protocol::{DataPacket, MessageType, PROTOCOL_VERSION_V2};
+
+    // [CHAT-PORTABLE-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] Explicitly
+    // distinguish a portable service composition from the full UDP dispatcher.
+    #[derive(Clone, Copy)]
+    pub(super) enum Ingress {
+        PortableHandlers,
+        #[cfg(not(target_os = "linux"))]
+        ProductionUdp,
+    }
 
     // Own every spawned UDP task; explicit bounded join is the success path,
     // while Drop also prevents an assertion failure from leaking a listener.
@@ -632,7 +662,7 @@ mod transport_acceptance {
     }
 
     impl UdpRuntime {
-        fn start(node: &mut CustodyAcceptanceNode) -> Self {
+        fn start(node: &mut CustodyAcceptanceNode, ingress: Ingress) -> Self {
             assert_eq!(node.sessions.count(), 0);
             let mut config = ServerConfig::default();
             config.memchain.mode = MemChainMode::Off;
@@ -656,31 +686,111 @@ mod transport_acceptance {
                 Arc::new(DenyList::new()),
                 policy,
             ));
-            // Empty signed extension takes the production Missing-voucher
-            // compatibility path without HTTP. Even unexpected lookup is
-            // confined to loopback, never the configured production issuer.
-            let voucher = Arc::new(VoucherVerifier::with_issuer_keys_url(
-                "http://127.0.0.1:9/unused-test-issuer".to_owned(),
-            ));
-            let task = server.spawn_udp_task(
-                Arc::clone(&node.udp),
-                handshake,
-                Arc::clone(&packet_handler),
-                voucher,
-                sessions,
-                SessionEventSender::disabled(),
-                None,
-                None,
-                None,
-                None,
-                server.config.memchain.clone(),
-                hex::encode(node.identity.public_key_bytes()),
-                Some(Arc::clone(&node.relay)),
-                routing,
-                Arc::clone(&node.peers),
-                test_peer_http_client(),
-                traffic,
-            );
+            let task = match ingress {
+                Ingress::PortableHandlers => {
+                    // [CHAT-PORTABLE-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex]
+                    // Test-only loop, NOT spawn_udp_task coverage: no limiter,
+                    // voucher policy, TUN, or session-eviction lifecycle claim.
+                    // Every receiver session still originates in HandshakeService;
+                    // only PacketHandler-authenticated MemChain reaches dispatch.
+                    let mut shutdown_rx = server.shutdown_tx.subscribe();
+                    let udp = Arc::clone(&node.udp);
+                    let handler = Arc::clone(&packet_handler);
+                    let relay = Some(Arc::clone(&node.relay));
+                    let peers = Arc::clone(&node.peers);
+                    let identity = node.identity.clone();
+                    let config = server.config.memchain.clone();
+                    tokio::spawn(async move {
+                        let mut buffer = vec![0; 65_535];
+                        let crypto = DefaultTransportCrypto::new();
+                        loop {
+                            let (len, source) = tokio::select! {
+                                _ = shutdown_rx.recv() => break,
+                                received = udp.recv(&mut buffer) => {
+                                    received.expect("portable fixture UDP receive")
+                                }
+                            };
+                            let bytes = &buffer[..len];
+                            match ProtocolCodec::classify_datagram(bytes) {
+                                MessageType::ClientHello => {
+                                    let hello = decode_client_hello(bytes).unwrap();
+                                    assert_eq!(hello.version, PROTOCOL_VERSION_V2);
+                                    assert!(&encode_client_hello(&hello)[..] == bytes);
+                                    let result = handshake
+                                        .process(&hello, &[], source.addr)
+                                        .expect("production handshake admits receiver");
+                                    assert_eq!(
+                                        result.session.protocol_version,
+                                        PROTOCOL_VERSION_V2
+                                    );
+                                    udp.send(&encode_server_hello(&result.response), &source.addr)
+                                        .await
+                                        .unwrap();
+                                }
+                                MessageType::Data => {
+                                    let Ok((session, payload)) =
+                                        handler.handle_udp_packet(bytes, source.addr)
+                                    else {
+                                        // Real drop counters prove AEAD/replay rejection.
+                                        continue;
+                                    };
+                                    let DecryptedPayload::MemChain(message) = payload else {
+                                        panic!("expected authenticated MemChain payload")
+                                    };
+                                    Server::handle_memchain_message(
+                                        message,
+                                        None,
+                                        None,
+                                        &None,
+                                        &None,
+                                        &config,
+                                        "unused-chat-only",
+                                        &session,
+                                        &udp,
+                                        &crypto,
+                                        &sessions,
+                                        &relay,
+                                        &peers,
+                                        &identity.public_key_bytes(),
+                                        &identity,
+                                        None,
+                                    )
+                                    .await;
+                                }
+                                _ => panic!("unexpected portable fixture datagram"),
+                            }
+                        }
+                    })
+                }
+                #[cfg(not(target_os = "linux"))]
+                Ingress::ProductionUdp => {
+                    // Empty signed extension takes the production Missing-voucher
+                    // compatibility path without HTTP. Even unexpected lookup is
+                    // confined to loopback, never the configured production issuer.
+                    let voucher = Arc::new(VoucherVerifier::with_issuer_keys_url(
+                        "http://127.0.0.1:9/unused-test-issuer".to_owned(),
+                    ));
+                    server.spawn_udp_task(
+                        Arc::clone(&node.udp),
+                        handshake,
+                        Arc::clone(&packet_handler),
+                        voucher,
+                        sessions,
+                        SessionEventSender::disabled(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        server.config.memchain.clone(),
+                        hex::encode(node.identity.public_key_bytes()),
+                        Some(Arc::clone(&node.relay)),
+                        routing,
+                        Arc::clone(&node.peers),
+                        test_peer_http_client(),
+                        traffic,
+                    )
+                }
+            };
             Self {
                 server,
                 packet_handler,
@@ -879,8 +989,9 @@ mod transport_acceptance {
         envelope: &ChatEnvelope,
         e2e: &aeronyx_core::crypto::E2eSession,
         plaintext: &[u8],
+        ingress: Ingress,
     ) {
-        let runtime = UdpRuntime::start(&mut target);
+        let runtime = UdpRuntime::start(&mut target, ingress);
         let mut client = WireClient::connect(&target, receiver.clone()).await;
         let (items, replay_packet) = client.pull().await;
         assert_custody_envelope(&items, envelope, e2e, plaintext);
@@ -906,7 +1017,7 @@ mod transport_acceptance {
         runtime.close().await;
         target = target.reopen(path, [0x93; 32]).await;
 
-        let runtime = UdpRuntime::start(&mut target);
+        let runtime = UdpRuntime::start(&mut target, ingress);
         let mut client = WireClient::connect(&target, receiver).await;
         assert!(client.pull().await.0.is_empty());
         assert_eq!(target.relay.storage_usage().unwrap().pending_messages, 0);
@@ -914,6 +1025,20 @@ mod transport_acceptance {
         runtime.close().await;
     }
 
+    // [CHAT-PORTABLE-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] Compiles and
+    // runs without a TUN on every supported platform; execution evidence is
+    // limited to the actual host running this test, not an unrun Linux runner.
+    #[tokio::test]
+    async fn chat_custody_portable_handshake_pull_ack_survives_reopen() {
+        tokio::time::timeout(
+            Duration::from_secs(35),
+            run_custody_acceptance(CustodyAcceptanceCase::PortableHandshake),
+        )
+        .await
+        .expect("bounded portable handshake/custody/reopen lifecycle");
+    }
+
+    #[cfg(not(target_os = "linux"))]
     #[tokio::test]
     async fn chat_custody_real_handshake_pull_ack_survives_reopen() {
         tokio::time::timeout(
