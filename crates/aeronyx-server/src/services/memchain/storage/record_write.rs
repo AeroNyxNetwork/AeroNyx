@@ -3,7 +3,185 @@
 // Bodies are unchanged. Private inherent items are pub(super) so the parent flow can call them.
 use super::*;
 
+use aeronyx_core::crypto::IdentityPublicKey;
+use aeronyx_core::ledger::record::{
+    memory_sealed_v2_record_id, memory_sealed_v2_signature_transcript, MemorySealedV2Envelope,
+    MEMORY_SEALED_V2_MAX_ENVELOPE_BYTES, MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES,
+};
+
+// [MEMORY-SEALED-V2 2026-10-02 by Codex] Durable outcomes are deliberately
+// coarse; callers never receive a row or any decrypted material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealedV2InsertOutcome {
+    Inserted,
+    ExactDuplicate,
+    Conflict,
+}
+
+impl SealedV2InsertOutcome {
+    pub(crate) const fn is_inserted(self) -> bool {
+        matches!(self, Self::Inserted)
+    }
+
+    pub(crate) const fn is_exact_duplicate(self) -> bool {
+        matches!(self, Self::ExactDuplicate)
+    }
+}
+
+// [MEMORY-SEALED-V2 2026-10-02 by Codex] Classification is shared by the
+// read-only admission preflight and the insert transaction.  It scans every
+// lifecycle state so tombstones cannot be resurrected by an exact retry.
+fn classify_sealed_v2_conn(
+    conn: &rusqlite::Connection,
+    record_id: &[u8; 32],
+    owner: &[u8; 32],
+    created_at: u64,
+    envelope: &[u8],
+    signature: &[u8; 64],
+) -> Result<Option<SealedV2InsertOutcome>, String> {
+    let existing: Option<(Vec<u8>, i64, Vec<u8>, Vec<u8>, i64)> = conn
+        .query_row(
+            "SELECT owner, created_at, envelope, signature, status
+             FROM memory_sealed_v2 WHERE record_id = ?1",
+            params![record_id.as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| format!("sealed v2 lookup: {e}"))?;
+    let Some((stored_owner, stored_created, stored_envelope, stored_sig, status)) = existing else {
+        return Ok(None);
+    };
+    let stored_owner: [u8; 32] = stored_owner
+        .try_into()
+        .map_err(|_| "sealed v2 owner corruption".to_string())?;
+    let stored_created =
+        u64::try_from(stored_created).map_err(|_| "sealed v2 timestamp corruption".to_string())?;
+    let stored_signature: [u8; 64] = stored_sig
+        .try_into()
+        .map_err(|_| "sealed v2 signature corruption".to_string())?;
+    let stored_envelope_view = MemorySealedV2Envelope::decode(&stored_envelope)
+        .map_err(|_| "sealed v2 envelope corruption".to_string())?;
+    if memory_sealed_v2_record_id(
+        &stored_owner,
+        stored_created,
+        stored_envelope_view.as_bytes(),
+    ) != *record_id
+        || IdentityPublicKey::from_bytes(&stored_owner)
+            .and_then(|key| {
+                key.verify(
+                    &memory_sealed_v2_signature_transcript(
+                        &stored_owner,
+                        record_id,
+                        stored_created,
+                        stored_envelope_view.as_bytes(),
+                    ),
+                    &stored_signature,
+                )
+            })
+            .is_err()
+    {
+        return Err("sealed v2 row integrity failure".to_string());
+    }
+    if status == 0
+        && stored_owner == *owner
+        && stored_created == created_at
+        && stored_envelope == envelope
+        && stored_signature == *signature
+    {
+        Ok(Some(SealedV2InsertOutcome::ExactDuplicate))
+    } else {
+        Ok(Some(SealedV2InsertOutcome::Conflict))
+    }
+}
+
 impl MemoryStorage {
+    // [MEMORY-SEALED-V2 2026-10-02 by Codex] Read-only preflight deliberately
+    // releases the SQLite mutex before quota admission can await.
+    pub(crate) async fn classify_sealed_v2(
+        &self,
+        owner: &[u8; 32],
+        record_id: &[u8; 32],
+        created_at: u64,
+        envelope: &[u8],
+        signature: &[u8; 64],
+    ) -> Result<Option<SealedV2InsertOutcome>, String> {
+        let conn = self.conn.lock().await;
+        classify_sealed_v2_conn(&conn, record_id, owner, created_at, envelope, signature)
+    }
+
+    /// Atomically insert one owner-authenticated opaque V2 envelope.
+    /// Exact byte retries are idempotent; a reused id with different bytes is
+    /// a conflict. No legacy projections are touched.
+    pub async fn insert_sealed_v2(
+        &self,
+        owner: &[u8; 32],
+        record_id: &[u8; 32],
+        created_at: u64,
+        envelope: &[u8],
+        signature: &[u8; 64],
+    ) -> Result<SealedV2InsertOutcome, String> {
+        if created_at > i64::MAX as u64
+            || !(MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES..=MEMORY_SEALED_V2_MAX_ENVELOPE_BYTES)
+                .contains(&envelope.len())
+            || MemorySealedV2Envelope::decode(envelope).is_err()
+        {
+            return Err("invalid sealed v2 row".to_string());
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "clock unavailable".to_string())?
+            .as_secs();
+        let now = i64::try_from(now).map_err(|_| "clock overflow".to_string())?;
+        let conn = self.conn.lock().await;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("sealed v2 transaction: {e}"))?;
+        let outcome = if let Some(outcome) =
+            classify_sealed_v2_conn(&tx, record_id, owner, created_at, envelope, signature)?
+        {
+            outcome
+        } else {
+            tx.execute(
+                "INSERT INTO memory_sealed_v2
+                 (record_id, owner, created_at, envelope, signature, status, inserted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+                params![
+                    record_id.as_slice(),
+                    owner.as_slice(),
+                    created_at as i64,
+                    envelope,
+                    signature.as_slice(),
+                    now,
+                ],
+            )
+            .map_err(|e| format!("sealed v2 insert: {e}"))?;
+            SealedV2InsertOutcome::Inserted
+        };
+        tx.commit().map_err(|e| format!("sealed v2 commit: {e}"))?;
+        Ok(outcome)
+    }
+
+    /// Owner-scoped V2 revoke/tombstone. The opaque envelope is retained for
+    /// audit/restart idempotence, while active listing excludes the row.
+    pub async fn revoke_sealed_v2(&self, owner: &[u8; 32], record_id: &[u8; 32]) -> bool {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE memory_sealed_v2 SET status = 2
+             WHERE record_id = ?1 AND owner = ?2 AND status = 0",
+            params![record_id.as_slice(), owner.as_slice()],
+        )
+        .map(|n| n == 1)
+        .unwrap_or(false)
+    }
+
     // ========================================
     // PATCH: Update record content (v2.5.2+Provenance)
     // ========================================
@@ -396,5 +574,230 @@ impl MemoryStorage {
                 params![rid_hex, src, owner_hex],
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sealed_v2_tests {
+    use super::*;
+    use aeronyx_core::crypto::IdentityKeyPair;
+    use aeronyx_core::ledger::record::{
+        memory_sealed_v2_record_id, memory_sealed_v2_signature_transcript, MemorySealedV2Envelope,
+        MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES,
+    };
+
+    fn frame() -> Vec<u8> {
+        let mut bytes = vec![0u8; MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES];
+        bytes[..4].copy_from_slice(b"AMV2");
+        bytes[4] = 1;
+        bytes[17..21].copy_from_slice(&(16u32).to_be_bytes());
+        assert!(MemorySealedV2Envelope::decode(&bytes).is_ok());
+        bytes
+    }
+
+    #[tokio::test]
+    async fn sealed_v2_exact_retry_conflict_owner_listing_and_revoke() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let key = IdentityKeyPair::from_bytes(&[7u8; 32]).unwrap();
+        let owner = key.public_key_bytes();
+        let other = [2u8; 32];
+        let envelope = frame();
+        let id = memory_sealed_v2_record_id(&owner, 7, &envelope);
+        let transcript = memory_sealed_v2_signature_transcript(&owner, &id, 7, &envelope);
+        let signature = key.sign(&transcript);
+        assert_eq!(
+            storage
+                .insert_sealed_v2(&owner, &id, 7, &envelope, &signature)
+                .await
+                .unwrap(),
+            SealedV2InsertOutcome::Inserted
+        );
+        assert_eq!(
+            storage
+                .insert_sealed_v2(&owner, &id, 7, &envelope, &signature)
+                .await
+                .unwrap(),
+            SealedV2InsertOutcome::ExactDuplicate
+        );
+        assert_eq!(
+            storage
+                .classify_sealed_v2(&owner, &id, 7, &envelope, &signature)
+                .await
+                .unwrap(),
+            Some(SealedV2InsertOutcome::ExactDuplicate)
+        );
+        let mut changed = envelope.clone();
+        changed[21] = 9;
+        assert_eq!(
+            storage
+                .insert_sealed_v2(&owner, &id, 7, &changed, &signature)
+                .await
+                .unwrap(),
+            SealedV2InsertOutcome::Conflict
+        );
+        assert!(storage.get_sealed_v2(&other, &id).await.unwrap().is_none());
+        for created_at in [8u64, 9] {
+            let row_id = memory_sealed_v2_record_id(&owner, created_at, &envelope);
+            let row_transcript =
+                memory_sealed_v2_signature_transcript(&owner, &row_id, created_at, &envelope);
+            let row_signature = key.sign(&row_transcript);
+            assert!(storage
+                .insert_sealed_v2(&owner, &row_id, created_at, &envelope, &row_signature)
+                .await
+                .unwrap()
+                .is_inserted());
+        }
+        let first = storage.list_sealed_v2(&owner, None, 1).await.unwrap();
+        assert_eq!(first.rows.len(), 1);
+        let second = storage
+            .list_sealed_v2(&owner, first.next_cursor.as_ref(), 1)
+            .await
+            .unwrap();
+        assert_eq!(second.rows.len(), 1);
+        let third = storage
+            .list_sealed_v2(&owner, second.next_cursor.as_ref(), 1)
+            .await
+            .unwrap();
+        assert_eq!(third.rows.len(), 1);
+        assert!(third.next_cursor.is_none());
+        assert!(storage.revoke_sealed_v2(&owner, &id).await);
+        assert_eq!(
+            storage
+                .classify_sealed_v2(&owner, &id, 7, &envelope, &signature)
+                .await
+                .unwrap(),
+            Some(SealedV2InsertOutcome::Conflict)
+        );
+        assert!(storage.get_sealed_v2(&owner, &id).await.unwrap().is_none());
+        assert_eq!(
+            storage
+                .list_sealed_v2(&owner, None, 10)
+                .await
+                .unwrap()
+                .rows
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_v2_reads_fail_closed_on_corrupt_durable_row() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let key = IdentityKeyPair::from_bytes(&[8u8; 32]).unwrap();
+        let owner = key.public_key_bytes();
+        let record_id = [4u8; 32];
+        let corrupt_envelope = vec![0u8; MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES];
+        let conn = storage.conn_lock().await;
+        conn.execute(
+            "INSERT INTO memory_sealed_v2
+             (record_id, owner, created_at, envelope, signature, status, inserted_at)
+             VALUES (?1, ?2, 7, ?3, ?4, 0, 7)",
+            rusqlite::params![
+                record_id.as_slice(),
+                owner.as_slice(),
+                corrupt_envelope,
+                [0u8; 64].as_slice()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(storage.get_sealed_v2(&owner, &record_id).await.is_err());
+        assert!(storage.list_sealed_v2(&owner, None, 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sealed_v2_list_prepare_failure_is_not_an_empty_page() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute("DROP TABLE memory_sealed_v2", []).unwrap();
+        }
+        assert!(storage.list_sealed_v2(&[3u8; 32], None, 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn owner_capacity_snapshot_unions_legacy_and_sealed_rows() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let legacy_owner = [0x31u8; 32];
+        let legacy_id = [0x41u8; 32];
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "INSERT INTO records
+                 (record_id, owner, timestamp, layer, signature, created_at)
+                 VALUES (?1, ?2, 1, 0, ?3, 1)",
+                rusqlite::params![legacy_id.as_slice(), legacy_owner.as_slice(), [0u8; 64]],
+            )
+            .unwrap();
+        }
+        let remote_key = IdentityKeyPair::from_bytes(&[9u8; 32]).unwrap();
+        let remote_owner = remote_key.public_key_bytes();
+        let remote_envelope = frame();
+        let remote_id = memory_sealed_v2_record_id(&remote_owner, 2, &remote_envelope);
+        let remote_signature = remote_key.sign(&memory_sealed_v2_signature_transcript(
+            &remote_owner,
+            &remote_id,
+            2,
+            &remote_envelope,
+        ));
+        assert!(storage
+            .insert_sealed_v2(
+                &remote_owner,
+                &remote_id,
+                2,
+                &remote_envelope,
+                &remote_signature,
+            )
+            .await
+            .unwrap()
+            .is_inserted());
+        let local_key = IdentityKeyPair::from_bytes(&[10u8; 32]).unwrap();
+        let local_owner = local_key.public_key_bytes();
+        let local_envelope = frame();
+        let local_id = memory_sealed_v2_record_id(&local_owner, 3, &local_envelope);
+        let local_signature = local_key.sign(&memory_sealed_v2_signature_transcript(
+            &local_owner,
+            &local_id,
+            3,
+            &local_envelope,
+        ));
+        assert!(storage
+            .insert_sealed_v2(
+                &local_owner,
+                &local_id,
+                3,
+                &local_envelope,
+                &local_signature,
+            )
+            .await
+            .unwrap()
+            .is_inserted());
+
+        assert_eq!(storage.count_distinct_owners().await, 3);
+        assert!(storage.owner_exists(&remote_owner).await);
+        assert_eq!(
+            storage
+                .remote_owner_capacity_snapshot(&local_owner, &[0x61u8; 32])
+                .await
+                .unwrap(),
+            (2, false)
+        );
+        assert_eq!(
+            storage
+                .remote_owner_capacity_snapshot(&local_owner, &remote_owner)
+                .await
+                .unwrap(),
+            (2, true)
+        );
+        assert!(storage.revoke_sealed_v2(&remote_owner, &remote_id).await);
+        assert_eq!(storage.count_distinct_owners().await, 3);
+        assert_eq!(
+            storage
+                .remote_owner_capacity_snapshot(&local_owner, &remote_owner)
+                .await
+                .unwrap(),
+            (2, true)
+        );
     }
 }

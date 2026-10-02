@@ -95,7 +95,8 @@ use super::mpi::{
 };
 
 pub use super::mpi_handlers::{
-    RecallRequest, RecallResponse, RecalledMemory, SealedMemory, TimeHint, TimeRangeParam,
+    RecallRequest, RecallResponse, RecalledMemory, SealedMemory, SealedV2Memory, TimeHint,
+    TimeRangeParam,
 };
 pub use crate::services::memchain::reranker::RERANK_TOP_N;
 
@@ -1021,6 +1022,28 @@ pub async fn mpi_recall(
             .collect()
     });
     let query_type_str = format!("{:?}", query_type).to_lowercase();
+    let sealed_v2 = {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        match storage.list_sealed_v2(&owner, None, top_k).await {
+            Ok(page) => page
+                .rows
+                .into_iter()
+                .map(|row| SealedV2Memory {
+                    record_id_b64: BASE64.encode(row.record_id),
+                    created_at: row.created_at,
+                    envelope_b64: BASE64.encode(row.envelope),
+                    signature_b64: BASE64.encode(row.signature),
+                })
+                .collect::<Vec<_>>(),
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error":"sealed v2 storage unavailable"})),
+                )
+                    .into_response()
+            }
+        }
+    };
 
     // ── Step 4.5: Progressive index mode ──
     if rb.mode == "index" {
@@ -1055,6 +1078,7 @@ pub async fn mpi_recall(
                 "query_type": query_type_str,
                 "matched_entities": matched_json,
                 "sealed": sealed_memories,
+                "sealed_v2": sealed_v2,
                 "hint": "Use POST /api/mpi/recall/detail with record_ids to fetch full content.",
             })),
         )
@@ -1084,6 +1108,7 @@ pub async fn mpi_recall(
             query_type: Some(query_type_str),
             matched_entities: matched_json,
             sealed: sealed_memories,
+            sealed_v2,
         })),
     )
         .into_response()
@@ -1165,6 +1190,7 @@ pub async fn mpi_recall_detail(
     }
 
     let mut memories: Vec<RecalledMemory> = Vec::new();
+    let mut sealed_v2: Vec<SealedV2Memory> = Vec::new();
     let mut total_tokens = 0usize;
 
     for rid_hex in &dr.record_ids {
@@ -1172,14 +1198,40 @@ pub async fn mpi_recall_detail(
             continue;
         }
 
-        let rid = match hex::decode(rid_hex) {
-            Ok(b) if b.len() == 32 => {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        let rid = BASE64
+            .decode(rid_hex.as_bytes())
+            .ok()
+            .filter(|b| BASE64.encode(b) == *rid_hex && b.len() == 32)
+            .or_else(|| hex::decode(rid_hex).ok().filter(|b| b.len() == 32));
+        let rid = match rid {
+            Some(bytes) => {
                 let mut a = [0u8; 32];
-                a.copy_from_slice(&b);
+                a.copy_from_slice(&bytes);
                 a
             }
-            _ => continue,
+            None => continue,
         };
+
+        match storage.get_sealed_v2(&owner, &rid).await {
+            Ok(Some(row)) => {
+                sealed_v2.push(SealedV2Memory {
+                    record_id_b64: BASE64.encode(row.record_id),
+                    created_at: row.created_at,
+                    envelope_b64: BASE64.encode(row.envelope),
+                    signature_b64: BASE64.encode(row.signature),
+                });
+                continue;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error":"sealed v2 storage unavailable"})),
+                )
+                    .into_response()
+            }
+        }
 
         if let Some(record) = storage.get(&rid).await {
             if !record.is_active() || record.owner != owner {
@@ -1213,6 +1265,7 @@ pub async fn mpi_recall_detail(
         Json(serde_json::json!({
             "memories": memories,
             "token_estimate": total_tokens,
+            "sealed_v2": sealed_v2,
         })),
     )
         .into_response()

@@ -552,6 +552,27 @@ impl MemoryStorage {
             CREATE INDEX IF NOT EXISTS idx_usage_task ON llm_usage_log(task_id);"
         ).map_err(|e| format!("Schema creation failed (v6 SuperNode tables): {}", e))?;
 
+        // [MEMORY-SEALED-V2 2026-10-02 by Codex] Additive opaque storage for
+        // V2. create_schema runs on every open, so existing V1 databases gain
+        // this table without rewriting or restricting legacy rows. No
+        // plaintext metadata, vectors, FTS terms, or relationship columns are
+        // admitted here.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_sealed_v2 (
+                record_id   BLOB PRIMARY KEY CHECK(length(record_id) = 32),
+                owner       BLOB NOT NULL CHECK(length(owner) = 32),
+                created_at  INTEGER NOT NULL CHECK(created_at >= 0),
+                envelope    BLOB NOT NULL CHECK(length(envelope) BETWEEN 37 AND 16421),
+                signature   BLOB NOT NULL CHECK(length(signature) = 64),
+                status      INTEGER NOT NULL DEFAULT 0 CHECK(status IN (0, 2)),
+                inserted_at INTEGER NOT NULL CHECK(inserted_at >= 0)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_sealed_v2_owner_cursor
+                ON memory_sealed_v2(owner, record_id)
+                WHERE status = 0;",
+        )
+        .map_err(|e| format!("Schema creation failed (V2 sealed memory): {e}"))?;
+
         // Insert schema version if not present
         let existing: Option<u32> = conn
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {

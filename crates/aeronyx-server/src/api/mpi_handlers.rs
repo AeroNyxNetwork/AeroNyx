@@ -101,6 +101,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use aeronyx_core::crypto::IdentityPublicKey;
+use aeronyx_core::ledger::record::{
+    memory_sealed_v2_record_id, memory_sealed_v2_signature_transcript, MemorySealedV2Envelope,
+    MEMORY_SEALED_V2_HTTP_BODY_BYTES, MEMORY_SEALED_V2_MAX_CLOCK_SKEW_SECS,
+    MEMORY_SEALED_V2_MAX_ENVELOPE_BYTES, MEMORY_SEALED_V2_MAX_RETENTION_SECS,
+};
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 use sha2::{Digest, Sha256};
 
@@ -362,6 +367,237 @@ pub struct SealedRememberRequest {
     pub project: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedRememberV2Request {
+    version: u16,
+    record_id_b64: String,
+    created_at: u64,
+    envelope_b64: String,
+    signature_b64: String,
+}
+
+async fn handle_remember_sealed_v2(
+    state: Arc<MpiState>,
+    auth: AuthenticatedOwner,
+    storage: Arc<MemoryStorage>,
+    body_bytes: &[u8],
+) -> axum::response::Response {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+    if !(state.blind_storage_enabled || state.allow_remote_storage) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"blind storage disabled"})),
+        )
+            .into_response();
+    }
+
+    if body_bytes.len() > MEMORY_SEALED_V2_HTTP_BODY_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error":"sealed v2 body too large"})),
+        )
+            .into_response();
+    }
+    let req: SealedRememberV2Request =
+        match serde_json::from_slice::<SealedRememberV2Request>(body_bytes) {
+            Ok(req) if req.version == 2 => req,
+            Ok(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"unsupported sealed memory version"})),
+                )
+                    .into_response()
+            }
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"invalid sealed v2 request"})),
+                )
+                    .into_response()
+            }
+        };
+    let owner = auth.owner_bytes();
+    if req.created_at > i64::MAX as u64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"invalid sealed v2 timestamp"})),
+        )
+            .into_response();
+    }
+    let now = now_secs();
+    if req.created_at > now.saturating_add(MEMORY_SEALED_V2_MAX_CLOCK_SKEW_SECS)
+        || now.saturating_sub(req.created_at) > MEMORY_SEALED_V2_MAX_RETENTION_SECS
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"sealed v2 timestamp outside retention window"})),
+        )
+            .into_response();
+    }
+    let decode_canonical = |value: &str| {
+        let decoded = BASE64.decode(value.as_bytes()).ok()?;
+        (BASE64.encode(&decoded) == value).then_some(decoded)
+    };
+    let record_id_bytes = match decode_canonical(&req.record_id_b64) {
+        Some(value) if value.len() == 32 => value,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid sealed v2 record id"})),
+            )
+                .into_response()
+        }
+    };
+    let envelope = match decode_canonical(&req.envelope_b64)
+        .filter(|value| value.len() <= MEMORY_SEALED_V2_MAX_ENVELOPE_BYTES)
+        .and_then(|value| MemorySealedV2Envelope::decode(&value).ok().map(|_| value))
+    {
+        Some(value) => value,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid sealed v2 envelope"})),
+            )
+                .into_response()
+        }
+    };
+    let signature_bytes = match decode_canonical(&req.signature_b64) {
+        Some(value) if value.len() == 64 => value,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid sealed v2 signature"})),
+            )
+                .into_response()
+        }
+    };
+    let mut supplied_id = [0u8; 32];
+    supplied_id.copy_from_slice(&record_id_bytes);
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&signature_bytes);
+    let expected_id = memory_sealed_v2_record_id(&owner, req.created_at, &envelope);
+    let transcript =
+        memory_sealed_v2_signature_transcript(&owner, &expected_id, req.created_at, &envelope);
+    if supplied_id != expected_id
+        || IdentityPublicKey::from_bytes(&owner)
+            .ok()
+            .and_then(|key| key.verify(&transcript, &signature).ok())
+            .is_none()
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error":"sealed v2 authorization failed"})),
+        )
+            .into_response();
+    }
+    // [MEMORY-SEALED-V2 2026-10-02 by Codex] Exact retries must be
+    // read-only and succeed even when no new volume bytes can be admitted.
+    match storage
+        .classify_sealed_v2(&owner, &expected_id, req.created_at, &envelope, &signature)
+        .await
+    {
+        Ok(Some(outcome)) if outcome.is_exact_duplicate() => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "record_id": BASE64.encode(expected_id),
+                    "status": "exists"
+                })),
+            )
+                .into_response();
+        }
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error":"sealed v2 record conflict"})),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":"sealed v2 storage unavailable"})),
+            )
+                .into_response();
+        }
+    }
+    let permit = match storage
+        .acquire_growth_permit(minimum_growth_bytes(body_bytes.len()))
+        .await
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            // A concurrent writer may have committed this exact row while
+            // admission was waiting. Reclassify before exposing 507.
+            match storage
+                .classify_sealed_v2(&owner, &expected_id, req.created_at, &envelope, &signature)
+                .await
+            {
+                Ok(Some(outcome)) if outcome.is_exact_duplicate() => {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "record_id": BASE64.encode(expected_id),
+                            "status": "exists"
+                        })),
+                    )
+                        .into_response();
+                }
+                Ok(Some(_)) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"error":"sealed v2 record conflict"})),
+                    )
+                        .into_response();
+                }
+                Ok(None) => return growth_failure_response(error),
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"error":"sealed v2 storage unavailable"})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+    let result = storage
+        .insert_sealed_v2(&owner, &expected_id, req.created_at, &envelope, &signature)
+        .await;
+    drop(permit);
+    match result {
+        Ok(outcome) if outcome.is_inserted() => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "record_id": BASE64.encode(expected_id),
+                "status": "created"
+            })),
+        )
+            .into_response(),
+        Ok(outcome) if outcome.is_exact_duplicate() => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "record_id": BASE64.encode(expected_id),
+                "status": "exists"
+            })),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"sealed v2 record conflict"})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"sealed v2 storage unavailable"})),
+        )
+            .into_response(),
+    }
+}
+
 /// A client-declared edge from this blind record to an existing one.
 #[derive(Debug, Deserialize)]
 pub struct RelatedEdge {
@@ -409,6 +645,18 @@ pub async fn mpi_remember_sealed(
                 .into_response()
         }
     };
+    // [MEMORY-SEALED-V2 2026-10-02 by Codex] Versioned bodies belong to the
+    // dedicated V2 route. Never let unknown/versioned JSON fall through the
+    // legacy serde path where unknown fields would otherwise be ignored.
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+        if value.get("version").is_some() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"use sealed v2 route"})),
+            )
+                .into_response();
+        }
+    }
     let growth_bytes = minimum_growth_bytes(body_bytes.len());
     let rb: SealedRememberRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
@@ -585,6 +833,29 @@ pub async fn mpi_remember_sealed(
         .into_response()
 }
 
+/// Dedicated V2 ingress with a pre-parse body cap. The legacy sealed route is
+/// intentionally not version-multiplexed, so malformed/unknown V2 requests
+/// cannot silently receive V1 semantics.
+pub async fn mpi_remember_sealed_v2(
+    State(state): State<Arc<MpiState>>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
+    req: Request<axum::body::Body>,
+) -> axum::response::Response {
+    let body_bytes =
+        match axum::body::to_bytes(req.into_body(), MEMORY_SEALED_V2_HTTP_BODY_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(serde_json::json!({"error":"sealed v2 body too large"})),
+                )
+                    .into_response()
+            }
+        };
+    handle_remember_sealed_v2(state, auth, storage, &body_bytes).await
+}
+
 // ============================================
 // D6: Storage-root attestation (verifiable node-blind memory)
 // ============================================
@@ -645,7 +916,16 @@ pub async fn mpi_attest(
 
     let owner = auth.owner_bytes();
 
-    let ids = storage.owner_record_ids(&owner).await;
+    let ids = match storage.owner_record_ids(&owner).await {
+        Ok(ids) => ids,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":"sealed v2 storage unavailable"})),
+            )
+                .into_response()
+        }
+    };
     let count = ids.len() as u64;
     let root = attest_storage_root(&ids);
     let epoch = now_secs();
@@ -750,6 +1030,14 @@ pub struct SealedMemory {
 }
 
 #[derive(Debug, Serialize)]
+pub struct SealedV2Memory {
+    pub record_id_b64: String,
+    pub created_at: u64,
+    pub envelope_b64: String,
+    pub signature_b64: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct RecallResponse {
     pub memories: Vec<RecalledMemory>,
     pub total_candidates: usize,
@@ -760,6 +1048,9 @@ pub struct RecallResponse {
     /// the owner uses node-blind storage.
     #[serde(default)]
     pub sealed: Vec<SealedMemory>,
+    /// Additive opaque V2 list; never enters legacy scoring or projections.
+    #[serde(default)]
+    pub sealed_v2: Vec<SealedV2Memory>,
 }
 
 // ============================================
@@ -769,6 +1060,23 @@ pub struct RecallResponse {
 #[derive(Debug, Deserialize)]
 pub struct ForgetRequest {
     pub record_id: String,
+}
+
+// [MEMORY-SEALED-V2 2026-10-02 by Codex] V2 responses use canonical standard
+// base64 while the legacy forget API used 64-character hex. The disjoint
+// grammar rule keeps old hex callers working and gives every other spelling a
+// single canonical base64 interpretation; non-canonical encodings are denied.
+fn decode_record_id_reference(value: &str) -> Option<[u8; 32]> {
+    if value.len() == 64 && value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        let bytes = hex::decode(value).ok()?.try_into().ok()?;
+        return Some(bytes);
+    }
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    let decoded = BASE64.decode(value.as_bytes()).ok()?;
+    if decoded.len() != 32 || BASE64.encode(&decoded) != value {
+        return None;
+    }
+    decoded.try_into().ok()
 }
 
 #[derive(Debug, Serialize)]
@@ -807,13 +1115,9 @@ pub async fn mpi_forget(
         }
     };
 
-    let rid = match hex::decode(&rb.record_id) {
-        Ok(b) if b.len() == 32 => {
-            let mut a = [0u8; 32];
-            a.copy_from_slice(&b);
-            a
-        }
-        _ => {
+    let rid = match decode_record_id_reference(&rb.record_id) {
+        Some(rid) => rid,
+        None => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error":"bad record_id"})),
@@ -832,10 +1136,43 @@ pub async fn mpi_forget(
                 .into_response();
         }
     } else {
+        match storage.get_sealed_v2(&owner, &rid).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!(ForgetResponse {
+                        status: "not_found".into(),
+                        record_id: rb.record_id
+                    })),
+                )
+                    .into_response()
+            }
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error":"sealed v2 storage unavailable"})),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    if storage.get(&rid).await.is_none() {
+        if !storage.revoke_sealed_v2(&owner, &rid).await {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!(ForgetResponse {
+                    status: "not_found".into(),
+                    record_id: rb.record_id
+                })),
+            )
+                .into_response();
+        }
         return (
-            StatusCode::NOT_FOUND,
+            StatusCode::OK,
             Json(serde_json::json!(ForgetResponse {
-                status: "not_found".into(),
+                status: "revoked".into(),
                 record_id: rb.record_id
             })),
         )
@@ -959,6 +1296,11 @@ pub struct MpiStatusResponse {
     pub graph_enabled: bool,
     pub graph_stats: Option<crate::services::memchain::storage_graph::GraphStats>,
     pub supernode: SuperNodeStatus,
+    /// Additive capability advertisement. V1 remains the legacy default;
+    /// clients must pin V2 before sending its explicit body.
+    pub sealed_memory_versions: Vec<u16>,
+    pub sealed_memory_v2_max_plaintext_bytes: usize,
+    pub sealed_memory_v2_max_envelope_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1141,6 +1483,11 @@ pub async fn mpi_status(
             graph_enabled: state.graph_enabled,
             graph_stats: gs,
             supernode: supernode_status,
+            sealed_memory_versions: vec![1, 2],
+            sealed_memory_v2_max_plaintext_bytes:
+                aeronyx_core::ledger::record::MEMORY_SEALED_V2_MAX_PLAINTEXT_BYTES,
+            sealed_memory_v2_max_envelope_bytes:
+                aeronyx_core::ledger::record::MEMORY_SEALED_V2_MAX_ENVELOPE_BYTES,
         })),
     )
 }
@@ -1615,10 +1962,16 @@ mod tests {
     use super::*;
     use crate::services::memchain::storage::{StorageGrowthAdmission, StorageGrowthPermit};
     use aeronyx_core::crypto::IdentityKeyPair;
+    use aeronyx_core::ledger::record::{
+        memory_sealed_v2_record_id, memory_sealed_v2_signature_transcript,
+        MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES,
+    };
     use aeronyx_core::ledger::RecordStatus;
     use axum::body::Body;
     use axum::http::Request;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use parking_lot::RwLock;
+    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use tower::ServiceExt;
@@ -1676,6 +2029,94 @@ mod tests {
         let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
         let (state, auth, _vector_index) = make_test_state_with_storage(Arc::clone(&storage));
         (state, auth, storage)
+    }
+
+    fn sealed_v2_body(key: &IdentityKeyPair, marker: u8) -> (Vec<u8>, [u8; 32], Vec<u8>, [u8; 64]) {
+        let owner = key.public_key_bytes();
+        let created_at = now_secs();
+        let mut envelope = vec![0u8; MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES];
+        envelope[..4].copy_from_slice(b"AMV2");
+        envelope[4] = 1;
+        envelope[17..21].copy_from_slice(&(16u32).to_be_bytes());
+        envelope[21] = marker;
+        let record_id = memory_sealed_v2_record_id(&owner, created_at, &envelope);
+        let signature = key.sign(&memory_sealed_v2_signature_transcript(
+            &owner, &record_id, created_at, &envelope,
+        ));
+        let body = serde_json::json!({
+            "version": 2,
+            "record_id_b64": BASE64.encode(record_id),
+            "created_at": created_at,
+            "envelope_b64": BASE64.encode(&envelope),
+            "signature_b64": BASE64.encode(signature),
+        });
+        (
+            body.to_string().into_bytes(),
+            record_id,
+            envelope,
+            signature,
+        )
+    }
+
+    fn signed_remote_request(
+        key: &IdentityKeyPair,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Request<Body> {
+        let timestamp = now_secs().to_string();
+        let body_hash = Sha256::digest(&body);
+        let mut hasher = Sha256::new();
+        hasher.update(timestamp.as_bytes());
+        hasher.update(method.as_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(body_hash);
+        let signature = key.sign(&hasher.finalize());
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("x-memchain-publickey", hex::encode(key.public_key_bytes()))
+            .header("x-memchain-timestamp", timestamp)
+            .header("x-memchain-signature", hex::encode(signature))
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn invalid_signature_request(
+        key: &IdentityKeyPair,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Request<Body> {
+        let timestamp = now_secs().to_string();
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("x-memchain-publickey", hex::encode(key.public_key_bytes()))
+            .header("x-memchain-timestamp", timestamp)
+            .header("x-memchain-signature", hex::encode([0u8; 64]))
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[test]
+    fn sealed_v2_record_id_reference_has_one_legacy_or_canonical_grammar() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        let bytes = [9u8; 32];
+        let hex_id = hex::encode(bytes);
+        assert_eq!(decode_record_id_reference(&hex_id), Some(bytes));
+
+        let base64_id = BASE64.encode(bytes);
+        assert_eq!(decode_record_id_reference(&base64_id), Some(bytes));
+        assert!(decode_record_id_reference(base64_id.trim_end_matches('=')).is_none());
+
+        // A 64-character hex spelling is always assigned the legacy grammar;
+        // this removes an otherwise ambiguous overlap with standard base64.
+        let overlap = "a".repeat(64);
+        assert_eq!(decode_record_id_reference(&overlap), Some([0xaa; 32]));
     }
 
     #[tokio::test]
@@ -1796,6 +2237,351 @@ mod tests {
             storage.get(&record.record_id).await.unwrap().status,
             RecordStatus::Revoked
         );
+    }
+
+    #[tokio::test]
+    async fn sealed_v2_ingress_rejects_32769_before_json_parse() {
+        let (mut state, auth, storage) = make_test_state();
+        Arc::get_mut(&mut state).unwrap().allow_remote_storage = true;
+        let request = Request::builder()
+            .uri("/remember_sealed_v2")
+            .method("POST")
+            .body(Body::from(vec![b' '; 32_768]))
+            .unwrap();
+        let response = mpi_remember_sealed_v2(
+            State(Arc::clone(&state)),
+            Extension(auth.clone()),
+            Extension(Arc::clone(&storage)),
+            request,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let request = Request::builder()
+            .uri("/remember_sealed_v2")
+            .method("POST")
+            .body(Body::from(vec![b' '; 32_769]))
+            .unwrap();
+        let response =
+            mpi_remember_sealed_v2(State(state), Extension(auth), Extension(storage), request)
+                .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn sealed_v2_exact_retry_remains_available_at_capacity() {
+        use aeronyx_core::ledger::record::{
+            memory_sealed_v2_record_id, memory_sealed_v2_signature_transcript,
+            MemorySealedV2Envelope, MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES,
+        };
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        let storage = Arc::new(
+            MemoryStorage::open(":memory:", None)
+                .unwrap()
+                .with_growth_admission(Arc::new(AtCapacityAdmission)),
+        );
+        let (mut state, auth, _vector_index) = make_test_state_with_storage(Arc::clone(&storage));
+        Arc::get_mut(&mut state).unwrap().allow_remote_storage = true;
+        let owner = auth.owner_bytes();
+        let mut envelope_bytes = vec![0u8; MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES];
+        envelope_bytes[..4].copy_from_slice(b"AMV2");
+        envelope_bytes[4] = 1;
+        envelope_bytes[17..21].copy_from_slice(&(16u32).to_be_bytes());
+        assert!(MemorySealedV2Envelope::decode(&envelope_bytes).is_ok());
+        let created_at = now_secs();
+        let record_id = memory_sealed_v2_record_id(&owner, created_at, &envelope_bytes);
+        let signature = state.identity.sign(&memory_sealed_v2_signature_transcript(
+            &owner,
+            &record_id,
+            created_at,
+            &envelope_bytes,
+        ));
+        assert!(storage
+            .insert_sealed_v2(&owner, &record_id, created_at, &envelope_bytes, &signature)
+            .await
+            .unwrap()
+            .is_inserted());
+        let body = serde_json::json!({
+            "version": 2,
+            "record_id_b64": BASE64.encode(record_id),
+            "created_at": created_at,
+            "envelope_b64": BASE64.encode(&envelope_bytes),
+            "signature_b64": BASE64.encode(signature),
+        });
+        let request = Request::builder()
+            .uri("/remember_sealed_v2")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response =
+            mpi_remember_sealed_v2(State(state), Extension(auth), Extension(storage), request)
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "exists");
+    }
+
+    #[tokio::test]
+    async fn sealed_v2_router_enforces_remote_owner_quota_without_barring_local_identity() {
+        // [MEMORY-SEALED-V2 2026-10-02 by Codex] Exercise the real unified
+        // auth/router path: remote quota limits new owners, revoked rows keep
+        // their slot, and a local identity entering via signed auth remains
+        // admissible without weakening signature validation.
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let (mut state, _auth, _vector_index) = make_test_state_with_storage(Arc::clone(&storage));
+        {
+            let state_mut = Arc::get_mut(&mut state).unwrap();
+            state_mut.max_remote_owners = 1;
+            state_mut.blind_storage_enabled = true;
+        }
+        let app = crate::api::mpi::build_mpi_router(Arc::clone(&state));
+        let key_a = IdentityKeyPair::generate();
+        let key_b = IdentityKeyPair::generate();
+
+        let (body_a, id_a, _envelope_a, _signature_a) = sealed_v2_body(&key_a, 1);
+        let response = app
+            .clone()
+            .oneshot(signed_remote_request(
+                &key_a,
+                "POST",
+                "/api/mpi/remember_sealed_v2",
+                body_a,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let (body_b, _id_b, _envelope_b, _signature_b) = sealed_v2_body(&key_b, 2);
+        let response = app
+            .clone()
+            .oneshot(signed_remote_request(
+                &key_b,
+                "POST",
+                "/api/mpi/remember_sealed_v2",
+                body_b.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let response = app
+            .clone()
+            .oneshot(signed_remote_request(
+                &key_a,
+                "POST",
+                "/api/mpi/recall",
+                b"{}".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let forget_body = serde_json::json!({
+            "record_id": BASE64.encode(id_a),
+        })
+        .to_string()
+        .into_bytes();
+        let response = app
+            .clone()
+            .oneshot(signed_remote_request(
+                &key_a,
+                "POST",
+                "/api/mpi/forget",
+                forget_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Revoke is a tombstone, not slot release: a new remote owner remains
+        // rejected even though the first owner's recall/forget paths work.
+        let (body_b_retry, _id_b_retry, _envelope_b_retry, _signature_b_retry) =
+            sealed_v2_body(&key_b, 3);
+        let response = app
+            .clone()
+            .oneshot(signed_remote_request(
+                &key_b,
+                "POST",
+                "/api/mpi/remember_sealed_v2",
+                body_b_retry,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // The local key has no durable row yet, but it must not be counted as
+        // a remote owner merely because it used the signed-auth branch.
+        let (body_local, _id_local, _envelope_local, _signature_local) =
+            sealed_v2_body(&state.identity, 4);
+        let response = app
+            .clone()
+            .oneshot(signed_remote_request(
+                &state.identity,
+                "POST",
+                "/api/mpi/remember_sealed_v2",
+                body_local,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .clone()
+            .oneshot(invalid_signature_request(
+                &key_b,
+                "POST",
+                "/api/mpi/remember_sealed_v2",
+                body_b,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sealed_v2_router_rechecks_exact_retry_and_at_capacity_tombstone() {
+        // [MEMORY-SEALED-V2 2026-10-02 by Codex] Full-router coverage keeps
+        // exact retries available while growth admission rejects new rows and
+        // never resurrects a revoked durable identity.
+        let base_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let key = IdentityKeyPair::generate();
+        let (body, record_id, envelope, signature) = sealed_v2_body(&key, 5);
+        // [MEMORY-V2-RELEASE-VERIFY 2026-10-02 by Codex] Persist the signed
+        // timestamp, not a second clock read that can cross a second boundary.
+        let signed_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let created_at = signed_body["created_at"].as_u64().unwrap();
+        assert!(base_storage
+            .insert_sealed_v2(
+                &key.public_key_bytes(),
+                &record_id,
+                created_at,
+                &envelope,
+                &signature,
+            )
+            .await
+            .unwrap()
+            .is_inserted());
+        let storage = Arc::new(
+            Arc::try_unwrap(base_storage)
+                .expect("single storage owner")
+                .with_growth_admission(Arc::new(AtCapacityAdmission)),
+        );
+        let (mut state, _auth, _vector_index) = make_test_state_with_storage(Arc::clone(&storage));
+        Arc::get_mut(&mut state).unwrap().blind_storage_enabled = true;
+        let app = crate::api::mpi::build_mpi_router(Arc::clone(&state));
+
+        let response = app
+            .clone()
+            .oneshot(signed_remote_request(
+                &key,
+                "POST",
+                "/api/mpi/remember_sealed_v2",
+                body.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let new_key = IdentityKeyPair::generate();
+        let (new_body, _new_id, _new_envelope, _new_signature) = sealed_v2_body(&new_key, 6);
+        let response = app
+            .clone()
+            .oneshot(signed_remote_request(
+                &new_key,
+                "POST",
+                "/api/mpi/remember_sealed_v2",
+                new_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+
+        assert!(
+            storage
+                .revoke_sealed_v2(&key.public_key_bytes(), &record_id)
+                .await
+        );
+        let response = app
+            .clone()
+            .oneshot(signed_remote_request(
+                &key,
+                "POST",
+                "/api/mpi/remember_sealed_v2",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn sealed_v2_router_recall_reports_storage_failure_instead_of_empty_success() {
+        // [MEMORY-SEALED-V2 2026-10-02 by Codex] A healthy empty recall is
+        // 200, while a missing V2 table is a bounded 503 through the actual
+        // router; SQL preparation failures must never become fake empties.
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let (mut state, _auth, _vector_index) = make_test_state_with_storage(Arc::clone(&storage));
+        {
+            let state_mut = Arc::get_mut(&mut state).unwrap();
+            state_mut.max_remote_owners = 1;
+            state_mut.blind_storage_enabled = true;
+            state_mut.api_secret = Some("sealed-v2-recall-test".to_string());
+        }
+        let app = crate::api::mpi::build_mpi_router(Arc::clone(&state));
+        let key = IdentityKeyPair::generate();
+        // [MEMORY-V2-RELEASE-VERIFY 2026-10-02 by Codex] Local auth reaches
+        // the recall read path even when the remote quota table is unavailable.
+        let local_recall_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/mpi/recall")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer sealed-v2-recall-test")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+
+        let response = app.clone().oneshot(local_recall_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sealed_v2"], serde_json::json!([]));
+
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute("DROP TABLE memory_sealed_v2", []).unwrap();
+        }
+        let response = app.clone().oneshot(local_recall_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "sealed v2 storage unavailable");
+
+        let (body, _id, _envelope, _signature) = sealed_v2_body(&key, 7);
+        let response = app
+            .oneshot(signed_remote_request(
+                &key,
+                "POST",
+                "/api/mpi/remember_sealed_v2",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "remote capacity unavailable");
     }
 
     #[tokio::test]

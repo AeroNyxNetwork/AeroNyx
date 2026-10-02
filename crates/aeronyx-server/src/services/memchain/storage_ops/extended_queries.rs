@@ -306,20 +306,64 @@ impl MemoryStorage {
 
     pub async fn count_distinct_owners(&self) -> usize {
         let conn = self.conn.lock().await;
-        conn.query_row("SELECT COUNT(DISTINCT owner) FROM records", [], |row| {
-            row.get::<_, i64>(0)
-        })
+        conn.query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT owner FROM records
+                 UNION
+                 SELECT owner FROM memory_sealed_v2
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
         .unwrap_or(0) as usize
     }
 
     pub async fn owner_exists(&self, owner: &[u8; 32]) -> bool {
         let conn = self.conn.lock().await;
         conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM records WHERE owner = ?1 LIMIT 1)",
+            "SELECT EXISTS(SELECT 1 FROM (
+                 SELECT owner FROM records
+                 UNION
+                 SELECT owner FROM memory_sealed_v2
+             ) WHERE owner = ?1)",
             params![owner.as_slice()],
             |row| row.get::<_, bool>(0),
         )
         .unwrap_or(false)
+    }
+
+    // [MEMORY-SEALED-V2 2026-10-02 by Codex] MPI quota admission needs one
+    // SQLite snapshot spanning both durable owner tables.  The local owner is
+    // excluded in SQL, so a missing local row never causes an underflow or an
+    // unconditional subtract-one heuristic.
+    pub(crate) async fn remote_owner_capacity_snapshot(
+        &self,
+        local_owner: &[u8; 32],
+        requester: &[u8; 32],
+    ) -> Result<(usize, bool), String> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "WITH owners AS (
+                 SELECT owner FROM records
+                 UNION
+                 SELECT owner FROM memory_sealed_v2
+             )
+             SELECT
+                 (SELECT COUNT(*) FROM owners WHERE owner != ?1),
+                 EXISTS(SELECT 1 FROM owners WHERE owner = ?2)",
+            params![local_owner.as_slice(), requester.as_slice()],
+            |row| {
+                let remote: i64 = row.get(0)?;
+                let requester_known: bool = row.get(1)?;
+                Ok((remote, requester_known))
+            },
+        )
+        .map_err(|error| format!("owner capacity snapshot: {error}"))
+        .and_then(|(remote, requester_known)| {
+            usize::try_from(remote)
+                .map(|remote| (remote, requester_known))
+                .map_err(|_| "owner capacity overflow".to_string())
+        })
     }
 
     /// Get active records filtered by project_id (context isolation).

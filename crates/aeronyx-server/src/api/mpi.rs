@@ -94,6 +94,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
+use aeronyx_core::ledger::record::MEMORY_SEALED_V2_HTTP_BODY_BYTES;
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
 use crate::services::memchain::mvf::WeightVector;
@@ -600,6 +601,7 @@ fn is_blind_safe_path(path: &str) -> bool {
     matches!(
         path,
         "/api/mpi/remember_sealed"
+            | "/api/mpi/remember_sealed_v2"
             | "/api/mpi/recall"
             | "/api/mpi/recall/detail"
             | "/api/mpi/forget"
@@ -985,7 +987,14 @@ async fn handle_remote_auth(
     let path = req.uri().path().to_string();
     let anonymous_mailbox_source = is_anonymous_mailbox_source_path(&path);
     let (parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+    // [MEMORY-SEALED-V2 2026-10-02 by Codex] Bound the dedicated V2 body
+    // before auth hashing/materialization; legacy V1 keeps its historical cap.
+    let body_limit = if parts.uri.path() == "/api/mpi/remember_sealed_v2" {
+        MEMORY_SEALED_V2_HTTP_BODY_BYTES
+    } else {
+        1024 * 1024
+    };
+    let body_bytes = match axum::body::to_bytes(body, body_limit).await {
         Ok(b) => b,
         Err(_) => {
             return (
@@ -1028,10 +1037,29 @@ async fn handle_remote_auth(
     if !anonymous_mailbox_source {
         if let Some(ref storage) = state.storage {
             if state.max_remote_owners > 0 {
-                let current = storage.count_distinct_owners().await;
-                let remote = current.saturating_sub(1);
-                let exists = storage.owner_exists(&pubkey_bytes).await;
-                if !exists && remote >= state.max_remote_owners {
+                // [MEMORY-SEALED-V2 2026-10-02 by Codex] Quota admission is
+                // one all-status snapshot across legacy and sealed owners;
+                // SQLite errors fail closed instead of silently admitting.
+                let (remote, exists) = match storage
+                    .remote_owner_capacity_snapshot(&state.owner_key, &pubkey_bytes)
+                    .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": "remote capacity unavailable"
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+                // [MEMORY-SEALED-V2 2026-10-02 by Codex] A verified local
+                // identity may enter through this signed branch too, but it
+                // must never consume a remote-owner slot merely because its
+                // durable owner row has not been created yet.
+                if !exists && pubkey_bytes != state.owner_key && remote >= state.max_remote_owners {
                     warn!(
                         "[MPI_AUTH] Remote capacity reached: {}/{}",
                         remote, state.max_remote_owners
@@ -1264,6 +1292,12 @@ fn build_mpi_router_inner(state: Arc<MpiState>, source_routes: Option<Router>) -
         .route(
             "/api/mpi/remember_sealed",
             post(mpi_handlers::mpi_remember_sealed),
+        )
+        .route(
+            // [MEMORY-SEALED-V2 2026-10-02 by Codex] Explicit V2 route avoids
+            // version multiplexing and preserves the legacy V1 endpoint.
+            "/api/mpi/remember_sealed_v2",
+            post(mpi_handlers::mpi_remember_sealed_v2),
         )
         .route("/api/mpi/recall", post(super::recall_handler::mpi_recall))
         .route(

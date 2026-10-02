@@ -47,6 +47,105 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+// [MEMORY-SEALED-V2 2026-10-02 by Codex] V2 is an additive, node-blind
+// envelope contract. The server validates framing and owner-authenticated
+// commitments only; it never derives a content key or parses plaintext.
+pub const MEMORY_SEALED_V2_VERSION: u16 = 2;
+pub const MEMORY_SEALED_V2_SUITE_AES_256_GCM: u8 = 0x01;
+pub const MEMORY_SEALED_V2_MAX_PLAINTEXT_BYTES: usize = 16_384;
+pub const MEMORY_SEALED_V2_MAX_CIPHERTEXT_TAG_BYTES: usize = 16_400;
+pub const MEMORY_SEALED_V2_MAX_ENVELOPE_BYTES: usize = 16_421;
+pub const MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES: usize = 37;
+pub const MEMORY_SEALED_V2_HTTP_BODY_BYTES: usize = 32_768;
+pub const MEMORY_SEALED_V2_MAX_CLOCK_SKEW_SECS: u64 = 300;
+pub const MEMORY_SEALED_V2_MAX_RETENTION_SECS: u64 = 31_536_000;
+const MEMORY_SEALED_V2_HEADER_BYTES: usize = 4 + 1 + 12 + 4;
+const MEMORY_SEALED_V2_TAG_BYTES: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySealedV2Envelope {
+    bytes: Vec<u8>,
+    plaintext_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemorySealedV2DecodeError;
+
+impl MemorySealedV2Envelope {
+    pub fn decode(bytes: &[u8]) -> Result<Self, MemorySealedV2DecodeError> {
+        if !(MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES..=MEMORY_SEALED_V2_MAX_ENVELOPE_BYTES)
+            .contains(&bytes.len())
+            || bytes.get(..4) != Some(b"AMV2")
+            || bytes.get(4) != Some(&MEMORY_SEALED_V2_SUITE_AES_256_GCM)
+        {
+            return Err(MemorySealedV2DecodeError);
+        }
+        let declared = u32::from_be_bytes(
+            bytes[17..21]
+                .try_into()
+                .map_err(|_| MemorySealedV2DecodeError)?,
+        ) as usize;
+        if !(MEMORY_SEALED_V2_TAG_BYTES..=MEMORY_SEALED_V2_MAX_CIPHERTEXT_TAG_BYTES)
+            .contains(&declared)
+            || declared.checked_add(MEMORY_SEALED_V2_HEADER_BYTES) != Some(bytes.len())
+            || declared - MEMORY_SEALED_V2_TAG_BYTES > MEMORY_SEALED_V2_MAX_PLAINTEXT_BYTES
+        {
+            return Err(MemorySealedV2DecodeError);
+        }
+        Ok(Self {
+            bytes: bytes.to_vec(),
+            plaintext_len: declared - MEMORY_SEALED_V2_TAG_BYTES,
+        })
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub fn plaintext_len(&self) -> usize {
+        self.plaintext_len
+    }
+}
+
+/// Stable owner/time AAD transcript. It intentionally does not consume the
+/// record id, envelope digest, or signature, avoiding an encryption cycle.
+pub fn memory_sealed_v2_aad(owner: &[u8; 32], created_at: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(25 + 2 + 1 + 32 + 8);
+    aad.extend_from_slice(b"AeroNyx-Memory-Sealed-V2\0");
+    aad.extend_from_slice(&MEMORY_SEALED_V2_VERSION.to_be_bytes());
+    aad.push(MEMORY_SEALED_V2_SUITE_AES_256_GCM);
+    aad.extend_from_slice(owner);
+    aad.extend_from_slice(&created_at.to_be_bytes());
+    aad
+}
+
+pub fn memory_sealed_v2_record_id(owner: &[u8; 32], created_at: u64, envelope: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"aeronyx.memory.record.v2\0");
+    h.update(owner);
+    h.update(created_at.to_be_bytes());
+    h.update(envelope);
+    h.finalize().into()
+}
+
+pub fn memory_sealed_v2_signature_transcript(
+    owner: &[u8; 32],
+    record_id: &[u8; 32],
+    created_at: u64,
+    envelope: &[u8],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"aeronyx.memory.remember.v2\0");
+    h.update(owner);
+    h.update(record_id);
+    h.update(created_at.to_be_bytes());
+    h.update((envelope.len() as u32).to_be_bytes());
+    h.update(envelope);
+    h.finalize().into()
+}
+
 // ============================================
 // Serde helpers for [u8; 64]
 // ============================================
@@ -632,5 +731,51 @@ mod tests {
         r.negative_feedback = 2;
         let s = format!("{}", r);
         assert!(s.contains("fb=5/2"), "Display should show feedback: {}", s);
+    }
+
+    #[test]
+    fn sealed_v2_frame_bounds_and_transcript_are_stable() {
+        let mut frame = Vec::with_capacity(MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES);
+        frame.extend_from_slice(b"AMV2");
+        frame.push(MEMORY_SEALED_V2_SUITE_AES_256_GCM);
+        frame.extend_from_slice(&[7u8; 12]);
+        frame.extend_from_slice(&(16u32).to_be_bytes());
+        frame.extend_from_slice(&[0u8; 16]);
+        let parsed = MemorySealedV2Envelope::decode(&frame).unwrap();
+        assert_eq!(parsed.plaintext_len(), 0);
+        assert_eq!(parsed.as_bytes(), frame.as_slice());
+
+        let owner = [3u8; 32];
+        let id = memory_sealed_v2_record_id(&owner, 17, &frame);
+        assert_eq!(id, memory_sealed_v2_record_id(&owner, 17, &frame));
+        assert_ne!(id, memory_sealed_v2_record_id(&owner, 18, &frame));
+        assert_ne!(
+            memory_sealed_v2_aad(&owner, 17),
+            memory_sealed_v2_aad(&owner, 18)
+        );
+        assert_ne!(
+            memory_sealed_v2_signature_transcript(&owner, &id, 17, &frame),
+            memory_sealed_v2_signature_transcript(&owner, &id, 17, b"tampered")
+        );
+    }
+
+    #[test]
+    fn sealed_v2_frame_rejects_trailing_and_oversize_bytes() {
+        let mut frame = vec![0u8; MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES];
+        frame[..4].copy_from_slice(b"AMV2");
+        frame[4] = MEMORY_SEALED_V2_SUITE_AES_256_GCM;
+        frame[17..21].copy_from_slice(&(16u32).to_be_bytes());
+        assert!(MemorySealedV2Envelope::decode(&frame).is_ok());
+        frame.push(0);
+        assert!(MemorySealedV2Envelope::decode(&frame).is_err());
+
+        let mut max = vec![0u8; MEMORY_SEALED_V2_MAX_ENVELOPE_BYTES];
+        max[..4].copy_from_slice(b"AMV2");
+        max[4] = MEMORY_SEALED_V2_SUITE_AES_256_GCM;
+        max[17..21]
+            .copy_from_slice(&(MEMORY_SEALED_V2_MAX_CIPHERTEXT_TAG_BYTES as u32).to_be_bytes());
+        assert!(MemorySealedV2Envelope::decode(&max).is_ok());
+        max.push(0);
+        assert!(MemorySealedV2Envelope::decode(&max).is_err());
     }
 }
