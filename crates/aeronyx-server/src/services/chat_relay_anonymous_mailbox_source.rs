@@ -6,15 +6,18 @@
 //! This default-off building block prepares one immutable blind-relay request
 //! for one receiver-provided, descriptor-pinned custody node. It does not own
 //! HTTP, server startup, client APIs, discovery, or any participant identity.
-//! All methods are synchronous deliberately: a future composition root must
-//! invoke the SQLite-backed journal through an explicit blocking boundary.
+//! Journal methods are synchronous: callers use an explicit blocking boundary.
+//! The shared execution registry admits bounded asynchronous per-route work.
 //!
 //! ## Last Modified
 //! v1.0.1-TicketTargetGuard — Reject an inner TicketIssue target mismatch
 //! before journal admission and on durable record recovery.
+//! [MAILBOX-SOURCE-COALESCING 2026-10-01 by Codex] Bound and serialize
+//! process-local exact-route executions without changing durable replay state.
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -78,6 +81,82 @@ const BODY_COMMITMENT_DOMAIN: &[u8] = b"aeronyx/anonymous-mailbox/source-body/v1
 // Unresolved phases deliberately retain NULL forever and cannot be age-cleaned.
 const SOURCE_JOURNAL_SCHEMA_VERSION: i64 = 2;
 const PEER_BLIND_RELAY_PATH: &str = "/api/chat/peer/blind-relay";
+
+// [MAILBOX-SOURCE-COALESCING 2026-10-01 by Codex] Independent hard ceiling
+// for active AND waiting executions across router clones. Normal requests
+// also retain the existing configured API admission limit. No identifiers
+// survive idle-lane reclamation or enter diagnostics.
+const MAX_SOURCE_EXECUTIONS: usize = 1024;
+
+struct SourceExecutionRegistry {
+    lanes: Mutex<HashMap<[u8; 16], Weak<tokio::sync::Semaphore>>>,
+    capacity: Arc<tokio::sync::Semaphore>,
+    limit: usize,
+    #[cfg(test)]
+    waiters: std::sync::atomic::AtomicUsize,
+}
+
+/// Owned asynchronous permits, never a synchronous mutex guard. Intentionally
+/// not Debug: its lifetime represents private request execution state.
+pub(crate) struct SourceExecutionPermit {
+    _route: tokio::sync::OwnedSemaphorePermit,
+    _capacity: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[cfg(test)]
+struct SourceExecutionWaiter<'a>(&'a std::sync::atomic::AtomicUsize);
+
+#[cfg(test)]
+impl Drop for SourceExecutionWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl SourceExecutionRegistry {
+    fn new(limit: usize) -> Self {
+        Self {
+            lanes: Mutex::new(HashMap::new()),
+            capacity: Arc::new(tokio::sync::Semaphore::new(limit)),
+            limit,
+            #[cfg(test)]
+            waiters: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    async fn acquire(&self, route_id: [u8; 16]) -> Option<SourceExecutionPermit> {
+        let capacity = self.capacity.clone().try_acquire_owned().ok()?;
+        let lane = {
+            // This guard is released BEFORE the only await. Different route
+            // IDs never share an execution lane, including hash collisions.
+            let mut lanes = self.lanes.lock();
+            if let Some(lane) = lanes.get(&route_id).and_then(Weak::upgrade) {
+                lane
+            } else {
+                if lanes.len() >= self.limit {
+                    lanes.retain(|_, lane| lane.strong_count() != 0);
+                }
+                if lanes.len() >= self.limit {
+                    return None;
+                }
+                let lane = Arc::new(tokio::sync::Semaphore::new(1));
+                lanes.insert(route_id, Arc::downgrade(&lane));
+                lane
+            }
+        };
+        #[cfg(test)]
+        let _waiting = {
+            self.waiters
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SourceExecutionWaiter(&self.waiters)
+        };
+        let route = lane.acquire_owned().await.ok()?;
+        Some(SourceExecutionPermit {
+            _route: route,
+            _capacity: capacity,
+        })
+    }
+}
 
 #[cfg(test)]
 const SOURCE_JOURNAL_CRASH_PHASE_ENV: &str = "AERONYX_TEST_ANONYMOUS_MAILBOX_SOURCE_CRASH_PHASE";
@@ -1070,9 +1149,30 @@ pub(crate) struct AnonymousMailboxSourceCoordinator {
     source_identity: Arc<IdentityKeyPair>,
     resolver: Arc<dyn ExactAnonymousMailboxTargetResolver>,
     journal: Arc<SqliteAnonymousMailboxSourceJournal>,
+    executions: SourceExecutionRegistry,
 }
 
 impl AnonymousMailboxSourceCoordinator {
+    // [MAILBOX-SOURCE-COALESCING 2026-10-01 by Codex] Test-only observation
+    // makes duplicate-arrival ordering explicit without a timer-based race.
+    #[cfg(test)]
+    pub(crate) fn execution_waiters(&self) -> usize {
+        self.executions
+            .waiters
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Acquire before prepare/result/dispatch and retain through completion.
+    /// Busy admission has no journal/network effect. This process-local guard
+    /// does not replace durable CAS or promise exactly-once network delivery
+    /// across cancellation, timeout or restart.
+    pub(crate) async fn acquire_execution(
+        &self,
+        route_id: [u8; 16],
+    ) -> Option<SourceExecutionPermit> {
+        self.executions.acquire(route_id).await
+    }
+
     #[must_use]
     pub(crate) fn new(
         source_identity: Arc<IdentityKeyPair>,
@@ -1083,6 +1183,7 @@ impl AnonymousMailboxSourceCoordinator {
             source_identity,
             resolver,
             journal,
+            executions: SourceExecutionRegistry::new(MAX_SOURCE_EXECUTIONS),
         }
     }
 
@@ -2087,6 +2188,31 @@ mod tests {
     use aeronyx_core::protocol::discovery::{NodeCapability, NodeDescriptor, NodeProtocolFeature};
 
     const NOW: u64 = 1_800_000_000;
+
+    // [MAILBOX-SOURCE-COALESCING 2026-10-01 by Codex] Active work and
+    // queued duplicates share one fixed budget; cancellation reclaims it.
+    #[tokio::test]
+    async fn source_coalescing_bounds_waiters_and_reclaims_idle_lanes() {
+        let registry = SourceExecutionRegistry::new(3);
+        let first = registry.acquire([1; 16]).await.unwrap();
+        let mut duplicate = Box::pin(registry.acquire([1; 16]));
+        assert!(futures::poll!(duplicate.as_mut()).is_pending());
+        assert_eq!(registry.waiters.load(Ordering::Relaxed), 1);
+        let other = registry.acquire([2; 16]).await.unwrap();
+        assert!(registry.acquire([3; 16]).await.is_none());
+        assert_eq!(registry.lanes.lock().len(), 2);
+        drop(duplicate);
+        assert_eq!(registry.waiters.load(Ordering::Relaxed), 0);
+        let third = registry.acquire([3; 16]).await.unwrap();
+        drop((first, other, third));
+        for id in 4..20 {
+            let permit = registry.acquire([id; 16]).await.unwrap();
+            assert!(registry.lanes.lock().len() <= 3);
+            drop(permit);
+        }
+        assert_eq!(registry.capacity.available_permits(), 3);
+    }
+
     const SOURCE_CRASH_STAGE_ENV: &str = "AERONYX_TEST_ANONYMOUS_MAILBOX_SOURCE_STAGE";
     const SOURCE_CRASH_DB_ENV: &str = "AERONYX_TEST_ANONYMOUS_MAILBOX_SOURCE_DB";
     const SOURCE_CRASH_WORKER: &str = concat!(

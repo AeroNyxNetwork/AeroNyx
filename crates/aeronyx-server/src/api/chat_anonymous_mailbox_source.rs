@@ -8,6 +8,8 @@
 //! before every outbound attempt, and persists retry/one-shot state in the
 //! source journal. The caller supplies neither an endpoint nor a raw peer
 //! carrier, so it cannot steer transport or cause fanout.
+//! [MAILBOX-SOURCE-COALESCING 2026-10-01 by Codex] Concurrent exact retries
+//! share a bounded coordinator execution lane through durable completion.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +35,7 @@ use crate::api::{decode_bounded_json_response, BLIND_RELAY_ACK_RESPONSE_MAX_BYTE
 use crate::config_chat_relay::AnonymousMailboxSourceConfig;
 use crate::services::chat_relay_anonymous_mailbox_source::{
     AnonymousMailboxSourceCoordinator, AnonymousMailboxSourceError, AnonymousMailboxSourceResult,
-    ExactAnonymousMailboxTargetPin,
+    ExactAnonymousMailboxTargetPin, SourceExecutionPermit,
 };
 
 const SOURCE_SUBMIT_VERSION: u8 = 1;
@@ -53,6 +55,14 @@ struct SourceApiState {
     client: Arc<reqwest::Client>,
     admission: Arc<Semaphore>,
     timeout: Duration,
+}
+
+// [MAILBOX-SOURCE-COALESCING 2026-10-01 by Codex] Blocking closures retain
+// BOTH permits if their HTTP future is cancelled. Neither is a mutex guard;
+// async transport never holds the journal or registry's synchronous mutex.
+struct SourceApiExecution {
+    _admission: tokio::sync::OwnedSemaphorePermit,
+    _route: SourceExecutionPermit,
 }
 
 /// Builds the VPN-only source composition router. `server.rs` mounts this
@@ -169,20 +179,33 @@ async fn submit(
     // participate in the anonymous mailbox protocol and is dropped before any
     // journal, descriptor, route or network action to avoid an identity link.
     drop(_owner);
-    let _permit = state
+    let permit = state
         .admission
         .clone()
         .try_acquire_owned()
         .map_err(|_| SourceApiFailure::busy())?;
     let (route_id, pin, terminal_frame) = parse_submit(input)?;
+    // Re-read the exact durable result AFTER waiting for the current attempt.
+    // Different claims still pass prepare's commitment comparison; they must
+    // never inherit a successful result merely because the route ID matches.
+    let execution = Arc::new(SourceApiExecution {
+        _route: state
+            .coordinator
+            .acquire_execution(route_id)
+            .await
+            .ok_or_else(SourceApiFailure::busy)?,
+        _admission: permit,
+    });
     let now = unix_now_secs();
     let coordinator = Arc::clone(&state.coordinator);
-    let prepared =
-        run_blocking(move || coordinator.prepare(pin, route_id, terminal_frame, now)).await?;
+    let prepared = run_blocking(&execution, move || {
+        coordinator.prepare(pin, route_id, terminal_frame, now)
+    })
+    .await?;
     let route_id = prepared.route_id();
 
     let coordinator = Arc::clone(&state.coordinator);
-    match run_blocking(move || coordinator.result(route_id)).await? {
+    match run_blocking(&execution, move || coordinator.result(route_id)).await? {
         AnonymousMailboxSourceResult::Completed(response) => return Ok(completed(response)),
         AnonymousMailboxSourceResult::Ambiguous => return Err(SourceApiFailure::ambiguous()),
         AnonymousMailboxSourceResult::Rejected => return Err(SourceApiFailure::conflict()),
@@ -190,8 +213,10 @@ async fn submit(
     }
 
     let coordinator = Arc::clone(&state.coordinator);
-    let outbound =
-        run_blocking(move || coordinator.begin_dispatch(route_id, unix_now_secs())).await?;
+    let outbound = run_blocking(&execution, move || {
+        coordinator.begin_dispatch(route_id, unix_now_secs())
+    })
+    .await?;
     let response = state
         .client
         .post(outbound.url().clone())
@@ -212,14 +237,18 @@ async fn submit(
             Ok(response) => response,
             Err(()) => {
                 let coordinator = Arc::clone(&state.coordinator);
-                let _ = run_blocking(move || coordinator.mark_ambiguous(route_id)).await;
+                let _ =
+                    run_blocking(&execution, move || coordinator.mark_ambiguous(route_id)).await;
                 return Err(SourceApiFailure::ambiguous());
             }
         };
     let coordinator = Arc::clone(&state.coordinator);
-    run_blocking(move || coordinator.open_response(route_id, &sealed_response)).await?;
+    run_blocking(&execution, move || {
+        coordinator.open_response(route_id, &sealed_response)
+    })
+    .await?;
     let coordinator = Arc::clone(&state.coordinator);
-    match run_blocking(move || coordinator.result(route_id)).await? {
+    match run_blocking(&execution, move || coordinator.result(route_id)).await? {
         AnonymousMailboxSourceResult::Completed(response) => Ok(completed(response)),
         AnonymousMailboxSourceResult::Ambiguous => Err(SourceApiFailure::ambiguous()),
         _ => Err(SourceApiFailure::unavailable()),
@@ -334,15 +363,20 @@ fn validate_terminal_response(
 }
 
 async fn run_blocking<T>(
+    execution: &Arc<SourceApiExecution>,
     operation: impl FnOnce() -> Result<T, AnonymousMailboxSourceError> + Send + 'static,
 ) -> Result<T, SourceApiFailure>
 where
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
-        .await
-        .map_err(|_| SourceApiFailure::unavailable())?
-        .map_err(map_source_error)
+    let execution = Arc::clone(execution);
+    tokio::task::spawn_blocking(move || {
+        let _execution = execution;
+        operation()
+    })
+    .await
+    .map_err(|_| SourceApiFailure::unavailable())?
+    .map_err(map_source_error)
 }
 
 fn map_source_error(error: AnonymousMailboxSourceError) -> SourceApiFailure {
@@ -1845,6 +1879,117 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn source_coalescing_cancellation_retains_permits_until_blocking_work_exits() {
+        // [MAILBOX-SOURCE-COALESCING 2026-10-01 by Codex] A cancelled
+        // HTTP future cannot release its lane while SQLite work still runs.
+        let fixture = source_router_fixture();
+        let admission = Arc::new(Semaphore::new(1));
+        let execution = Arc::new(SourceApiExecution {
+            _route: fixture
+                .coordinator
+                .acquire_execution(fixture.route_id)
+                .await
+                .unwrap(),
+            _admission: admission.clone().try_acquire_owned().unwrap(),
+        });
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            run_blocking(&execution, move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                Ok(())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert_eq!(admission.available_permits(), 0);
+        let mut waiting = Box::pin(fixture.coordinator.acquire_execution(fixture.route_id));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        release_tx.send(()).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .unwrap();
+        assert!(next.is_some());
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn source_router_coalesces_concurrent_exact_retries_without_global_serialization() {
+        // [MAILBOX-SOURCE-COALESCING 2026-10-01 by Codex] The first reply
+        // stays withheld until its duplicate is queued and another route has
+        // completed. No timer releases replies or establishes ordering.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut fixture = source_router_fixture();
+            fixture.config.max_in_flight = 4;
+            fixture.config.request_timeout_secs = 25;
+            let signer = IdentityKeyPair::from_bytes(&[0xBD; 32]).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let app = source_app(source_mpi_state(), &fixture, loopback_proxy_client(&listener));
+            let body = submit_body(fixture.route_id, fixture.commitment, &fixture.terminal_frame);
+            let request = |bytes: Vec<u8>| signed_remote_request(
+                Method::POST, ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH, &bytes, bytes.clone(), &signer,
+            );
+            let first = tokio::spawn(app.clone().oneshot(request(body.clone())));
+            let (mut first_stream, _) = listener.accept().await.unwrap();
+            let (_, first_peer_body) = read_proxy_request(&mut first_stream).await;
+            let (first_reply, _) = terminal_peer_response(&first_peer_body, &fixture.target);
+
+            let duplicate = tokio::spawn(app.clone().oneshot(request(body)));
+            tokio::select! {
+                connection = listener.accept() => {
+                    connection.unwrap();
+                    panic!("identical concurrent request dispatched twice while first response was held");
+                }
+                () = async {
+                    while fixture.coordinator.execution_waiters() != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+
+            // A different frame with the same route must not share success.
+            let conflicting_frame = canonical_ticket_terminal(&fixture.target, [0xCA; 16], unix_now_secs());
+            let conflict_body = submit_body(fixture.route_id, fixture.commitment, &conflicting_frame);
+            let conflict = tokio::spawn(app.clone().oneshot(request(conflict_body)));
+            while fixture.coordinator.execution_waiters() != 2 {
+                tokio::task::yield_now().await;
+            }
+
+            // The first route is still awaiting its reply. A second route
+            // must reach its terminal and finish independently.
+            let other_body = submit_body([0xCB; 16], fixture.commitment, &conflicting_frame);
+            let other = tokio::spawn(app.oneshot(request(other_body)));
+            let (mut other_stream, _) = listener.accept().await.unwrap();
+            let (_, other_peer_body) = read_proxy_request(&mut other_stream).await;
+            let other_request: PeerBlindRelayRequest = serde_json::from_slice(&other_peer_body).unwrap();
+            assert_eq!(other_request.envelope.route_id, [0xCB; 16]);
+            let (other_reply, _) = terminal_peer_response(&other_peer_body, &fixture.target);
+            write_peer_response(&mut other_stream, &other_reply).await;
+            assert_eq!(other.await.unwrap().unwrap().status(), StatusCode::OK);
+            assert!(!first.is_finished());
+            assert!(!duplicate.is_finished());
+
+            write_peer_response(&mut first_stream, &first_reply).await;
+            let first_response = first.await.unwrap().unwrap();
+            let duplicate_response = duplicate.await.unwrap().unwrap();
+            assert_eq!(first_response.status(), StatusCode::OK);
+            assert_eq!(duplicate_response.status(), StatusCode::OK);
+            assert_eq!(
+                axum::body::to_bytes(first_response.into_body(), SOURCE_SUBMIT_BODY_MAX_BYTES).await.unwrap(),
+                axum::body::to_bytes(duplicate_response.into_body(), SOURCE_SUBMIT_BODY_MAX_BYTES).await.unwrap(),
+            );
+            assert_eq!(conflict.await.unwrap().unwrap().status(), StatusCode::CONFLICT);
+            assert_eq!(fixture.coordinator.execution_waiters(), 0);
+            assert_eq!(fixture.resolver.unexpected_calls.load(Ordering::Relaxed), 0);
+            // Exactly two connections were accepted: one per distinct route.
+            assert_no_proxy_connection(&listener).await;
+        }).await.expect("bounded coalescing regression");
     }
 
     #[tokio::test]
