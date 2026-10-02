@@ -306,21 +306,12 @@ async fn handle_chat_pull_http(
     let cursor = request.cursor;
     let after_timestamp = request.after_timestamp;
     let limit = request.limit;
-    let permit = state
-        .admission
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ChatHttpFailure::Busy)?;
-    let operation = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+    let page = run_chat_blocking(&state, move || {
         relay
-            .pull_pending_v2(&receiver, after_timestamp, &cursor, limit)
+            .pull_pending_v2_http(&receiver, after_timestamp, &cursor, limit)
             .map_err(|_| ())
-    });
-    let page = tokio::time::timeout(state.timeout, operation)
-        .await
-        .map_err(|_| ChatHttpFailure::Unavailable)?
-        .map_err(|_| ChatHttpFailure::Unavailable)?;
+    })
+    .await?;
     let response = MemChainMessage::ChatPullResponseV2 {
         envelopes: page
             .messages
@@ -352,6 +343,18 @@ async fn handle_chat_ack_http(
     let relay = Arc::clone(&state.relay);
     let wallet = request.wallet;
     let message_ids = request.message_ids;
+    let deleted = run_chat_blocking(&state, move || {
+        relay.ack_messages(&message_ids, &wallet).map_err(|_| ())
+    })
+    .await?;
+    Ok((StatusCode::OK, Json(json!({ "deleted": deleted }))).into_response())
+}
+
+async fn run_chat_blocking<T, F>(state: &ChatHttpState, operation: F) -> Result<T, ChatHttpFailure>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ()> + Send + 'static,
+{
     let permit = state
         .admission
         .clone()
@@ -359,13 +362,13 @@ async fn handle_chat_ack_http(
         .map_err(|_| ChatHttpFailure::Busy)?;
     let operation = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        relay.ack_messages(&message_ids, &wallet).map_err(|_| ())
+        operation()
     });
-    let deleted = tokio::time::timeout(state.timeout, operation)
+    tokio::time::timeout(state.timeout, operation)
         .await
         .map_err(|_| ChatHttpFailure::Unavailable)?
-        .map_err(|_| ChatHttpFailure::Unavailable)?;
-    Ok((StatusCode::OK, Json(json!({ "deleted": deleted }))).into_response())
+        .map_err(|_| ChatHttpFailure::Unavailable)?
+        .map_err(|_| ChatHttpFailure::Unavailable)
 }
 
 fn decode_canonical_http<T>(body: &[u8]) -> Result<T, ChatHttpFailure>
@@ -1113,6 +1116,38 @@ mod tests {
         drop(held);
     }
 
+    #[tokio::test]
+    async fn timed_out_blocking_pull_keeps_permit_until_worker_finishes() {
+        let state = ChatHttpState {
+            relay: make_relay(),
+            admission: Arc::new(Semaphore::new(1)),
+            timeout: Duration::from_millis(1),
+        };
+        let admission = Arc::clone(&state.admission);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let result = run_chat_blocking(&state, move || {
+            release_rx.recv().expect("release blocking worker");
+            Ok::<_, ()>(())
+        })
+        .await;
+        assert!(matches!(result, Err(ChatHttpFailure::Unavailable)));
+        assert!(admission.clone().try_acquire_owned().is_err());
+        release_tx.send(()).expect("release worker");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(admission.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn blocking_storage_failure_maps_to_coarse_unavailable() {
+        let state = ChatHttpState {
+            relay: make_relay(),
+            admission: Arc::new(Semaphore::new(1)),
+            timeout: Duration::from_secs(1),
+        };
+        let result = run_chat_blocking(&state, || Err::<usize, ()>(())).await;
+        assert!(matches!(result, Err(ChatHttpFailure::Unavailable)));
+    }
+
     #[test]
     fn chat_blob_logs_stay_free_of_routing_identifiers() {
         let source = include_str!("chat_handlers.rs");
@@ -1176,7 +1211,7 @@ mod tests {
             .find("let mut vpn_source_router = axum::Router::new()")
             .expect("authenticated source group");
         assert!(public_prefix < source_group);
-        assert!(!source[..source_group].contains("build_chat_pull_http_router"));
+        assert!(!source[public_prefix..source_group].contains("build_chat_pull_http_router"));
     }
 
     #[tokio::test]

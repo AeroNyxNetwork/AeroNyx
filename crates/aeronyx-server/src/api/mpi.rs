@@ -133,6 +133,25 @@ use super::supernode_handlers;
 
 pub(crate) const AUTH_TIMESTAMP_TOLERANCE_SECS: u64 = 300;
 
+// [CHAT-HTTP-RELIABLE-PULL 2026-10-03 by Codex] The unified remote-auth
+// middleware hashes request bodies before the handler's route layer runs.
+// Keep the two reliable chat requests at their canonical 4 KiB ceiling here,
+// so an unauthenticated/invalid remote request cannot retain the historical
+// 1 MiB pre-auth buffer.
+const CHAT_PULL_HTTP_PATH: &str = "/api/mpi/chat/pull_v2";
+const CHAT_ACK_HTTP_PATH: &str = "/api/mpi/chat/ack_v2";
+const CHAT_HTTP_REQUEST_MAX_BYTES: usize = 4 * 1024;
+
+fn unified_request_body_limit(path: &str) -> usize {
+    if matches!(path, CHAT_PULL_HTTP_PATH | CHAT_ACK_HTTP_PATH) {
+        CHAT_HTTP_REQUEST_MAX_BYTES
+    } else if path == "/api/mpi/remember_sealed_v2" {
+        MEMORY_SEALED_V2_HTTP_BODY_BYTES
+    } else {
+        1024 * 1024
+    }
+}
+
 // ============================================
 // Mode Enum
 // ============================================
@@ -474,6 +493,29 @@ mod session_embedding_cache_tests {
     use super::*;
 
     #[test]
+    fn reliable_chat_http_body_limit_applies_before_remote_auth_buffering() {
+        assert_eq!(
+            unified_request_body_limit(CHAT_PULL_HTTP_PATH),
+            CHAT_HTTP_REQUEST_MAX_BYTES
+        );
+        assert_eq!(
+            unified_request_body_limit(CHAT_ACK_HTTP_PATH),
+            CHAT_HTTP_REQUEST_MAX_BYTES
+        );
+        assert_eq!(unified_request_body_limit("/api/mpi/remember"), 1024 * 1024);
+    }
+
+    #[test]
+    fn reliable_chat_http_is_privacy_sensitive_without_opening_other_routes() {
+        assert!(is_privacy_sensitive_mpi_path(CHAT_PULL_HTTP_PATH));
+        assert!(is_privacy_sensitive_mpi_path(CHAT_ACK_HTTP_PATH));
+        assert!(is_privacy_sensitive_mpi_path(
+            ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH
+        ));
+        assert!(!is_privacy_sensitive_mpi_path("/api/mpi/remember"));
+    }
+
+    #[test]
     fn anonymous_mailbox_source_path_is_closed_and_exact() {
         assert!(is_anonymous_mailbox_source_path(
             ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH
@@ -570,6 +612,110 @@ mod session_embedding_cache_tests {
         assert!(!cache.entries.contains_key(&session_a));
         assert!(cache.entries.contains_key(&session_b));
         assert!(cache.entries.contains_key(&session_c));
+    }
+}
+
+#[cfg(test)]
+mod reliable_chat_http_route_tests {
+    use super::*;
+    use axum::{body::Body, http::Request, routing::post, Router};
+    use sha2::{Digest, Sha256};
+    use tower::ServiceExt;
+
+    fn local_state(allow_remote_storage: bool) -> (Arc<MpiState>, IdentityKeyPair) {
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).expect("storage"));
+        let vector_index = Arc::new(VectorIndex::new());
+        let identity = IdentityKeyPair::generate();
+        let owner = identity.public_key_bytes();
+        let state = MpiState::local(
+            storage,
+            vector_index,
+            identity.clone(),
+            RwLock::new(HashMap::new()),
+            AtomicBool::new(true),
+            Arc::new(RwLock::new(HashMap::new())),
+            0.0,
+            false,
+            RwLock::new(SessionEmbeddingCache::default()),
+            RwLock::new(None),
+            owner,
+            Some("test-secret".to_string()),
+            None,
+            allow_remote_storage,
+            false,
+            0,
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        (Arc::new(state), identity)
+    }
+
+    #[tokio::test]
+    async fn reliable_chat_http_is_source_only_and_unified_auth_precedes_handler() {
+        let (state, identity) = local_state(true);
+        let source = Router::new().route(
+            CHAT_PULL_HTTP_PATH,
+            post(|| async { StatusCode::NO_CONTENT }),
+        );
+        let vpn_app = build_mpi_router_with_source(Arc::clone(&state), source);
+
+        let unauthenticated = vpn_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(CHAT_PULL_HTTP_PATH)
+                    .body(Body::from(vec![0u8; 8]))
+                    .unwrap(),
+            )
+            .await
+            .expect("unauthenticated response");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let timestamp = now_secs().to_string();
+        let body = vec![0xA5u8; CHAT_HTTP_REQUEST_MAX_BYTES + 1];
+        let body_hash: [u8; 32] = Sha256::digest(&body).into();
+        let mut signed = Sha256::new();
+        signed.update(timestamp.as_bytes());
+        signed.update(b"POST");
+        signed.update(CHAT_PULL_HTTP_PATH.as_bytes());
+        signed.update(body_hash);
+        let signature = identity.sign(&signed.finalize());
+        let oversized = vpn_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(CHAT_PULL_HTTP_PATH)
+                    .header(
+                        "x-memchain-publickey",
+                        hex::encode(identity.public_key_bytes()),
+                    )
+                    .header("x-memchain-timestamp", &timestamp)
+                    .header("x-memchain-signature", hex::encode(signature))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("oversized response");
+        assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+
+        let node_app = build_mpi_router(state);
+        let absent = node_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(CHAT_PULL_HTTP_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("node route response");
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
     }
 }
 
@@ -683,7 +829,7 @@ async fn handle_saas_jwt_auth(
     mut req: Request<axum::body::Body>,
     next: Next,
 ) -> axum::response::Response {
-    let anonymous_mailbox_source = is_anonymous_mailbox_source_path(req.uri().path());
+    let privacy_sensitive_path = is_privacy_sensitive_mpi_path(req.uri().path());
     // ── 1. Extract Bearer JWT ─────────────────────────────────────────
     let token = match extract_bearer_token(req.headers()) {
         Some(t) => t,
@@ -730,15 +876,15 @@ async fn handle_saas_jwt_auth(
     let owner = match parse_pubkey_hex(&claims.sub) {
         Ok(b) => b,
         Err(e) => {
-            if anonymous_mailbox_source {
-                warn!("[MPI_AUTH_SAAS] Invalid anonymous-mailbox source claim");
+            if privacy_sensitive_path {
+                warn!("[MPI_AUTH_SAAS] Invalid privacy-sensitive chat claim");
             } else {
                 warn!(
                     sub = &claims.sub[..8.min(claims.sub.len())],
                     "[MPI_AUTH_SAAS] Invalid sub claim"
                 );
             }
-            let error = if anonymous_mailbox_source {
+            let error = if privacy_sensitive_path {
                 "invalid token claims".to_owned()
             } else {
                 format!("invalid token claims: {e}")
@@ -756,7 +902,7 @@ async fn handle_saas_jwt_auth(
     // vector index, or activity row would turn an anonymous transport action
     // into an owner-linked durable side effect. Other MPI endpoints retain
     // their historical provisioning behavior.
-    let owner_resources = if anonymous_mailbox_source {
+    let owner_resources = if privacy_sensitive_path {
         None
     } else {
         // ── 4. Get or create per-user Storage from pool ───────────────
@@ -840,6 +986,7 @@ async fn handle_remote_auth(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> axum::response::Response {
+    let privacy_sensitive_path = is_privacy_sensitive_mpi_path(req.uri().path());
     let pubkey_hex = match req
         .headers()
         .get("x-memchain-publickey")
@@ -985,15 +1132,10 @@ async fn handle_remote_auth(
 
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
-    let anonymous_mailbox_source = is_anonymous_mailbox_source_path(&path);
     let (parts, body) = req.into_parts();
     // [MEMORY-SEALED-V2 2026-10-02 by Codex] Bound the dedicated V2 body
     // before auth hashing/materialization; legacy V1 keeps its historical cap.
-    let body_limit = if parts.uri.path() == "/api/mpi/remember_sealed_v2" {
-        MEMORY_SEALED_V2_HTTP_BODY_BYTES
-    } else {
-        1024 * 1024
-    };
+    let body_limit = unified_request_body_limit(parts.uri.path());
     let body_bytes = match axum::body::to_bytes(body, body_limit).await {
         Ok(b) => b,
         Err(_) => {
@@ -1016,8 +1158,8 @@ async fn handle_remote_auth(
     let signed_msg = msg_hasher.finalize();
 
     if identity_pubkey.verify(&signed_msg, &sig_bytes).is_err() {
-        if anonymous_mailbox_source {
-            warn!("[MPI_AUTH] Anonymous-mailbox source signature verification failed");
+        if privacy_sensitive_path {
+            warn!("[MPI_AUTH] Privacy-sensitive chat signature verification failed");
         } else {
             warn!(
                 "[MPI_AUTH] Ed25519 sig verification failed for {}",
@@ -1034,7 +1176,7 @@ async fn handle_remote_auth(
     }
 
     // Check remote capacity against the single-user storage.
-    if !anonymous_mailbox_source {
+    if !privacy_sensitive_path {
         if let Some(ref storage) = state.storage {
             if state.max_remote_owners > 0 {
                 // [MEMORY-SEALED-V2 2026-10-02 by Codex] Quota admission is
@@ -1077,8 +1219,8 @@ async fn handle_remote_auth(
         }
     }
 
-    if anonymous_mailbox_source {
-        debug!("[MPI_AUTH] Anonymous-mailbox source authenticated");
+    if privacy_sensitive_path {
+        debug!("[MPI_AUTH] Privacy-sensitive chat request authenticated");
     } else {
         debug!(
             "[MPI_AUTH] Remote OK: {} ({} {})",
@@ -1097,7 +1239,7 @@ async fn handle_remote_auth(
 
     // Local mode: inject the single-user storage + vector_index as extensions
     // so that handlers can use the same Extension<> extractor pattern in both modes.
-    if !anonymous_mailbox_source {
+    if !privacy_sensitive_path {
         if let (Some(ref st), Some(ref vi)) = (&state.storage, &state.vector_index) {
             req.extensions_mut().insert(Arc::clone(st));
             req.extensions_mut().insert(Arc::clone(vi));
@@ -1165,7 +1307,7 @@ async fn handle_local_auth(
 
     // Local mode: inject storage + vector_index as extensions for handler
     // consistency (handlers use Extension<> in both Local and SaaS modes).
-    if !is_anonymous_mailbox_source_path(req.uri().path()) {
+    if !is_privacy_sensitive_mpi_path(req.uri().path()) {
         if let (Some(ref st), Some(ref vi)) = (&state.storage, &state.vector_index) {
             req.extensions_mut().insert(Arc::clone(st));
             req.extensions_mut().insert(Arc::clone(vi));
@@ -1178,6 +1320,15 @@ async fn handle_local_auth(
 
 fn is_anonymous_mailbox_source_path(path: &str) -> bool {
     path == ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH
+}
+
+// [CHAT-HTTP-RELIABLE-PULL 2026-10-03 by Codex] Reliable pull/ACK carries a
+// wallet-bound request body. Treat it like the source carrier for diagnostics
+// and SaaS provisioning: neither supplied identity nor owner storage details
+// belong in logs or an unrelated per-owner resource side effect.
+fn is_privacy_sensitive_mpi_path(path: &str) -> bool {
+    is_anonymous_mailbox_source_path(path)
+        || matches!(path, CHAT_PULL_HTTP_PATH | CHAT_ACK_HTTP_PATH)
 }
 
 // ── Helper: extract Bearer token from Authorization header ───────────
