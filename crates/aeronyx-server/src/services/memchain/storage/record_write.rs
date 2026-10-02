@@ -999,6 +999,27 @@ mod sealed_v2_tests {
                 .revoke_sealed_v2(&remote_key.public_key_bytes(), &remote_id)
                 .await
         );
+        // [MEMORY-V2-OWNER-SLOT-TESTS 2026-10-02 by Codex] A revoked exact
+        // retry remains a conflict and cannot resurrect the tombstone.
+        assert_eq!(
+            storage
+                .insert_sealed_v2_with_owner_slot(
+                    &remote_key.public_key_bytes(),
+                    &remote_id,
+                    created_at,
+                    &envelope,
+                    &signature,
+                    policy,
+                )
+                .await
+                .unwrap(),
+            SealedV2InsertOutcome::Conflict
+        );
+        assert!(storage
+            .get_sealed_v2(&remote_key.public_key_bytes(), &remote_id)
+            .await
+            .unwrap()
+            .is_none());
         let rejected = storage
             .insert_with_owner_slot(&v1_record([0xB2; 32], 12), "", policy)
             .await
@@ -1039,19 +1060,26 @@ mod sealed_v2_tests {
             )
             .unwrap();
         }
+        let failed_record = v1_record([0xC1; 32], 21);
+        let failed_id = failed_record.record_id;
         let failed = storage
-            .insert_with_owner_slot(&v1_record([0xC1; 32], 21), "", policy)
+            .insert_with_owner_slot(&failed_record, "", policy)
             .await
             .unwrap_err();
         assert!(!failed.is_at_capacity());
         assert_eq!(storage.total_inserted(), 0);
+        // [MEMORY-V2-OWNER-SLOT-TESTS 2026-10-02 by Codex] A rolled-back
+        // write leaves neither a durable row nor a cache entry, so another
+        // remote owner may consume the still-free slot.
+        assert!(storage.get(&failed_id).await.is_none());
+        assert!(storage.cache.write().get(&failed_id).is_none());
         {
             let conn = storage.conn_lock().await;
             conn.execute("DROP TRIGGER reject_owner_slot_insert", [])
                 .unwrap();
         }
         assert!(storage
-            .insert_with_owner_slot(&v1_record([0xC1; 32], 22), "", policy)
+            .insert_with_owner_slot(&v1_record([0xC2; 32], 22), "", policy)
             .await
             .unwrap());
         assert_eq!(storage.total_inserted(), 1);
