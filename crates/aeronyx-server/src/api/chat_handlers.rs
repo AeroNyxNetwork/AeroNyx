@@ -307,9 +307,7 @@ async fn handle_chat_pull_http(
     let after_timestamp = request.after_timestamp;
     let limit = request.limit;
     let page = run_chat_blocking(&state, move || {
-        relay
-            .pull_pending_v2_http(&receiver, after_timestamp, &cursor, limit)
-            .map_err(|_| ())
+        relay.pull_pending_v2_http(&receiver, after_timestamp, &cursor, limit)
     })
     .await?;
     let response = MemChainMessage::ChatPullResponseV2 {
@@ -343,17 +341,15 @@ async fn handle_chat_ack_http(
     let relay = Arc::clone(&state.relay);
     let wallet = request.wallet;
     let message_ids = request.message_ids;
-    let deleted = run_chat_blocking(&state, move || {
-        relay.ack_messages(&message_ids, &wallet).map_err(|_| ())
-    })
-    .await?;
+    let deleted =
+        run_chat_blocking(&state, move || relay.ack_messages(&message_ids, &wallet)).await?;
     Ok((StatusCode::OK, Json(json!({ "deleted": deleted }))).into_response())
 }
 
 async fn run_chat_blocking<T, F>(state: &ChatHttpState, operation: F) -> Result<T, ChatHttpFailure>
 where
     T: Send + 'static,
-    F: FnOnce() -> Result<T, ()> + Send + 'static,
+    F: FnOnce() -> Result<T, ChatRelayError> + Send + 'static,
 {
     let permit = state
         .admission
@@ -368,7 +364,17 @@ where
         .await
         .map_err(|_| ChatHttpFailure::Unavailable)?
         .map_err(|_| ChatHttpFailure::Unavailable)?
-        .map_err(|_| ChatHttpFailure::Unavailable)
+        .map_err(|error| map_chat_storage_error(&error))
+}
+
+// [CHAT-HTTP-CURSOR-ERROR 2026-10-03 by Codex] Keep a caller's authenticated
+// but invalid opaque cursor distinct from SQLite, corruption, and worker
+// failures. The response remains coarse and contains no cursor details.
+fn map_chat_storage_error(error: &ChatRelayError) -> ChatHttpFailure {
+    match error {
+        ChatRelayError::InvalidPullCursor => ChatHttpFailure::BadRequest,
+        _ => ChatHttpFailure::Unavailable,
+    }
 }
 
 fn decode_canonical_http<T>(body: &[u8]) -> Result<T, ChatHttpFailure>
@@ -1466,6 +1472,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_http_pull_invalid_cursor_is_bad_request_without_mutation() {
+        // [CHAT-HTTP-CURSOR-ERROR 2026-10-03 by Codex] A fresh owner-signed
+        // request with an authenticated but undecryptable cursor is a caller
+        // error, not a transient storage outage. No pending row is touched.
+        let relay = make_relay();
+        let wallet = IdentityKeyPair::generate();
+        let receiver = wallet.public_key_bytes();
+        let mut request: ChatPullHttpRequestV1 =
+            decode_canonical_http(&encode_pull_request(&wallet, receiver, Vec::new()))
+                .expect("decode fresh pull request");
+        request.cursor = vec![0xA5; MAX_CHAT_PULL_CURSOR_V2_BYTES];
+        let version = [request.version];
+        let cursor_len = u16::try_from(request.cursor.len())
+            .expect("bounded cursor length")
+            .to_le_bytes();
+        let after_timestamp = request.after_timestamp.to_le_bytes();
+        let limit = request.limit.to_le_bytes();
+        let timestamp = request.request_timestamp.to_le_bytes();
+        request.signature = wallet
+            .sign(&signed_message_digest(
+                CHAT_PULL_HTTP_DOMAIN,
+                &[
+                    &version,
+                    &request.wallet,
+                    &after_timestamp,
+                    &cursor_len,
+                    &request.cursor,
+                    &limit,
+                    &timestamp,
+                ],
+            ))
+            .to_vec();
+        let body = bincode::options()
+            .with_fixint_encoding()
+            .serialize(&request)
+            .expect("encode invalid-cursor request");
+        let app = build_chat_pull_http_router(Arc::clone(&relay))
+            .layer(Extension(AuthenticatedOwner::Local { owner: receiver }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(CHAT_PULL_HTTP_PATH)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("HTTP response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(relay.storage_usage().unwrap().pending_messages, 0);
+    }
+
+    #[tokio::test]
     async fn authenticated_http_pull_rejects_udp_domain_replay() {
         let relay = make_relay();
         let wallet = IdentityKeyPair::generate();
@@ -1562,7 +1621,7 @@ mod tests {
             started_tx.send(()).expect("worker started");
             release_rx.recv().expect("release blocking worker");
             finished_tx.send(()).expect("worker finished");
-            Ok::<_, ()>(())
+            Ok::<_, ChatRelayError>(())
         })
         .await;
         started_rx.await.expect("observe blocking worker start");
@@ -1586,7 +1645,10 @@ mod tests {
             admission: Arc::new(Semaphore::new(1)),
             timeout: Duration::from_secs(1),
         };
-        let result = run_chat_blocking(&state, || Err::<usize, ()>(())).await;
+        let result = run_chat_blocking(&state, || {
+            Err::<usize, ChatRelayError>(ChatRelayError::CorruptStoredData { field: "test" })
+        })
+        .await;
         assert!(matches!(result, Err(ChatHttpFailure::Unavailable)));
     }
 
