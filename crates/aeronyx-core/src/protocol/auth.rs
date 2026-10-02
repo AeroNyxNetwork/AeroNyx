@@ -231,6 +231,282 @@ mod tests {
     use super::*;
     use crate::crypto::IdentityKeyPair;
 
+    // [HTTP-AUTH-GOLDEN 2026-10-03 by Codex] Public-seed interoperability
+    // literals independently packed/signed in Python and Node, not generated
+    // by the Rust helper under test. These mirrors do not test the actual
+    // server-private decoder; its tests and Dart must consume the same goldens.
+    mod http_golden_vectors {
+        use super::*;
+        use bincode::Options;
+        use serde::{Deserialize, Serialize};
+
+        const SEED: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+        const WALLET: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+        const PULL_DOMAIN: &str = "AeroNyx-ChatPull-v2-http";
+        const ACK_DOMAIN: &str = "AeroNyx-ChatAck-v1-http";
+        // Historical time is intentional: verify digest/signature, not the
+        // live verifier's freshness gate. No clock or freshness override.
+        const TIMESTAMP: u64 = 1_700_000_000;
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Pull {
+            version: u8,
+            wallet: [u8; 32],
+            after_timestamp: u64,
+            cursor: Vec<u8>,
+            limit: u32,
+            request_timestamp: u64,
+            signature: Vec<u8>,
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Ack {
+            version: u8,
+            wallet: [u8; 32],
+            message_ids: Vec<[u8; 16]>,
+            ack_timestamp: u64,
+            signature: Vec<u8>,
+        }
+
+        struct Golden {
+            transcript: &'static str,
+            digest: &'static str,
+            signature: &'static str,
+            body: &'static str,
+            body_sha256: &'static str,
+            transcript_len: usize,
+            body_len: usize,
+        }
+
+        const GOLDENS: [Golden; 3] = [
+            Golden {
+                transcript: "4165726f4e79782d4368617450756c6c2d76322d6874747001d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a9cf053650000000000006400000000f1536500000000",
+                digest: "619e7c711a4555f88ed4ac1995206a36c4da2e7ca14bd35aaae7c9b27b346d69",
+                signature: "b9ba63df3ad41719789b2c9780af8a250ba32559a912caeda9463a2f54a9c251d564355b004e34162c1aa1b5a516c3a7e9397f6731136f16921923821211fd0b",
+                body: "01d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a9cf053650000000000000000000000006400000000f15365000000004000000000000000b9ba63df3ad41719789b2c9780af8a250ba32559a912caeda9463a2f54a9c251d564355b004e34162c1aa1b5a516c3a7e9397f6731136f16921923821211fd0b",
+                body_sha256: "a8a0410216a5e0a21079aa4c7c844e67c4cd6b2928db29c4b4836544ab5c514e",
+                transcript_len: 79,
+                body_len: 133,
+            },
+            Golden {
+                transcript: "4165726f4e79782d4368617450756c6c2d76322d6874747001d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a9cf0536500000000390001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233343536376400000000f1536500000000",
+                digest: "256cda3aca755a4fdace8d306fa1e2da5af38d330a8e5c13822e7a18ba8b6dfb",
+                signature: "4d2f7d3314016dd6ee1256173a9f92e1d1801fa512a9958a6922c6677bb3b313fb805c067a9219fd460085e76818bb048535ee530d46c6f430b37010c9f1580b",
+                body: "01d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a9cf0536500000000390000000000000001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233343536376400000000f153650000000040000000000000004d2f7d3314016dd6ee1256173a9f92e1d1801fa512a9958a6922c6677bb3b313fb805c067a9219fd460085e76818bb048535ee530d46c6f430b37010c9f1580b",
+                body_sha256: "f456cc079bb38cf3970dcb0317a2ab6792d2c76f3ac860b0e3a7d79967b6480c",
+                transcript_len: 136,
+                body_len: 190,
+            },
+            Golden {
+                transcript: "4165726f4e79782d4368617441636b2d76312d6874747001d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a00f1536500000000f9dc893ec67d3b68d642037b856be26b84c8c90ddabb42e4eab61fbb2993b8bf",
+                digest: "9758f272d243b1048759d38463cb5240516f3a8bba21980e820653b9d224693e",
+                signature: "29f0c98e67dbe82792ed66c2774aa8f727889dd07482a58ba611dc8c4c55aa40f46f58080f400a507210c5b924a770ba34745e25e3c83bcd8634eacf22c00a00",
+                body: "01d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a0200000000000000000102030405060708090a0b0c0d0e0ff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff00f1536500000000400000000000000029f0c98e67dbe82792ed66c2774aa8f727889dd07482a58ba611dc8c4c55aa40f46f58080f400a507210c5b924a770ba34745e25e3c83bcd8634eacf22c00a00",
+                body_sha256: "3befc94fad9f271c990cd53046351399ffe16a0d7fcf57c317f978287a375aba",
+                transcript_len: 96,
+                body_len: 153,
+            },
+        ];
+
+        fn bytes(value: &str) -> Vec<u8> {
+            hex::decode(value).expect("fixed public fixture hex")
+        }
+
+        fn key() -> IdentityKeyPair {
+            let key = IdentityKeyPair::from_bytes(&bytes(SEED)).unwrap();
+            assert_eq!(hex::encode(key.public_key_bytes()), WALLET);
+            key
+        }
+
+        fn pull(index: usize) -> Pull {
+            Pull {
+                version: 1,
+                wallet: bytes(WALLET).try_into().unwrap(),
+                after_timestamp: 1_699_999_900,
+                // Synthetic opaque bytes: NOT a valid server-issued AEAD
+                // continuation cursor and not evidence of successful paging.
+                cursor: if index == 0 {
+                    Vec::new()
+                } else {
+                    std::iter::once(1).chain(0u8..56).collect()
+                },
+                limit: 100,
+                request_timestamp: TIMESTAMP,
+                signature: bytes(GOLDENS[index].signature),
+            }
+        }
+
+        fn ack() -> Ack {
+            Ack {
+                version: 1,
+                wallet: bytes(WALLET).try_into().unwrap(),
+                message_ids: vec![
+                    std::array::from_fn(|i| i as u8),
+                    std::array::from_fn(|i| 240 + i as u8),
+                ],
+                ack_timestamp: TIMESTAMP,
+                signature: bytes(GOLDENS[2].signature),
+            }
+        }
+
+        fn assert_golden<T>(request: &T, domain: &str, fields: &[&[u8]], golden: &Golden)
+        where
+            T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+        {
+            let transcript = [domain.as_bytes(), fields.concat().as_slice()].concat();
+            assert_eq!(transcript, bytes(golden.transcript));
+            assert_eq!(transcript.len(), golden.transcript_len);
+            let digest = signed_message_digest(domain, fields);
+            assert_eq!(hex::encode(digest), golden.digest);
+            let signature: [u8; 64] = bytes(golden.signature).try_into().unwrap();
+            let key = key();
+            assert_eq!(key.sign(&digest), signature);
+            key.public_key().verify(&digest, &signature).unwrap();
+            assert!(key.public_key().verify(&transcript, &signature).is_err());
+
+            let body = bincode::options()
+                .with_fixint_encoding()
+                .serialize(request)
+                .unwrap();
+            assert_eq!(body, bytes(golden.body));
+            assert_eq!(body.len(), golden.body_len);
+            assert_eq!(hex::encode(Sha256::digest(&body)), golden.body_sha256);
+            let decoded: T = bincode::options()
+                .with_fixint_encoding()
+                .reject_trailing_bytes()
+                .with_limit(4096)
+                .deserialize(&body)
+                .unwrap();
+            assert_eq!(&decoded, request);
+
+            // Every transcript byte (domain and all signed fields) is bound.
+            for index in 0..transcript.len() {
+                let mut changed = transcript.clone();
+                changed[index] ^= 1;
+                assert!(key
+                    .public_key()
+                    .verify(&Sha256::digest(&changed), &signature)
+                    .is_err());
+            }
+        }
+
+        fn assert_pull(index: usize) {
+            let request = pull(index);
+            assert_golden(
+                &request,
+                PULL_DOMAIN,
+                &[
+                    &[request.version],
+                    &request.wallet,
+                    &request.after_timestamp.to_le_bytes(),
+                    &(request.cursor.len() as u16).to_le_bytes(),
+                    &request.cursor,
+                    &request.limit.to_le_bytes(),
+                    &request.request_timestamp.to_le_bytes(),
+                ],
+                &GOLDENS[index],
+            );
+        }
+
+        #[test]
+        fn pull_empty_literal() {
+            assert_pull(0);
+        }
+
+        #[test]
+        fn pull_synthetic_cursor_literal() {
+            assert_pull(1);
+        }
+
+        #[test]
+        fn ack_ordered_ids_literal() {
+            let request = ack();
+            let ids_hash = Sha256::digest(request.message_ids.concat());
+            assert_eq!(
+                hex::encode(ids_hash),
+                "f9dc893ec67d3b68d642037b856be26b84c8c90ddabb42e4eab61fbb2993b8bf"
+            );
+            assert_golden(
+                &request,
+                ACK_DOMAIN,
+                &[
+                    &[request.version],
+                    &request.wallet,
+                    &request.ack_timestamp.to_le_bytes(),
+                    &ids_hash,
+                ],
+                &GOLDENS[2],
+            );
+        }
+
+        #[test]
+        fn wrong_domain_length_width_and_id_order_rejected() {
+            let key = key();
+            let request = pull(1);
+            let signature = bytes(GOLDENS[1].signature).try_into().unwrap();
+            for (domain, length) in [
+                (DOMAIN_CHAT_PULL_V2, (57u16).to_le_bytes().to_vec()),
+                (PULL_DOMAIN, (57u64).to_le_bytes().to_vec()),
+            ] {
+                let digest = signed_message_digest(
+                    domain,
+                    &[
+                        &[request.version],
+                        &request.wallet,
+                        &request.after_timestamp.to_le_bytes(),
+                        &length,
+                        &request.cursor,
+                        &request.limit.to_le_bytes(),
+                        &request.request_timestamp.to_le_bytes(),
+                    ],
+                );
+                assert!(key.public_key().verify(&digest, &signature).is_err());
+            }
+            let mut request = ack();
+            request.message_ids.reverse();
+            let digest = signed_message_digest(
+                ACK_DOMAIN,
+                &[
+                    &[request.version],
+                    &request.wallet,
+                    &request.ack_timestamp.to_le_bytes(),
+                    &Sha256::digest(request.message_ids.concat()),
+                ],
+            );
+            let signature = bytes(GOLDENS[2].signature).try_into().unwrap();
+            assert!(key.public_key().verify(&digest, &signature).is_err());
+        }
+
+        #[test]
+        fn literal_codec_rejects_trailing_truncation_and_huge_vec_prefix() {
+            fn rejects<T: for<'de> Deserialize<'de>>(body: &[u8]) {
+                assert!(bincode::options()
+                    .with_fixint_encoding()
+                    .reject_trailing_bytes()
+                    .with_limit(4096)
+                    .deserialize::<T>(body)
+                    .is_err());
+            }
+            for (index, golden) in GOLDENS.iter().enumerate() {
+                let body = bytes(golden.body);
+                let mut trailing = body.clone();
+                trailing.push(0);
+                let truncated = &body[..body.len() - 1];
+                let mut huge = body.clone();
+                // Pull cursor length starts at41; ACK ID count starts at33.
+                let offset = if index < 2 { 41 } else { 33 };
+                huge[offset..offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+                for malformed in [trailing.as_slice(), truncated, huge.as_slice()] {
+                    if index < 2 {
+                        rejects::<Pull>(malformed);
+                    } else {
+                        rejects::<Ack>(malformed);
+                    }
+                }
+            }
+        }
+    }
+
     /// Build a valid (domain, payload, sig, ts) tuple for the given keypair.
     fn make_signed(kp: &IdentityKeyPair, domain: &str, payload: &[u8]) -> (u64, [u8; 64]) {
         let ts = SystemTime::now()
