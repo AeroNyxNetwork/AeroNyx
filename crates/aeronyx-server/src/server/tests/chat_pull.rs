@@ -1,10 +1,11 @@
 // File: crates/aeronyx-server/src/server/tests/chat_pull.rs
-// Purpose: Pull route authority and direct-relay custody lifecycle acceptance.
+// Purpose: Pull authority, direct-relay custody, and UDP handshake acceptance.
 // Dependencies: parent test helpers, production dispatcher/router, core crypto,
 // ephemeral loopback HTTP/UDP, and private temporary SQLite repositories.
-// Flow: signed sender ingress -> direct-v3 -> reopen -> signed PullV2/ACK.
-// Boundary: preauthenticated sessions, in-process tasks, orderly DB reopen;
-// NOT handshake, Server::run, discovery gossip, process crash, or failover proof.
+// Flow: signed sender ingress -> direct-v3 -> reopen -> signed PullV2/ACK;
+// the non-Linux transport fixture adds real V2 handshake and inbound AEAD/replay.
+// Boundary: sender ingress remains preauthenticated; orderly in-process reopen,
+// NOT Server::run, discovery gossip, process crash, failover, or Linux TUN proof.
 // [CHAT-CUSTODY-LIFECYCLE 2026-10-02 by Codex] Add composed acceptance without
 // changing production behavior or seeding target custody through storage APIs.
 // Last Modified: 2026-10-02. Originally split from server.rs `mod tests`.
@@ -358,6 +359,10 @@ enum CustodyAcceptanceCase {
     Ack,
     UnackedReopen,
     InvalidAck,
+    // [CHAT-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] Linux's production UDP
+    // task requires a real TUN; this fixture never creates privileged devices.
+    #[cfg(not(target_os = "linux"))]
+    TransportHandshake,
 }
 
 // [CHAT-CUSTODY-LIFECYCLE 2026-10-02 by Codex] One bounded protocol fixture
@@ -470,6 +475,21 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
     // is allowed; this is one target copy, not a global exactly-once assertion.
     router.close().await;
     target = target.reopen(&target_path, [0x93; 32]).await;
+    // [CHAT-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] The receiver in this
+    // branch has no injected Session and never calls the dispatcher directly.
+    #[cfg(not(target_os = "linux"))]
+    if matches!(case, CustodyAcceptanceCase::TransportHandshake) {
+        transport_acceptance::run(
+            target,
+            &target_path,
+            receiver_identity,
+            &envelope,
+            &receiver_e2e,
+            plaintext,
+        )
+        .await;
+        return;
+    }
     let mut receiver = target.client(receiver_identity.clone()).await;
     assert_custody_envelope(
         &receiver.pull(&target).await,
@@ -479,6 +499,10 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
     );
     match case {
         CustodyAcceptanceCase::Ack => {}
+        #[cfg(not(target_os = "linux"))]
+        CustodyAcceptanceCase::TransportHandshake => {
+            unreachable!("handled before session injection")
+        }
         CustodyAcceptanceCase::UnackedReopen => {
             drop(receiver);
             target = target.reopen(&target_path, [0x93; 32]).await;
@@ -575,4 +599,328 @@ async fn chat_custody_invalid_acks_preserve_item_until_valid_ack() {
     )
     .await
     .expect("bounded invalid ACK lifecycle");
+}
+
+// [CHAT-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] Private composition of the
+// actual UDP ingress, not a substitute packet handler or preauthenticated
+// receiver. Server::new only creates in-memory shutdown/telemetry state here;
+// run/startup, management, API/discovery listeners, and TUN are never started.
+#[cfg(not(target_os = "linux"))]
+mod transport_acceptance {
+    use super::*;
+    use crate::handlers::PacketHandler;
+    use crate::management::reporter::SessionEventSender;
+    use crate::services::traffic_tracker::TrafficTracker;
+    use crate::services::{DenyList, HandshakeService, NodePolicyRuntime};
+    use aeronyx_core::crypto::handshake::{
+        create_client_hello_v2, derive_client_session_keys_v2, verify_server_hello_v2,
+    };
+    use aeronyx_core::crypto::kdf::SessionKeys;
+    use aeronyx_core::crypto::EphemeralKeyPair;
+    use aeronyx_core::protocol::codec::{
+        decode_data_packet, decode_server_hello, encode_client_hello, encode_data_packet,
+    };
+    use aeronyx_core::protocol::{DataPacket, PROTOCOL_VERSION_V2};
+
+    // Own every spawned UDP task; explicit bounded join is the success path,
+    // while Drop also prevents an assertion failure from leaking a listener.
+    struct UdpRuntime {
+        server: Server,
+        packet_handler: Arc<PacketHandler>,
+        udp: Arc<UdpTransport>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl UdpRuntime {
+        fn start(node: &mut CustodyAcceptanceNode) -> Self {
+            assert_eq!(node.sessions.count(), 0);
+            let mut config = ServerConfig::default();
+            config.memchain.mode = MemChainMode::Off;
+            let server = Server::new(config, node.identity.clone(), None);
+            let (ip_pool, sessions, routing) = server.init_services().unwrap();
+            node.sessions = Arc::clone(&sessions);
+            let traffic = Arc::new(TrafficTracker::new());
+            let policy = Arc::new(NodePolicyRuntime::default());
+            let packet_handler = Arc::new(PacketHandler::new(
+                Arc::clone(&sessions),
+                Arc::clone(&routing),
+                Arc::clone(&traffic),
+                Arc::new(AtomicU64::new(0)),
+                Arc::clone(&policy),
+            ));
+            let handshake = Arc::new(HandshakeService::new(
+                node.identity.clone(),
+                ip_pool,
+                Arc::clone(&sessions),
+                Arc::clone(&routing),
+                Arc::new(DenyList::new()),
+                policy,
+            ));
+            // Empty signed extension takes the production Missing-voucher
+            // compatibility path without HTTP. Even unexpected lookup is
+            // confined to loopback, never the configured production issuer.
+            let voucher = Arc::new(VoucherVerifier::with_issuer_keys_url(
+                "http://127.0.0.1:9/unused-test-issuer".to_owned(),
+            ));
+            let task = server.spawn_udp_task(
+                Arc::clone(&node.udp),
+                handshake,
+                Arc::clone(&packet_handler),
+                voucher,
+                sessions,
+                SessionEventSender::disabled(),
+                None,
+                None,
+                None,
+                None,
+                server.config.memchain.clone(),
+                hex::encode(node.identity.public_key_bytes()),
+                Some(Arc::clone(&node.relay)),
+                routing,
+                Arc::clone(&node.peers),
+                test_peer_http_client(),
+                traffic,
+            );
+            Self {
+                server,
+                packet_handler,
+                udp: Arc::clone(&node.udp),
+                task,
+            }
+        }
+
+        async fn expect_drops(&self, decrypt_failed: u64, replay: u64) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let drops = self.packet_handler.runtime_status().drop_reasons;
+                    if drops.decrypt_failed == decrypt_failed && drops.replay == replay {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("UDP handler observed the expected authentication/replay rejection");
+        }
+
+        async fn close(mut self) {
+            self.server.shutdown.store(true, AtomicOrdering::SeqCst);
+            self.server
+                .shutdown_tx
+                .send(())
+                .expect("UDP task subscribed");
+            tokio::time::timeout(Duration::from_secs(5), &mut self.task)
+                .await
+                .expect("UDP shutdown deadline")
+                .expect("UDP task joined");
+            Server::shutdown_udp_transport(&self.udp).await;
+        }
+    }
+
+    impl Drop for UdpRuntime {
+        fn drop(&mut self) {
+            self.server.shutdown.store(true, AtomicOrdering::SeqCst);
+            let _ = self.server.shutdown_tx.send(());
+            self.task.abort();
+        }
+    }
+
+    // No Debug and no reference to server Session/keys: all transport material
+    // below comes from verified wire hellos and the client's own ephemeral DH.
+    struct WireClient {
+        identity: IdentityKeyPair,
+        session_id: [u8; 16],
+        keys: SessionKeys,
+        udp: UdpTransport,
+        target: std::net::SocketAddr,
+        tx_counter: u64,
+        rx_counter: Option<u64>,
+    }
+
+    impl WireClient {
+        async fn connect(node: &CustodyAcceptanceNode, identity: IdentityKeyPair) -> Self {
+            let udp = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+            let target = node.udp.local_addr().unwrap();
+            let ephemeral = EphemeralKeyPair::generate();
+            let hello = create_client_hello_v2(&identity, ephemeral.public_key_bytes(), &[]);
+            udp.send(&encode_client_hello(&hello), &target)
+                .await
+                .unwrap();
+            let mut response = vec![0; 65_535];
+            let (len, source) =
+                tokio::time::timeout(Duration::from_secs(3), udp.recv(&mut response))
+                    .await
+                    .expect("bounded real ServerHello")
+                    .unwrap();
+            assert_eq!(source.addr, target);
+            let response = decode_server_hello(&response[..len]).unwrap();
+            assert_eq!(response.version, PROTOCOL_VERSION_V2);
+            verify_server_hello_v2(&response, &hello, Some(&node.identity.public_key_bytes()))
+                .expect("ServerHello bound to client hello and pinned node");
+            let shared = ephemeral.exchange(&response.server_ephemeral_key);
+            let keys = derive_client_session_keys_v2(&shared, &hello, &[], &response).unwrap();
+            assert!(keys.c2s != keys.s2c, "direction keys must be distinct");
+            assert_eq!(node.sessions.count(), 1, "handshake created the session");
+            Self {
+                identity,
+                session_id: response.session_id,
+                keys,
+                udp,
+                target,
+                tx_counter: 0,
+                rx_counter: None,
+            }
+        }
+
+        fn packet(&mut self, message: &MemChainMessage) -> Vec<u8> {
+            self.tx_counter = self.tx_counter.checked_add(1).unwrap();
+            let clear = aeronyx_core::protocol::encode_memchain(message).unwrap();
+            let mut sealed = vec![0; clear.len() + 16];
+            let len = DefaultTransportCrypto::new()
+                .encrypt(
+                    &self.keys.c2s,
+                    self.tx_counter,
+                    &self.session_id,
+                    &clear,
+                    &mut sealed,
+                )
+                .unwrap();
+            sealed.truncate(len);
+            encode_data_packet(&DataPacket::new(self.session_id, self.tx_counter, sealed)).to_vec()
+        }
+
+        async fn send(&self, packet: &[u8]) {
+            self.udp.send(packet, &self.target).await.unwrap();
+        }
+
+        async fn pull(&mut self) -> (Vec<ChatEnvelope>, Vec<u8>) {
+            use aeronyx_core::protocol::auth::{signed_message_digest, DOMAIN_CHAT_PULL_V2};
+            let wallet = self.identity.public_key_bytes();
+            let now = unix_now_secs();
+            let signature = self.identity.sign(&signed_message_digest(
+                DOMAIN_CHAT_PULL_V2,
+                &[
+                    &wallet,
+                    &0u64.to_le_bytes(),
+                    &0u16.to_le_bytes(),
+                    &[],
+                    &1u32.to_le_bytes(),
+                    &now.to_le_bytes(),
+                ],
+            ));
+            let packet = self.packet(&MemChainMessage::ChatPullV2 {
+                wallet,
+                after_timestamp: 0,
+                cursor: Vec::new(),
+                limit: 1,
+                request_timestamp: now,
+                signature,
+            });
+            self.send(&packet).await;
+            let mut datagram = vec![0; 65_535];
+            let (len, source) =
+                tokio::time::timeout(Duration::from_secs(3), self.udp.recv(&mut datagram))
+                    .await
+                    .expect("bounded encrypted PullV2 response")
+                    .unwrap();
+            assert_eq!(source.addr, self.target);
+            let response = decode_data_packet(&datagram[..len]).unwrap();
+            assert!(response.session_id == self.session_id);
+            assert!(self
+                .rx_counter
+                .is_none_or(|previous| response.counter > previous));
+            let mut clear = vec![0; response.encrypted_payload.len()];
+            let len = DefaultTransportCrypto::new()
+                .decrypt(
+                    &self.keys.s2c,
+                    response.counter,
+                    &self.session_id,
+                    &response.encrypted_payload,
+                    &mut clear,
+                )
+                .expect("response authenticated under negotiated s2c key");
+            self.rx_counter = Some(response.counter);
+            assert_eq!(clear[0], aeronyx_core::protocol::memchain::MEMCHAIN_MAGIC);
+            let MemChainMessage::ChatPullResponseV2 {
+                envelopes,
+                has_more,
+                ..
+            } = aeronyx_core::protocol::decode_memchain(&clear[1..len]).unwrap()
+            else {
+                panic!("expected PullV2 response")
+            };
+            assert!(!has_more);
+            (envelopes, packet)
+        }
+
+        fn ack_packet(&mut self, message_id: [u8; 16]) -> Vec<u8> {
+            use aeronyx_core::protocol::auth::{signed_message_digest, DOMAIN_CHAT_ACK};
+            use sha2::{Digest, Sha256};
+            let wallet = self.identity.public_key_bytes();
+            let now = unix_now_secs();
+            let ids_hash: [u8; 32] = Sha256::digest(message_id).into();
+            let signature = self.identity.sign(&signed_message_digest(
+                DOMAIN_CHAT_ACK,
+                &[&wallet, &now.to_le_bytes(), &ids_hash],
+            ));
+            self.packet(&MemChainMessage::ChatAck {
+                message_ids: vec![message_id],
+                wallet,
+                ack_timestamp: now,
+                signature,
+            })
+        }
+    }
+
+    pub(super) async fn run(
+        mut target: CustodyAcceptanceNode,
+        path: &std::path::Path,
+        receiver: IdentityKeyPair,
+        envelope: &ChatEnvelope,
+        e2e: &aeronyx_core::crypto::E2eSession,
+        plaintext: &[u8],
+    ) {
+        let runtime = UdpRuntime::start(&mut target);
+        let mut client = WireClient::connect(&target, receiver.clone()).await;
+        let (items, replay_packet) = client.pull().await;
+        assert_custody_envelope(&items, envelope, e2e, plaintext);
+
+        // A valid owner ACK inside an INVALID transport packet must never
+        // reach custody deletion. Observe the real handler, not a timeout alone.
+        let mut tampered = client.ack_packet(envelope.message_id);
+        *tampered.last_mut().unwrap() ^= 1;
+        client.send(&tampered).await;
+        runtime.expect_drops(1, 0).await;
+        assert_custody_envelope(&client.pull().await.0, envelope, e2e, plaintext);
+
+        client.send(&replay_packet).await;
+        runtime.expect_drops(1, 1).await;
+        assert_eq!(target.relay.storage_usage().unwrap().pending_messages, 1);
+        let ack = client.ack_packet(envelope.message_id);
+        client.send(&ack).await;
+        // Ordered processing of the subsequent Pull provides an authenticated
+        // completion barrier for ACK, which has no response of its own.
+        assert!(client.pull().await.0.is_empty());
+        assert_eq!(target.relay.storage_usage().unwrap().pending_messages, 0);
+        drop(client);
+        runtime.close().await;
+        target = target.reopen(path, [0x93; 32]).await;
+
+        let runtime = UdpRuntime::start(&mut target);
+        let mut client = WireClient::connect(&target, receiver).await;
+        assert!(client.pull().await.0.is_empty());
+        assert_eq!(target.relay.storage_usage().unwrap().pending_messages, 0);
+        drop(client);
+        runtime.close().await;
+    }
+
+    #[tokio::test]
+    async fn chat_custody_real_handshake_pull_ack_survives_reopen() {
+        tokio::time::timeout(
+            Duration::from_secs(35),
+            run_custody_acceptance(CustodyAcceptanceCase::TransportHandshake),
+        )
+        .await
+        .expect("bounded handshake/custody/reopen lifecycle");
+    }
 }
