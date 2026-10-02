@@ -821,59 +821,139 @@ mod sealed_v2_tests {
         (record_id, created_at, envelope, signature)
     }
 
-    #[tokio::test]
-    async fn owner_slot_mixed_v1_v2_first_writes_admit_exactly_one() {
-        // [MEMORY-V2-OWNER-SLOT 2026-10-02 by Codex] This is the deterministic
-        // race regression: two distinct first owners enter together, but the
-        // immediate transaction admits only one aggregate remote slot.
+    // [MEMORY-V2-OWNER-SLOT 2026-10-02 by Codex] The race matrix deliberately
+    // maps both storage APIs to one coarse outcome so every pair proves the
+    // same aggregate invariant without cold-starting a separate test process.
+    #[derive(Clone, Copy, Debug)]
+    enum OwnerSlotRaceKind {
+        V1V1,
+        V2V2,
+        Mixed,
+    }
+
+    enum FirstWrite {
+        V1(MemoryRecord),
+        V2 {
+            owner: [u8; 32],
+            record_id: [u8; 32],
+            created_at: u64,
+            envelope: Vec<u8>,
+            signature: [u8; 64],
+        },
+    }
+
+    async fn run_owner_slot_race(
+        kind: OwnerSlotRaceKind,
+    ) -> ([Result<bool, OwnerSlotAdmissionError>; 2], usize) {
         let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
-        let local = [0xE0; 32];
         let policy = OwnerSlotPolicy {
-            local_owner: local,
+            local_owner: [0xE0; 32],
             max_remote_owners: 1,
         };
-        let key_v1 = IdentityKeyPair::from_bytes(&[0xA1; 32]).unwrap();
-        let key_v2 = IdentityKeyPair::from_bytes(&[0xA2; 32]).unwrap();
-        let (record_id, created_at, envelope, signature) = signed_v2(&key_v2, 2);
+        let key_a = IdentityKeyPair::from_bytes(&[0xA1; 32]).unwrap();
+        let key_b = IdentityKeyPair::from_bytes(&[0xA2; 32]).unwrap();
+        let v1_a = FirstWrite::V1(v1_record(key_a.public_key_bytes(), 1));
+        let v1_b = FirstWrite::V1(v1_record(key_b.public_key_bytes(), 2));
+        let (v2_id_a, v2_created_a, v2_envelope_a, v2_signature_a) = signed_v2(&key_a, 3);
+        let v2_a = FirstWrite::V2 {
+            owner: key_a.public_key_bytes(),
+            record_id: v2_id_a,
+            created_at: v2_created_a,
+            envelope: v2_envelope_a,
+            signature: v2_signature_a,
+        };
+        let (v2_id_b, v2_created_b, v2_envelope_b, v2_signature_b) = signed_v2(&key_b, 4);
+        let v2_b = FirstWrite::V2 {
+            owner: key_b.public_key_bytes(),
+            record_id: v2_id_b,
+            created_at: v2_created_b,
+            envelope: v2_envelope_b,
+            signature: v2_signature_b,
+        };
+        let (first, second) = match kind {
+            OwnerSlotRaceKind::V1V1 => (v1_a, v1_b),
+            OwnerSlotRaceKind::V2V2 => (v2_a, v2_b),
+            OwnerSlotRaceKind::Mixed => (v1_a, v2_b),
+        };
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
-        let v1_storage = Arc::clone(&storage);
-        let v1_barrier = Arc::clone(&barrier);
-        let v1 = tokio::spawn(async move {
-            let record = v1_record(key_v1.public_key_bytes(), 1);
-            v1_barrier.wait().await;
-            v1_storage.insert_with_owner_slot(&record, "", policy).await
-        });
-        let v2_storage = Arc::clone(&storage);
-        let v2_barrier = Arc::clone(&barrier);
-        let v2 = tokio::spawn(async move {
-            v2_barrier.wait().await;
-            v2_storage
-                .insert_sealed_v2_with_owner_slot(
-                    &key_v2.public_key_bytes(),
-                    &record_id,
+        let first_storage = Arc::clone(&storage);
+        let first_barrier = Arc::clone(&barrier);
+        let first_task = tokio::spawn(async move {
+            first_barrier.wait().await;
+            match first {
+                FirstWrite::V1(record) => {
+                    first_storage
+                        .insert_with_owner_slot(&record, "", policy)
+                        .await
+                }
+                FirstWrite::V2 {
+                    owner,
+                    record_id,
                     created_at,
-                    &envelope,
-                    &signature,
-                    policy,
-                )
-                .await
+                    envelope,
+                    signature,
+                } => first_storage
+                    .insert_sealed_v2_with_owner_slot(
+                        &owner, &record_id, created_at, &envelope, &signature, policy,
+                    )
+                    .await
+                    .map(|outcome| outcome == SealedV2InsertOutcome::Inserted),
+            }
+        });
+        let second_storage = Arc::clone(&storage);
+        let second_barrier = Arc::clone(&barrier);
+        let second_task = tokio::spawn(async move {
+            second_barrier.wait().await;
+            match second {
+                FirstWrite::V1(record) => {
+                    second_storage
+                        .insert_with_owner_slot(&record, "", policy)
+                        .await
+                }
+                FirstWrite::V2 {
+                    owner,
+                    record_id,
+                    created_at,
+                    envelope,
+                    signature,
+                } => second_storage
+                    .insert_sealed_v2_with_owner_slot(
+                        &owner, &record_id, created_at, &envelope, &signature, policy,
+                    )
+                    .await
+                    .map(|outcome| outcome == SealedV2InsertOutcome::Inserted),
+            }
         });
         barrier.wait().await;
-        let v1 = v1.await.unwrap();
-        let v2 = v2.await.unwrap();
-        let v1_inserted = matches!(v1, Ok(true));
-        let v2_inserted = matches!(v2, Ok(SealedV2InsertOutcome::Inserted));
-        assert_ne!(v1_inserted, v2_inserted);
-        assert!(
-            matches!(
-                (v1, v2),
-                (Ok(true), Err(error)) if error.is_at_capacity()
-            ) || matches!(
-                (v1, v2),
-                (Err(error), Ok(SealedV2InsertOutcome::Inserted)) if error.is_at_capacity()
-            )
-        );
-        assert_eq!(storage.count_distinct_owners().await, 1);
+        let outcomes = [first_task.await.unwrap(), second_task.await.unwrap()];
+        let owner_count = storage.count_distinct_owners().await;
+        (outcomes, owner_count)
+    }
+
+    #[tokio::test]
+    async fn owner_slot_v1_v1_v2_v2_and_mixed_races_admit_exactly_one() {
+        for kind in [
+            OwnerSlotRaceKind::V1V1,
+            OwnerSlotRaceKind::V2V2,
+            OwnerSlotRaceKind::Mixed,
+        ] {
+            let (outcomes, owner_count) = run_owner_slot_race(kind).await;
+            let admitted = outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Ok(true)))
+                .count();
+            assert_eq!(admitted, 1, "{kind:?} race admitted {admitted} writers");
+            assert_eq!(
+                owner_count, 1,
+                "{kind:?} race persisted {owner_count} owners"
+            );
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, Err(error) if error.is_at_capacity())),
+                "{kind:?} race did not produce the typed capacity rejection"
+            );
+        }
     }
 
     #[tokio::test]
