@@ -781,6 +781,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use aeronyx_core::crypto::IdentityKeyPair;
+    use aeronyx_core::protocol::memchain::MEMCHAIN_MAGIC;
     use axum::{
         body::Body,
         http::{Method, Request},
@@ -1052,16 +1053,18 @@ mod tests {
             db_path: path.to_string_lossy().into_owned(),
             ..test_config()
         });
-        for id in 1u8..=100 {
+        let expected_envelopes: Vec<_> = (1u8..=100)
+            .map(|id| signed_envelope_with_id(&wallet, receiver, [id; 16], 65_536))
+            .collect();
+        for envelope in &expected_envelopes {
             relay
-                .store_pending(&signed_envelope_with_id(
-                    &wallet, receiver, [id; 16], 65_536,
-                ))
+                .store_pending(envelope)
                 .expect("store legal 64 KiB envelope");
         }
 
         let expected_page_lengths = [31usize, 31, 31, 7];
         let mut cursor = Vec::new();
+        let mut expected_offset = 0usize;
         let mut relay = relay;
         for (page_index, expected_len) in expected_page_lengths.into_iter().enumerate() {
             let app = build_chat_pull_http_router(Arc::clone(&relay))
@@ -1083,12 +1086,24 @@ mod tests {
                 .await
                 .expect("HTTP pull response");
             assert_eq!(pull.status(), StatusCode::OK);
+            assert_eq!(
+                pull.headers()
+                    .get(header::CONTENT_TYPE)
+                    .map(HeaderValue::as_bytes),
+                Some(b"application/octet-stream".as_slice())
+            );
             let body = axum::body::to_bytes(pull.into_body(), CHAT_HTTP_RESPONSE_MAX_BYTES)
                 .await
                 .expect("bounded HTTP pull body");
             assert!(body.len() <= CHAT_HTTP_RESPONSE_MAX_BYTES);
-            let decoded = aeronyx_core::protocol::decode_memchain(&body[1..])
+            assert_eq!(body.first().copied(), Some(MEMCHAIN_MAGIC));
+            let raw_body = body.to_vec();
+            let decoded = aeronyx_core::protocol::decode_memchain(&raw_body[1..])
                 .expect("canonical MemChain response");
+            assert_eq!(
+                encode_memchain(&decoded).expect("canonical response re-encode"),
+                raw_body
+            );
             let (envelopes, next_cursor, has_more) = match decoded {
                 MemChainMessage::ChatPullResponseV2 {
                     envelopes,
@@ -1099,9 +1114,20 @@ mod tests {
             };
             assert_eq!(envelopes.len(), expected_len);
             assert_eq!(has_more, page_index + 1 < expected_page_lengths.len());
-            assert!(envelopes
+            for (actual, expected) in envelopes
                 .iter()
-                .all(|envelope| envelope.ciphertext.len() == 65_536));
+                .zip(&expected_envelopes[expected_offset..expected_offset + expected_len])
+            {
+                assert_eq!(actual.message_id, expected.message_id);
+                assert_eq!(actual.sender, expected.sender);
+                assert_eq!(actual.receiver, expected.receiver);
+                assert_eq!(actual.timestamp, expected.timestamp);
+                assert_eq!(actual.ciphertext, expected.ciphertext);
+                assert_eq!(actual.nonce, expected.nonce);
+                assert_eq!(actual.content_type, expected.content_type);
+                assert_eq!(actual.signature, expected.signature);
+            }
+            expected_offset += expected_len;
             let ids: Vec<_> = envelopes
                 .iter()
                 .map(|envelope| envelope.message_id)
