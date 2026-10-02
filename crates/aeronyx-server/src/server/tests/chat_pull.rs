@@ -14,6 +14,8 @@
 // single-envelope compatibility and 51-item multi-page custody acceptance.
 // Last Modified: 2026-10-03. Originally split from server.rs `mod tests`.
 use super::*;
+// [CHAT-V1-COALESCING 2026-10-03 by Codex] Import the production AEAD size explicitly.
+use aeronyx_core::crypto::transport::ENCRYPTION_OVERHEAD;
 
 // [CHAT-V1-COALESCING 2026-10-03 by Codex] Codec-only synthetic envelopes:
 // these do not claim valid signatures or replace real-ingress custody fixtures.
