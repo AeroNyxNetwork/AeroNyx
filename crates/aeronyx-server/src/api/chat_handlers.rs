@@ -1455,6 +1455,7 @@ mod tests {
         let app = build_chat_pull_http_router(relay)
             .layer(Extension(AuthenticatedOwner::Local { owner: other_owner }));
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -1474,15 +1475,65 @@ mod tests {
     #[tokio::test]
     async fn authenticated_http_pull_invalid_cursor_is_bad_request_without_mutation() {
         // [CHAT-HTTP-CURSOR-ERROR 2026-10-03 by Codex] A fresh owner-signed
-        // request with an authenticated but undecryptable cursor is a caller
-        // error, not a transient storage outage. No pending row is touched.
+        // request with an authenticated but undecryptable genuine cursor is a
+        // caller error, not a transient storage outage. Durable rows must
+        // survive the rejection and a valid continuation must still work.
         let relay = make_relay();
         let wallet = IdentityKeyPair::generate();
         let receiver = wallet.public_key_bytes();
-        let mut request: ChatPullHttpRequestV1 =
-            decode_canonical_http(&encode_pull_request(&wallet, receiver, Vec::new()))
-                .expect("decode fresh pull request");
-        request.cursor = vec![0xA5; MAX_CHAT_PULL_CURSOR_V2_BYTES];
+        let first = signed_envelope_with_id(&wallet, receiver, [0x61; 16], 32);
+        let second = signed_envelope_with_id(&wallet, receiver, [0x62; 16], 32);
+        relay
+            .store_pending(&first)
+            .expect("store first pending row");
+        relay
+            .store_pending(&second)
+            .expect("store second pending row");
+        let app = build_chat_pull_http_router(Arc::clone(&relay))
+            .layer(Extension(AuthenticatedOwner::Local { owner: receiver }));
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(CHAT_PULL_HTTP_PATH)
+                    .body(Body::from(encode_pull_request_with_limit(
+                        &wallet,
+                        receiver,
+                        Vec::new(),
+                        1,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .expect("initial HTTP pull response");
+        assert_eq!(initial.status(), StatusCode::OK);
+        let initial_body = axum::body::to_bytes(initial.into_body(), CHAT_HTTP_RESPONSE_MAX_BYTES)
+            .await
+            .expect("bounded initial pull body");
+        let (next_cursor, first_id) =
+            match aeronyx_core::protocol::decode_memchain(&initial_body[1..])
+                .expect("canonical initial pull response")
+            {
+                MemChainMessage::ChatPullResponseV2 {
+                    envelopes,
+                    next_cursor,
+                    has_more,
+                } => {
+                    assert!(has_more);
+                    assert_eq!(envelopes.len(), 1);
+                    (next_cursor, envelopes[0].message_id)
+                }
+                other => panic!("unexpected initial pull response: {other:?}"),
+            };
+        assert_eq!(first_id, first.message_id);
+        assert_eq!(next_cursor.len(), 57);
+
+        let mut request: ChatPullHttpRequestV1 = decode_canonical_http(
+            &encode_pull_request_with_limit(&wallet, receiver, next_cursor.clone(), 1),
+        )
+        .expect("decode fresh continuation request");
+        request.cursor[1] ^= 1;
         let version = [request.version];
         let cursor_len = u16::try_from(request.cursor.len())
             .expect("bounded cursor length")
@@ -1508,9 +1559,8 @@ mod tests {
             .with_fixint_encoding()
             .serialize(&request)
             .expect("encode invalid-cursor request");
-        let app = build_chat_pull_http_router(Arc::clone(&relay))
-            .layer(Extension(AuthenticatedOwner::Local { owner: receiver }));
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -1521,7 +1571,45 @@ mod tests {
             .await
             .expect("HTTP response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(relay.storage_usage().unwrap().pending_messages, 0);
+        let error_body = axum::body::to_bytes(response.into_body(), CHAT_HTTP_REQUEST_MAX_BYTES)
+            .await
+            .expect("bounded error body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&error_body).expect("error JSON"),
+            serde_json::json!({ "error": "chat_request_invalid" })
+        );
+        assert_eq!(relay.storage_usage().unwrap().pending_messages, 2);
+
+        let continuation = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(CHAT_PULL_HTTP_PATH)
+                    .body(Body::from(encode_pull_request_with_limit(
+                        &wallet,
+                        receiver,
+                        next_cursor,
+                        1,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .expect("valid continuation response");
+        assert_eq!(continuation.status(), StatusCode::OK);
+        let continuation_body =
+            axum::body::to_bytes(continuation.into_body(), CHAT_HTTP_RESPONSE_MAX_BYTES)
+                .await
+                .expect("bounded continuation body");
+        match aeronyx_core::protocol::decode_memchain(&continuation_body[1..])
+            .expect("canonical continuation response")
+        {
+            MemChainMessage::ChatPullResponseV2 { envelopes, .. } => {
+                assert_eq!(envelopes.len(), 1);
+                assert_eq!(envelopes[0].message_id, second.message_id);
+            }
+            other => panic!("unexpected continuation response: {other:?}"),
+        }
+        assert_eq!(relay.storage_usage().unwrap().pending_messages, 2);
     }
 
     #[tokio::test]
