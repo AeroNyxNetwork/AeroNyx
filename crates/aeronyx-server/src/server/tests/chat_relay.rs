@@ -683,6 +683,146 @@ async fn discovered_chat_relay_prefers_target_bound_v3_when_advertised() {
 }
 
 #[tokio::test]
+async fn direct_relay_fanout_filters_routeability_before_limit() {
+    // [ROUTEABILITY-BEFORE-FANOUT 2026-10-02 by Codex] Signed descriptors
+    // without route evidence remain probe candidates, but cannot consume the
+    // bounded direct-delivery budget ahead of an eligible V3 target.
+    let target_identity = Arc::new(IdentityKeyPair::generate());
+    let target_for_handler = Arc::clone(&target_identity);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_handler = Arc::clone(&calls);
+    let app = Router::new().route(
+        "/api/chat/peer/relay-v3",
+        post(move |Json(request): Json<PeerChatRelayRequestV3>| {
+            let target_for_handler = Arc::clone(&target_for_handler);
+            let calls_for_handler = Arc::clone(&calls_for_handler);
+            async move {
+                let commitment = request
+                    .verified_request_commitment_for_target(&target_for_handler.public_key_bytes())
+                    .expect("routeable V3 target must receive a target-bound request");
+                calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok::<_, StatusCode>(Json(PeerChatRelayResponseV2 {
+                    relay: PeerChatRelayResponse {
+                        accepted: true,
+                        duplicate: false,
+                        delivered_online: 0,
+                        stored_pending: true,
+                    },
+                    receipt: Some(PeerChatRelayReceiptV2::accepted(
+                        commitment,
+                        unix_now_secs(),
+                        target_for_handler.as_ref(),
+                    )),
+                }))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let mock_peer = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let now = unix_now_secs();
+    let peer_store = PeerStore::new();
+    let high_capacity = NodeCapacity {
+        max_sessions: 10_000,
+        max_bps: Some(1_000_000_000),
+        max_pps: Some(1_000_000),
+    };
+    let low_capacity = NodeCapacity::default();
+    let mut unknown_node_ids = Vec::new();
+    for _ in 0..3 {
+        let identity = IdentityKeyPair::generate();
+        let mut descriptor = NodeDescriptor::new(
+            identity.public_key_bytes(),
+            now.saturating_sub(1),
+            now.saturating_sub(1),
+            now + 300,
+            "unknown-routeable-test-peer",
+        );
+        descriptor.public_endpoint = Some("http://127.0.0.1:9".to_string());
+        descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        descriptor.capacity = high_capacity.clone();
+        let descriptor = SignedNodeDescriptor::sign(descriptor, &identity).unwrap();
+        unknown_node_ids.push(descriptor.node_id());
+        peer_store.upsert_verified(descriptor, now).unwrap();
+    }
+
+    let mut target_descriptor = NodeDescriptor::new(
+        target_identity.public_key_bytes(),
+        now.saturating_sub(1),
+        now.saturating_sub(1),
+        now + 300,
+        "routeable-v3-test-peer",
+    )
+    .with_protocol_features([NodeProtocolFeature::DirectPeerRelayTargetBindingV3]);
+    target_descriptor.public_endpoint = Some(endpoint);
+    target_descriptor.capabilities = vec![NodeCapability::ChatRelay];
+    target_descriptor.capacity = low_capacity;
+    let target_descriptor =
+        SignedNodeDescriptor::sign(target_descriptor, &target_identity).unwrap();
+    let target_node_id = target_descriptor.node_id();
+    peer_store
+        .upsert_verified(target_descriptor, now)
+        .expect("target descriptor should verify");
+    peer_store.record_route_forward_success(&target_node_id, now);
+
+    let pre_fix_candidates = peer_store.route_candidates_with_capability_excluding(
+        NodeCapability::ChatRelay,
+        now,
+        3,
+        &[],
+    );
+    assert_eq!(pre_fix_candidates.len(), 3);
+    assert!(pre_fix_candidates
+        .iter()
+        .all(|candidate| unknown_node_ids.contains(&candidate.node_id())));
+    let routeable_candidates = peer_store.routeable_route_candidates_with_capability_excluding(
+        NodeCapability::ChatRelay,
+        now,
+        3,
+        &[],
+    );
+    assert_eq!(routeable_candidates.len(), 1);
+    assert_eq!(routeable_candidates[0].node_id(), target_node_id);
+    assert!(peer_store
+        .routeable_route_candidates_with_capability_excluding(
+            NodeCapability::ChatRelay,
+            now,
+            3,
+            &[target_node_id],
+        )
+        .is_empty());
+    let expired_identity = IdentityKeyPair::generate();
+    let mut expired_descriptor = NodeDescriptor::new(
+        expired_identity.public_key_bytes(),
+        now.saturating_sub(1),
+        now.saturating_sub(1),
+        now.saturating_sub(1),
+        "expired-routeable-test-peer",
+    );
+    expired_descriptor.public_endpoint = Some("http://127.0.0.1:9".to_string());
+    expired_descriptor.capabilities = vec![NodeCapability::ChatRelay];
+    let expired_descriptor =
+        SignedNodeDescriptor::sign(expired_descriptor, &expired_identity).unwrap();
+    assert!(peer_store.upsert_verified(expired_descriptor, now).is_err());
+
+    let client = test_peer_http_client();
+    let accepted = Server::relay_chat_envelope_to_discovered_peers(
+        Some(client.as_ref()),
+        None,
+        &peer_store,
+        &IdentityKeyPair::generate(),
+        &signed_test_chat_envelope(now),
+    )
+    .await;
+    assert_eq!(accepted, 1);
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    mock_peer.abort();
+}
+
+#[tokio::test]
 async fn target_bound_v3_retry_health_distinguishes_exhaustion_and_determinism() {
     // [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] The first
     // delivery spends its exact-retry budget on two ambiguous 425 replies.

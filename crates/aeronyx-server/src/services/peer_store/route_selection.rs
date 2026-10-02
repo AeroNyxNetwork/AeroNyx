@@ -233,6 +233,35 @@ impl PeerStore {
             .collect()
     }
 
+    /// Returns health-ready route candidates after excluding specific node ids.
+    ///
+    /// [ROUTEABILITY-BEFORE-FANOUT 2026-10-02 by Codex] Normal outbound
+    /// delivery must not let signed-but-unprobed descriptors consume the small
+    /// network fanout budget before the routeability gate runs. Probe callers
+    /// intentionally keep using the broader selector above so cold-start
+    /// recovery can establish route evidence.
+    #[must_use]
+    pub fn routeable_route_candidates_with_capability_excluding(
+        &self,
+        capability: NodeCapability,
+        now: u64,
+        limit: usize,
+        excluded_node_ids: &[[u8; 32]],
+    ) -> Vec<SignedNodeDescriptor> {
+        self.scored_route_candidates(capability, now, None, false)
+            .into_iter()
+            .filter(|candidate| candidate.summary.routeability_ready)
+            .filter(|candidate| {
+                let node_id = candidate.descriptor.node_id();
+                !excluded_node_ids
+                    .iter()
+                    .any(|excluded| *excluded == node_id)
+            })
+            .take(limit)
+            .map(|candidate| candidate.descriptor)
+            .collect()
+    }
+
     /// Returns routeable peers that recently proved purpose-bound v2 receipt
     /// interoperability, after applying capability and exclusion policy.
     ///

@@ -868,7 +868,11 @@ impl Server {
 
         let excluded_node_ids = [node_identity.public_key_bytes()];
         let mut candidates = peer_store
-            .route_candidates_with_capability_excluding(
+            // [ROUTEABILITY-BEFORE-FANOUT 2026-10-02 by Codex] Apply the
+            // route-health admission before the bounded direct fanout. A
+            // signed descriptor without fresh delivery evidence must remain
+            // probeable, but cannot hide a lower-ranked routeable target.
+            .routeable_route_candidates_with_capability_excluding(
                 NodeCapability::ChatRelay,
                 now,
                 CHAT_PEER_RELAY_FANOUT_LIMIT,
