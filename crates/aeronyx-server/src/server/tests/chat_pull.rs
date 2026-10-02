@@ -5,7 +5,8 @@
 // Flow: signed sender ingress -> direct-v3 -> reopen -> signed PullV2/ACK;
 // portable handler composition adds V2 handshake and inbound AEAD/replay;
 // a separate non-Linux fixture also exercises the production UDP dispatcher.
-// Boundary: sender ingress remains preauthenticated; orderly in-process reopen,
+// Boundary: legacy cases retain preauthenticated sender ingress; the dual case
+// uses real handshake/packet services at both ends. Orderly in-process reopen,
 // NOT Server::run, discovery gossip, process crash, failover, or Linux TUN proof.
 // [CHAT-CUSTODY-LIFECYCLE 2026-10-02 by Codex] Add composed acceptance without
 // changing production behavior or seeding target custody through storage APIs.
@@ -363,6 +364,9 @@ enum CustodyAcceptanceCase {
     // [CHAT-PORTABLE-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] No TUN or
     // platform gate: compose production handshake and packet services directly.
     PortableHandshake,
+    // [CHAT-DUAL-HANDSHAKE-CUSTODY 2026-10-02 by Codex] Both client-facing
+    // ends authenticate on the wire; peer custody still uses the real HTTP API.
+    DualPortableHandshake,
     // [CHAT-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] Linux's production UDP
     // task requires a real TUN; this fixture never creates privileged devices.
     #[cfg(not(target_os = "linux"))]
@@ -375,21 +379,22 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("source.sqlite3");
     let target_path = directory.path().join("target.sqlite3");
-    let source =
+    let mut source =
         CustodyAcceptanceNode::open(&source_path, [0x92; 32], IdentityKeyPair::generate()).await;
     let mut target =
         CustodyAcceptanceNode::open(&target_path, [0x93; 32], IdentityKeyPair::generate()).await;
-    let sender = source.client(IdentityKeyPair::generate()).await;
+    // [CHAT-DUAL-HANDSHAKE-CUSTODY 2026-10-02 by Codex] Envelope construction
+    // needs an identity, not an injected session. Only legacy cases use client().
+    let sender_identity = IdentityKeyPair::generate();
     let receiver_identity = IdentityKeyPair::generate();
-    let (sender_e2e, sender_kem) = sender
-        .identity
-        .e2e_handshake(&receiver_identity.x25519_public_key_bytes());
+    let (sender_e2e, sender_kem) =
+        sender_identity.e2e_handshake(&receiver_identity.x25519_public_key_bytes());
     let (receiver_e2e, _) = receiver_identity.e2e_handshake(&sender_kem);
     let plaintext = b"ephemeral custody acceptance payload";
     let nonce = [0x94; 24];
     let mut envelope = ChatEnvelope {
         message_id: [0x95; 16],
-        sender: sender.identity.public_key_bytes(),
+        sender: sender_identity.public_key_bytes(),
         receiver: receiver_identity.public_key_bytes(),
         timestamp: unix_now_secs(),
         ciphertext: sender_e2e.encrypt_raw(plaintext, &nonce).unwrap(),
@@ -397,7 +402,7 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
         content_type: ChatContentType::Text,
         signature: [0; 64],
     };
-    envelope.signature = sender.identity.sign(&envelope.sign_data());
+    envelope.signature = sender_identity.sign(&envelope.sign_data());
     let target_id = target.identity.public_key_bytes();
     let commitment = PeerChatRelayRequestV3::sign(envelope.clone(), target_id, &source.identity)
         .unwrap()
@@ -460,13 +465,28 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
     // the production compatibility direct-v3 path to the sole eligible target.
     source.peers.record_route_forward_success(&target_id, now);
     assert!(source.peers.is_routeable_now(&target_id, now));
-    source
-        .dispatch(
-            &sender,
-            MemChainMessage::ChatRelay(envelope.clone()),
-            Some(http.as_ref()),
+    // [CHAT-DUAL-HANDSHAKE-CUSTODY 2026-10-02 by Codex] No direct dispatch or
+    // SessionManager::create on the dual case's sender or receiver path.
+    if matches!(case, CustodyAcceptanceCase::DualPortableHandshake) {
+        transport_acceptance::submit_from_wire(
+            &mut source,
+            sender_identity,
+            &envelope,
+            Arc::clone(&http),
+            &evidence,
+            &target,
         )
         .await;
+    } else {
+        let sender = source.client(sender_identity).await;
+        source
+            .dispatch(
+                &sender,
+                MemChainMessage::ChatRelay(envelope.clone()),
+                Some(http.as_ref()),
+            )
+            .await;
+    }
     assert_eq!(evidence.v3_calls.load(AtomicOrdering::SeqCst), 1);
     assert_eq!(evidence.legacy_calls.load(AtomicOrdering::SeqCst), 0);
     assert_eq!(evidence.valid_receipts.load(AtomicOrdering::SeqCst), 1);
@@ -484,7 +504,7 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
     // [CHAT-PORTABLE-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] Both ingress
     // variants share the wire client and the complete durable custody lifecycle.
     let ingress = match case {
-        CustodyAcceptanceCase::PortableHandshake => {
+        CustodyAcceptanceCase::PortableHandshake | CustodyAcceptanceCase::DualPortableHandshake => {
             Some(transport_acceptance::Ingress::PortableHandlers)
         }
         #[cfg(not(target_os = "linux"))]
@@ -515,7 +535,7 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
     );
     match case {
         CustodyAcceptanceCase::Ack => {}
-        CustodyAcceptanceCase::PortableHandshake => {
+        CustodyAcceptanceCase::PortableHandshake | CustodyAcceptanceCase::DualPortableHandshake => {
             unreachable!("handled before session injection")
         }
         #[cfg(not(target_os = "linux"))]
@@ -657,12 +677,26 @@ mod transport_acceptance {
     struct UdpRuntime {
         server: Server,
         packet_handler: Arc<PacketHandler>,
+        // [CHAT-DUAL-HANDSHAKE-CUSTODY 2026-10-02 by Codex] Test-only portable
+        // completion evidence, not a protocol ACK or a production metric.
+        completed_dispatches: Arc<AtomicUsize>,
         udp: Arc<UdpTransport>,
         task: tokio::task::JoinHandle<()>,
     }
 
     impl UdpRuntime {
         fn start(node: &mut CustodyAcceptanceNode, ingress: Ingress) -> Self {
+            Self::start_with_http(node, ingress, None)
+        }
+
+        // [CHAT-DUAL-HANDSHAKE-CUSTODY 2026-10-02 by Codex] Inject only the
+        // existing loopback peer client for the sender's portable composition;
+        // receiver-only callers preserve their no-outbound-HTTP boundary.
+        fn start_with_http(
+            node: &mut CustodyAcceptanceNode,
+            ingress: Ingress,
+            http: Option<Arc<reqwest::Client>>,
+        ) -> Self {
             assert_eq!(node.sessions.count(), 0);
             let mut config = ServerConfig::default();
             config.memchain.mode = MemChainMode::Off;
@@ -686,6 +720,7 @@ mod transport_acceptance {
                 Arc::new(DenyList::new()),
                 policy,
             ));
+            let completed_dispatches = Arc::new(AtomicUsize::new(0));
             let task = match ingress {
                 Ingress::PortableHandlers => {
                     // [CHAT-PORTABLE-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex]
@@ -700,6 +735,7 @@ mod transport_acceptance {
                     let peers = Arc::clone(&node.peers);
                     let identity = node.identity.clone();
                     let config = server.config.memchain.clone();
+                    let completed = Arc::clone(&completed_dispatches);
                     tokio::spawn(async move {
                         let mut buffer = vec![0; 65_535];
                         let crypto = DefaultTransportCrypto::new();
@@ -753,9 +789,13 @@ mod transport_acceptance {
                                         &peers,
                                         &identity.public_key_bytes(),
                                         &identity,
-                                        None,
+                                        http.as_deref(),
                                     )
                                     .await;
+                                    // Observe completion only after the real
+                                    // authenticated dispatcher returns. A lost
+                                    // negative-control datagram cannot pass.
+                                    completed.fetch_add(1, AtomicOrdering::SeqCst);
                                 }
                                 _ => panic!("unexpected portable fixture datagram"),
                             }
@@ -794,9 +834,22 @@ mod transport_acceptance {
             Self {
                 server,
                 packet_handler,
+                completed_dispatches,
                 udp: Arc::clone(&node.udp),
                 task,
             }
+        }
+
+        // [CHAT-DUAL-HANDSHAKE-CUSTODY 2026-10-02 by Codex] A bounded local
+        // barrier complements authenticated Pull without assuming UDP delivery.
+        async fn expect_completed(&self, count: usize) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.completed_dispatches.load(AtomicOrdering::SeqCst) != count {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("portable authenticated dispatch completion deadline");
         }
 
         async fn expect_drops(&self, decrypt_failed: u64, replay: u64) {
@@ -982,6 +1035,86 @@ mod transport_acceptance {
         }
     }
 
+    // [CHAT-DUAL-HANDSHAKE-CUSTODY 2026-10-02 by Codex] Reuse the same wire
+    // client for sender admission. Legacy ChatRelay has no sender success ACK:
+    // neither UDP send nor our test-only completion counter proves durability.
+    // The real request-bound target receipt, stored item and subsequent reopen do.
+    pub(super) async fn submit_from_wire(
+        source: &mut CustodyAcceptanceNode,
+        sender: IdentityKeyPair,
+        envelope: &ChatEnvelope,
+        http: Arc<reqwest::Client>,
+        evidence: &CustodyHttpEvidence,
+        target: &CustodyAcceptanceNode,
+    ) {
+        let runtime = UdpRuntime::start_with_http(source, Ingress::PortableHandlers, Some(http));
+        let mut client = WireClient::connect(source, sender).await;
+        assert_eq!(target.sessions.count(), 0, "receiver remains offline");
+        let assert_no_custody = || {
+            assert_eq!(evidence.v3_calls.load(AtomicOrdering::SeqCst), 0);
+            assert_eq!(evidence.legacy_calls.load(AtomicOrdering::SeqCst), 0);
+            assert_eq!(evidence.valid_receipts.load(AtomicOrdering::SeqCst), 0);
+            assert_eq!(source.relay.peer_status().outbound_accepted_total, 0);
+            assert_eq!(source.relay.storage_usage().unwrap().pending_messages, 0);
+            assert_eq!(target.relay.storage_usage().unwrap().pending_messages, 0);
+        };
+        assert_no_custody();
+
+        let mut tampered = client.packet(&MemChainMessage::ChatRelay(envelope.clone()));
+        *tampered.last_mut().unwrap() ^= 1;
+        client.send(&tampered).await;
+        runtime.expect_drops(1, 0).await;
+        assert_eq!(runtime.completed_dispatches.load(AtomicOrdering::SeqCst), 0);
+        assert_no_custody();
+
+        // This envelope is correctly signed but not by the authenticated session
+        // identity. Observe its completed dispatch before checking zero effects.
+        let unrelated_identity = IdentityKeyPair::generate();
+        let mut mismatched = envelope.clone();
+        mismatched.sender = unrelated_identity.public_key_bytes();
+        mismatched.signature = unrelated_identity.sign(&mismatched.sign_data());
+        assert!(mismatched.verify_signature().is_ok());
+        let mismatch = client.packet(&MemChainMessage::ChatRelay(mismatched));
+        client.send(&mismatch).await;
+        runtime.expect_completed(1).await;
+        assert!(client.pull().await.0.is_empty());
+        runtime.expect_completed(2).await;
+        assert_no_custody();
+        assert!(source
+            .relay
+            .wallet_routes
+            .lookup(&unrelated_identity.public_key_bytes())
+            .is_empty());
+
+        let valid = client.packet(&MemChainMessage::ChatRelay(envelope.clone()));
+        client.send(&valid).await;
+        runtime.expect_completed(3).await;
+        // Signed Pull queries the sender's own mailbox, never the receiver's.
+        // An authenticated response is a serial barrier, not a custody receipt.
+        assert!(client.pull().await.0.is_empty());
+        runtime.expect_completed(4).await;
+        assert_eq!(evidence.v3_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(evidence.valid_receipts.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(source.relay.storage_usage().unwrap().pending_messages, 1);
+        assert_eq!(target.relay.storage_usage().unwrap().pending_messages, 1);
+
+        client.send(&valid).await;
+        runtime.expect_drops(1, 1).await;
+        assert_eq!(runtime.completed_dispatches.load(AtomicOrdering::SeqCst), 4);
+        assert!(client.pull().await.0.is_empty());
+        runtime.expect_completed(5).await;
+        assert_eq!(evidence.v3_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(evidence.legacy_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(evidence.valid_receipts.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(source.relay.peer_status().outbound_accepted_total, 1);
+        assert_eq!(source.relay.peer_status().outbound_failed_total, 0);
+        assert_eq!(source.relay.storage_usage().unwrap().pending_messages, 1);
+        assert_eq!(target.relay.storage_usage().unwrap().pending_messages, 1);
+        assert_eq!(target.sessions.count(), 0, "receiver remains offline");
+        drop(client);
+        runtime.close().await;
+    }
+
     pub(super) async fn run(
         mut target: CustodyAcceptanceNode,
         path: &std::path::Path,
@@ -1036,6 +1169,18 @@ mod transport_acceptance {
         )
         .await
         .expect("bounded portable handshake/custody/reopen lifecycle");
+    }
+
+    // [CHAT-DUAL-HANDSHAKE-CUSTODY 2026-10-02 by Codex] Both client-facing
+    // ends use portable production services, not a full Server::run/TUN fixture.
+    #[tokio::test]
+    async fn chat_custody_dual_handshake_sender_admission_pull_ack_survives_reopen() {
+        tokio::time::timeout(
+            Duration::from_secs(45),
+            run_custody_acceptance(CustodyAcceptanceCase::DualPortableHandshake),
+        )
+        .await
+        .expect("bounded dual handshake/custody/reopen lifecycle");
     }
 
     #[cfg(not(target_os = "linux"))]
