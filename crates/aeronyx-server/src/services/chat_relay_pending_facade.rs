@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_pending_facade.rs
 // ============================================
-// Version: 1.2.0-ByteAwareSnapshotPaging
+// Version: 1.3.0-HttpBoundedSnapshotPaging
 //
 // Creation Reason:
 //   [CHAT-PENDING-FACADE-DOMAIN 2026-08-28 by Codex] Move offline-message
@@ -9,6 +9,8 @@
 //   the relay composition root without widening service field visibility.
 //
 // Modification Reason:
+//   [CHAT-HTTP-V2-BYTE-PAGING 2026-10-03 by Codex] Expose a separate strict
+//   HTTP encoded-page budget, keeping existing public and UDP pull semantics.
 //   [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] Add an internal transport-budgeted
 //   snapshot path without changing the public count-based pull contract.
 //   [CHAT-PENDING-CURSOR-SEAM-DOMAIN 2026-08-28 by Codex] Co-locate the
@@ -39,6 +41,7 @@
 //   - Never log message IDs, wallet keys, ciphertext, routes, or raw rows.
 //
 // Last Modified:
+//   v1.3.0-HttpBoundedSnapshotPaging - 2026-10-03, HTTP codec-bounded pull API
 //   v1.2.0-ByteAwareSnapshotPaging - 2026-10-03, internal budgeted snapshot path
 //   v1.1.0-PendingCursorTestSeam - Co-located test-only cursor decoding
 //   v1.0.0-PendingMessageFacade - Initial pending-message facade extraction
@@ -190,6 +193,38 @@ impl ChatRelayService {
             encoded_cursor,
             limit,
             SnapshotPageBudget::UdpCoalescing { target_bytes },
+        )?;
+        self.record_pending_pull_quarantine(delivery.quarantine);
+        Ok(delivery.page)
+    }
+
+    /// Retrieves a whole ordered HTTP v2 prefix within the MemChain codec bound.
+    ///
+    /// [CHAT-HTTP-V2-BYTE-PAGING 2026-10-03 by Codex] Includes response fields
+    /// and the protected cursor in the 2 MiB + discriminator raw byte ceiling.
+    /// Selection precedes cursor protection; callers must not truncate the page.
+    /// This synchronous repository boundary must run off async worker threads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the existing cursor/storage errors, or a coarse serialization
+    /// error if even the first whole item cannot fit. Valid pending rows remain
+    /// stored; no oversized-first exception, ACK, or skip is implied by HTTP.
+    pub(crate) fn pull_pending_v2_http(
+        &self,
+        receiver: &[u8; 32],
+        after_timestamp: u64,
+        encoded_cursor: &[u8],
+        limit: u32,
+    ) -> ChatRelayResult<PendingMessagePageV2> {
+        let delivery = self.pending_delivery.pull_snapshot_budgeted(
+            &self.conn,
+            &self.durable_quarantine,
+            receiver,
+            after_timestamp,
+            encoded_cursor,
+            limit,
+            SnapshotPageBudget::HttpEncoded,
         )?;
         self.record_pending_pull_quarantine(delivery.quarantine);
         Ok(delivery.page)
@@ -386,5 +421,173 @@ mod byte_paging_tests {
             .unwrap();
         assert_eq!((decoded.position, decoded.ceiling), (1, 2));
         assert_eq!(service.storage_usage().unwrap().pending_messages, 2);
+    }
+
+    // [CHAT-HTTP-V2-BYTE-PAGING 2026-10-03 by Codex] Exercise the real codec
+    // on the returned cursor and whole signed envelopes, not a size estimate.
+    fn http_encoded_len(page: &PendingMessagePageV2) -> Result<usize, bincode::Error> {
+        use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
+        encode_memchain(&MemChainMessage::ChatPullResponseV2 {
+            envelopes: page
+                .messages
+                .iter()
+                .map(|message| message.envelope.clone())
+                .collect(),
+            next_cursor: page.next_cursor.clone(),
+            has_more: page.has_more,
+        })
+        .map(|encoded| encoded.len())
+    }
+
+    #[test]
+    fn http_v2_large_count_page_becomes_bounded_prefixes_across_ack_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custody.sqlite3");
+        let service = open(&path);
+        for id in 1..=100 {
+            store(&service, id, 65_536);
+        }
+        let old = service.pull_pending_v2(&[0x92; 32], 0, &[], 100).unwrap();
+        assert_eq!(old.messages.len(), 100);
+        // Reproduce the old HTTP failure with an entirely legal retained page.
+        assert!(http_encoded_len(&old).is_err());
+        drop(old);
+        let first = service
+            .pull_pending_v2_http(&[0x92; 32], 0, &[], 100)
+            .unwrap();
+        assert_eq!(first.messages.len(), 31);
+        assert_eq!(http_encoded_len(&first).unwrap(), 2_037_523);
+        assert!(first.has_more);
+        let decoded = service
+            .decode_pull_cursor_v2(&[0x92; 32], 0, &first.next_cursor)
+            .unwrap();
+        assert_eq!((decoded.position, decoded.ceiling), (31, 100));
+        for (index, message) in first.messages.iter().enumerate() {
+            assert!(message.message_id == [index as u8 + 1; 16]);
+            assert_eq!(message.envelope.ciphertext.len(), 65_536);
+        }
+        // A lost HTTP response has no ACK side effect; the same input returns
+        // the same envelope prefix/ceiling (cursor encryption may use a new nonce).
+        let retry = service
+            .pull_pending_v2_http(&[0x92; 32], 0, &[], 100)
+            .unwrap();
+        assert!(first
+            .messages
+            .iter()
+            .zip(&retry.messages)
+            .all(|(a, b)| a.message_id == b.message_id));
+        assert_eq!(retry.messages.len(), 31);
+        assert_eq!(service.storage_usage().unwrap().pending_messages, 100);
+        store(&service, 101, 1);
+        let ids: Vec<_> = first
+            .messages
+            .iter()
+            .map(|message| message.message_id)
+            .collect();
+        assert_eq!(service.ack_messages(&ids, &[0x92; 32]).unwrap(), 31);
+        let mut cursor = first.next_cursor;
+        drop(service);
+        let service = open(&path);
+        for (start, end) in [(32u8, 62u8), (63, 93), (94, 100)] {
+            let page = service
+                .pull_pending_v2_http(&[0x92; 32], 0, &cursor, 100)
+                .unwrap();
+            assert_eq!(page.messages.len(), usize::from(end - start + 1));
+            assert!(http_encoded_len(&page).unwrap() <= 2_097_153);
+            for (id, message) in (start..=end).zip(&page.messages) {
+                assert!(message.message_id == [id; 16]);
+                assert_eq!(message.envelope.ciphertext.len(), 65_536);
+            }
+            let decoded = service
+                .decode_pull_cursor_v2(&[0x92; 32], 0, &page.next_cursor)
+                .unwrap();
+            assert_eq!((decoded.position, decoded.ceiling), (u64::from(end), 100));
+            assert_eq!(page.has_more, end < 100);
+            let ids: Vec<_> = page
+                .messages
+                .iter()
+                .map(|message| message.message_id)
+                .collect();
+            assert_eq!(service.ack_messages(&ids, &[0x92; 32]).unwrap(), ids.len());
+            cursor = page.next_cursor;
+        }
+        let exhausted = service
+            .pull_pending_v2_http(&[0x92; 32], 0, &cursor, 100)
+            .unwrap();
+        assert!(exhausted.messages.is_empty() && !exhausted.has_more);
+        assert_eq!(http_encoded_len(&exhausted).unwrap(), 79);
+        let fresh = service
+            .pull_pending_v2_http(&[0x92; 32], 0, &[], 100)
+            .unwrap();
+        assert_eq!(fresh.messages.len(), 1);
+        assert!(fresh.messages[0].message_id == [101; 16]);
+        assert_eq!(service.storage_usage().unwrap().pending_messages, 1);
+    }
+
+    #[test]
+    fn http_v2_byte_limited_cursor_never_skips_valid_rows_among_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = open(&dir.path().join("custody.sqlite3"));
+        for id in 1..=35 {
+            store(&service, id, 65_536);
+        }
+        service
+            .conn
+            .lock()
+            .execute(
+                "UPDATE pending_messages SET sender = zeroblob(32) WHERE queue_sequence IN (2,34)",
+                [],
+            )
+            .unwrap();
+        let first = service
+            .pull_pending_v2_http(&[0x92; 32], 0, &[], 100)
+            .unwrap();
+        assert_eq!(first.messages.len(), 31);
+        assert!(first.has_more);
+        let decoded = service
+            .decode_pull_cursor_v2(&[0x92; 32], 0, &first.next_cursor)
+            .unwrap();
+        assert_eq!((decoded.position, decoded.ceiling), (32, 35));
+        assert_eq!(service.storage_usage().unwrap().pending_messages, 33);
+        let last = service
+            .pull_pending_v2_http(&[0x92; 32], 0, &first.next_cursor, 100)
+            .unwrap();
+        assert_eq!(last.messages.len(), 2);
+        assert!(last.messages[0].message_id == [33; 16]);
+        assert!(last.messages[1].message_id == [35; 16]);
+        assert!(!last.has_more);
+        assert!(http_encoded_len(&last).unwrap() <= 2_097_153);
+    }
+
+    #[test]
+    fn http_v2_corrupt_only_bounded_scan_keeps_forward_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = open(&dir.path().join("custody.sqlite3"));
+        for id in 1..=4 {
+            store(&service, id, 1);
+        }
+        service
+            .conn
+            .lock()
+            .execute(
+                "UPDATE pending_messages SET sender = zeroblob(32) WHERE queue_sequence <= 3",
+                [],
+            )
+            .unwrap();
+        let first = service
+            .pull_pending_v2_http(&[0x92; 32], 0, &[], 2)
+            .unwrap();
+        assert!(first.messages.is_empty() && first.has_more);
+        assert_eq!(http_encoded_len(&first).unwrap(), 79);
+        let decoded = service
+            .decode_pull_cursor_v2(&[0x92; 32], 0, &first.next_cursor)
+            .unwrap();
+        assert_eq!((decoded.position, decoded.ceiling), (3, 4));
+        let last = service
+            .pull_pending_v2_http(&[0x92; 32], 0, &first.next_cursor, 2)
+            .unwrap();
+        assert_eq!(last.messages.len(), 1);
+        assert!(last.messages[0].message_id == [4; 16]);
+        assert!(!last.has_more);
     }
 }

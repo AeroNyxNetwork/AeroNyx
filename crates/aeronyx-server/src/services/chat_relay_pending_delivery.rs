@@ -1,13 +1,15 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_pending_delivery.rs
 // ============================================
-// Version: 1.2.0-ByteAwareSnapshotPaging
+// Version: 1.3.0-HttpBoundedSnapshotPaging
 //
 // Creation Reason:
 //   [CHAT-PENDING-DELIVERY-DOMAIN 2026-08-28 by Codex] Extract complete legacy
 //   and snapshot pull use cases from the oversized relay orchestration service.
 //
 // Modification Reason:
+//   [CHAT-HTTP-V2-BYTE-PAGING 2026-10-03 by Codex] Bound HTTP pages by the
+//   actual MemChain codec ceiling before cursor protection, without UDP framing.
 //   [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] Select a whole-envelope byte
 //   prefix before protecting its cursor; preserve the public count-only path.
 //   [CHAT-PENDING-CONTRACT-DOMAIN 2026-08-28 by Codex] Depend directly on the
@@ -42,6 +44,7 @@
 //   - Keep final pagination outside the connection-lock scope.
 //
 // Last Modified:
+//   v1.3.0-HttpBoundedSnapshotPaging - 2026-10-03, strict HTTP encoded prefix
 //   v1.2.0-ByteAwareSnapshotPaging - 2026-10-03, select prefix before cursor
 //   v1.1.0-PendingContractDependency - Removed orchestrator dependency
 //   v1.0.0-PendingDeliveryDomain - Initial pull use-case composition
@@ -107,7 +110,15 @@ pub(crate) struct SnapshotPendingDeliveryPage {
 pub(crate) enum SnapshotPageBudget {
     CountOnly,
     UdpCoalescing { target_bytes: usize },
+    // [CHAT-HTTP-V2-BYTE-PAGING 2026-10-03 by Codex] Unlike UDP coalescing,
+    // this is a hard codec bound: even a single item must fit in full.
+    HttpEncoded,
 }
+
+// [CHAT-HTTP-V2-BYTE-PAGING 2026-10-03 by Codex] Frozen MemChain codec limit:
+// 2 MiB bincode payload plus its one-byte discriminator. The core constant is
+// private; boundary tests below exercise encode_memchain at this exact ceiling.
+const HTTP_SNAPSHOT_ENCODED_MAX_BYTES: usize = 2 * 1024 * 1024 + 1;
 
 impl SnapshotPageBudget {
     fn select_prefix(
@@ -115,19 +126,35 @@ impl SnapshotPageBudget {
         messages: &[(u64, PendingMessage)],
         page_limit: usize,
     ) -> ChatRelayResult<(usize, Option<usize>)> {
-        let Self::UdpCoalescing { target_bytes } = self else {
-            return Ok((messages.len().min(page_limit), None));
+        // [CHAT-HTTP-V2-BYTE-PAGING 2026-10-03 by Codex] Keep transport units
+        // explicit. HTTP counts raw MemChain bytes, not UDP/AEAD framing.
+        let (target_bytes, mut bytes, allow_oversized_first) = match self {
+            Self::CountOnly => return Ok((messages.len().min(page_limit), None)),
+            Self::UdpCoalescing { target_bytes } => (
+                target_bytes,
+                snapshot_datagram_bytes(&[], &[0; ENCODED_CURSOR_BYTES])?,
+                true,
+            ),
+            Self::HttpEncoded => (
+                HTTP_SNAPSHOT_ENCODED_MAX_BYTES,
+                snapshot_encoded_bytes(&[], &[0; ENCODED_CURSOR_BYTES])?,
+                false,
+            ),
         };
-        // Measure the actual empty response, including the frozen opaque cursor
-        // and outer transport framing. The final encode below checks composition.
-        let mut bytes = snapshot_datagram_bytes(&[], &[0; ENCODED_CURSOR_BYTES])?;
         let mut selected = 0;
         for (_, message) in messages.iter().take(page_limit) {
             let item_bytes = usize::try_from(bincode::serialized_size(&message.envelope)?)
                 .map_err(|_| snapshot_size_error())?;
             let next = checked_page_bytes(bytes, item_bytes)?;
-            if selected != 0 && next > target_bytes {
-                break;
+            if next > target_bytes {
+                if selected != 0 {
+                    break;
+                }
+                if !allow_oversized_first {
+                    // Do not return an empty non-progressing page or skip a
+                    // valid row. Existing custody/admission policy is unchanged.
+                    return Err(snapshot_size_error());
+                }
             }
             bytes = next;
             selected += 1;
@@ -143,11 +170,24 @@ impl SnapshotPageBudget {
         page: &PendingMessagePageV2,
         expected_bytes: Option<usize>,
     ) -> ChatRelayResult<()> {
-        let Self::UdpCoalescing { target_bytes } = self else {
-            return Ok(());
+        // [CHAT-HTTP-V2-BYTE-PAGING 2026-10-03 by Codex] Encode the selected
+        // page with the actual protected cursor as an independent final guard.
+        let (actual, target_bytes, allow_oversized_first) = match self {
+            Self::CountOnly => return Ok(()),
+            Self::UdpCoalescing { target_bytes } => (
+                snapshot_datagram_bytes(&page.messages, &page.next_cursor)?,
+                target_bytes,
+                true,
+            ),
+            Self::HttpEncoded => (
+                snapshot_encoded_bytes(&page.messages, &page.next_cursor)?,
+                HTTP_SNAPSHOT_ENCODED_MAX_BYTES,
+                false,
+            ),
         };
-        let actual = snapshot_datagram_bytes(&page.messages, &page.next_cursor)?;
-        if Some(actual) != expected_bytes || (actual > target_bytes && page.messages.len() != 1) {
+        if Some(actual) != expected_bytes
+            || (actual > target_bytes && !(allow_oversized_first && page.messages.len() == 1))
+        {
             return Err(snapshot_size_error());
         }
         Ok(())
@@ -167,6 +207,18 @@ fn checked_page_bytes(current: usize, additional: usize) -> ChatRelayResult<usiz
 }
 
 fn snapshot_datagram_bytes(messages: &[PendingMessage], cursor: &[u8]) -> ChatRelayResult<usize> {
+    checked_page_bytes(
+        checked_page_bytes(
+            snapshot_encoded_bytes(messages, cursor)?,
+            DATA_PACKET_HEADER_SIZE,
+        )?,
+        ENCRYPTION_OVERHEAD,
+    )
+}
+
+// [CHAT-HTTP-V2-BYTE-PAGING 2026-10-03 by Codex] Shared canonical inner
+// measurement; each transport adds only its own framing outside this helper.
+fn snapshot_encoded_bytes(messages: &[PendingMessage], cursor: &[u8]) -> ChatRelayResult<usize> {
     let response = MemChainMessage::ChatPullResponseV2 {
         envelopes: messages
             .iter()
@@ -177,10 +229,7 @@ fn snapshot_datagram_bytes(messages: &[PendingMessage], cursor: &[u8]) -> ChatRe
         has_more: false,
     };
     let clear = encode_memchain(&response).map_err(|_| snapshot_size_error())?;
-    checked_page_bytes(
-        checked_page_bytes(clear.len(), DATA_PACKET_HEADER_SIZE)?,
-        ENCRYPTION_OVERHEAD,
-    )
+    Ok(clear.len())
 }
 
 /// Composed pending-message delivery use cases.
@@ -471,5 +520,90 @@ mod byte_paging_tests {
         assert!(budget.validate(&page, Some(1200)).is_err());
         // Even an accurate oversized estimate cannot admit a multi-item frame.
         assert!(budget.validate(&page, Some(1201)).is_err());
+    }
+
+    // [CHAT-HTTP-V2-BYTE-PAGING 2026-10-03 by Codex] Real codec boundary,
+    // using individually legal <=64 KiB ciphertexts, not an oversized fake row.
+    #[test]
+    fn http_v2_prefix_exact_codec_limit_and_plus_one_never_skip() {
+        let budget = SnapshotPageBudget::HttpEncoded;
+        assert_eq!(
+            snapshot_encoded_bytes(&[], &[0; ENCODED_CURSOR_BYTES]).unwrap(),
+            79
+        );
+        let mut messages: Vec<_> = (1..=31).map(|id| message(id, 65_536)).collect();
+        // 79 fixed + 31*(188+65536) + (188+59442) = 2097153.
+        messages.push(message(32, 59_442));
+        assert_eq!(
+            budget.select_prefix(&messages, 100).unwrap(),
+            (32, Some(HTTP_SNAPSHOT_ENCODED_MAX_BYTES))
+        );
+        let mut page = PendingMessagePageV2 {
+            messages: messages.into_iter().map(|(_, message)| message).collect(),
+            next_cursor: vec![0; ENCODED_CURSOR_BYTES],
+            has_more: true,
+        };
+        assert_eq!(
+            snapshot_encoded_bytes(&page.messages, &page.next_cursor).unwrap(),
+            2_097_153
+        );
+        assert!(budget.validate(&page, Some(2_097_153)).is_ok());
+        page.messages[31].envelope.ciphertext.push(0);
+        // The real core encoder rejects +1, independent of selection arithmetic.
+        assert!(snapshot_encoded_bytes(&page.messages, &page.next_cursor).is_err());
+        let mut over: Vec<_> = page
+            .messages
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| (index as u64 + 1, message))
+            .collect();
+        over.push(message(33, 1));
+        // Do not skip row32 to fit the small row33; row32 belongs to the next page.
+        assert_eq!(
+            budget.select_prefix(&over, 100).unwrap(),
+            (31, Some(2_037_523))
+        );
+        assert_eq!(
+            SnapshotPageBudget::CountOnly
+                .select_prefix(&over, 100)
+                .unwrap(),
+            (33, None)
+        );
+    }
+
+    #[test]
+    fn http_v2_empty_limits_and_unrepresentable_first_fail_closed() {
+        let budget = SnapshotPageBudget::HttpEncoded;
+        assert_eq!(budget.select_prefix(&[], 100).unwrap(), (0, Some(79)));
+        let mut messages = vec![message(1, 65_536), message(2, 1)];
+        assert_eq!(
+            budget.select_prefix(&messages, 1).unwrap(),
+            (1, Some(65_803))
+        );
+        // Guard future/custom custody configurations without deleting or skipping.
+        messages[0]
+            .1
+            .envelope
+            .ciphertext
+            .resize(HTTP_SNAPSHOT_ENCODED_MAX_BYTES, 0);
+        assert!(matches!(
+            budget.select_prefix(&messages, 100),
+            Err(ChatRelayError::Serialize(_))
+        ));
+    }
+
+    #[test]
+    fn http_v2_actual_cursor_and_encoder_guard_reject_estimate_drift() {
+        let budget = SnapshotPageBudget::HttpEncoded;
+        let mut page = PendingMessagePageV2 {
+            messages: vec![message(1, 65_536).1],
+            next_cursor: vec![0; ENCODED_CURSOR_BYTES],
+            has_more: false,
+        };
+        assert!(budget.validate(&page, Some(65_803)).is_ok());
+        assert!(budget.validate(&page, Some(65_802)).is_err());
+        assert!(budget.validate(&page, None).is_err());
+        page.next_cursor.push(0);
+        assert!(budget.validate(&page, Some(65_803)).is_err());
     }
 }
