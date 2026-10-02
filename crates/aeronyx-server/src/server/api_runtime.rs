@@ -2,6 +2,7 @@
 // required-listener binding/serving, and management task construction in one
 // server-local runtime child while preserving startup and shutdown ordering.
 use super::*;
+use crate::api::chat_handlers::build_chat_pull_http_router;
 
 impl Server {
     // ============================================
