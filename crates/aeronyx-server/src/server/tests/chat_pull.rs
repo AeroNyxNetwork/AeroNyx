@@ -2,7 +2,7 @@
 // Purpose: Pull authority, direct-relay custody, and UDP handshake acceptance.
 // Dependencies: parent test helpers, production dispatcher/router, core crypto,
 // ephemeral loopback HTTP/UDP, and private temporary SQLite repositories.
-// Flow: signed sender ingress -> direct-v3 -> reopen -> signed PullV2/ACK;
+// Flow: signed sender ingress -> direct-v3 -> reopen -> signed PullV1/V2/ACK;
 // portable handler composition adds V2 handshake and inbound AEAD/replay;
 // a separate non-Linux fixture also exercises the production UDP dispatcher.
 // Boundary: legacy cases retain preauthenticated sender ingress; the dual case
@@ -10,8 +10,120 @@
 // NOT Server::run, discovery gossip, process crash, failover, or Linux TUN proof.
 // [CHAT-CUSTODY-LIFECYCLE 2026-10-02 by Codex] Add composed acceptance without
 // changing production behavior or seeding target custody through storage APIs.
-// Last Modified: 2026-10-02. Originally split from server.rs `mod tests`.
+// [CHAT-V1-COALESCING 2026-10-03 by Codex] Cover byte-target prefixes,
+// single-envelope compatibility and 51-item multi-page custody acceptance.
+// Last Modified: 2026-10-03. Originally split from server.rs `mod tests`.
 use super::*;
+
+// [CHAT-V1-COALESCING 2026-10-03 by Codex] Codec-only synthetic envelopes:
+// these do not claim valid signatures or replace real-ingress custody fixtures.
+fn coalescing_envelope(id: u8, ciphertext_len: usize) -> ChatEnvelope {
+    ChatEnvelope {
+        message_id: [id; 16],
+        sender: [0; 32],
+        receiver: [0; 32],
+        timestamp: 0,
+        ciphertext: vec![0; ciphertext_len],
+        nonce: [0; 24],
+        content_type: ChatContentType::Text,
+        signature: [0; 64],
+    }
+}
+
+fn coalescing_datagram_size(response: &MemChainMessage) -> usize {
+    let plaintext = aeronyx_core::protocol::encode_memchain(response).unwrap();
+    // Exercise the actual DataPacket codec as well as the application encoder.
+    let packet = aeronyx_core::protocol::DataPacket::new(
+        [0; 16],
+        0,
+        vec![0; plaintext.len() + ENCRYPTION_OVERHEAD],
+    );
+    aeronyx_core::protocol::codec::encode_data_packet(&packet).len()
+}
+
+#[test]
+fn chat_pull_v1_coalescing_exact_boundary_and_plus_one() {
+    // 54 + 2 * (188 + 385) = 1200 full UDP payload bytes.
+    let exact = Server::coalesce_legacy_chat_pull(
+        vec![coalescing_envelope(1, 385), coalescing_envelope(2, 385)],
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        coalescing_datagram_size(&exact),
+        Server::LEGACY_CHAT_PULL_COALESCING_TARGET
+    );
+    assert!(
+        matches!(&exact, MemChainMessage::ChatPullResponse { envelopes, has_more: false } if envelopes.len() == 2)
+    );
+    let overflow = Server::coalesce_legacy_chat_pull(
+        vec![
+            coalescing_envelope(1, 385),
+            coalescing_envelope(2, 386),
+            coalescing_envelope(3, 1),
+        ],
+        false,
+    )
+    .unwrap();
+    assert_eq!(coalescing_datagram_size(&overflow), 627);
+    assert!(
+        matches!(&overflow, MemChainMessage::ChatPullResponse { envelopes, has_more: true }
+        if envelopes.len() == 1 && envelopes[0].message_id == [1; 16])
+    );
+}
+
+#[test]
+fn chat_pull_v1_coalescing_single_over_target_stays_whole() {
+    let first = coalescing_envelope(1, 2048);
+    let expected =
+        aeronyx_core::protocol::encode_memchain(&MemChainMessage::ChatRelay(first.clone()))
+            .unwrap();
+    for has_tail in [false, true] {
+        let mut input = vec![first.clone()];
+        if has_tail {
+            input.push(coalescing_envelope(2, 1));
+        }
+        let response = Server::coalesce_legacy_chat_pull(input, false).unwrap();
+        assert_eq!(coalescing_datagram_size(&response), 2290);
+        let MemChainMessage::ChatPullResponse {
+            envelopes,
+            has_more,
+        } = response
+        else {
+            panic!("expected V1 response")
+        };
+        assert_eq!(has_more, has_tail);
+        assert_eq!(envelopes.len(), 1);
+        assert!(
+            aeronyx_core::protocol::encode_memchain(&MemChainMessage::ChatRelay(
+                envelopes[0].clone()
+            ))
+            .unwrap()
+                == expected
+        );
+    }
+}
+
+#[test]
+fn chat_pull_v1_coalescing_preserves_existing_more_flag() {
+    for envelopes in [Vec::new(), vec![coalescing_envelope(1, 1)]] {
+        let response = Server::coalesce_legacy_chat_pull(envelopes, true).unwrap();
+        assert!(coalescing_datagram_size(&response) <= Server::LEGACY_CHAT_PULL_COALESCING_TARGET);
+        assert!(matches!(
+            response,
+            MemChainMessage::ChatPullResponse { has_more: true, .. }
+        ));
+    }
+    let empty = Server::coalesce_legacy_chat_pull(Vec::new(), false).unwrap();
+    assert_eq!(coalescing_datagram_size(&empty), 54);
+    assert!(matches!(
+        empty,
+        MemChainMessage::ChatPullResponse {
+            has_more: false,
+            ..
+        }
+    ));
+}
 
 #[tokio::test]
 async fn chat_pull_route_authority_v1_cannot_create() {
@@ -284,7 +396,9 @@ impl CustodyAcceptanceClient {
 // never replace it. The source must use v3 and verify a request-bound receipt.
 struct CustodyHttpEvidence {
     target: [u8; 32],
-    request_commitment: [u8; 32],
+    // [CHAT-MANUAL-V1-ACCEPTANCE 2026-10-02 by Codex] One expected commitment
+    // per admitted fixture envelope; do not replace the real target receipt.
+    request_commitments: Vec<[u8; 32]>,
     v3_calls: AtomicUsize,
     legacy_calls: AtomicUsize,
     valid_receipts: AtomicUsize,
@@ -313,16 +427,11 @@ async fn observe_custody_http(
     let body = to_bytes(body, PEER_ACK_RESPONSE_MAX_BYTES).await.unwrap();
     let ack: PeerChatRelayResponseV2 = serde_json::from_slice(&body).unwrap();
     assert!(ack.relay.accepted && ack.relay.stored_pending);
+    let receipt = ack.receipt.as_ref().expect("signed custody receipt");
     assert!(
-        ack.receipt
-            .as_ref()
-            .expect("signed custody receipt")
-            .verify_expected_commitment(
-                &evidence.request_commitment,
-                &evidence.target,
-                unix_now_secs()
-            )
-            .is_ok(),
+        evidence.request_commitments.iter().any(|commitment| receipt
+            .verify_expected_commitment(commitment, &evidence.target, unix_now_secs())
+            .is_ok()),
         "custody receipt did not bind request and target"
     );
     evidence.valid_receipts.fetch_add(1, AtomicOrdering::SeqCst);
@@ -367,6 +476,12 @@ enum CustodyAcceptanceCase {
     // [CHAT-DUAL-HANDSHAKE-CUSTODY 2026-10-02 by Codex] Both client-facing
     // ends authenticate on the wire; peer custody still uses the real HTTP API.
     DualPortableHandshake,
+    // [CHAT-V1-COALESCING 2026-10-03 by Codex] V2 transport carrying
+    // independently assembled legacy V1 frames across byte-target-sized pages.
+    ManualLegacyPages,
+    // [CHAT-V1-COALESCING 2026-10-03 by Codex] Deterministic socket failure
+    // leaves durable custody available after reopen and before an explicit ACK.
+    LegacyWriteFailure,
     // [CHAT-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] Linux's production UDP
     // task requires a real TUN; this fixture never creates privileged devices.
     #[cfg(not(target_os = "linux"))]
@@ -403,14 +518,40 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
         signature: [0; 64],
     };
     envelope.signature = sender_identity.sign(&envelope.sign_data());
+    // [CHAT-MANUAL-V1-ACCEPTANCE 2026-10-02 by Codex] Deliberately reverse
+    // timestamp order relative to IDs and share seconds across adjacent IDs.
+    // Each message has its own nonce; every target row enters through real HTTP.
+    let envelopes = if matches!(case, CustodyAcceptanceCase::ManualLegacyPages) {
+        (1u8..=51)
+            .map(|index| {
+                let mut item = envelope.clone();
+                item.message_id = [index; 16];
+                item.timestamp = envelope
+                    .timestamp
+                    .checked_sub(u64::from((index - 1) / 2))
+                    .unwrap();
+                item.nonce = [index; 24];
+                item.ciphertext = sender_e2e.encrypt_raw(plaintext, &item.nonce).unwrap();
+                item.signature = sender_identity.sign(&item.sign_data());
+                item
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![envelope.clone()]
+    };
     let target_id = target.identity.public_key_bytes();
-    let commitment = PeerChatRelayRequestV3::sign(envelope.clone(), target_id, &source.identity)
-        .unwrap()
-        .request_commitment()
-        .unwrap();
+    let commitments = envelopes
+        .iter()
+        .map(|item| {
+            PeerChatRelayRequestV3::sign(item.clone(), target_id, &source.identity)
+                .unwrap()
+                .request_commitment()
+                .unwrap()
+        })
+        .collect();
     let evidence = Arc::new(CustodyHttpEvidence {
         target: target_id,
-        request_commitment: commitment,
+        request_commitments: commitments,
         v3_calls: AtomicUsize::new(0),
         legacy_calls: AtomicUsize::new(0),
         valid_receipts: AtomicUsize::new(0),
@@ -467,7 +608,15 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
     assert!(source.peers.is_routeable_now(&target_id, now));
     // [CHAT-DUAL-HANDSHAKE-CUSTODY 2026-10-02 by Codex] No direct dispatch or
     // SessionManager::create on the dual case's sender or receiver path.
-    if matches!(case, CustodyAcceptanceCase::DualPortableHandshake) {
+    if matches!(case, CustodyAcceptanceCase::ManualLegacyPages) {
+        transport_acceptance::submit_legacy_pages_from_wire(
+            &mut source,
+            sender_identity,
+            &envelopes,
+            Arc::clone(&http),
+        )
+        .await;
+    } else if matches!(case, CustodyAcceptanceCase::DualPortableHandshake) {
         transport_acceptance::submit_from_wire(
             &mut source,
             sender_identity,
@@ -487,18 +636,40 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
             )
             .await;
     }
-    assert_eq!(evidence.v3_calls.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(
+        evidence.v3_calls.load(AtomicOrdering::SeqCst),
+        envelopes.len()
+    );
     assert_eq!(evidence.legacy_calls.load(AtomicOrdering::SeqCst), 0);
-    assert_eq!(evidence.valid_receipts.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(
+        evidence.valid_receipts.load(AtomicOrdering::SeqCst),
+        envelopes.len()
+    );
+    let expected_pending = u64::try_from(envelopes.len()).unwrap();
     let source_status = source.relay.peer_status();
-    assert_eq!(source_status.outbound_accepted_total, 1);
+    assert_eq!(source_status.outbound_accepted_total, expected_pending);
     assert_eq!(source_status.outbound_failed_total, 0);
     assert_eq!(target.relay.peer_status().inbound_delivered_online_total, 0);
-    assert_eq!(target.relay.storage_usage().unwrap().pending_messages, 1);
+    assert_eq!(
+        target.relay.storage_usage().unwrap().pending_messages,
+        expected_pending
+    );
     // There has been no receiver session on T. Local source fallback custody
     // is allowed; this is one target copy, not a global exactly-once assertion.
     router.close().await;
     target = target.reopen(&target_path, [0x93; 32]).await;
+    if matches!(case, CustodyAcceptanceCase::ManualLegacyPages) {
+        transport_acceptance::run_legacy_pages(
+            target,
+            &target_path,
+            receiver_identity,
+            &envelopes,
+            &receiver_e2e,
+            plaintext,
+        )
+        .await;
+        return;
+    }
     // [CHAT-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] The receiver in this
     // branch has no injected Session and never calls the dispatcher directly.
     // [CHAT-PORTABLE-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] Both ingress
@@ -535,6 +706,44 @@ async fn run_custody_acceptance(case: CustodyAcceptanceCase) {
     );
     match case {
         CustodyAcceptanceCase::Ack => {}
+        CustodyAcceptanceCase::LegacyWriteFailure => {
+            // [CHAT-V1-COALESCING 2026-10-03 by Codex] Shutdown forces the
+            // real send to return false without sysctl changes or UDP loss bets.
+            target.udp.shutdown().await.unwrap();
+            let response =
+                Server::coalesce_legacy_chat_pull(vec![envelope.clone()], false).unwrap();
+            assert!(
+                !Server::send_to_session(
+                    &response,
+                    &receiver.session,
+                    &target.udp,
+                    &DefaultTransportCrypto::new(),
+                )
+                .await
+            );
+            let frame = transport_acceptance::legacy_pull_frame(
+                &receiver.identity,
+                0,
+                [0; 16],
+                unix_now_secs(),
+                b"AeroNyx-ChatPull-v1",
+            );
+            let request = aeronyx_core::protocol::decode_memchain(&frame[1..]).unwrap();
+            target.dispatch(&receiver, request, None).await;
+            assert_eq!(target.relay.storage_usage().unwrap().pending_messages, 1);
+            drop(receiver);
+            target = target.reopen(&target_path, [0x93; 32]).await;
+            receiver = target.client(receiver_identity.clone()).await;
+            assert_custody_envelope(
+                &receiver.pull(&target).await,
+                &envelope,
+                &receiver_e2e,
+                plaintext,
+            );
+        }
+        CustodyAcceptanceCase::ManualLegacyPages => {
+            unreachable!("handled before session injection")
+        }
         CustodyAcceptanceCase::PortableHandshake | CustodyAcceptanceCase::DualPortableHandshake => {
             unreachable!("handled before session injection")
         }
@@ -638,6 +847,13 @@ async fn chat_custody_invalid_acks_preserve_item_until_valid_ack() {
     )
     .await
     .expect("bounded invalid ACK lifecycle");
+}
+
+// [CHAT-V1-COALESCING 2026-10-03 by Codex] Existing custody lifecycle still
+// requires explicit owner ACK after a failed V1 write and successful reopen.
+#[tokio::test]
+async fn chat_custody_failed_v1_write_preserves_item_until_ack() {
+    run_custody_acceptance(CustodyAcceptanceCase::LegacyWriteFailure).await;
 }
 
 // [CHAT-TRANSPORT-ACCEPTANCE 2026-10-02 by Codex] Private composition of the
@@ -936,15 +1152,21 @@ mod transport_acceptance {
         }
 
         fn packet(&mut self, message: &MemChainMessage) -> Vec<u8> {
-            self.tx_counter = self.tx_counter.checked_add(1).unwrap();
             let clear = aeronyx_core::protocol::encode_memchain(message).unwrap();
+            self.packet_from_plaintext(&clear)
+        }
+
+        // [CHAT-MANUAL-V1-ACCEPTANCE 2026-10-02 by Codex] Share negotiated
+        // transport without forcing independently built frames through serde.
+        fn packet_from_plaintext(&mut self, clear: &[u8]) -> Vec<u8> {
+            self.tx_counter = self.tx_counter.checked_add(1).unwrap();
             let mut sealed = vec![0; clear.len() + 16];
             let len = DefaultTransportCrypto::new()
                 .encrypt(
                     &self.keys.c2s,
                     self.tx_counter,
                     &self.session_id,
-                    &clear,
+                    clear,
                     &mut sealed,
                 )
                 .unwrap();
@@ -980,11 +1202,27 @@ mod transport_acceptance {
                 signature,
             });
             self.send(&packet).await;
+            let clear = self.receive_plaintext().await;
+            let MemChainMessage::ChatPullResponseV2 {
+                envelopes,
+                has_more,
+                ..
+            } = aeronyx_core::protocol::decode_memchain(&clear[1..]).unwrap()
+            else {
+                panic!("expected PullV2 response")
+            };
+            assert!(!has_more);
+            (envelopes, packet)
+        }
+
+        // [CHAT-MANUAL-V1-ACCEPTANCE 2026-10-02 by Codex] Reuse exact s2c,
+        // session and replay checks for both application response versions.
+        async fn receive_plaintext(&mut self) -> Vec<u8> {
             let mut datagram = vec![0; 65_535];
             let (len, source) =
                 tokio::time::timeout(Duration::from_secs(3), self.udp.recv(&mut datagram))
                     .await
-                    .expect("bounded encrypted PullV2 response")
+                    .expect("bounded encrypted pull response")
                     .unwrap();
             assert_eq!(source.addr, self.target);
             let response = decode_data_packet(&datagram[..len]).unwrap();
@@ -1003,17 +1241,40 @@ mod transport_acceptance {
                 )
                 .expect("response authenticated under negotiated s2c key");
             self.rx_counter = Some(response.counter);
+            clear.truncate(len);
             assert_eq!(clear[0], aeronyx_core::protocol::memchain::MEMCHAIN_MAGIC);
-            let MemChainMessage::ChatPullResponseV2 {
-                envelopes,
-                has_more,
-                ..
-            } = aeronyx_core::protocol::decode_memchain(&clear[1..len]).unwrap()
-            else {
-                panic!("expected PullV2 response")
-            };
-            assert!(!has_more);
-            (envelopes, packet)
+            clear
+        }
+
+        // [CHAT-MANUAL-V1-ACCEPTANCE 2026-10-02 by Codex] Independent V1
+        // application bytes inside the negotiated V2 transport session.
+        async fn legacy_pull(&mut self, after: u64, cursor: [u8; 16]) -> (Vec<ChatEnvelope>, bool) {
+            let frame = legacy_pull_frame(
+                &self.identity,
+                after,
+                cursor,
+                unix_now_secs(),
+                b"AeroNyx-ChatPull-v1",
+            );
+            let packet = self.packet_from_plaintext(&frame);
+            self.send(&packet).await;
+            let clear = self.receive_plaintext().await;
+            // [CHAT-V1-COALESCING 2026-10-03 by Codex] These real-wire
+            // fixture items are small; every full response must fit the target.
+            let packet_bytes = clear.len()
+                + ENCRYPTION_OVERHEAD
+                + aeronyx_core::protocol::messages::DATA_PACKET_HEADER_SIZE;
+            assert!(packet_bytes <= Server::LEGACY_CHAT_PULL_COALESCING_TARGET);
+            let page = parse_legacy_response(&clear).expect("bounded canonical V1 response");
+            // Exercise parser fail-closed bounds against real response bytes.
+            assert!(parse_legacy_response(&clear[..clear.len() - 1]).is_none());
+            let mut invalid = clear.clone();
+            invalid.extend_from_slice(&[0]);
+            assert!(parse_legacy_response(&invalid).is_none());
+            invalid = clear;
+            invalid[5..13].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert!(parse_legacy_response(&invalid).is_none());
+            page
         }
 
         fn ack_packet(&mut self, message_id: [u8; 16]) -> Vec<u8> {
@@ -1033,6 +1294,277 @@ mod transport_acceptance {
                 signature,
             })
         }
+    }
+
+    // [CHAT-MANUAL-V1-ACCEPTANCE 2026-10-02 by Codex] Freeze the client V1
+    // layout independently of serde and of the server's signing helper.
+    pub(super) fn legacy_pull_frame(
+        identity: &IdentityKeyPair,
+        after: u64,
+        cursor: [u8; 16],
+        timestamp: u64,
+        domain: &[u8],
+    ) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let wallet = identity.public_key_bytes();
+        let mut fields = Vec::new();
+        fields.extend_from_slice(&wallet);
+        fields.extend_from_slice(&after.to_le_bytes());
+        fields.extend_from_slice(&cursor);
+        fields.extend_from_slice(&50u32.to_le_bytes());
+        fields.extend_from_slice(&timestamp.to_le_bytes());
+        let mut transcript = Sha256::new();
+        transcript.update(domain);
+        transcript.update(&fields);
+        let signature = identity.sign(&transcript.finalize());
+        let mut frame = vec![0xAE, 12, 0, 0, 0];
+        frame.extend_from_slice(&fields);
+        frame.extend_from_slice(&signature);
+        assert_eq!(frame.len(), 137);
+        assert!(
+            frame
+                == aeronyx_core::protocol::encode_memchain(&MemChainMessage::ChatPull {
+                    wallet,
+                    after_timestamp: after,
+                    cursor,
+                    limit: 50,
+                    request_timestamp: timestamp,
+                    signature,
+                })
+                .unwrap()
+        );
+        frame
+    }
+
+    // [CHAT-MANUAL-V1-ACCEPTANCE 2026-10-02 by Codex] ACK signs the ordered
+    // ID digest, not its wire count. No production codec constructs this frame.
+    fn legacy_ack_frame(identity: &IdentityKeyPair, ids: &[[u8; 16]]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        assert!(!ids.is_empty() && ids.len() <= 100);
+        let wallet = identity.public_key_bytes();
+        let timestamp = unix_now_secs();
+        let mut ordered = Vec::new();
+        for id in ids {
+            ordered.extend_from_slice(id);
+        }
+        let mut transcript = Sha256::new();
+        transcript.update(b"AeroNyx-ChatAck-v1");
+        transcript.update(wallet);
+        transcript.update(timestamp.to_le_bytes());
+        transcript.update(Sha256::digest(&ordered));
+        let signature = identity.sign(&transcript.finalize());
+        let mut frame = vec![0xAE, 14, 0, 0, 0];
+        frame.extend_from_slice(&u64::try_from(ids.len()).unwrap().to_le_bytes());
+        frame.extend_from_slice(&ordered);
+        frame.extend_from_slice(&wallet);
+        frame.extend_from_slice(&timestamp.to_le_bytes());
+        frame.extend_from_slice(&signature);
+        assert_eq!(frame.len(), 117 + 16 * ids.len());
+        assert!(
+            frame
+                == aeronyx_core::protocol::encode_memchain(&MemChainMessage::ChatAck {
+                    message_ids: ids.to_vec(),
+                    wallet,
+                    ack_timestamp: timestamp,
+                    signature,
+                })
+                .unwrap()
+        );
+        frame
+    }
+
+    // [CHAT-MANUAL-V1-ACCEPTANCE 2026-10-02 by Codex] Bounded manual reader:
+    // no allocation from an unvalidated wire length. Canonical bool/trailing
+    // policy is deliberately stricter than the legacy Dart decoder.
+    fn legacy_take<'a>(rest: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+        let (field, remaining) = rest.split_at_checked(len)?;
+        *rest = remaining;
+        Some(field)
+    }
+
+    fn legacy_array<const N: usize>(rest: &mut &[u8]) -> Option<[u8; N]> {
+        legacy_take(rest, N)?.try_into().ok()
+    }
+
+    fn parse_legacy_response(frame: &[u8]) -> Option<(Vec<ChatEnvelope>, bool)> {
+        use aeronyx_core::protocol::chat::ChatContentType;
+        if frame.len() > 65_535 {
+            return None;
+        }
+        let mut rest = frame;
+        if legacy_take(&mut rest, 5)? != [0xAE, 13, 0, 0, 0] {
+            return None;
+        }
+        let count = usize::try_from(u64::from_le_bytes(legacy_array(&mut rest)?)).ok()?;
+        if count > 500 || count > rest.len() / 188 {
+            return None;
+        }
+        let mut envelopes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let message_id = legacy_array(&mut rest)?;
+            let sender = legacy_array(&mut rest)?;
+            let receiver = legacy_array(&mut rest)?;
+            let timestamp = u64::from_le_bytes(legacy_array(&mut rest)?);
+            let len = usize::try_from(u64::from_le_bytes(legacy_array(&mut rest)?)).ok()?;
+            let ciphertext = legacy_take(&mut rest, len)?.to_vec();
+            let nonce = legacy_array(&mut rest)?;
+            let content_type = match u32::from_le_bytes(legacy_array(&mut rest)?) {
+                0 => ChatContentType::Text,
+                1 => ChatContentType::Media,
+                2 => ChatContentType::System,
+                _ => return None,
+            };
+            let signature = legacy_array(&mut rest)?;
+            envelopes.push(ChatEnvelope {
+                message_id,
+                sender,
+                receiver,
+                timestamp,
+                ciphertext,
+                nonce,
+                content_type,
+                signature,
+            });
+        }
+        let has_more = match legacy_take(&mut rest, 1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        rest.is_empty().then_some((envelopes, has_more))
+    }
+
+    // [CHAT-MANUAL-V1-ACCEPTANCE 2026-10-02 by Codex] All 51 items traverse
+    // real sender handshake/AEAD admission and the target's HTTP custody path.
+    pub(super) async fn submit_legacy_pages_from_wire(
+        source: &mut CustodyAcceptanceNode,
+        sender: IdentityKeyPair,
+        envelopes: &[ChatEnvelope],
+        http: Arc<reqwest::Client>,
+    ) {
+        let runtime = UdpRuntime::start_with_http(source, Ingress::PortableHandlers, Some(http));
+        let mut client = WireClient::connect(source, sender).await;
+        for (index, envelope) in envelopes.iter().enumerate() {
+            let packet = client.packet(&MemChainMessage::ChatRelay(envelope.clone()));
+            client.send(&packet).await;
+            runtime.expect_completed(index + 1).await;
+        }
+        let (items, more) = client.legacy_pull(0, [0; 16]).await;
+        assert!(items.is_empty() && !more);
+        runtime.expect_completed(envelopes.len() + 1).await;
+        drop(client);
+        runtime.close().await;
+    }
+
+    // [CHAT-MANUAL-V1-ACCEPTANCE 2026-10-02 by Codex] Fixed timestamp floor
+    // across all pages, including deletion of the previous cursor row by ACK.
+    pub(super) async fn run_legacy_pages(
+        mut target: CustodyAcceptanceNode,
+        path: &std::path::Path,
+        receiver: IdentityKeyPair,
+        expected: &[ChatEnvelope],
+        e2e: &aeronyx_core::crypto::E2eSession,
+        plaintext: &[u8],
+    ) {
+        assert_eq!(expected.len(), 51);
+        assert_eq!(expected[0].timestamp, expected[1].timestamp);
+        assert!(expected[0].timestamp > expected[50].timestamp);
+        assert!(expected
+            .windows(2)
+            .all(|pair| pair[0].message_id < pair[1].message_id));
+        let after = expected[50].timestamp.checked_sub(1).unwrap();
+        let runtime = UdpRuntime::start(&mut target, Ingress::PortableHandlers);
+        let mut client = WireClient::connect(&target, receiver.clone()).await;
+        let now = unix_now_secs();
+        let wrong_domain =
+            legacy_pull_frame(&receiver, after, [0; 16], now, b"AeroNyx-ChatPull-v2");
+        let mut changed_cursor =
+            legacy_pull_frame(&receiver, after, [0; 16], now, b"AeroNyx-ChatPull-v1");
+        changed_cursor[45] ^= 1;
+        let expired = legacy_pull_frame(
+            &receiver,
+            after,
+            [0; 16],
+            now.checked_sub(120).unwrap(),
+            b"AeroNyx-ChatPull-v1",
+        );
+        for (index, frame) in [wrong_domain, changed_cursor, expired].iter().enumerate() {
+            let packet = client.packet_from_plaintext(frame);
+            client.send(&packet).await;
+            // Completion is observed after the real dispatcher returns. A lost
+            // packet alone cannot make the subsequent no-response check pass.
+            runtime.expect_completed(index + 1).await;
+            assert_eq!(target.relay.storage_usage().unwrap().pending_messages, 51);
+            assert!(target
+                .relay
+                .wallet_routes
+                .lookup(&receiver.public_key_bytes())
+                .is_empty());
+            let mut datagram = vec![0; 65_535];
+            assert!(tokio::time::timeout(
+                Duration::from_millis(100),
+                client.udp.recv(&mut datagram)
+            )
+            .await
+            .is_err());
+        }
+        // [CHAT-V1-COALESCING 2026-10-03 by Codex] Limit50 remains an upper
+        // bound. Prove an exact ordered union across byte-target-sized pages.
+        let mut cursor = [0; 16];
+        let mut received = 0;
+        let mut pages = 0;
+        let mut completed = 3;
+        let mut unique = std::collections::BTreeSet::new();
+        loop {
+            assert!(pages < expected.len(), "bounded pagination progress");
+            let (page, more) = client.legacy_pull(after, cursor).await;
+            completed += 1;
+            runtime.expect_completed(completed).await;
+            // This fixture has no expiry notifications; no empty progress page.
+            assert!(!page.is_empty() && page.len() <= 50);
+            let end = received + page.len();
+            assert!(end <= expected.len());
+            for (actual, expected) in page.iter().zip(&expected[received..end]) {
+                assert_custody_envelope(std::slice::from_ref(actual), expected, e2e, plaintext);
+                assert!(unique.insert(actual.message_id), "duplicate across pages");
+            }
+            cursor = page.last().unwrap().message_id;
+            received = end;
+            pages += 1;
+            assert_eq!(more, received < expected.len());
+            // ACK only this fully verified page. The next cursor deliberately
+            // references a deleted row; never advance to fetched-but-unsent IDs.
+            let ids: Vec<_> = page.iter().map(|item| item.message_id).collect();
+            let packet = client.packet_from_plaintext(&legacy_ack_frame(&receiver, &ids));
+            client.send(&packet).await;
+            completed += 1;
+            runtime.expect_completed(completed).await;
+            assert_eq!(
+                target.relay.storage_usage().unwrap().pending_messages,
+                u64::try_from(expected.len() - received).unwrap()
+            );
+            if !more {
+                break;
+            }
+        }
+        assert!(pages > 1);
+        assert_eq!(received, 51);
+        assert_eq!(unique.len(), 51);
+        let (empty, more) = client.legacy_pull(after, cursor).await;
+        runtime.expect_completed(completed + 1).await;
+        assert!(empty.is_empty() && !more);
+        assert_eq!(target.relay.storage_usage().unwrap().pending_messages, 0);
+        drop(client);
+        runtime.close().await;
+        target = target.reopen(path, [0x93; 32]).await;
+        let runtime = UdpRuntime::start(&mut target, Ingress::PortableHandlers);
+        let mut client = WireClient::connect(&target, receiver).await;
+        let (empty, more) = client.legacy_pull(0, [0; 16]).await;
+        runtime.expect_completed(1).await;
+        assert!(empty.is_empty() && !more);
+        assert_eq!(target.relay.storage_usage().unwrap().pending_messages, 0);
+        drop(client);
+        runtime.close().await;
     }
 
     // [CHAT-DUAL-HANDSHAKE-CUSTODY 2026-10-02 by Codex] Reuse the same wire
@@ -1181,6 +1713,18 @@ mod transport_acceptance {
         )
         .await
         .expect("bounded dual handshake/custody/reopen lifecycle");
+    }
+
+    // [CHAT-V1-COALESCING 2026-10-03 by Codex] Final acceptance slice with
+    // small coalesced pages; not a PMTU guarantee or Dart/native client test.
+    #[tokio::test]
+    async fn chat_custody_manual_v1_multiple_pages_ack_survives_reopen() {
+        tokio::time::timeout(
+            Duration::from_secs(90),
+            run_custody_acceptance(CustodyAcceptanceCase::ManualLegacyPages),
+        )
+        .await
+        .expect("bounded manual V1 51-item multi-page custody lifecycle");
     }
 
     #[cfg(not(target_os = "linux"))]

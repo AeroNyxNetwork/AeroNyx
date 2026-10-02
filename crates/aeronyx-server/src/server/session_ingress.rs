@@ -1,9 +1,72 @@
-// [ARCH-SPLIT 2026-10-02]
-// Session MemChain frames, expired-notification push, and one encrypted write.
-// Bodies are unchanged. Private items are pub(super) so the parent flow can call them.
+// File: crates/aeronyx-server/src/server/session_ingress.rs
+// Purpose: Session MemChain dispatch, expiry notifications and encrypted writes.
+// Dependencies: parent server services and the existing core/transport codecs.
+// Flow: authenticate -> read custody -> coalesce V1 prefix -> encrypted write.
+// Boundary: V1 coalescing never ACKs/deletes records or changes V2 cursors.
+// [ARCH-SPLIT 2026-10-02] Private items remain pub(super) for parent composition.
+// [CHAT-V1-COALESCING 2026-10-03 by Codex] Bound multi-envelope coalescing,
+// preserving the existing single-envelope send path above the target.
+// Last Modified: 2026-10-03.
 use super::*;
 
 impl Server {
+    // [CHAT-V1-COALESCING 2026-10-03 by Codex] Full UDP payload target,
+    // NOT a hard admission ceiling, socket capacity, or Internet PMTU promise.
+    pub(super) const LEGACY_CHAT_PULL_COALESCING_TARGET: usize = 1200;
+
+    // Keep an ordered, whole-envelope prefix. A first envelope above the target
+    // is sent alone for single-message compatibility, even if the old transport
+    // may fail to carry it. No repository, cursor or ACK mutation happens here.
+    pub(super) fn coalesce_legacy_chat_pull(
+        mut envelopes: Vec<ChatEnvelope>,
+        has_more: bool,
+    ) -> std::result::Result<MemChainMessage, &'static str> {
+        use aeronyx_core::protocol::messages::DATA_PACKET_HEADER_SIZE;
+        // Frozen fixed-int V1 layout: magic + enum + Vec length + bool.
+        let overhead = DATA_PACKET_HEADER_SIZE
+            .checked_add(ENCRYPTION_OVERHEAD)
+            .ok_or("size_overflow")?;
+        let mut expected_bytes = overhead.checked_add(1 + 4 + 8 + 1).ok_or("size_overflow")?;
+        let mut selected = 0;
+        for envelope in &envelopes {
+            // id16 + sender32 + receiver32 + timestamp8 + Vec length8 +
+            // nonce24 + content enum4 + raw signature64 = 188 fixed bytes.
+            let item_bytes = 188usize
+                .checked_add(envelope.ciphertext.len())
+                .ok_or("size_overflow")?;
+            let next_bytes = expected_bytes
+                .checked_add(item_bytes)
+                .ok_or("size_overflow")?;
+            if selected != 0 && next_bytes > Self::LEGACY_CHAT_PULL_COALESCING_TARGET {
+                break;
+            }
+            expected_bytes = next_bytes;
+            selected += 1;
+            if expected_bytes > Self::LEGACY_CHAT_PULL_COALESCING_TARGET {
+                break;
+            }
+        }
+        let has_more = has_more || selected < envelopes.len();
+        envelopes.truncate(selected);
+        let response = MemChainMessage::ChatPullResponse {
+            envelopes,
+            has_more,
+        };
+        // The actual bounded production encoder is the final authority. Fail
+        // closed if its layout drifts from the checked size calculation.
+        let actual_bytes = encode_memchain(&response)
+            .map_err(|_| "encode_failed")?
+            .len()
+            .checked_add(overhead)
+            .ok_or("size_overflow")?;
+        if actual_bytes != expected_bytes
+            || (actual_bytes > Self::LEGACY_CHAT_PULL_COALESCING_TARGET && selected != 1)
+        {
+            return Err("encoded_size_mismatch");
+        }
+        Ok(response)
+    }
+
     // ============================================
     // MemChain Message Handler
     // ============================================
@@ -469,11 +532,23 @@ impl Server {
                                 );
                             }
                         }
-                        let resp = MemChainMessage::ChatPullResponse {
-                            envelopes,
-                            has_more,
+                        // [CHAT-V1-COALESCING 2026-10-03 by Codex] A byte-
+                        // shortened prefix remains pending until owner ACK.
+                        let resp = match Self::coalesce_legacy_chat_pull(envelopes, has_more) {
+                            Ok(response) => response,
+                            Err(reason) => {
+                                debug!(reason, "[CHAT_RELAY] Legacy pull assembly failed");
+                                return;
+                            }
                         };
-                        Self::send_to_session(&resp, session, udp, crypto).await;
+                        if !Self::send_to_session(&resp, session, udp, crypto).await {
+                            // No retry amplification, fake success or deletion.
+                            // Single-envelope socket failures remain possible.
+                            debug!(
+                                reason = "response_write_failed",
+                                "[CHAT_RELAY] Legacy pull not written"
+                            );
+                        }
                     }
                     Err(e) => {
                         warn!(
