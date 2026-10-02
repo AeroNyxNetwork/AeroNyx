@@ -220,6 +220,34 @@ pub async fn mpi_recall(
         }
     };
 
+    // [MEMORY-SEALED-V2-ENUMERATION 2026-10-02 by Codex] Decode the cursor
+    // before query analysis or session-cache work. Standard base64 is the
+    // sole wire spelling; malformed, non-canonical, and wrong-length cursors
+    // fail closed without storage mutation or a co-occurrence task.
+    let sealed_v2_after = match rb.sealed_v2_after.as_deref() {
+        None => None,
+        Some(value) => {
+            use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+            let Some(decoded) = BASE64.decode(value.as_bytes()).ok() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"invalid sealed v2 cursor"})),
+                )
+                    .into_response();
+            };
+            if decoded.len() != 32 || BASE64.encode(&decoded) != value {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"invalid sealed v2 cursor"})),
+                )
+                    .into_response();
+            }
+            let mut cursor = [0u8; 32];
+            cursor.copy_from_slice(&decoded);
+            Some(cursor)
+        }
+    };
+
     // [RECALL-SESSION-CACHE 2026-07-29 by Codex] Bound attacker-controlled
     // labels and retained vectors before either reaches the process-wide
     // session cache. Existing requests remain wire-compatible.
@@ -1022,19 +1050,26 @@ pub async fn mpi_recall(
             .collect()
     });
     let query_type_str = format!("{:?}", query_type).to_lowercase();
-    let sealed_v2 = {
+    let (sealed_v2, sealed_v2_next_cursor) = {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-        match storage.list_sealed_v2(&owner, None, top_k).await {
-            Ok(page) => page
-                .rows
-                .into_iter()
-                .map(|row| SealedV2Memory {
-                    record_id_b64: BASE64.encode(row.record_id),
-                    created_at: row.created_at,
-                    envelope_b64: BASE64.encode(row.envelope),
-                    signature_b64: BASE64.encode(row.signature),
-                })
-                .collect::<Vec<_>>(),
+        match storage
+            .list_sealed_v2(&owner, sealed_v2_after.as_ref(), top_k)
+            .await
+        {
+            Ok(page) => {
+                let next_cursor = page.next_cursor.map(|cursor| BASE64.encode(cursor));
+                let rows = page
+                    .rows
+                    .into_iter()
+                    .map(|row| SealedV2Memory {
+                        record_id_b64: BASE64.encode(row.record_id),
+                        created_at: row.created_at,
+                        envelope_b64: BASE64.encode(row.envelope),
+                        signature_b64: BASE64.encode(row.signature),
+                    })
+                    .collect::<Vec<_>>();
+                (rows, next_cursor)
+            }
             Err(_) => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1079,6 +1114,7 @@ pub async fn mpi_recall(
                 "matched_entities": matched_json,
                 "sealed": sealed_memories,
                 "sealed_v2": sealed_v2,
+                "sealed_v2_next_cursor": sealed_v2_next_cursor,
                 "hint": "Use POST /api/mpi/recall/detail with record_ids to fetch full content.",
             })),
         )
@@ -1109,6 +1145,7 @@ pub async fn mpi_recall(
             matched_entities: matched_json,
             sealed: sealed_memories,
             sealed_v2,
+            sealed_v2_next_cursor,
         })),
     )
         .into_response()

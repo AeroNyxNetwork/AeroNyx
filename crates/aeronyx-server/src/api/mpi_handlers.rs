@@ -980,6 +980,11 @@ pub struct RecallRequest {
     /// v2.5.3+Isolation: None/"all" = no filter; other = project_id filter.
     #[serde(default)]
     pub context: Option<String>,
+    /// [MEMORY-SEALED-V2-ENUMERATION 2026-10-02 by Codex] Canonical
+    /// owner-scoped V2 record cursor returned by the previous recall page.
+    /// Omitted keeps the legacy first-page behavior.
+    #[serde(default)]
+    pub sealed_v2_after: Option<String>,
     /// Brick 3b node-blind: client-hashed query token-hashes (`HMAC(k_fts, token)`
     /// hex) for blind full-text. Matching blind records are returned as ciphertext
     /// in the `sealed` list. Empty = no blind full-text search.
@@ -1051,6 +1056,10 @@ pub struct RecallResponse {
     /// Additive opaque V2 list; never enters legacy scoring or projections.
     #[serde(default)]
     pub sealed_v2: Vec<SealedV2Memory>,
+    /// [MEMORY-SEALED-V2-ENUMERATION 2026-10-02 by Codex] Canonical cursor
+    /// for the next owner-scoped page; `null` is the terminal page.
+    #[serde(default)]
+    pub sealed_v2_next_cursor: Option<String>,
 }
 
 // ============================================
@@ -2582,6 +2591,122 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "remote capacity unavailable");
+    }
+
+    #[tokio::test]
+    async fn sealed_v2_router_enumerates_owner_scoped_pages_with_canonical_cursor() {
+        // [MEMORY-SEALED-V2-ENUMERATION 2026-10-02 by Codex] The production
+        // router must expose the storage cursor without leaking another
+        // owner's rows, repeating a page, or accepting a non-canonical token.
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let (mut state, _auth, _vector_index) = make_test_state_with_storage(Arc::clone(&storage));
+        Arc::get_mut(&mut state).unwrap().blind_storage_enabled = true;
+        let app = crate::api::mpi::build_mpi_router(Arc::clone(&state));
+        let owner_a = IdentityKeyPair::generate();
+        let owner_b = IdentityKeyPair::generate();
+        let mut owner_a_ids = Vec::new();
+
+        for marker in 1..=3 {
+            let (body, record_id, _envelope, _signature) = sealed_v2_body(&owner_a, marker);
+            let response = app
+                .clone()
+                .oneshot(signed_remote_request(
+                    &owner_a,
+                    "POST",
+                    "/api/mpi/remember_sealed_v2",
+                    body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            owner_a_ids.push(BASE64.encode(record_id));
+        }
+        let (owner_b_body, owner_b_id, _envelope, _signature) = sealed_v2_body(&owner_b, 9);
+        let response = app
+            .clone()
+            .oneshot(signed_remote_request(
+                &owner_b,
+                "POST",
+                "/api/mpi/remember_sealed_v2",
+                owner_b_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let owner_b_id = BASE64.encode(owner_b_id);
+
+        let response = app
+            .clone()
+            .oneshot(signed_remote_request(
+                &owner_a,
+                "POST",
+                "/api/mpi/recall",
+                br#"{"mode":"index","top_k":2}"#.to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let first_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        let first_rows = first["sealed_v2"].as_array().unwrap();
+        assert_eq!(first_rows.len(), 2);
+        assert!(first_rows.iter().all(|row| {
+            owner_a_ids
+                .iter()
+                .any(|id| id == row["record_id_b64"].as_str().unwrap())
+                && row["record_id_b64"].as_str().unwrap() != owner_b_id
+        }));
+        let cursor = first["sealed_v2_next_cursor"].as_str().unwrap().to_string();
+        assert_eq!(BASE64.encode(BASE64.decode(&cursor).unwrap()), cursor);
+
+        let second_request = serde_json::json!({
+            "mode": "index",
+            "top_k": 2,
+            "sealed_v2_after": cursor,
+        })
+        .to_string()
+        .into_bytes();
+        let response = app
+            .clone()
+            .oneshot(signed_remote_request(
+                &owner_a,
+                "POST",
+                "/api/mpi/recall",
+                second_request,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let second_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        let second_rows = second["sealed_v2"].as_array().unwrap();
+        assert_eq!(second_rows.len(), 1);
+        assert_eq!(second["sealed_v2_next_cursor"], serde_json::Value::Null);
+        let second_id = second_rows[0]["record_id_b64"].as_str().unwrap();
+        assert!(owner_a_ids.iter().any(|id| id == second_id));
+        let mut all_ids = first_rows
+            .iter()
+            .chain(second_rows.iter())
+            .map(|row| row["record_id_b64"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        all_ids.sort_unstable();
+        all_ids.dedup();
+        assert_eq!(all_ids.len(), 3);
+
+        let response = app
+            .oneshot(signed_remote_request(
+                &owner_a,
+                "POST",
+                "/api/mpi/recall",
+                br#"{"sealed_v2_after":"AA=="}"#.to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
