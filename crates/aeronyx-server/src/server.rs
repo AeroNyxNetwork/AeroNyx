@@ -1022,7 +1022,7 @@ use crate::api::blind_vault::{
     build_blind_vault_router_with_admission_runtime, BlindVaultApiAdmissionRuntime,
 };
 use crate::api::chat_anonymous_mailbox_source::build_chat_anonymous_mailbox_source_router;
-use crate::api::chat_handlers::build_chat_router;
+use crate::api::chat_handlers::{build_chat_pull_http_router, build_chat_router};
 #[cfg(test)]
 use crate::api::chat_peer::blind_relay_delivery_receipt_is_valid;
 use crate::api::chat_peer::{

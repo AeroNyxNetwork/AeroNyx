@@ -13,6 +13,8 @@
 //! - `POST /api/chat/blob` — Upload an encrypted blob (Alice → Node)
 //! - `GET  /api/chat/blob/{blob_id}` — Download an encrypted blob (Node → Bob)
 //! - `DELETE /api/chat/blob/{blob_id}` — Retract a blob (Alice → Node)
+//! - `POST /api/mpi/chat/pull_v2` — Authenticated raw-MemChain pending pull
+//! - `POST /api/mpi/chat/ack_v2` — Authenticated receiver-bound ACK
 //! - `build_chat_router()` — Assembles the Axum sub-router for mounting
 //!
 //! ## Request Authentication
@@ -68,6 +70,9 @@
 //! - `Arc<ChatRelayService>` is passed via Axum `State` — do NOT store
 //!   a `Mutex` around the entire service in State (the service already
 //!   has internal locking).
+//! - Reliable pull/ACK routes are built separately and may only be merged
+//!   through `build_mpi_router_with_source`; they require unified MPI auth plus
+//!   an inner wallet signature and never enter the ordinary blob router.
 //! - Body size is limited by `axum::extract::DefaultBodyLimit` set in
 //!   `build_chat_router()`. This is a hard limit enforced BEFORE the
 //!   handler runs, so `max_blob_size` in `ChatRelayConfig` is a second
@@ -88,23 +93,34 @@
 //! v1.1.0-ChatRelay — Initial implementation
 
 use std::sync::{atomic::AtomicUsize, Arc};
+use std::time::Duration;
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Request, State},
+    extract::{DefaultBodyLimit, Extension, Path, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-use aeronyx_core::crypto::keys::IdentityPublicKey;
+use aeronyx_core::{
+    crypto::keys::IdentityPublicKey,
+    protocol::{
+        auth::{signed_message_digest, verify_signed_message},
+        encode_memchain, MemChainMessage, MAX_CHAT_PULL_CURSOR_V2_BYTES,
+    },
+};
+use bincode::Options;
+use tokio::sync::Semaphore;
 
 use crate::{
+    api::mpi::AuthenticatedOwner,
     api::InFlightRequestGuard,
     services::chat_relay::{ChatRelayError, ChatRelayService},
 };
@@ -120,6 +136,22 @@ const MAX_IN_FLIGHT_BLOB_UPLOADS: usize = 16;
 /// Downloads have their own pool so a large upload wave cannot prevent an
 /// intended recipient from fetching an already stored encrypted attachment.
 const MAX_IN_FLIGHT_BLOB_ACCESSES: usize = 32;
+
+// [CHAT-HTTP-RELIABLE-PULL 2026-10-03 by Codex] The HTTP carrier is an
+// authenticated MPI/VPN-only fallback for a valid envelope that cannot fit a
+// UDP datagram. It carries canonical MemChain bytes, not a new wire variant.
+const CHAT_PULL_HTTP_PATH: &str = "/api/mpi/chat/pull_v2";
+const CHAT_ACK_HTTP_PATH: &str = "/api/mpi/chat/ack_v2";
+const CHAT_HTTP_REQUEST_MAX_BYTES: usize = 4 * 1024;
+const CHAT_HTTP_RESPONSE_MAX_BYTES: usize = 1 + 2 * 1024 * 1024;
+const CHAT_HTTP_MAX_IN_FLIGHT: usize = 8;
+const CHAT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const CHAT_PULL_HTTP_DOMAIN: &str = "AeroNyx-ChatPull-v2-http";
+const CHAT_ACK_HTTP_DOMAIN: &str = "AeroNyx-ChatAck-v1-http";
+const CHAT_PULL_HTTP_VERSION: u8 = 1;
+const CHAT_ACK_HTTP_VERSION: u8 = 1;
+const CHAT_PULL_HTTP_MAX_LIMIT: u32 = 100;
+const CHAT_ACK_HTTP_MAX_IDS: usize = 100;
 
 // ============================================
 // Shared state
@@ -184,6 +216,250 @@ fn build_chat_router_with_state(state: ChatBlobState) -> Router {
         ));
 
     upload_router.merge(access_router).with_state(state)
+}
+
+#[derive(Clone)]
+struct ChatHttpState {
+    relay: Arc<ChatRelayService>,
+    admission: Arc<Semaphore>,
+    timeout: Duration,
+}
+
+impl ChatHttpState {
+    fn new(relay: Arc<ChatRelayService>) -> Self {
+        Self {
+            relay,
+            admission: Arc::new(Semaphore::new(CHAT_HTTP_MAX_IN_FLIGHT)),
+            timeout: CHAT_HTTP_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatPullHttpRequestV1 {
+    version: u8,
+    wallet: [u8; 32],
+    after_timestamp: u64,
+    cursor: Vec<u8>,
+    limit: u32,
+    request_timestamp: u64,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatAckHttpRequestV1 {
+    version: u8,
+    wallet: [u8; 32],
+    message_ids: Vec<[u8; 16]>,
+    ack_timestamp: u64,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChatHttpFailure {
+    BadRequest,
+    Unauthorized,
+    Busy,
+    Unavailable,
+    TooLarge,
+}
+
+impl IntoResponse for ChatHttpFailure {
+    fn into_response(self) -> Response {
+        let (status, code) = match self {
+            Self::BadRequest => (StatusCode::BAD_REQUEST, "chat_request_invalid"),
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "chat_request_unauthorized"),
+            Self::Busy => (StatusCode::TOO_MANY_REQUESTS, "chat_service_busy"),
+            Self::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "chat_service_unavailable"),
+            Self::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "chat_response_too_large"),
+        };
+        (status, Json(json!({ "error": code }))).into_response()
+    }
+}
+
+/// Builds the authenticated raw-MemChain HTTP pull/ACK carrier. The caller
+/// must mount this router only through `build_mpi_router_with_source`; placing
+/// it on the ordinary local/VPN app would bypass the unified owner middleware.
+pub fn build_chat_pull_http_router(relay: Arc<ChatRelayService>) -> Router {
+    build_chat_pull_http_router_with_state(ChatHttpState::new(relay))
+}
+
+fn build_chat_pull_http_router_with_state(state: ChatHttpState) -> Router {
+    Router::new()
+        .route(CHAT_PULL_HTTP_PATH, post(handle_chat_pull_http))
+        .route(CHAT_ACK_HTTP_PATH, post(handle_chat_ack_http))
+        .layer(DefaultBodyLimit::max(CHAT_HTTP_REQUEST_MAX_BYTES))
+        .with_state(state)
+}
+
+async fn handle_chat_pull_http(
+    State(state): State<ChatHttpState>,
+    Extension(owner): Extension<AuthenticatedOwner>,
+    body: Bytes,
+) -> Result<Response, ChatHttpFailure> {
+    let request: ChatPullHttpRequestV1 = decode_canonical_http(&body)?;
+    validate_pull_http_request(&request, owner.owner_bytes())?;
+    let relay = Arc::clone(&state.relay);
+    let receiver = request.wallet;
+    let cursor = request.cursor;
+    let after_timestamp = request.after_timestamp;
+    let limit = request.limit;
+    let permit = state
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ChatHttpFailure::Busy)?;
+    let operation = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        relay
+            .pull_pending_v2(&receiver, after_timestamp, &cursor, limit)
+            .map_err(|_| ())
+    });
+    let page = tokio::time::timeout(state.timeout, operation)
+        .await
+        .map_err(|_| ChatHttpFailure::Unavailable)?
+        .map_err(|_| ChatHttpFailure::Unavailable)?;
+    let response = MemChainMessage::ChatPullResponseV2 {
+        envelopes: page
+            .messages
+            .into_iter()
+            .map(|message| message.envelope)
+            .collect(),
+        next_cursor: page.next_cursor,
+        has_more: page.has_more,
+    };
+    let encoded = encode_memchain(&response).map_err(|_| ChatHttpFailure::Unavailable)?;
+    if encoded.len() > CHAT_HTTP_RESPONSE_MAX_BYTES {
+        return Err(ChatHttpFailure::TooLarge);
+    }
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        encoded,
+    )
+        .into_response())
+}
+
+async fn handle_chat_ack_http(
+    State(state): State<ChatHttpState>,
+    Extension(owner): Extension<AuthenticatedOwner>,
+    body: Bytes,
+) -> Result<Response, ChatHttpFailure> {
+    let request: ChatAckHttpRequestV1 = decode_canonical_http(&body)?;
+    validate_ack_http_request(&request, owner.owner_bytes())?;
+    let relay = Arc::clone(&state.relay);
+    let wallet = request.wallet;
+    let message_ids = request.message_ids;
+    let permit = state
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ChatHttpFailure::Busy)?;
+    let operation = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        relay.ack_messages(&message_ids, &wallet).map_err(|_| ())
+    });
+    let deleted = tokio::time::timeout(state.timeout, operation)
+        .await
+        .map_err(|_| ChatHttpFailure::Unavailable)?
+        .map_err(|_| ChatHttpFailure::Unavailable)?;
+    Ok((StatusCode::OK, Json(json!({ "deleted": deleted }))).into_response())
+}
+
+fn decode_canonical_http<T>(body: &[u8]) -> Result<T, ChatHttpFailure>
+where
+    T: DeserializeOwned + Serialize,
+{
+    if body.is_empty() || body.len() > CHAT_HTTP_REQUEST_MAX_BYTES {
+        return Err(ChatHttpFailure::BadRequest);
+    }
+    let options = bincode::options()
+        .with_fixint_encoding()
+        .with_limit(CHAT_HTTP_REQUEST_MAX_BYTES as u64)
+        .reject_trailing_bytes();
+    let value = options
+        .deserialize(body)
+        .map_err(|_| ChatHttpFailure::BadRequest)?;
+    let canonical = options
+        .serialize(&value)
+        .map_err(|_| ChatHttpFailure::BadRequest)?;
+    if canonical != body {
+        return Err(ChatHttpFailure::BadRequest);
+    }
+    Ok(value)
+}
+
+fn validate_pull_http_request(
+    request: &ChatPullHttpRequestV1,
+    owner: [u8; 32],
+) -> Result<(), ChatHttpFailure> {
+    if request.version != CHAT_PULL_HTTP_VERSION
+        || request.wallet != owner
+        || request.cursor.len() > MAX_CHAT_PULL_CURSOR_V2_BYTES
+        || request.limit == 0
+        || request.limit > CHAT_PULL_HTTP_MAX_LIMIT
+    {
+        return Err(ChatHttpFailure::Unauthorized);
+    }
+    let cursor_len =
+        u16::try_from(request.cursor.len()).map_err(|_| ChatHttpFailure::BadRequest)?;
+    let cursor_len_bytes = cursor_len.to_le_bytes();
+    let version = [request.version];
+    let after_bytes = request.after_timestamp.to_le_bytes();
+    let limit_bytes = request.limit.to_le_bytes();
+    let timestamp_bytes = request.request_timestamp.to_le_bytes();
+    let signature = fixed_signature(&request.signature)?;
+    verify_signed_message(
+        CHAT_PULL_HTTP_DOMAIN,
+        &[
+            &version,
+            &request.wallet,
+            &after_bytes,
+            &cursor_len_bytes,
+            &request.cursor,
+            &limit_bytes,
+            &timestamp_bytes,
+        ],
+        &request.wallet,
+        &signature,
+        request.request_timestamp,
+    )
+    .map_err(|_| ChatHttpFailure::Unauthorized)
+}
+
+fn validate_ack_http_request(
+    request: &ChatAckHttpRequestV1,
+    owner: [u8; 32],
+) -> Result<(), ChatHttpFailure> {
+    if request.version != CHAT_ACK_HTTP_VERSION
+        || request.wallet != owner
+        || request.message_ids.is_empty()
+        || request.message_ids.len() > CHAT_ACK_HTTP_MAX_IDS
+    {
+        return Err(ChatHttpFailure::Unauthorized);
+    }
+    let mut ids_hasher = Sha256::new();
+    for message_id in &request.message_ids {
+        ids_hasher.update(message_id);
+    }
+    let ids_hash: [u8; 32] = ids_hasher.finalize().into();
+    let version = [request.version];
+    let timestamp_bytes = request.ack_timestamp.to_le_bytes();
+    let signature = fixed_signature(&request.signature)?;
+    verify_signed_message(
+        CHAT_ACK_HTTP_DOMAIN,
+        &[&version, &request.wallet, &timestamp_bytes, &ids_hash],
+        &request.wallet,
+        &signature,
+        request.ack_timestamp,
+    )
+    .map_err(|_| ChatHttpFailure::Unauthorized)
+}
+
+fn fixed_signature(bytes: &[u8]) -> Result<[u8; 64], ChatHttpFailure> {
+    bytes.try_into().map_err(|_| ChatHttpFailure::Unauthorized)
 }
 
 /// Rejects excess uploads before Axum materializes `Bytes` or computes SHA-256.
@@ -508,6 +784,8 @@ mod tests {
     };
     use tower::ServiceExt; // for `oneshot`
 
+    use aeronyx_core::protocol::ChatEnvelope;
+
     use crate::config::ChatRelayConfig;
     use crate::services::chat_relay::derive_node_secret;
 
@@ -550,6 +828,291 @@ mod tests {
         hex::encode(kp.sign(&hash))
     }
 
+    fn unix_now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn signed_envelope(kp: &IdentityKeyPair, receiver: [u8; 32]) -> ChatEnvelope {
+        let mut envelope = ChatEnvelope {
+            message_id: [0x51; 16],
+            sender: kp.public_key_bytes(),
+            receiver,
+            timestamp: unix_now_secs(),
+            ciphertext: vec![0xA5; 32],
+            nonce: [0x33; 24],
+            content_type: aeronyx_core::protocol::chat::ChatContentType::Text,
+            signature: [0; 64],
+        };
+        envelope.signature = kp.sign(&envelope.sign_data());
+        envelope
+    }
+
+    fn encode_pull_request(kp: &IdentityKeyPair, receiver: [u8; 32], cursor: Vec<u8>) -> Vec<u8> {
+        let request_timestamp = unix_now_secs();
+        let after_timestamp = 0u64;
+        let limit = 10u32;
+        let cursor_len = u16::try_from(cursor.len()).expect("test cursor length");
+        let version = [CHAT_PULL_HTTP_VERSION];
+        let signature = kp.sign(&signed_message_digest(
+            CHAT_PULL_HTTP_DOMAIN,
+            &[
+                &version,
+                &receiver,
+                &after_timestamp.to_le_bytes(),
+                &cursor_len.to_le_bytes(),
+                &cursor,
+                &limit.to_le_bytes(),
+                &request_timestamp.to_le_bytes(),
+            ],
+        ));
+        bincode::options()
+            .with_fixint_encoding()
+            .serialize(&ChatPullHttpRequestV1 {
+                version: CHAT_PULL_HTTP_VERSION,
+                wallet: receiver,
+                after_timestamp,
+                cursor,
+                limit,
+                request_timestamp,
+                signature: signature.to_vec(),
+            })
+            .expect("encode pull request")
+    }
+
+    fn encode_ack_request(kp: &IdentityKeyPair, receiver: [u8; 32], id: [u8; 16]) -> Vec<u8> {
+        let ack_timestamp = unix_now_secs();
+        let ids_hash: [u8; 32] = Sha256::digest(id).into();
+        let version = [CHAT_ACK_HTTP_VERSION];
+        let signature = kp.sign(&signed_message_digest(
+            CHAT_ACK_HTTP_DOMAIN,
+            &[&version, &receiver, &ack_timestamp.to_le_bytes(), &ids_hash],
+        ));
+        bincode::options()
+            .with_fixint_encoding()
+            .serialize(&ChatAckHttpRequestV1 {
+                version: CHAT_ACK_HTTP_VERSION,
+                wallet: receiver,
+                message_ids: vec![id],
+                ack_timestamp,
+                signature: signature.to_vec(),
+            })
+            .expect("encode ack request")
+    }
+
+    #[test]
+    fn http_codec_rejects_trailing_and_oversized_length_prefixes() {
+        let kp = IdentityKeyPair::generate();
+        let wallet = kp.public_key_bytes();
+        let body = encode_pull_request(&kp, wallet, Vec::new());
+        assert!(decode_canonical_http::<ChatPullHttpRequestV1>(&body).is_ok());
+        let mut trailing = body.clone();
+        trailing.push(0);
+        assert!(matches!(
+            decode_canonical_http::<ChatPullHttpRequestV1>(&trailing),
+            Err(ChatHttpFailure::BadRequest)
+        ));
+        let mut hostile = body;
+        // The cursor Vec length is the fixed-int u64 immediately after the
+        // version/wallet/after_timestamp fields; the bounded decoder must
+        // reject this before allocating from the attacker-controlled length.
+        hostile[41..49].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(
+            decode_canonical_http::<ChatPullHttpRequestV1>(&hostile),
+            Err(ChatHttpFailure::BadRequest)
+        ));
+    }
+
+    #[tokio::test]
+    async fn authenticated_http_pull_and_idempotent_ack_are_receiver_bound() {
+        let relay = make_relay();
+        let wallet = IdentityKeyPair::generate();
+        let receiver = wallet.public_key_bytes();
+        let envelope = signed_envelope(&wallet, receiver);
+        let message_id = envelope.message_id;
+        relay
+            .store_pending(&envelope)
+            .expect("store pending envelope");
+
+        let app = build_chat_pull_http_router(Arc::clone(&relay))
+            .layer(Extension(AuthenticatedOwner::Local { owner: receiver }));
+        let pull = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(CHAT_PULL_HTTP_PATH)
+                    .body(Body::from(encode_pull_request(
+                        &wallet,
+                        receiver,
+                        Vec::new(),
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pull.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(pull.into_body(), CHAT_HTTP_RESPONSE_MAX_BYTES)
+            .await
+            .unwrap();
+        assert!(body.len() <= CHAT_HTTP_RESPONSE_MAX_BYTES);
+        let response = aeronyx_core::protocol::decode_memchain(&body[1..]).unwrap();
+        assert!(matches!(
+            response,
+            MemChainMessage::ChatPullResponseV2 { envelopes, .. }
+                if envelopes.len() == 1 && envelopes[0].message_id == message_id
+        ));
+
+        let ack_body = encode_ack_request(&wallet, receiver, message_id);
+        let ack = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(CHAT_ACK_HTTP_PATH)
+                    .body(Body::from(ack_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ack.status(), StatusCode::OK);
+        let ack_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(ack.into_body(), CHAT_HTTP_REQUEST_MAX_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ack_json["deleted"], 1);
+
+        let duplicate = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(CHAT_ACK_HTTP_PATH)
+                    .body(Body::from(ack_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(duplicate.into_body(), CHAT_HTTP_REQUEST_MAX_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(duplicate_json["deleted"], 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_http_pull_rejects_owner_mismatch_before_storage() {
+        let relay = make_relay();
+        let wallet = IdentityKeyPair::generate();
+        let receiver = wallet.public_key_bytes();
+        let other_owner = [0x7Fu8; 32];
+        let app = build_chat_pull_http_router(relay)
+            .layer(Extension(AuthenticatedOwner::Local { owner: other_owner }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(CHAT_PULL_HTTP_PATH)
+                    .body(Body::from(encode_pull_request(
+                        &wallet,
+                        receiver,
+                        Vec::new(),
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticated_http_pull_rejects_udp_domain_replay() {
+        let relay = make_relay();
+        let wallet = IdentityKeyPair::generate();
+        let receiver = wallet.public_key_bytes();
+        let mut request: ChatPullHttpRequestV1 =
+            decode_canonical_http(&encode_pull_request(&wallet, receiver, Vec::new()))
+                .expect("decode test request");
+        let cursor_len = 0u16.to_le_bytes();
+        let version = [CHAT_PULL_HTTP_VERSION];
+        let after_timestamp = request.after_timestamp.to_le_bytes();
+        let limit = request.limit.to_le_bytes();
+        let timestamp = request.request_timestamp.to_le_bytes();
+        request.signature = wallet
+            .sign(&signed_message_digest(
+                aeronyx_core::protocol::auth::DOMAIN_CHAT_PULL_V2,
+                &[
+                    &version,
+                    &request.wallet,
+                    &after_timestamp,
+                    &cursor_len,
+                    &request.cursor,
+                    &limit,
+                    &timestamp,
+                ],
+            ))
+            .to_vec();
+        let body = bincode::options()
+            .with_fixint_encoding()
+            .serialize(&request)
+            .expect("encode replay request");
+        let app = build_chat_pull_http_router(relay)
+            .layer(Extension(AuthenticatedOwner::Local { owner: receiver }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(CHAT_PULL_HTTP_PATH)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticated_http_pull_applies_bounded_admission() {
+        let relay = make_relay();
+        let wallet = IdentityKeyPair::generate();
+        let receiver = wallet.public_key_bytes();
+        let state = ChatHttpState::new(relay);
+        let mut held = Vec::new();
+        for _ in 0..CHAT_HTTP_MAX_IN_FLIGHT {
+            held.push(
+                state
+                    .admission
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("test admission permit"),
+            );
+        }
+        let app = build_chat_pull_http_router_with_state(state)
+            .layer(Extension(AuthenticatedOwner::Local { owner: receiver }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(CHAT_PULL_HTTP_PATH)
+                    .body(Body::from(encode_pull_request(
+                        &wallet,
+                        receiver,
+                        Vec::new(),
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(held);
+    }
+
     #[test]
     fn chat_blob_logs_stay_free_of_routing_identifiers() {
         let source = include_str!("chat_handlers.rs");
@@ -575,6 +1138,14 @@ mod tests {
     }
 
     #[test]
+    fn reliable_pull_bounds_are_the_raw_memchain_ceiling() {
+        assert_eq!(CHAT_HTTP_RESPONSE_MAX_BYTES, 1 + 2 * 1024 * 1024);
+        assert_eq!(CHAT_HTTP_MAX_IN_FLIGHT, 8);
+        assert_eq!(CHAT_PULL_HTTP_MAX_LIMIT, 100);
+        assert_eq!(CHAT_ACK_HTTP_MAX_IDS, 100);
+    }
+
+    #[test]
     fn blob_router_wiring_stays_on_client_surface() {
         // [SERVER-API-RUNTIME-SPLIT 2026-09-25 by Codex] Router composition
         // now lives in the API-runtime child, not the startup facade.
@@ -590,6 +1161,22 @@ mod tests {
         assert!(server_source[public_router_end..].contains(".merge(chat_blob_router)"));
         assert!(!public_router_source.contains("build_chat_router"));
         assert!(!public_router_source.contains("chat_blob_router"));
+    }
+
+    #[test]
+    fn reliable_pull_route_is_mounted_only_in_authenticated_vpn_source_group() {
+        let source = include_str!("../server/api_runtime.rs");
+        assert!(source.contains("build_chat_pull_http_router"));
+        assert!(source.contains("let chat_pull_enabled = chat_relay.is_some()"));
+        assert!(source.contains("build_mpi_router_with_source(mpi_state, vpn_source_router)"));
+        let public_prefix = source
+            .find("if let Some((public_addr, public_listener)) = public_api_listener")
+            .expect("public listener branch");
+        let source_group = source
+            .find("let mut vpn_source_router = axum::Router::new()")
+            .expect("authenticated source group");
+        assert!(public_prefix < source_group);
+        assert!(!source[..source_group].contains("build_chat_pull_http_router"));
     }
 
     #[tokio::test]

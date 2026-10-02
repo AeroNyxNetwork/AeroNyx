@@ -610,20 +610,30 @@ impl Server {
             let source_coordinator_enabled = vpn_anonymous_mailbox_source.is_some();
             let (app, vpn_app, dispatcher_admitted) = if let Some(mpi_state) = mpi_state {
                 let node_mpi = build_mpi_router(Arc::clone(&mpi_state));
-                let (vpn_mpi, dispatcher_admitted) =
-                    if let Some(source) = vpn_anonymous_mailbox_source {
-                        let vpn_source_router = build_chat_anonymous_mailbox_source_router(
+                // [CHAT-HTTP-RELIABLE-PULL 2026-10-03 by Codex] Keep the
+                // reliable client carrier in the authenticated MPI/VPN source
+                // router. It must not be merged into the ordinary local app or
+                // node/public surfaces, and it is absent when chat relay is off.
+                let mut vpn_source_router = axum::Router::new();
+                let mut dispatcher_admitted = false;
+                if let Some(source) = vpn_anonymous_mailbox_source {
+                    vpn_source_router =
+                        vpn_source_router.merge(build_chat_anonymous_mailbox_source_router(
                             source,
                             Arc::clone(&peer_http_client),
                             &anonymous_mailbox_source_config,
-                        );
-                        (
-                            build_mpi_router_with_source(mpi_state, vpn_source_router),
-                            true,
-                        )
-                    } else {
-                        (build_mpi_router(mpi_state), false)
-                    };
+                        ));
+                    dispatcher_admitted = true;
+                }
+                let chat_pull_enabled = chat_relay.is_some();
+                if let Some(relay) = chat_relay.clone() {
+                    vpn_source_router = vpn_source_router.merge(build_chat_pull_http_router(relay));
+                }
+                let vpn_mpi = if dispatcher_admitted || chat_pull_enabled {
+                    build_mpi_router_with_source(mpi_state, vpn_source_router)
+                } else {
+                    build_mpi_router(mpi_state)
+                };
                 (
                     app.clone().merge(node_mpi),
                     app.merge(vpn_mpi),
