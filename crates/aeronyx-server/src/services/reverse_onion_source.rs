@@ -36,6 +36,11 @@ use aeronyx_core::protocol::blind_vault_replica_workflow::{
     MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_SEALED_BYTES,
 };
 use aeronyx_core::protocol::chat::{encode_blind_relay_envelope, BlindRelayEnvelope};
+use aeronyx_core::protocol::discovery::{
+    DirectoryDescriptorCommitmentV1, SignedNodeDescriptor,
+    SignedPrivateOnionRecipientAuthorizationV1,
+    MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_BYTES,
+};
 use aeronyx_core::protocol::onion::{is_onion_blob, VerifiedOnionForwardExpectation, reverse_delivery::{
     ReverseOnionFrameV1, MAX_REVERSE_ONION_FRAME_BYTES,
     REVERSE_ONION_ENVELOPE_LIFETIME_SECS, REVERSE_ONION_RESULT_RETENTION_SECS,
@@ -45,7 +50,9 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction, Tr
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::api::chat_peer::PeerBlindRelayRequest;
+use crate::api::chat_peer::{
+    blind_relay_authenticated_request_commitment, PeerBlindRelayRequest,
+};
 
 #[cfg(unix)]
 use std::fs::File;
@@ -61,8 +68,14 @@ const MAX_TERMINAL_BYTES: usize = 512;
 const MAX_CLAIM_BYTES: usize = 234;
 const MAX_LEASE_BYTES: usize = 234 + 256 * 1024;
 const MAX_PAGE_BYTES: usize = BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS;
+// [REVERSE-ONION-SOURCE-JOURNAL-V2 2026-10-04 by Codex] Sealed v2 rows bind
+// the canonical dispatch/body, route authority bytes, and restart metadata;
+// historical v1 rows remain readable only as an explicit migration failure.
+const MAX_SIGNED_DESCRIPTOR_BYTES: usize = 16 * 1024;
+const MAX_AUTHORIZATION_BYTES: usize = MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_BYTES;
+const SOURCE_RECORD_VERSION_V2: u16 = 2;
 const RECORD_FIXED_BYTES: usize = 4 + 2 + 1 + 8 + 8 + 8 + 32 + 16 + 32 * 4
-    + 8 + 8 + 1 + 8 + 32 * 2 + 7 * 4;
+    + 8 + 8 + 1 + 8 + 32 * 2 + 32 * 4 + 11 * 4;
 const SEALED_OVERHEAD: usize = MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_SEALED_BYTES
     - MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_BODY_BYTES;
 const ROW_ACCOUNTING_BYTES: usize = 256;
@@ -84,12 +97,146 @@ pub(crate) enum SourceJournalError {
     #[error("source journal unavailable")] Unavailable,
     #[error("source journal clock rejected")] ClockRollback,
     #[error("source reply rejected")] ReplyRejected,
+    #[error("source journal migration required")] MigrationRequired,
 }
 type Result<T> = std::result::Result<T, SourceJournalError>;
 
 pub(crate) struct SourceJournalLimits {
     pub(crate) max_entries: usize,
     pub(crate) max_bytes: u64,
+}
+
+/// Authenticated R/P route evidence retained inside the sealed source row.
+/// The purpose is caller-supplied and must be the separately reviewed private
+/// BlindVaultPull authorization; this journal does not admit AMST/AMSR.
+/// The endpoint is never accepted as an independent caller argument: a
+/// recovered transport must revalidate these canonical descriptors against its
+/// current PeerStore view before opening a socket.
+pub(crate) struct SourceRouteAuthority {
+    relay_descriptor: Zeroizing<Vec<u8>>,
+    recipient_descriptor: Zeroizing<Vec<u8>>,
+    authorization: Zeroizing<Vec<u8>>,
+    purpose: Zeroizing<Vec<u8>>,
+}
+
+impl SourceRouteAuthority {
+    pub(crate) fn from_signed(
+        relay: &SignedNodeDescriptor,
+        recipient: &SignedNodeDescriptor,
+        authorization: &SignedPrivateOnionRecipientAuthorizationV1,
+        purpose: &str,
+    ) -> Result<Self> {
+        let relay_descriptor = relay
+            .encode_canonical()
+            .map_err(|_| SourceJournalError::Rejected)?;
+        let recipient_descriptor = recipient
+            .encode_canonical()
+            .map_err(|_| SourceJournalError::Rejected)?;
+        let authorization = authorization
+            .encode_canonical()
+            .map_err(|_| SourceJournalError::Rejected)?;
+        if purpose != aeronyx_core::protocol::onion::OnionRoutePurpose::BlindVaultPull.as_str() {
+            return Err(SourceJournalError::Rejected);
+        }
+        let authority = Self {
+            relay_descriptor: Zeroizing::new(relay_descriptor),
+            recipient_descriptor: Zeroizing::new(recipient_descriptor),
+            authorization: Zeroizing::new(authorization),
+            purpose: Zeroizing::new(purpose.as_bytes().to_vec()),
+        };
+        authority.validate_shape()?;
+        Ok(authority)
+    }
+
+    fn validate_shape(&self) -> Result<()> {
+        if self.relay_descriptor.is_empty()
+            || self.relay_descriptor.len() > MAX_SIGNED_DESCRIPTOR_BYTES
+            || self.recipient_descriptor.is_empty()
+            || self.recipient_descriptor.len() > MAX_SIGNED_DESCRIPTOR_BYTES
+            || self.authorization.is_empty()
+            || self.authorization.len() > MAX_AUTHORIZATION_BYTES
+        {
+            return Err(SourceJournalError::Capacity);
+        }
+        let relay = SignedNodeDescriptor::decode_canonical(&self.relay_descriptor)
+            .map_err(|_| SourceJournalError::Rejected)?;
+        let recipient = SignedNodeDescriptor::decode_canonical(&self.recipient_descriptor)
+            .map_err(|_| SourceJournalError::Rejected)?;
+        let _authorization = SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(
+            &self.authorization,
+        )
+        .map_err(|_| SourceJournalError::Rejected)?;
+        let purpose = std::str::from_utf8(&self.purpose).map_err(|_| SourceJournalError::Rejected)?;
+        if purpose != aeronyx_core::protocol::onion::OnionRoutePurpose::BlindVaultPull.as_str() {
+            return Err(SourceJournalError::Rejected);
+        }
+        relay
+            .verify_signature()
+            .map_err(|_| SourceJournalError::Rejected)?;
+        recipient
+            .verify_signature()
+            .map_err(|_| SourceJournalError::Rejected)?;
+        let relay_commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&relay)
+            .map_err(|_| SourceJournalError::Rejected)?;
+        let recipient_commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&recipient)
+                .map_err(|_| SourceJournalError::Rejected)?;
+        if relay_commitment.node_id == [0; 32]
+            || relay_commitment.sequence == 0
+            || relay_commitment.descriptor_hash == [0; 32]
+            || recipient_commitment.node_id == [0; 32]
+            || recipient_commitment.sequence == 0
+            || recipient_commitment.descriptor_hash == [0; 32]
+        {
+            return Err(SourceJournalError::Rejected);
+        }
+        Ok(())
+    }
+
+    fn validate_at(
+        &self,
+        expected_relay: [u8; 32],
+        expected_recipient: [u8; 32],
+        relay_commitment: [u8; 32],
+        recipient_commitment: [u8; 32],
+        now: u64,
+    ) -> Result<()> {
+        self.validate_shape()?;
+        let relay = SignedNodeDescriptor::decode_canonical(&self.relay_descriptor)
+            .map_err(|_| SourceJournalError::Rejected)?;
+        let recipient = SignedNodeDescriptor::decode_canonical(&self.recipient_descriptor)
+            .map_err(|_| SourceJournalError::Rejected)?;
+        let authorization = SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(
+            &self.authorization,
+        )
+        .map_err(|_| SourceJournalError::Rejected)?;
+        let purpose = std::str::from_utf8(&self.purpose).map_err(|_| SourceJournalError::Rejected)?;
+        let relay_pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&relay)
+            .map_err(|_| SourceJournalError::Rejected)?;
+        let recipient_pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&recipient)
+            .map_err(|_| SourceJournalError::Rejected)?;
+        if relay.node_id() != expected_relay
+            || recipient.node_id() != expected_recipient
+            || relay_pin.hash() != relay_commitment
+            || recipient_pin.hash() != recipient_commitment
+        {
+            return Err(SourceJournalError::Rejected);
+        }
+        authorization
+            .verify_at(&relay, &recipient, purpose, now)
+            .map_err(|_| SourceJournalError::Rejected)
+    }
+}
+
+impl std::fmt::Debug for SourceRouteAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourceRouteAuthority")
+            .field("relay_descriptor_bytes", &self.relay_descriptor.len())
+            .field("recipient_descriptor_bytes", &self.recipient_descriptor.len())
+            .field("authorization_bytes", &self.authorization.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Private route-construction projection. Never supplied by a response handler.
@@ -165,6 +312,11 @@ pub(crate) struct SourcePreparedPull {
     source: [u8; 32],
     target: [u8; 32],
     descriptor: [u8; 32],
+    relay_descriptor_commitment: [u8; 32],
+    recipient_descriptor_commitment: [u8; 32],
+    request_commitment: [u8; 32],
+    body_commitment: [u8; 32],
+    authority: SourceRouteAuthority,
     expected: ExpectedRetainedEnvelope,
     deadline: u64,
     original_expiry: u64,
@@ -173,9 +325,14 @@ pub(crate) struct SourcePreparedPull {
 }
 
 impl SourcePreparedPull {
+    /// `request_commitment` must be the existing authenticated blind-relay
+    /// commitment, supplied by the admission owner; this journal never
+    /// substitutes a new hash domain for that protocol commitment.
     pub(crate) fn from_runtime_admission(
         source: &IdentityKeyPair, request: PeerBlindRelayRequest,
         expected: ExpectedRetainedEnvelope, target: [u8; 32], descriptor: [u8; 32],
+        relay_descriptor_commitment: [u8; 32], recipient_descriptor_commitment: [u8; 32],
+        request_commitment: [u8; 32], authority: SourceRouteAuthority,
         admitted_deadline: u64, exact_terminal_request: Vec<u8>,
     ) -> Result<Self> {
         let terminal = Zeroizing::new(exact_terminal_request);
@@ -189,7 +346,10 @@ impl SourcePreparedPull {
         let original_expiry = request.envelope.timestamp
             .checked_add(REVERSE_ONION_ENVELOPE_LIFETIME_SECS).ok_or(SourceJournalError::Rejected)?;
         let dispatch = serde_json::to_vec(&request).map_err(|_| SourceJournalError::Rejected)?;
-        let value = Self { source: source.public_key_bytes(), target, descriptor, expected,
+        let body_commitment = hash(&dispatch);
+        let value = Self { source: source.public_key_bytes(), target, descriptor,
+            relay_descriptor_commitment, recipient_descriptor_commitment,
+            request_commitment, body_commitment, authority, expected,
             deadline: admitted_deadline, original_expiry, dispatch, terminal };
         value.validate()?;
         Ok(value)
@@ -200,7 +360,13 @@ impl SourcePreparedPull {
         valid_key(self.expected.relay)?; valid_key(self.expected.recipient)?;
         if self.dispatch.is_empty() || self.dispatch.len() > MAX_DISPATCH_BYTES
             || self.terminal.is_empty() || self.terminal.len() > MAX_TERMINAL_BYTES
-            || self.descriptor == [0; 32] || self.expected.route == [0; 16]
+            || self.descriptor == [0; 32]
+            || self.relay_descriptor_commitment == [0; 32]
+            || self.recipient_descriptor_commitment == [0; 32]
+            || self.request_commitment == [0; 32]
+            || self.body_commitment == [0; 32]
+            || self.body_commitment != hash(&self.dispatch)
+            || self.expected.route == [0; 16]
             || self.expected.timestamp == 0 || self.expected.blob_hash == [0; 32]
             || self.expected.signing_commitment == [0; 32]
             || self.expected.ttl == 0 || self.expected.relay == self.expected.recipient
@@ -211,6 +377,11 @@ impl SourcePreparedPull {
         { return Err(SourceJournalError::Rejected); }
         let request: PeerBlindRelayRequest = serde_json::from_slice(&self.dispatch)
             .map_err(|_| SourceJournalError::Rejected)?;
+        let request_commitment = blind_relay_authenticated_request_commitment(&request)
+            .map_err(|_| SourceJournalError::Rejected)?;
+        if request_commitment != self.request_commitment {
+            return Err(SourceJournalError::Rejected);
+        }
         if request.previous_hop_node_id != self.source || request.onward_envelope.is_some()
             || request.onward_descriptor_hint.is_some()
             || request.envelope.route_id != self.expected.route
@@ -225,12 +396,31 @@ impl SourcePreparedPull {
             || serde_json::to_vec(&request).map_err(|_| SourceJournalError::Rejected)? != self.dispatch
         { return Err(SourceJournalError::Rejected); }
         encode_blind_relay_envelope(&request.envelope).map_err(|_| SourceJournalError::Rejected)?;
+        self.authority.validate_shape()?;
         request.envelope.verify_signature_from(&IdentityPublicKey::from_bytes(&self.source)
             .map_err(|_| SourceJournalError::Rejected)?).map_err(|_| SourceJournalError::Rejected)?;
         Ok(())
     }
 
+    fn validate_at(&self, now: u64) -> Result<()> {
+        self.validate()?;
+        self.authority.validate_at(
+            self.expected.relay,
+            self.expected.recipient,
+            self.relay_descriptor_commitment,
+            self.recipient_descriptor_commitment,
+            now,
+        )?;
+        if self.descriptor != self.recipient_descriptor_commitment
+            || self.target != self.expected.recipient
+        {
+            return Err(SourceJournalError::Rejected);
+        }
+        Ok(())
+    }
+
     fn fresh(&self, now: u64) -> Result<()> {
+        self.validate_at(now)?;
         let request: PeerBlindRelayRequest = serde_json::from_slice(&self.dispatch)
             .map_err(|_| SourceJournalError::Corrupt)?;
         if now < self.expected.timestamp || now < request.envelope.timestamp || now >= self.deadline {
@@ -249,6 +439,14 @@ impl SourcePreparedPull {
 
     fn same(&self, other: &Self) -> bool {
         self.source == other.source && self.target == other.target && self.descriptor == other.descriptor
+            && self.relay_descriptor_commitment == other.relay_descriptor_commitment
+            && self.recipient_descriptor_commitment == other.recipient_descriptor_commitment
+            && self.request_commitment == other.request_commitment
+            && self.body_commitment == other.body_commitment
+            && self.authority.relay_descriptor == other.authority.relay_descriptor
+            && self.authority.recipient_descriptor == other.authority.recipient_descriptor
+            && self.authority.authorization == other.authority.authorization
+            && self.authority.purpose == other.authority.purpose
             && self.expected.relay == other.expected.relay && self.expected.recipient == other.expected.recipient
             && self.expected.route == other.expected.route && self.expected.ttl == other.expected.ttl
             && self.expected.timestamp == other.expected.timestamp
@@ -292,6 +490,48 @@ pub(crate) struct SourceRecoveryPage {
     pub(crate) next_after: Option<[u8; 16]>,
 }
 
+/// Immutable restart/query metadata. It deliberately omits dispatch and
+/// terminal bytes; after Armed, recovery may only issue read-only evidence
+/// queries and must not obtain a second effectful request body.
+pub(crate) struct SourceRecoveryMetadata {
+    route: [u8; 16],
+    phase: SourcePhase,
+    source: [u8; 32],
+    relay: [u8; 32],
+    recipient: [u8; 32],
+    target: [u8; 32],
+    request_commitment: [u8; 32],
+    body_commitment: [u8; 32],
+    relay_descriptor_commitment: [u8; 32],
+    recipient_descriptor_commitment: [u8; 32],
+    deadline: u64,
+    retain_until: u64,
+}
+
+impl SourceRecoveryMetadata {
+    pub(crate) fn route(&self) -> [u8; 16] { self.route }
+    pub(crate) fn phase(&self) -> SourcePhase { self.phase }
+    pub(crate) fn source(&self) -> [u8; 32] { self.source }
+    pub(crate) fn relay(&self) -> [u8; 32] { self.relay }
+    pub(crate) fn recipient(&self) -> [u8; 32] { self.recipient }
+    pub(crate) fn target(&self) -> [u8; 32] { self.target }
+    pub(crate) fn request_commitment(&self) -> [u8; 32] { self.request_commitment }
+    pub(crate) fn body_commitment(&self) -> [u8; 32] { self.body_commitment }
+    pub(crate) fn relay_descriptor_commitment(&self) -> [u8; 32] {
+        self.relay_descriptor_commitment
+    }
+    pub(crate) fn recipient_descriptor_commitment(&self) -> [u8; 32] {
+        self.recipient_descriptor_commitment
+    }
+    pub(crate) fn deadline(&self) -> u64 { self.deadline }
+    pub(crate) fn retain_until(&self) -> u64 { self.retain_until }
+}
+
+pub(crate) struct SourceRecoveryMetadataPage {
+    pub(crate) items: Vec<SourceRecoveryMetadata>,
+    pub(crate) next_after: Option<[u8; 16]>,
+}
+
 struct Record {
     plan: SourcePreparedPull,
     phase: SourcePhase,
@@ -309,7 +549,8 @@ impl Record {
     fn reservation(plan: &SourcePreparedPull) -> Result<u64> {
         let maximum_body = [RECORD_FIXED_BYTES, plan.dispatch.len(), plan.terminal.len(),
             MAX_BLIND_VAULT_ONION_PULL_RESTART_BYTES, MAX_CLAIM_BYTES, MAX_LEASE_BYTES,
-            MAX_REVERSE_ONION_FRAME_BYTES, MAX_PAGE_BYTES].into_iter()
+            MAX_REVERSE_ONION_FRAME_BYTES, MAX_PAGE_BYTES, MAX_SIGNED_DESCRIPTOR_BYTES,
+            MAX_SIGNED_DESCRIPTOR_BYTES, MAX_AUTHORIZATION_BYTES, 128].into_iter()
             .try_fold(0usize, |sum, n| sum.checked_add(n)).ok_or(SourceJournalError::Capacity)?;
         if maximum_body > MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_BODY_BYTES {
             return Err(SourceJournalError::Capacity);
@@ -364,11 +605,15 @@ impl Record {
     }
 
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
-        let fields: [(&[u8], usize); 7] = [
+        let fields: [(&[u8], usize); 11] = [
             (&self.plan.dispatch, MAX_DISPATCH_BYTES), (&self.plan.terminal, MAX_TERMINAL_BYTES),
             (&self.restart, MAX_BLIND_VAULT_ONION_PULL_RESTART_BYTES), (&self.claim, MAX_CLAIM_BYTES),
             (&self.lease, MAX_LEASE_BYTES), (&self.result, MAX_REVERSE_ONION_FRAME_BYTES),
             (&self.verified, MAX_PAGE_BYTES),
+            (&self.plan.authority.relay_descriptor, MAX_SIGNED_DESCRIPTOR_BYTES),
+            (&self.plan.authority.recipient_descriptor, MAX_SIGNED_DESCRIPTOR_BYTES),
+            (&self.plan.authority.authorization, MAX_AUTHORIZATION_BYTES),
+            (&self.plan.authority.purpose, 128),
         ];
         let mut length = RECORD_FIXED_BYTES;
         for (field, bound) in fields {
@@ -377,7 +622,7 @@ impl Record {
         }
         if length > MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_BODY_BYTES { return Err(SourceJournalError::Capacity); }
         let mut bytes = Zeroizing::new(Vec::with_capacity(length));
-        bytes.extend_from_slice(b"AXSJ"); bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(b"AXSJ"); bytes.extend_from_slice(&SOURCE_RECORD_VERSION_V2.to_be_bytes());
         bytes.push(self.phase as u8);
         for value in [self.generation, self.reserved, self.retain_until] { bytes.extend_from_slice(&value.to_be_bytes()); }
         bytes.extend_from_slice(&self.plan.source); bytes.extend_from_slice(&self.plan.expected.route);
@@ -389,6 +634,10 @@ impl Record {
         bytes.extend_from_slice(&self.plan.expected.timestamp.to_be_bytes());
         bytes.extend_from_slice(&self.plan.expected.blob_hash);
         bytes.extend_from_slice(&self.plan.expected.signing_commitment);
+        bytes.extend_from_slice(&self.plan.relay_descriptor_commitment);
+        bytes.extend_from_slice(&self.plan.recipient_descriptor_commitment);
+        bytes.extend_from_slice(&self.plan.request_commitment);
+        bytes.extend_from_slice(&self.plan.body_commitment);
         for (field, _) in fields {
             bytes.extend_from_slice(&(field.len() as u32).to_be_bytes()); bytes.extend_from_slice(field);
         }
@@ -399,9 +648,12 @@ impl Record {
     fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_BODY_BYTES { return Err(SourceJournalError::Corrupt); }
         let mut cursor = Cursor(bytes);
-        if cursor.array::<4>()? != *b"AXSJ" || cursor.array::<2>()? != 1u16.to_be_bytes() {
+        if cursor.array::<4>()? != *b"AXSJ" {
             return Err(SourceJournalError::Corrupt);
         }
+        let version = u16::from_be_bytes(cursor.array()?);
+        if version == 1 { return Err(SourceJournalError::MigrationRequired); }
+        if version != SOURCE_RECORD_VERSION_V2 { return Err(SourceJournalError::Corrupt); }
         let phase = SourcePhase::decode(cursor.array::<1>()?[0])?;
         let generation = cursor.number()?; let reserved = cursor.number()?; let retain_until = cursor.number()?;
         let source = cursor.array()?; let route = cursor.array()?; let target = cursor.array()?;
@@ -409,14 +661,26 @@ impl Record {
         let deadline = cursor.number()?; let original_expiry = cursor.number()?;
         let ttl = cursor.array::<1>()?[0]; let timestamp = cursor.number()?;
         let blob_hash = cursor.array()?; let signing_commitment = cursor.array()?;
+        let relay_descriptor_commitment = cursor.array()?;
+        let recipient_descriptor_commitment = cursor.array()?;
+        let request_commitment = cursor.array()?;
+        let body_commitment = cursor.array()?;
         let dispatch = cursor.field(MAX_DISPATCH_BYTES)?.to_vec();
         let terminal = Zeroizing::new(cursor.field(MAX_TERMINAL_BYTES)?.to_vec());
         let restart = Zeroizing::new(cursor.field(MAX_BLIND_VAULT_ONION_PULL_RESTART_BYTES)?.to_vec());
         let claim = cursor.field(MAX_CLAIM_BYTES)?.to_vec(); let lease = cursor.field(MAX_LEASE_BYTES)?.to_vec();
         let result = cursor.field(MAX_REVERSE_ONION_FRAME_BYTES)?.to_vec();
         let verified = Zeroizing::new(cursor.field(MAX_PAGE_BYTES)?.to_vec());
+        let relay_descriptor = Zeroizing::new(cursor.field(MAX_SIGNED_DESCRIPTOR_BYTES)?.to_vec());
+        let recipient_descriptor = Zeroizing::new(cursor.field(MAX_SIGNED_DESCRIPTOR_BYTES)?.to_vec());
+        let authorization = Zeroizing::new(cursor.field(MAX_AUTHORIZATION_BYTES)?.to_vec());
+        let purpose = Zeroizing::new(cursor.field(128)?.to_vec());
         if !cursor.0.is_empty() { return Err(SourceJournalError::Corrupt); }
-        let record = Self { plan: SourcePreparedPull { source, target, descriptor, deadline, original_expiry,
+        let record = Self { plan: SourcePreparedPull { source, target, descriptor,
+            relay_descriptor_commitment, recipient_descriptor_commitment, request_commitment,
+            body_commitment,
+            authority: SourceRouteAuthority { relay_descriptor, recipient_descriptor, authorization, purpose },
+            deadline, original_expiry,
             expected: ExpectedRetainedEnvelope { relay, recipient, route, ttl, timestamp, blob_hash, signing_commitment },
             dispatch, terminal }, phase, generation, reserved, retain_until, restart, claim, lease, result, verified };
         record.validate()?;
@@ -505,6 +769,10 @@ impl ReverseOnionSourceJournal {
         journal.with_inner(|inner| journal.transaction(inner, now, |tx| {
             for id in ids(tx, None, MAX_ENTRIES + 1)? {
                 let mut row = journal.load(tx, id)?.ok_or(SourceJournalError::Corrupt)?;
+                // Historical descriptor/auth evidence proves the original
+                // admission; current execution/recovery freshness is checked
+                // separately by the phase and retention deadlines.
+                row.plan.validate_at(row.plan.expected.timestamp)?;
                 let next = match row.phase {
                     SourcePhase::Armed => Some(SourcePhase::DispatchAmbiguous),
                     SourcePhase::Opening => Some(SourcePhase::OpenAmbiguous), _ => None,
@@ -645,6 +913,44 @@ impl ReverseOnionSourceJournal {
             }
             let next_after = if more { items.last().map(|(id, _)| *id) } else { None };
             Ok(SourceRecoveryPage { items, next_after })
+        }))
+    }
+
+    /// Returns only immutable evidence-query metadata. No persisted effectful
+    /// dispatch or terminal bytes cross this recovery boundary.
+    pub(crate) fn recover_metadata(
+        &self,
+        after: Option<[u8; 16]>,
+        limit: usize,
+        now: u64,
+    ) -> Result<SourceRecoveryMetadataPage> {
+        if limit == 0 || limit > PAGE_LIMIT { return Err(SourceJournalError::Rejected); }
+        self.with_inner(|inner| self.transaction(inner, now, |tx| {
+            let selected = ids(tx, after, limit + 1)?;
+            let more = selected.len() > limit;
+            let mut items = Vec::with_capacity(limit);
+            for id in selected.into_iter().take(limit) {
+                let row = self.load(tx, id)?.ok_or(SourceJournalError::Corrupt)?;
+                // Descriptor/auth verification is anchored to the original
+                // admitted timestamp, not to a later result-grace read.
+                row.plan.validate_at(row.plan.expected.timestamp)?;
+                items.push(SourceRecoveryMetadata {
+                    route: id,
+                    phase: row.phase,
+                    source: row.plan.source,
+                    relay: row.plan.expected.relay,
+                    recipient: row.plan.expected.recipient,
+                    target: row.plan.target,
+                    request_commitment: row.plan.request_commitment,
+                    body_commitment: row.plan.body_commitment,
+                    relay_descriptor_commitment: row.plan.relay_descriptor_commitment,
+                    recipient_descriptor_commitment: row.plan.recipient_descriptor_commitment,
+                    deadline: row.plan.deadline,
+                    retain_until: row.retain_until,
+                });
+            }
+            let next_after = if more { items.last().map(|item| item.route) } else { None };
+            Ok(SourceRecoveryMetadataPage { items, next_after })
         }))
     }
 
@@ -992,7 +1298,10 @@ mod tests {
         BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES,
     };
     use aeronyx_core::protocol::onion::{open_onion_layer, OnionRoutePurpose, VerifiedOnionRoute};
-    use aeronyx_core::protocol::discovery::{NodeCapability, NodeDescriptor, SignedNodeDescriptor};
+    use aeronyx_core::protocol::discovery::{
+        NodeCapability, NodeDescriptor, NodeProtocolFeature, SignedNodeDescriptor,
+        SignedPrivateOnionRecipientAuthorizationV1,
+    };
     use aeronyx_core::protocol::onion_reply::{encode_onion_sealed_response, seal_onion_reply};
 
     const NOW: u64 = 1_800_000_000;
@@ -1004,6 +1313,9 @@ mod tests {
         expectation: VerifiedOnionForwardExpectation,
         terminal: Zeroizing<Vec<u8>>, snapshot: Zeroizing<Vec<u8>>,
         claim: ReverseOnionFrameV1, lease: ReverseOnionFrameV1,
+        authority: SourceRouteAuthority,
+        relay_descriptor_commitment: [u8; 32],
+        recipient_descriptor_commitment: [u8; 32],
     }
 
     impl Fixture {
@@ -1012,8 +1324,9 @@ mod tests {
         fn descriptor(identity: &IdentityKeyPair) -> SignedNodeDescriptor {
             let purpose = OnionRoutePurpose::BlindVaultPull;
             let features = purpose.required_terminal_protocol_features().iter()
-                .chain(purpose.required_path_protocol_features()).copied();
-            let mut descriptor = NodeDescriptor::new(identity.public_key_bytes(), 1, NOW - 1, NOW + 600, "test")
+                .chain(purpose.required_path_protocol_features()).copied()
+                .chain(std::iter::once(NodeProtocolFeature::AnonymousMailboxV1));
+            let mut descriptor = NodeDescriptor::new(identity.public_key_bytes(), 1, NOW - 1, NOW + 10_000, "test")
                 .with_x25519_kem(identity.x25519_public_key_bytes()).with_protocol_features(features);
             descriptor.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle, NodeCapability::BlindVaultReplica];
             descriptor.public_endpoint = Some("https://1.1.1.1:443".into());
@@ -1035,6 +1348,18 @@ mod tests {
             let terminal = Zeroizing::new(request);
             let snapshot = Zeroizing::new(session.seal_restart(&source, route, recipient.public_key_bytes(), &terminal).unwrap());
             let descriptors = [Self::descriptor(&relay), Self::descriptor(&recipient)];
+            let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+                &descriptors[0], &descriptors[1], OnionRoutePurpose::BlindVaultPull.as_str(),
+                NOW, NOW + 9_000, &recipient,
+            ).unwrap();
+            let authority = SourceRouteAuthority::from_signed(
+                &descriptors[0], &descriptors[1], &authorization,
+                OnionRoutePurpose::BlindVaultPull.as_str(),
+            ).unwrap();
+            let relay_descriptor_commitment =
+                DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptors[0]).unwrap().hash();
+            let recipient_descriptor_commitment =
+                DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptors[1]).unwrap().hash();
             let verified_route = VerifiedOnionRoute::from_signed_descriptors(
                 source.public_key_bytes(), descriptors.iter(), OnionRoutePurpose::BlindVaultPull, NOW,
             ).unwrap();
@@ -1051,7 +1376,8 @@ mod tests {
             let lease = ReverseOnionFrameV1::lease(&claim, &retained, [13; 16], NOW + 600, NOW, &relay).unwrap();
             let outbound = PeerBlindRelayRequest { envelope, previous_hop_node_id: source.public_key_bytes(),
                 onward_envelope: None, onward_descriptor_hint: None };
-            Self { directory, source, relay, recipient, outbound, retained, expectation, terminal, snapshot, claim, lease }
+            Self { directory, source, relay, recipient, outbound, retained, expectation, terminal, snapshot,
+                claim, lease, authority, relay_descriptor_commitment, recipient_descriptor_commitment }
         }
         fn path(&self) -> std::path::PathBuf { self.directory.path().join("source.sqlite") }
         fn route(&self) -> [u8; 16] { self.retained.route_id }
@@ -1059,8 +1385,17 @@ mod tests {
             ExpectedRetainedEnvelope::from_verified_forward_expectation(&self.expectation).unwrap()
         }
         fn plan(&self) -> SourcePreparedPull {
+            let request_commitment =
+                blind_relay_authenticated_request_commitment(&self.outbound).unwrap();
             SourcePreparedPull::from_runtime_admission(&self.source, self.outbound.clone(), self.expected(),
-                self.recipient.public_key_bytes(), [14; 32], NOW + 600, self.terminal.to_vec()).unwrap()
+                self.recipient.public_key_bytes(), self.recipient_descriptor_commitment,
+                self.relay_descriptor_commitment, self.recipient_descriptor_commitment,
+                request_commitment, SourceRouteAuthority {
+                    relay_descriptor: self.authority.relay_descriptor.clone(),
+                    recipient_descriptor: self.authority.recipient_descriptor.clone(),
+                    authorization: self.authority.authorization.clone(),
+                    purpose: self.authority.purpose.clone(),
+                }, NOW + 600, self.terminal.to_vec()).unwrap()
         }
         fn session(&self) -> BlindVaultOnionPullSession {
             // Fixture construction only. Production restore lives inside Opening.
@@ -1115,6 +1450,74 @@ mod tests {
         let result = f.response(&f.lease, [7; 32], false);
         journal.record_result(f.route(), &f.claim, &f.lease, &result, NOW + 2).unwrap();
         assert_eq!(journal.open_result(f.route(), NOW + 2).unwrap().lease_id, [7; 32]);
+    }
+
+    // [REVERSE-ONION-SOURCE-JOURNAL-V2 2026-10-04 by Codex] Recovery exposes
+    // only immutable evidence-query metadata; the exact effectful body remains
+    // available solely through the one-shot Prepared->Armed CAS.
+    #[test]
+    fn recovery_metadata_binds_exact_body_and_descriptor_authority() {
+        let f = Fixture::new();
+        let journal = f.open(NOW);
+        f.prepare(&journal, NOW);
+        let page = journal.recover_metadata(None, 1, NOW + 1).unwrap();
+        let item = &page.items[0];
+        assert_eq!(item.route(), f.route());
+        assert_eq!(item.phase(), SourcePhase::Prepared);
+        assert_eq!(item.source(), f.source.public_key_bytes());
+        assert_eq!(item.relay(), f.relay.public_key_bytes());
+        assert_eq!(item.recipient(), f.recipient.public_key_bytes());
+        assert_eq!(item.target(), f.recipient.public_key_bytes());
+        assert_eq!(item.recipient_descriptor_commitment(), f.recipient_descriptor_commitment);
+        assert_eq!(item.relay_descriptor_commitment(), f.relay_descriptor_commitment);
+        assert_eq!(item.body_commitment(), hash(&serde_json::to_vec(&f.outbound).unwrap()));
+        assert_ne!(item.request_commitment(), [0; 32]);
+        assert!(item.deadline() <= item.retain_until());
+        assert!(page.next_after.is_none());
+    }
+
+    #[test]
+    fn historical_authority_survives_execution_expiry_during_result_grace() {
+        let f = Fixture::new();
+        let journal = f.open(NOW);
+        f.prepare(&journal, NOW);
+        journal.arm(f.route(), NOW + 1).unwrap();
+        let page = journal.recover_metadata(None, 1, NOW + 601).unwrap();
+        assert_eq!(page.items[0].phase(), SourcePhase::Armed);
+        assert!(page.items[0].deadline() < NOW + 601);
+        assert!(page.items[0].retain_until() > NOW + 601);
+    }
+
+    #[test]
+    fn request_commitment_and_purpose_drift_fail_before_prepare() {
+        let f = Fixture::new();
+        let journal = f.open(NOW);
+        let mut request_drift = f.plan();
+        request_drift.request_commitment[0] ^= 1;
+        assert_eq!(journal.prepare(request_drift, f.session(), NOW).err(), Some(SourceJournalError::Rejected));
+        let mut purpose_drift = f.plan();
+        purpose_drift.authority.purpose[0] ^= 1;
+        assert_eq!(journal.prepare(purpose_drift, f.session(), NOW).err(), Some(SourceJournalError::Rejected));
+    }
+
+    #[test]
+    fn historical_v1_payload_is_migration_required_without_rewrite() {
+        let f = Fixture::new();
+        let journal = f.open(NOW);
+        f.prepare(&journal, NOW);
+        journal.with_inner(|inner| journal.transaction(inner, NOW + 1, |tx| {
+            let row = journal.load(tx, f.route())?.ok_or(SourceJournalError::Corrupt)?;
+            let mut clear = row.encode()?.to_vec();
+            clear[4..6].copy_from_slice(&1u16.to_be_bytes());
+            let sealed = seal_blind_vault_source_pull_journal(&journal.identity, &Zeroizing::new(clear))
+                .map_err(|_| SourceJournalError::Corrupt)?;
+            one(tx.execute("UPDATE source_jobs SET sealed=?1 WHERE route=?2",
+                params![sealed, f.route().as_slice()]).map_err(unavailable)?)
+        })).unwrap();
+        drop(journal);
+        assert_eq!(ReverseOnionSourceJournal::open(&f.path(), f.source.clone(),
+            SourceJournalLimits { max_entries: 8, max_bytes: RESERVED_PER_JOB * 8 }, NOW + 2).err(),
+            Some(SourceJournalError::MigrationRequired));
     }
 
     #[test]
