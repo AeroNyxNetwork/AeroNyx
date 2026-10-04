@@ -10,8 +10,14 @@
 //! This adapter neither arms the journal nor persists results. Its caller must
 //! await journal.arm first, then persist the returned exact Result BEFORE POST.
 //! Returning a Result authenticates opaque custody, not source execution proof.
+//! [REVERSE-ONION-TRACKED-DISPATCH 2026-10-04 by Codex] Runtime owners must
+//! close admission and await `shutdown_and_drain` BEFORE dropping this adapter
+//! or its Tokio runtime. A wait timeout never aborts the tracked operation.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aeronyx_core::crypto::IdentityKeyPair;
@@ -26,7 +32,8 @@ use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tower::ServiceExt;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -58,6 +65,33 @@ pub(crate) struct ReverseOnionTerminalAdapter {
     relay: [u8; 32],
     timeout: Duration,
     permits: Arc<Semaphore>,
+    tracked: Mutex<TrackedOperations>,
+    drain_waiter: tokio::sync::Mutex<()>,
+}
+
+// [REVERSE-ONION-TRACKED-DISPATCH 2026-10-04 by Codex] Live handles stay here
+// until real completion, including after a caller's deadline/cancellation.
+struct TrackedOperations {
+    closed: bool,
+    panicked: bool,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl TrackedOperations {
+    fn reap_finished(&mut self) {
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut index = 0;
+        while index < self.handles.len() {
+            if self.handles[index].is_finished() {
+                if let Poll::Ready(result) = Pin::new(&mut self.handles[index]).poll(&mut cx) {
+                    let _completed = self.handles.swap_remove(index);
+                    if result.is_err() { self.panicked = true; }
+                    continue;
+                }
+            }
+            index += 1;
+        }
+    }
 }
 
 struct PreparedDispatch {
@@ -84,12 +118,18 @@ impl ReverseOnionTerminalAdapter {
             return Err(ReverseOnionTerminalError::Rejected);
         }
         Ok(Self { router: peer_router, identity: local_identity, relay: pinned_relay,
-            timeout, permits: Arc::new(Semaphore::new(MAX_LOCAL_DISPATCHES)) })
+            timeout, permits: Arc::new(Semaphore::new(MAX_LOCAL_DISPATCHES)),
+            tracked: Mutex::new(TrackedOperations {
+                closed: false, panicked: false, handles: Vec::new(),
+            }),
+            drain_waiter: tokio::sync::Mutex::new(()),
+        })
     }
 
     /// Consumes one post-Armed projection. Even preflight rejection does NOT
-    /// authorize resetting the journal or re-executing this lease. Timeout may
-    /// leave router-owned blocking execution running; never call dispatch again.
+    /// authorize resetting the journal or re-executing this lease. Caller
+    /// timeout/cancellation drops only its result receiver, not the operation.
+    /// Late results are not automatically journaled; never dispatch again.
     pub(crate) async fn dispatch(&self, armed: RecipientDispatch) -> Result<ReverseOnionFrameV1> {
         let permit = Arc::clone(&self.permits).try_acquire_owned()
             .map_err(|_| ReverseOnionTerminalError::Busy)?;
@@ -138,8 +178,66 @@ impl ReverseOnionTerminalAdapter {
                     .map_err(|_| ReverseOnionTerminalError::Ambiguous)
             }).await.map_err(|_| ReverseOnionTerminalError::Ambiguous)?
         };
-        tokio::time::timeout(self.timeout, operation).await
+        // [REVERSE-ONION-TRACKED-DISPATCH 2026-10-04 by Codex] Register under
+        // the same lock as admission closure. No live handle is detached or
+        // removed by timeout; the permit belongs to operation, not its waiter.
+        let receive = {
+            let mut tracked = self.tracked.lock().map_err(|_| ReverseOnionTerminalError::Rejected)?;
+            if tracked.closed { return Err(ReverseOnionTerminalError::Rejected); }
+            // Completed tasks own no continuing work; pending handles stay put.
+            tracked.reap_finished();
+            if tracked.panicked {
+                tracked.closed = true;
+                return Err(ReverseOnionTerminalError::Ambiguous);
+            }
+            if tracked.handles.len() >= MAX_LOCAL_DISPATCHES {
+                return Err(ReverseOnionTerminalError::Busy);
+            }
+            let (send, receive) = oneshot::channel();
+            tracked.handles.push(tokio::spawn(async move {
+                let result = operation.await;
+                let _ = send.send(result);
+            }));
+            receive
+        };
+        tokio::time::timeout(self.timeout, receive).await
             .map_err(|_| ReverseOnionTerminalError::Ambiguous)?
+            .map_err(|_| ReverseOnionTerminalError::Ambiguous)?
+    }
+
+    /// Stop admission and join real completion, without aborting effects.
+    /// Cancellation of this wait leaves every unfinished handle in the registry;
+    /// retain the adapter and call again. There is intentionally no forced-drop
+    /// or abort fallback: an indefinitely blocked router means drain is pending.
+    pub(crate) async fn shutdown_and_drain(&self) -> Result<()> {
+        {
+            let mut tracked = self.tracked.lock().map_err(|_| ReverseOnionTerminalError::Ambiguous)?;
+            tracked.closed = true;
+        }
+        // One join poller at a time: concurrent drains cannot overwrite one
+        // another's JoinHandle wakers and leave an earlier waiter asleep.
+        let _waiter = self.drain_waiter.lock().await;
+        futures::future::poll_fn(|cx| {
+            let mut tracked = match self.tracked.lock() {
+                Ok(tracked) => tracked,
+                Err(_) => return Poll::Ready(Err(ReverseOnionTerminalError::Ambiguous)),
+            };
+            let mut index = 0;
+            while index < tracked.handles.len() {
+                match Pin::new(&mut tracked.handles[index]).poll(cx) {
+                    Poll::Ready(result) => {
+                        let _completed = tracked.handles.swap_remove(index);
+                        if result.is_err() { tracked.panicked = true; }
+                    }
+                    Poll::Pending => index += 1,
+                }
+            }
+            if tracked.handles.is_empty() {
+                Poll::Ready(if tracked.panicked { Err(ReverseOnionTerminalError::Ambiguous) } else { Ok(()) })
+            } else {
+                Poll::Pending
+            }
+        }).await
     }
 }
 
@@ -306,5 +404,161 @@ mod tests {
         let mut changed = response;
         changed.opaque_terminal_response_b64 = Some("AA==".into());
         assert_eq!(verify(&changed).err(), Some(ReverseOnionTerminalError::Ambiguous));
+    }
+
+    // [REVERSE-ONION-TRACKED-DISPATCH 2026-10-04 by Codex] Authored only.
+    // A real Router waits for a real blocking worker, but opens no socket/DB.
+    // The release guard prevents a failed assertion from stranding test workers.
+    struct BlockingGate {
+        open: Mutex<bool>,
+        condition: std::sync::Condvar,
+    }
+
+    impl BlockingGate {
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open { open = self.condition.wait(open).unwrap(); }
+        }
+
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.condition.notify_all();
+        }
+    }
+
+    struct ReleaseOnDrop(Arc<BlockingGate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) { self.0.release(); }
+    }
+
+    // Keep paused Tokio time from auto-advancing while real blocking workers
+    // enter. Once their deterministic entry signals arrive, release this guard
+    // and explicitly advance time (or cancel the caller) under test control.
+    struct HoldPausedClock(JoinHandle<()>);
+    impl HoldPausedClock {
+        fn new() -> Self {
+            Self(tokio::spawn(async {
+                loop { tokio::task::yield_now().await; }
+            }))
+        }
+    }
+    impl Drop for HoldPausedClock {
+        fn drop(&mut self) { self.0.abort(); }
+    }
+
+    fn blocked_router(
+        gate: Arc<BlockingGate>,
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Router {
+        Router::new().route("/api/chat/peer/blind-relay", axum::routing::post(move || {
+            let gate = Arc::clone(&gate);
+            let entered = entered.clone();
+            let count = Arc::clone(&count);
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = entered.send(());
+                    gate.wait();
+                }).await.unwrap();
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        }))
+    }
+
+    fn live_dispatch(relay: &IdentityKeyPair, local: &IdentityKeyPair, id: u8) -> RecipientDispatch {
+        let now = now_secs().unwrap();
+        let route = [id; 16];
+        let (request, _session) = OnionReplySession::prepare_source_sealed(
+            route, local.public_key_bytes(), ONION_REPLY_RESPONSE_SIZE_CLASSES[0], b"operation".to_vec(),
+        ).unwrap();
+        let inner = aeronyx_core::protocol::onion_reply::encode_onion_reply_request(&request).unwrap();
+        let envelope = build_onion_envelope(
+            &[OnionHop { node_id: local.public_key_bytes(),
+                kem_pub: crate::services::onion_keys::current_public_key() }],
+            &inner, route, 1, now, relay,
+        ).unwrap();
+        let claim = ReverseOnionFrameV1::claim(relay.public_key_bytes(), route, now, now + 30, local).unwrap();
+        let lease = ReverseOnionFrameV1::lease(&claim, &envelope, route, now + 600, now, relay).unwrap();
+        RecipientDispatch { envelope, claim, lease, route_deadline: now + 600 }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_router_work_keeps_four_permits_and_drain_cancellation_keeps_handles() {
+        let clock = HoldPausedClock::new();
+        let relay = IdentityKeyPair::from_bytes(&[61; 32]).unwrap();
+        let local = Arc::new(IdentityKeyPair::from_bytes(&[62; 32]).unwrap());
+        let gate = Arc::new(BlockingGate { open: Mutex::new(false), condition: std::sync::Condvar::new() });
+        let _release = ReleaseOnDrop(Arc::clone(&gate));
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapter = Arc::new(ReverseOnionTerminalAdapter::new(
+            blocked_router(Arc::clone(&gate), entered, Arc::clone(&count)), Arc::clone(&local),
+            relay.public_key_bytes(), Duration::from_secs(1),
+        ).unwrap());
+        let mut callers = tokio::task::JoinSet::new();
+        for id in 1..=4 {
+            let dispatch = live_dispatch(&relay, local.as_ref(), id);
+            let adapter = Arc::clone(&adapter);
+            callers.spawn(async move { adapter.dispatch(dispatch).await });
+        }
+        // Entry signals originate inside the blocked spawn_blocking workers.
+        for _ in 0..4 {
+            tokio::select! {
+                entry = entries.recv() => { entry.unwrap(); }
+                _ = callers.join_next() => panic!("caller completed before blocked router entry"),
+            }
+        }
+        tokio::time::advance(Duration::from_secs(2)).await;
+        drop(clock);
+        while let Some(caller) = callers.join_next().await {
+            assert_eq!(caller.unwrap().err(), Some(ReverseOnionTerminalError::Ambiguous));
+        }
+        assert_eq!(adapter.permits.available_permits(), 0);
+        assert_eq!(adapter.dispatch(live_dispatch(&relay, local.as_ref(), 5)).await.err(),
+            Some(ReverseOnionTerminalError::Busy));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let mut drain = Box::pin(adapter.shutdown_and_drain());
+        assert!(matches!(futures::poll!(drain.as_mut()), Poll::Pending));
+        drop(drain); // Cancel the wait, not the tracked jobs.
+        assert_eq!(adapter.tracked.lock().unwrap().handles.len(), 4);
+        gate.release();
+        adapter.shutdown_and_drain().await.unwrap();
+        assert_eq!(adapter.permits.available_permits(), MAX_LOCAL_DISPATCHES);
+        assert!(adapter.tracked.lock().unwrap().handles.is_empty());
+        assert_eq!(adapter.dispatch(live_dispatch(&relay, local.as_ref(), 6)).await.err(),
+            Some(ReverseOnionTerminalError::Rejected));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_caller_does_not_abort_owned_router_operation() {
+        let clock = HoldPausedClock::new();
+        let relay = IdentityKeyPair::from_bytes(&[63; 32]).unwrap();
+        let local = Arc::new(IdentityKeyPair::from_bytes(&[64; 32]).unwrap());
+        let gate = Arc::new(BlockingGate { open: Mutex::new(false), condition: std::sync::Condvar::new() });
+        let _release = ReleaseOnDrop(Arc::clone(&gate));
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapter = Arc::new(ReverseOnionTerminalAdapter::new(
+            blocked_router(Arc::clone(&gate), entered, count), Arc::clone(&local),
+            relay.public_key_bytes(), Duration::from_secs(30),
+        ).unwrap());
+        let dispatch = live_dispatch(&relay, local.as_ref(), 7);
+        let caller_adapter = Arc::clone(&adapter);
+        let mut caller = tokio::spawn(async move { caller_adapter.dispatch(dispatch).await });
+        tokio::select! {
+            entry = entries.recv() => { entry.unwrap(); }
+            _ = &mut caller => panic!("caller completed before blocked router entry"),
+        }
+        assert!(!caller.is_finished());
+        caller.abort(); // Abort only the WAITING caller, never the tracked job.
+        let _ = caller.await;
+        drop(clock);
+        assert_eq!(adapter.permits.available_permits(), MAX_LOCAL_DISPATCHES - 1);
+        assert_eq!(adapter.tracked.lock().unwrap().handles.len(), 1);
+        gate.release();
+        adapter.shutdown_and_drain().await.unwrap();
+        assert!(adapter.tracked.lock().unwrap().handles.is_empty());
     }
 }
