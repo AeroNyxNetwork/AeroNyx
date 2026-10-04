@@ -15,6 +15,8 @@
 //   connection locking, quarantine, and final pagination moved to a coordinator.
 //
 // Main Functionality:
+//   [PENDING-PULL-BOUNDED-PROJECTION 2026-10-04 by Codex] Reject invalid
+//   durable BLOB shapes before copying them into Rust-owned page buffers.
 //   - Defines a replaceable pending-pull repository trait.
 //   - Implements legacy message-id and v2 sequence-ordered SQLite reads.
 //   - Validates every denormalized durable row against its signed envelope.
@@ -40,6 +42,8 @@
 //   - Replacement repositories must preserve limits and deterministic order.
 //
 // Last Modified:
+//   [PENDING-PULL-BOUNDED-PROJECTION 2026-10-04 by Codex] Shared SQL admission
+//   preserves original byte evidence and both existing pagination contracts.
 //   v1.3.0-PendingContractDependency - Removed orchestrator dependency
 //   v1.2.0-PendingDeliveryComposition - Documented coordinator ownership
 //   [CHAT-DURABLE-QUARANTINE-DOMAIN 2026-08-25 by Codex]
@@ -47,8 +51,8 @@
 //   v1.0.0-PendingPullDomain - Initial repository/validation composition
 // ============================================
 
-use aeronyx_core::protocol::chat::decode_envelope;
-use rusqlite::{params, Connection};
+use aeronyx_core::protocol::chat::{decode_envelope, MAX_CHAT_ENVELOPE_BYTES};
+use rusqlite::{named_params, params, Connection, Row};
 
 // [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Pull repositories consume the
 // typed failure boundary directly while pending row models remain contract-owned.
@@ -64,6 +68,9 @@ pub(crate) struct StoredPendingMessageRow {
     receiver: Vec<u8>,
     timestamp: i64,
     envelope: Vec<u8>,
+    // [PENDING-PULL-BOUNDED-PROJECTION 2026-10-04 by Codex] A rejected SQL
+    // projection carries only bounded evidence, never the rejected BLOB.
+    projection_rejection: Option<CorruptDurableRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +130,65 @@ pub(crate) trait PendingMessagePullRepository: Send + Sync {
 /// Production SQLite implementation of the pending-pull repository.
 pub(crate) struct SqlitePendingMessagePullRepository;
 
+// [PENDING-PULL-BOUNDED-PROJECTION 2026-10-04 by Codex] Both readers select
+// only these guarded BLOB expressions, never an additional raw BLOB column.
+// Named parameters keep the shared ceiling independent of query column/order
+// differences. CAST is used only for scalar byte accounting (including TEXT),
+// not as a way to admit non-BLOB data. SQLite's own pager/evaluation memory is
+// outside this Rust projection bound; valid envelopes retain the core ceiling.
+const BOUNDED_PENDING_ROW_PROJECTION: &str = "
+    rowid, timestamp, length(CAST(envelope AS BLOB)),
+    CASE WHEN typeof(message_id) = 'blob' AND length(message_id) = 16
+         THEN message_id ELSE NULL END,
+    CASE WHEN typeof(sender) = 'blob' AND length(sender) = 32
+         THEN sender ELSE NULL END,
+    CASE WHEN typeof(receiver) = 'blob' AND length(receiver) = 32
+         THEN receiver ELSE NULL END,
+    CASE WHEN typeof(envelope) = 'blob'
+                   AND length(envelope) <= :max_envelope_bytes
+         THEN envelope ELSE NULL END";
+
+// [PENDING-PULL-BOUNDED-PROJECTION 2026-10-04 by Codex] Materialize only
+// SQL-admitted fields. Preserve row identity and original byte length for the
+// existing quarantine transaction; SQL/type/conversion failures propagate.
+fn read_bounded_pending_row(row: &Row<'_>, base: usize) -> rusqlite::Result<StoredPendingMessageRow> {
+    let rowid = row.get(base)?;
+    let timestamp = row.get(base + 1)?;
+    let encoded_bytes = match row.get::<_, Option<i64>>(base + 2)? {
+        Some(length) => u64::try_from(length).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        None => 0,
+    };
+    let message_id: Option<Vec<u8>> = row.get(base + 3)?;
+    let sender: Option<Vec<u8>> = row.get(base + 4)?;
+    let receiver: Option<Vec<u8>> = row.get(base + 5)?;
+    let envelope: Option<Vec<u8>> = row.get(base + 6)?;
+    let reason = if message_id.is_none() {
+        Some("pending_message_id")
+    } else if sender.is_none() {
+        Some("pending_message_sender")
+    } else if receiver.is_none() {
+        Some("pending_message_receiver")
+    } else if envelope.is_none() {
+        Some("pending_message_envelope")
+    } else {
+        None
+    };
+    Ok(StoredPendingMessageRow {
+        rowid,
+        message_id: message_id.unwrap_or_default(),
+        sender: sender.unwrap_or_default(),
+        receiver: receiver.unwrap_or_default(),
+        timestamp,
+        envelope: envelope.unwrap_or_default(),
+        projection_rejection: reason.map(|reason| CorruptDurableRow {
+            row_key: rowid,
+            source_kind: QUARANTINE_SOURCE_PENDING_MESSAGE,
+            reason,
+            encoded_bytes,
+        }),
+    })
+}
+
 impl PendingMessagePullRepository for SqlitePendingMessagePullRepository {
     fn capture_snapshot_ceiling(
         &self,
@@ -153,34 +219,29 @@ impl PendingMessagePullRepository for SqlitePendingMessagePullRepository {
         cursor: &[u8; 16],
         limit: i64,
     ) -> ChatRelayResult<Vec<StoredPendingMessageRow>> {
-        let mut stmt = conn.prepare(
-            "SELECT rowid, message_id, sender, receiver, timestamp, envelope
+        // [PENDING-PULL-BOUNDED-PROJECTION 2026-10-04 by Codex] Project, do
+        // not filter invalid rows: they still count toward LIMIT/quarantine.
+        let sql = format!(
+            "SELECT {BOUNDED_PENDING_ROW_PROJECTION}
              FROM pending_messages
-             WHERE receiver = ?1
+             WHERE receiver = :receiver
                AND status = 0
-               AND timestamp > ?2
-               AND message_id > ?3
+               AND timestamp > :after_timestamp
+               AND message_id > :cursor
              ORDER BY message_id ASC
-             LIMIT ?4",
-        )?;
+             LIMIT :row_limit"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
-                params![
-                    receiver.as_slice(),
-                    after_timestamp,
-                    cursor.as_slice(),
-                    limit,
-                ],
-                |row| {
-                    Ok(StoredPendingMessageRow {
-                        rowid: row.get(0)?,
-                        message_id: row.get(1)?,
-                        sender: row.get(2)?,
-                        receiver: row.get(3)?,
-                        timestamp: row.get(4)?,
-                        envelope: row.get(5)?,
-                    })
+                named_params! {
+                    ":receiver": receiver.as_slice(),
+                    ":after_timestamp": after_timestamp,
+                    ":cursor": cursor.as_slice(),
+                    ":row_limit": limit,
+                    ":max_envelope_bytes": MAX_CHAT_ENVELOPE_BYTES,
                 },
+                |row| read_bounded_pending_row(row, 0),
             )?
             .collect::<Result<Vec<_>, rusqlite::Error>>()?;
         Ok(rows)
@@ -195,37 +256,34 @@ impl PendingMessagePullRepository for SqlitePendingMessagePullRepository {
         ceiling: i64,
         limit: i64,
     ) -> ChatRelayResult<Vec<StoredSequencedPendingMessageRow>> {
-        let mut stmt = conn.prepare(
-            "SELECT queue_sequence, rowid, message_id, sender, receiver, timestamp, envelope
+        // [PENDING-PULL-BOUNDED-PROJECTION 2026-10-04 by Codex] Keep the
+        // same sequence prefix, including rejected rows and the lookahead row.
+        let sql = format!(
+            "SELECT queue_sequence, {BOUNDED_PENDING_ROW_PROJECTION}
              FROM pending_messages
-             WHERE receiver = ?1
+             WHERE receiver = :receiver
                AND status = 0
-               AND timestamp > ?2
-               AND queue_sequence > ?3
-               AND queue_sequence <= ?4
+               AND timestamp > :after_timestamp
+               AND queue_sequence > :position
+               AND queue_sequence <= :ceiling
              ORDER BY queue_sequence ASC
-             LIMIT ?5",
-        )?;
+             LIMIT :row_limit"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
-                params![
-                    receiver.as_slice(),
-                    after_timestamp,
-                    position,
-                    ceiling,
-                    limit,
-                ],
+                named_params! {
+                    ":receiver": receiver.as_slice(),
+                    ":after_timestamp": after_timestamp,
+                    ":position": position,
+                    ":ceiling": ceiling,
+                    ":row_limit": limit,
+                    ":max_envelope_bytes": MAX_CHAT_ENVELOPE_BYTES,
+                },
                 |row| {
                     Ok(StoredSequencedPendingMessageRow {
                         queue_sequence: row.get(0)?,
-                        row: StoredPendingMessageRow {
-                            rowid: row.get(1)?,
-                            message_id: row.get(2)?,
-                            sender: row.get(3)?,
-                            receiver: row.get(4)?,
-                            timestamp: row.get(5)?,
-                            envelope: row.get(6)?,
-                        },
+                        row: read_bounded_pending_row(row, 1)?,
                     })
                 },
             )?
@@ -359,7 +417,12 @@ fn corrupt_sequence_row(row: &StoredPendingMessageRow) -> CorruptDurableRow {
         row_key: row.rowid,
         source_kind: QUARANTINE_SOURCE_PENDING_MESSAGE,
         reason: "pending_message_queue_sequence",
-        encoded_bytes: u64::try_from(row.envelope.len()).unwrap_or(u64::MAX),
+        // [PENDING-PULL-BOUNDED-PROJECTION 2026-10-04 by Codex] Sequence
+        // corruption retains priority without losing the unmaterialized size.
+        encoded_bytes: row.projection_rejection.map_or_else(
+            || u64::try_from(row.envelope.len()).unwrap_or(u64::MAX),
+            |rejection| rejection.encoded_bytes,
+        ),
     }
 }
 
@@ -367,6 +430,12 @@ fn validate_pending_message_row(
     row: StoredPendingMessageRow,
     expected_receiver: &[u8; 32],
 ) -> Result<PendingMessage, CorruptDurableRow> {
+    // [PENDING-PULL-BOUNDED-PROJECTION 2026-10-04 by Codex] Rejected
+    // projections cannot be decoded or returned as custody. Accepted rows
+    // still pass every existing codec, binding, and signature check below.
+    if let Some(rejection) = row.projection_rejection {
+        return Err(rejection);
+    }
     let encoded_bytes = u64::try_from(row.envelope.len()).unwrap_or(u64::MAX);
     let corrupt = |reason| CorruptDurableRow {
         row_key: row.rowid,
@@ -469,6 +538,7 @@ mod tests {
             receiver: envelope.receiver.to_vec(),
             timestamp: i64::try_from(envelope.timestamp).expect("test timestamp fits SQLite"),
             envelope: encode_envelope(envelope).expect("encode test envelope"),
+            projection_rejection: None,
         }
     }
 
