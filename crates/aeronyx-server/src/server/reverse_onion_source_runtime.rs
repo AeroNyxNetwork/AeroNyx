@@ -12,7 +12,7 @@
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -959,6 +959,135 @@ impl ReverseOnionSourceRuntime {
     }
 }
 
+// [REVERSE-ONION-SOURCE-LIFECYCLE 2026-10-04 by Codex] Composition injects
+// one already-authenticated runtime; this owner adds only admission/ownership
+// sequencing. It never creates a key, opens a journal, selects an endpoint,
+// or exposes a transport route. The runtime's semaphore remains the sole
+// accounting source for blocking children and in-flight network work.
+pub(crate) struct ReverseOnionSourceLifecycle {
+    runtime: Mutex<Option<Arc<ReverseOnionSourceRuntime>>>,
+    stopped: AtomicBool,
+    drain_waiter: tokio::sync::Mutex<()>,
+}
+
+impl ReverseOnionSourceLifecycle {
+    pub(crate) fn new() -> Self {
+        Self {
+            runtime: Mutex::new(None),
+            stopped: AtomicBool::new(false),
+            drain_waiter: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Installs a fully preflighted runtime. No filesystem or network work is
+    /// performed here; startup owns those effects before calling this method.
+    pub(crate) fn install(
+        &self,
+        runtime: Arc<ReverseOnionSourceRuntime>,
+    ) -> Result<(), SourceRuntimeError> {
+        let mut slot = self
+            .runtime
+            .lock()
+            .map_err(|_| SourceRuntimeError::Unavailable)?;
+        if self.stopped.load(Ordering::Acquire) || slot.is_some() {
+            return Err(SourceRuntimeError::Rejected);
+        }
+        *slot = Some(runtime);
+        Ok(())
+    }
+
+    fn runtime_for_work(&self) -> Result<Arc<ReverseOnionSourceRuntime>, SourceRuntimeError> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(SourceRuntimeError::Stopped);
+        }
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| SourceRuntimeError::Unavailable)?
+            .clone()
+            .ok_or(SourceRuntimeError::Unavailable)?;
+        // request_stop races are closed by the runtime's own admission gate;
+        // this second owner check only avoids starting a new call after stop.
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(SourceRuntimeError::Stopped);
+        }
+        Ok(runtime)
+    }
+
+    pub(crate) fn request_stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        if let Ok(runtime) = self.runtime.lock() {
+            if let Some(runtime) = runtime.as_ref() {
+                runtime.request_stop();
+            }
+        }
+    }
+
+    /// Internal caller path; no caller-selected endpoint or alternate
+    /// transport can bypass ReverseOnionSourceRuntime's policy/journal gates.
+    pub(crate) async fn dispatch(
+        &self,
+        request: PeerBlindRelayRequest,
+        expected: ExpectedRetainedEnvelope,
+        session: BlindVaultOnionPullSession,
+        admitted_deadline: u64,
+        terminal_request: Vec<u8>,
+        now: u64,
+    ) -> Result<BlindVaultPullResult, SourceRuntimeError> {
+        let runtime = self.runtime_for_work()?;
+        runtime
+            .dispatch(
+                request,
+                expected,
+                session,
+                admitted_deadline,
+                terminal_request,
+                now,
+            )
+            .await
+    }
+
+    /// Internal restart path; historical journal semantics remain owned by
+    /// ReverseOnionSourceRuntime::resume and are not replaced by lifecycle
+    /// policy or a new live authorization check.
+    pub(crate) async fn resume(
+        &self,
+        route: [u8; 16],
+        now: u64,
+    ) -> Result<BlindVaultPullResult, SourceRuntimeError> {
+        let runtime = self.runtime_for_work()?;
+        runtime.resume(route, now).await
+    }
+
+    /// Closes new work first, then retains the injected runtime/journal until
+    /// its semaphore reaches zero. Only after that point is the owner slot
+    /// released for shutdown teardown.
+    pub(crate) async fn shutdown_and_drain(&self) -> Result<(), SourceRuntimeError> {
+        let _waiter = self.drain_waiter.lock().await;
+        self.request_stop();
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| SourceRuntimeError::Unavailable)?
+            .clone();
+        if let Some(runtime) = runtime {
+            runtime.shutdown_and_drain().await;
+        }
+        let mut slot = self
+            .runtime
+            .lock()
+            .map_err(|_| SourceRuntimeError::Unavailable)?;
+        *slot = None;
+        Ok(())
+    }
+}
+
+impl Drop for ReverseOnionSourceLifecycle {
+    fn drop(&mut self) {
+        self.request_stop();
+    }
+}
+
 enum SourceAdmission {
     Send(PreparedDispatch),
     Recover { route: [u8; 16] },
@@ -1043,6 +1172,13 @@ fn verify_success_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    #[cfg(unix)]
+    use std::future::Future;
+    #[cfg(unix)]
+    use std::task::{Context, Poll, Wake, Waker};
 
     #[test]
     fn default_timeout_is_bounded_without_constructing_network_state() {
@@ -1162,4 +1298,173 @@ mod tests {
             Err(SourceRuntimeError::Ambiguous)
         );
     }
+
+    // [REVERSE-ONION-SOURCE-RUNTIME-TESTS 2026-10-04 by Codex] These tests
+    // exercise only the existing private constructor and source journal
+    // fixture. No production route, endpoint, or transport is registered.
+    #[cfg(unix)]
+    struct CountingTransport {
+        posts: Arc<AtomicUsize>,
+        queries: Arc<AtomicUsize>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl SourceTransport for CountingTransport {
+        async fn post(&self, _url: reqwest::Url, _body: Bytes) -> SourceTransportOutcome {
+            self.posts.fetch_add(1, AtomicOrdering::SeqCst);
+            SourceTransportOutcome::Ambiguous
+        }
+
+        async fn query(&self, _url: reqwest::Url, _body: Bytes) -> SourceTransportOutcome {
+            self.queries.fetch_add(1, AtomicOrdering::SeqCst);
+            SourceTransportOutcome::Ambiguous
+        }
+    }
+
+    #[cfg(unix)]
+    fn fixture_runtime(
+        fixture: &crate::services::reverse_onion_source::tests::Fixture,
+        transport: Arc<dyn SourceTransport>,
+        journal: Arc<ReverseOnionSourceJournal>,
+    ) -> Arc<ReverseOnionSourceRuntime> {
+        let (relay, recipient, authorization) = fixture.policy_parts();
+        let policy = Arc::new(SourcePinnedRelayPolicy {
+            source: fixture.source_identity().public_key_bytes(),
+            relay,
+            recipient,
+            authorization,
+        });
+        Arc::new(
+            ReverseOnionSourceRuntime::new(
+                journal,
+                fixture.source_identity(),
+                policy,
+                transport,
+                SourceRuntimeConfig::new(1, Duration::from_secs(1)).unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_sets_stop_and_waits_for_all_accepted_permits() {
+        let fixture = crate::services::reverse_onion_source::tests::Fixture::new();
+        let journal = Arc::new(fixture.open(1_800_000_000));
+        let transport = Arc::new(CountingTransport {
+            posts: Arc::new(AtomicUsize::new(0)),
+            queries: Arc::new(AtomicUsize::new(0)),
+        });
+        let runtime = fixture_runtime(&fixture, transport, journal);
+        let held = runtime.permits.clone().acquire_owned().await.unwrap();
+        let mut draining = Box::pin(runtime.shutdown_and_drain());
+        struct NoopWake;
+        impl Wake for NoopWake {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(draining.as_mut().poll(&mut context), Poll::Pending));
+        assert!(runtime.stopped.load(Ordering::Acquire));
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), draining)
+            .await
+            .unwrap();
+        assert!(runtime.stopped.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reopened_journal_helper_opens_result_without_post_or_query() {
+        let fixture = crate::services::reverse_onion_source::tests::Fixture::new_for_runtime();
+        let journal = Arc::new(fixture.open(fixture.now()));
+        fixture.ready_with_maximum(&journal);
+        let expected_body = fixture.outbound_bytes();
+        assert!(!expected_body.is_empty());
+        let before = journal
+            .recover_metadata(None, 1, fixture.now() + 3)
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(before.phase(), SourcePhase::ResultReady);
+        assert_eq!(before.body_commitment(), fixture.outbound_body_commitment());
+        drop(journal);
+        let reopened = Arc::new(fixture.open(fixture.now() + 3));
+        let reopened_item = reopened
+            .recover_metadata(None, 1, fixture.now() + 3)
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(reopened_item.phase(), SourcePhase::ResultReady);
+        assert_eq!(reopened_item.body_commitment(), before.body_commitment());
+        let posts = Arc::new(AtomicUsize::new(0));
+        let queries = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(CountingTransport {
+            posts: Arc::clone(&posts),
+            queries: Arc::clone(&queries),
+        });
+        let runtime = fixture_runtime(&fixture, transport, reopened);
+        let permit = Arc::new(runtime.permits.clone().try_acquire_owned().unwrap());
+        let result = runtime
+            .open_result(fixture.route(), fixture.now(), permit)
+            .await
+            .unwrap();
+        assert_eq!(result.response().lease_id, [7; 32]);
+        assert_eq!(result.response().objects.len(), 1);
+        assert_eq!(result.response().objects[0].object_id, [6; 32]);
+        assert_eq!(
+            result.response().objects[0].ciphertext,
+            fixture.result_object_bytes()
+        );
+        assert_eq!(
+            result.response().objects[0].ciphertext_commitment,
+            fixture.result_object_commitment()
+        );
+        let observed = observed_now(0).unwrap();
+        let verified = runtime
+            .journal
+            .recover_metadata(None, 1, observed)
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(verified.phase(), SourcePhase::Verified);
+        assert_eq!(posts.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(queries.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lifecycle_stop_gate_rejects_new_resume_and_drains_injected_runtime() {
+        let fixture = crate::services::reverse_onion_source::tests::Fixture::new();
+        let journal = Arc::new(fixture.open(1_800_000_000));
+        let transport = Arc::new(CountingTransport {
+            posts: Arc::new(AtomicUsize::new(0)),
+            queries: Arc::new(AtomicUsize::new(0)),
+        });
+        let runtime = fixture_runtime(&fixture, transport, journal);
+        let lifecycle = ReverseOnionSourceLifecycle::new();
+        lifecycle.install(Arc::clone(&runtime)).unwrap();
+        lifecycle.request_stop();
+        assert!(matches!(
+            lifecycle.resume(fixture.route(), 1_800_000_000).await,
+            Err(SourceRuntimeError::Stopped)
+        ));
+        lifecycle.shutdown_and_drain().await.unwrap();
+        assert!(matches!(
+            lifecycle.resume(fixture.route(), 1_800_000_000).await,
+            Err(SourceRuntimeError::Stopped)
+        ));
+        assert_eq!(
+            lifecycle.install(runtime).err(),
+            Some(SourceRuntimeError::Rejected)
+        );
+    }
+
 }

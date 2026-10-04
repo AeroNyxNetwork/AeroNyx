@@ -1298,7 +1298,7 @@ fn one(n: usize) -> Result<()> { if n == 1 { Ok(()) } else { Err(SourceJournalEr
 // tests use R's private key only to simulate actual relay delivery; expected
 // bytes now come from the production typed, same-pass verified builder.
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use aeronyx_core::protocol::blind_vault::{
         BlindVaultPullRequest, BlindVaultRecoveredObject, BLIND_VAULT_PROTOCOL_VERSION,
@@ -1313,7 +1313,8 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
 
-    struct Fixture {
+    pub(crate) struct Fixture {
+        now: u64,
         directory: tempfile::TempDir,
         source: Arc<IdentityKeyPair>, relay: IdentityKeyPair, recipient: IdentityKeyPair,
         outbound: PeerBlindRelayRequest, retained: BlindRelayEnvelope,
@@ -1328,21 +1329,35 @@ mod tests {
     impl Fixture {
         // [REVERSE-ONION-TYPED-EXPECTATION 2026-10-04 by Codex] All route
         // descriptors are signed; no server fixture constructs the core type.
-        fn descriptor(identity: &IdentityKeyPair) -> SignedNodeDescriptor {
+        fn descriptor_at(identity: &IdentityKeyPair, now: u64) -> SignedNodeDescriptor {
             let purpose = OnionRoutePurpose::BlindVaultPull;
             let features = purpose.required_terminal_protocol_features().iter()
                 .chain(purpose.required_path_protocol_features()).copied()
                 .chain(std::iter::once(NodeProtocolFeature::AnonymousMailboxV1));
-            let mut descriptor = NodeDescriptor::new(identity.public_key_bytes(), 1, NOW - 1, NOW + 10_000, "test")
+            let mut descriptor = NodeDescriptor::new(identity.public_key_bytes(), 1, now - 1, now + 10_000, "test")
                 .with_x25519_kem(identity.x25519_public_key_bytes()).with_protocol_features(features);
             descriptor.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle, NodeCapability::BlindVaultReplica];
             descriptor.public_endpoint = Some("https://1.1.1.1:443".into());
             SignedNodeDescriptor::sign(descriptor, identity).unwrap()
         }
-        fn new() -> Self {
+        fn descriptor(identity: &IdentityKeyPair) -> SignedNodeDescriptor {
+            Self::descriptor_at(identity, NOW)
+        }
+        pub(crate) fn new() -> Self {
             Self::new_with_route(11)
         }
         fn new_with_route(route_byte: u8) -> Self {
+            Self::new_with_route_at(route_byte, NOW)
+        }
+        pub(crate) fn new_for_runtime() -> Self {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_sub(120);
+            Self::new_with_route_at(11, now)
+        }
+        fn new_with_route_at(route_byte: u8, now: u64) -> Self {
             let directory = tempfile::Builder::new().prefix("r1-source-pull-test-")
                 .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
             let source = Arc::new(IdentityKeyPair::from_bytes(&[41; 32]).unwrap());
@@ -1354,10 +1369,10 @@ mod tests {
                     read_capability: [8; 32], continuation_cursor: vec![], limit: 1 }).unwrap();
             let terminal = Zeroizing::new(request);
             let snapshot = Zeroizing::new(session.seal_restart(&source, route, recipient.public_key_bytes(), &terminal).unwrap());
-            let descriptors = [Self::descriptor(&relay), Self::descriptor(&recipient)];
+            let descriptors = [Self::descriptor_at(&relay, now), Self::descriptor_at(&recipient, now)];
             let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
                 &descriptors[0], &descriptors[1], OnionRoutePurpose::BlindVaultPull.as_str(),
-                NOW, NOW + 9_000, &recipient,
+                now, now + 9_000, &recipient,
             ).unwrap();
             let authority = SourceRouteAuthority::from_signed(
                 &descriptors[0], &descriptors[1], &authorization,
@@ -1368,26 +1383,49 @@ mod tests {
             let recipient_descriptor_commitment =
                 DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptors[1]).unwrap().hash();
             let verified_route = VerifiedOnionRoute::from_signed_descriptors(
-                source.public_key_bytes(), descriptors.iter(), OnionRoutePurpose::BlindVaultPull, NOW,
+                source.public_key_bytes(), descriptors.iter(), OnionRoutePurpose::BlindVaultPull, now,
             ).unwrap();
             let (envelope, expectation) = verified_route.build_envelope_with_forward_expectation(
-                &terminal, route, NOW, &source,
+                &terminal, route, now, &source,
             ).unwrap();
             let expectation = expectation.unwrap();
             // R's secret is used ONLY after source construction to emulate R.
             let (relay_secret, _) = relay.to_x25519();
             let peeled = open_onion_layer(&envelope.encrypted_blob, &relay_secret).unwrap();
             let retained = BlindRelayEnvelope { route_id: route, next_hop: recipient.public_key_bytes(), ttl: 1,
-                timestamp: NOW, encrypted_blob: peeled.inner, signature: [0; 64] }.sign_with(&relay);
-            let claim = ReverseOnionFrameV1::claim(relay.public_key_bytes(), [12; 16], NOW, NOW + 30, &recipient).unwrap();
-            let lease = ReverseOnionFrameV1::lease(&claim, &retained, [13; 16], NOW + 600, NOW, &relay).unwrap();
+                timestamp: now, encrypted_blob: peeled.inner, signature: [0; 64] }.sign_with(&relay);
+            let claim = ReverseOnionFrameV1::claim(relay.public_key_bytes(), [12; 16], now, now + 30, &recipient).unwrap();
+            let lease = ReverseOnionFrameV1::lease(&claim, &retained, [13; 16], now + 600, now, &relay).unwrap();
             let outbound = PeerBlindRelayRequest { envelope, previous_hop_node_id: source.public_key_bytes(),
                 onward_envelope: None, onward_descriptor_hint: None };
-            Self { directory, source, relay, recipient, outbound, retained, expectation, terminal, snapshot,
+            Self { now, directory, source, relay, recipient, outbound, retained, expectation, terminal, snapshot,
                 claim, lease, authority, relay_descriptor_commitment, recipient_descriptor_commitment }
         }
         fn path(&self) -> std::path::PathBuf { self.directory.path().join("source.sqlite") }
-        fn route(&self) -> [u8; 16] { self.retained.route_id }
+        pub(crate) fn source_identity(&self) -> Arc<IdentityKeyPair> {
+            Arc::clone(&self.source)
+        }
+        pub(crate) fn now(&self) -> u64 { self.now }
+        pub(crate) fn outbound_bytes(&self) -> Vec<u8> {
+            serde_json::to_vec(&self.outbound).unwrap()
+        }
+        pub(crate) fn outbound_body_commitment(&self) -> [u8; 32] {
+            hash(&self.outbound_bytes())
+        }
+        pub(crate) fn policy_parts(
+            &self,
+        ) -> (
+            SignedNodeDescriptor,
+            SignedNodeDescriptor,
+            SignedPrivateOnionRecipientAuthorizationV1,
+        ) {
+            (
+                self.authority.relay_descriptor.clone(),
+                self.authority.recipient_descriptor.clone(),
+                self.authority.authorization.clone(),
+            )
+        }
+        pub(crate) fn route(&self) -> [u8; 16] { self.retained.route_id }
         fn expected(&self) -> ExpectedRetainedEnvelope {
             ExpectedRetainedEnvelope::from_verified_forward_expectation(&self.expectation).unwrap()
         }
@@ -1402,14 +1440,14 @@ mod tests {
                     recipient_descriptor: self.authority.recipient_descriptor.clone(),
                     authorization: self.authority.authorization.clone(),
                     purpose: self.authority.purpose.clone(),
-                }, NOW + 600, self.terminal.to_vec()).unwrap()
+                }, self.now + 600, self.terminal.to_vec()).unwrap()
         }
         fn session(&self) -> BlindVaultOnionPullSession {
             // Fixture construction only. Production restore lives inside Opening.
             BlindVaultOnionPullSession::restore_restart(&self.source, &self.snapshot,
                 self.route(), self.recipient.public_key_bytes(), &self.terminal).unwrap()
         }
-        fn open(&self, now: u64) -> ReverseOnionSourceJournal {
+        pub(crate) fn open(&self, now: u64) -> ReverseOnionSourceJournal {
             self.open_limits(now, 8, RESERVED_PER_JOB * 8).unwrap()
         }
         fn open_limits(&self, now: u64, max_entries: usize, max_bytes: u64) -> Result<ReverseOnionSourceJournal> {
@@ -1423,21 +1461,38 @@ mod tests {
             let objects = if maximum {
                 let bytes = vec![0x55; BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES[BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES.len() - 1]];
                 vec![BlindVaultRecoveredObject { object_id: [6; 32], ciphertext_commitment: hash(&bytes),
-                    ciphertext: bytes, expires_at_ms: (NOW + 3600) * 1000 }]
+                    ciphertext: bytes, expires_at_ms: (self.now + 3600) * 1000 }]
             } else { vec![] };
-            let mut page = BlindVaultPullResponse::new(lease_id, objects, vec![], NOW * 1000, self.recipient.public_key_bytes());
+            let mut page = BlindVaultPullResponse::new(lease_id, objects, vec![], self.now * 1000, self.recipient.public_key_bytes());
             page.sign(&self.recipient).unwrap();
             let encoded = encode_blind_vault_frame(&BlindVaultFrame::PullResponse(page)).unwrap();
             let sealed = seal_onion_reply(self.route(), &request, &encoded, &self.recipient).unwrap();
             ReverseOnionFrameV1::result(&self.claim, lease, &encode_onion_sealed_response(&sealed).unwrap(),
-                NOW + 600, NOW + 2, &self.recipient).unwrap()
+                self.now + 600, self.now + 2, &self.recipient).unwrap()
         }
-        fn ready(&self, journal: &ReverseOnionSourceJournal) -> ReverseOnionFrameV1 {
-            self.prepare(journal, NOW);
-            journal.arm(self.route(), NOW + 1).unwrap();
-            let result = self.response(&self.lease, [7; 32], false);
-            journal.record_result(self.route(), &self.claim, &self.lease, &result, NOW + 2).unwrap();
+        pub(crate) fn ready(&self, journal: &ReverseOnionSourceJournal) -> ReverseOnionFrameV1 {
+            self.ready_with_maximum_inner(journal, false)
+        }
+        pub(crate) fn ready_with_maximum(&self, journal: &ReverseOnionSourceJournal) -> ReverseOnionFrameV1 {
+            self.ready_with_maximum_inner(journal, true)
+        }
+        fn ready_with_maximum_inner(
+            &self,
+            journal: &ReverseOnionSourceJournal,
+            maximum: bool,
+        ) -> ReverseOnionFrameV1 {
+            self.prepare(journal, self.now);
+            journal.arm(self.route(), self.now + 1).unwrap();
+            let result = self.response(&self.lease, [7; 32], maximum);
+            journal.record_result(self.route(), &self.claim, &self.lease, &result, self.now + 2).unwrap();
             result
+        }
+        pub(crate) fn result_object_commitment(&self) -> [u8; 32] {
+            let bytes = vec![0x55; BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES[BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES.len() - 1]];
+            hash(&bytes)
+        }
+        pub(crate) fn result_object_bytes(&self) -> Vec<u8> {
+            vec![0x55; BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES[BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES.len() - 1]]
         }
     }
 
