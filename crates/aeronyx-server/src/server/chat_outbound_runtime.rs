@@ -6,6 +6,8 @@
 // ambiguity-safe retry. Caller startup/shutdown and public wire stay unchanged.
 // [DIRECT-RELAY-READMISSION 2026-10-04 by Codex] Re-admit the pinned direct
 // route before every send; local admission changes stop without replacement.
+// [ONION-AMBIGUITY-BARRIER 2026-10-04 by Codex] An unconfirmed onion POST
+// stops this round without widening route exposure or discarding prior custody.
 use super::*;
 
 const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
@@ -201,6 +203,17 @@ pub(super) enum OnionRouteFailureAttribution {
     EndToEnd,
 }
 
+/// Evidence permitting another replica after an onion HTTP attempt.
+///
+/// [ONION-AMBIGUITY-BARRIER 2026-10-04 by Codex] This state is created only
+/// after zero-send preflight has succeeded. Transport/status/body/verifier
+/// failures cannot prove that the selected hops observed no effect. Only the
+/// existing verified-delivery branch may authorize another independent replica.
+enum OnionPostedAttemptEvidence {
+    Unconfirmed,
+    VerifiedDelivery,
+}
+
 /// Bounded local failure from authenticated onion request construction.
 ///
 /// [ONION-REQUEST-BUILD-ERROR 2026-08-29 by Codex] This type preserves route
@@ -384,6 +397,10 @@ impl Server {
     /// terminal replica returned a fresh signature bound to that payload.
     /// Mixed-version meshes return an empty outcome before sending, preserving
     /// the compatibility availability fallback without widening route exposure.
+    /// [ONION-AMBIGUITY-BARRIER 2026-10-04 by Codex] Once a POST is attempted,
+    /// any result without verified delivery stops the remaining replica round.
+    /// Earlier verified receipts remain valid; callers retain existing local
+    /// custody/recovery handling. This does not create a durable source retry.
     pub(super) async fn relay_authenticated_chat_over_onion_paths(
         client: Option<&reqwest::Client>,
         relay: Option<&ChatRelayService>,
@@ -558,6 +575,10 @@ impl Server {
             used_hops.push(middle.clone());
             used_hops.push(terminal.clone());
             attempted = attempted.saturating_add(1);
+            // [ONION-AMBIGUITY-BARRIER 2026-10-04 by Codex] Fail closed from
+            // the send boundary, even if transport cannot confirm bytes sent.
+            // Preflight continuations above never enter this exposed state.
+            let mut posted_evidence = OnionPostedAttemptEvidence::Unconfirmed;
             match client
                 .post(&url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -577,9 +598,10 @@ impl Server {
                             // Validate freshness at response observation time,
                             // not request-selection time, then commit both hop
                             // surfaces and the aggregate delivery as one state
-                            // transition. A concurrent descriptor rotation is
-                            // a conservative retry/fallback signal, not route
-                            // failure evidence against either replacement.
+                            // transition. [ONION-AMBIGUITY-BARRIER 2026-10-04
+                            // by Codex] Descriptor rotation keeps its existing
+                            // conservative unconfirmed outcome, now stopping this
+                            // round without replacement-route failure evidence.
                             let observed_at = unix_now_secs();
                             match verify_blind_relay_delivery_receipt(
                                 ack.delivery_receipt,
@@ -601,6 +623,10 @@ impl Server {
                                     if first_terminal_receipt.is_none() {
                                         first_terminal_receipt = Some(receipt);
                                     }
+                                    // [ONION-AMBIGUITY-BARRIER 2026-10-04 by Codex]
+                                    // Preserve the existing success predicate;
+                                    // do not loosen receipt/route validation.
+                                    posted_evidence = OnionPostedAttemptEvidence::VerifiedDelivery;
                                 }
                                 Ok(_) => {
                                     last_failure_reason =
@@ -679,6 +705,14 @@ impl Server {
                         OnionRouteFailureAttribution::FirstHop,
                     );
                 }
+            }
+            // [ONION-AMBIGUITY-BARRIER 2026-10-04 by Codex] Do not turn an
+            // unknown effect into another terminal/middle, route ID, or onion
+            // body. Keep prior accepted receipts/counters and let the existing
+            // caller retain pending custody. attempted > 0 also continues to
+            // suppress compatibility direct fallback. No new retry is invented.
+            if matches!(posted_evidence, OnionPostedAttemptEvidence::Unconfirmed) {
+                break;
             }
         }
 
