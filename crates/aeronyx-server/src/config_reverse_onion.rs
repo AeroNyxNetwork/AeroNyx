@@ -9,11 +9,23 @@
 //! authenticated handlers, and recovery worker have initialized successfully.
 //! Existing permissionless endpoint and source-sealed reply rules still apply.
 //! No model inference, TEE attestation, or public exposure is enabled here.
+//! Last Modified: v0.2.0-SignedPrivateRecipientConfig — canonical authority
+//! inputs and bounded source admission fields remain default-off.
+
+// [REVERSE-ONION-SIGNED-AUTH-CONFIG 2026-10-04 by Codex] The isolated
+// single-recipient experiment accepts only canonical core descriptor and
+// recipient-authorization bytes represented as standard Base64. This module
+// checks shape/bounds/bindings; runtime composition owns current TTL/features.
 
 use std::collections::HashSet;
 use std::path::{Component, Path};
 
 use aeronyx_core::crypto::keys::IdentityPublicKey;
+use aeronyx_core::protocol::discovery::{
+    SignedNodeDescriptor, SignedPrivateOnionRecipientAuthorizationV1,
+    MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_BYTES, MAX_SIGNED_NODE_DESCRIPTOR_BYTES,
+};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, ServerError};
@@ -36,8 +48,23 @@ pub struct ReverseOnionQueueConfig {
     pub enabled: bool,
     /// Dedicated durable SQLite file, never an in-memory database.
     pub db_path: String,
-    /// Immediate recipients permitted to claim work in the isolated rollout.
+    /// Legacy ID-only mode accepts 1..=64 pins; signed experiment mode requires one.
     pub recipient_node_ids: Vec<String>,
+    /// Canonical signed R descriptor, encoded with standard Base64.
+    #[serde(default)]
+    pub relay_descriptor_b64: String,
+    /// Canonical signed P descriptor, encoded with standard Base64.
+    #[serde(default)]
+    pub recipient_descriptor_b64: String,
+    /// Canonical P-signed private-recipient authorization, standard Base64.
+    #[serde(default)]
+    pub recipient_authorization_b64: String,
+    /// Explicit source identities permitted to enqueue this experiment.
+    #[serde(default)]
+    pub source_node_ids: Vec<String>,
+    /// Shared bounded HTTP blocking admission for the queue API.
+    #[serde(default = "default_reverse_onion_max_in_flight")]
+    pub max_in_flight: usize,
     /// Maximum number of pending and retained records combined.
     pub max_items: u32,
     /// Per-recipient pending and retained record ceiling.
@@ -56,6 +83,11 @@ impl Default for ReverseOnionQueueConfig {
             enabled: false,
             db_path: String::new(),
             recipient_node_ids: Vec::new(),
+            relay_descriptor_b64: String::new(),
+            recipient_descriptor_b64: String::new(),
+            recipient_authorization_b64: String::new(),
+            source_node_ids: Vec::new(),
+            max_in_flight: default_reverse_onion_max_in_flight(),
             max_items: 256,
             max_items_per_recipient: 16,
             max_bytes: 64 * 1024 * 1024,
@@ -123,6 +155,61 @@ impl ReverseOnionConfig {
                     return Err(invalid("duplicate queue recipient identity"));
                 }
             }
+            if !(1..=64).contains(&q.max_in_flight) {
+                return Err(invalid("queue max_in_flight outside bounded rollout policy"));
+            }
+            let authority_fields = [
+                !q.relay_descriptor_b64.is_empty(),
+                !q.recipient_descriptor_b64.is_empty(),
+                !q.recipient_authorization_b64.is_empty(),
+            ];
+            if authority_fields.iter().any(|present| *present) {
+                if authority_fields.iter().any(|present| !*present)
+                    || q.recipient_node_ids.len() != 1
+                {
+                    return Err(invalid("queue signed recipient authority is incomplete"));
+                }
+                if q.source_node_ids.is_empty() || q.source_node_ids.len() > 64 {
+                    return Err(invalid("queue requires 1..=64 source identity pins"));
+                }
+                let mut sources = HashSet::new();
+                for source in &q.source_node_ids {
+                    let source = node_id(source)?;
+                    if !sources.insert(source) {
+                        return Err(invalid("duplicate queue source identity"));
+                    }
+                }
+                let relay_descriptor = decode_descriptor_blob(&q.relay_descriptor_b64)?;
+                let recipient_descriptor = decode_descriptor_blob(&q.recipient_descriptor_b64)?;
+                let authorization = decode_authorization_blob(&q.recipient_authorization_b64)?;
+                let relay_node_id = relay_descriptor.node_id();
+                let recipient_node_id = recipient_descriptor.node_id();
+                if relay_node_id == [0; 32]
+                    || recipient_node_id == [0; 32]
+                    || relay_node_id == recipient_node_id
+                    || recipient_node_id != node_id(&q.recipient_node_ids[0])?
+                    || authorization.relay_node_id() != relay_node_id
+                    || authorization.recipient_node_id() != recipient_node_id
+                {
+                    return Err(invalid("queue signed recipient authority bindings are invalid"));
+                }
+                if sources
+                    .iter()
+                    .any(|source| *source == relay_node_id || *source == recipient_node_id)
+                {
+                    return Err(invalid("queue source identity overlaps route authority"));
+                }
+            } else if !q.source_node_ids.is_empty() {
+                if q.source_node_ids.len() > 64 {
+                    return Err(invalid("queue source identity pins exceed rollout bound"));
+                }
+                let mut sources = HashSet::new();
+                for source in &q.source_node_ids {
+                    if !sources.insert(node_id(source)?) {
+                        return Err(invalid("duplicate queue source identity"));
+                    }
+                }
+            }
             if !(1..=4096).contains(&q.max_items)
                 || q.max_items_per_recipient == 0
                 || q.max_items_per_recipient > q.max_items
@@ -169,6 +256,59 @@ impl ReverseOnionConfig {
 
 fn invalid(reason: &'static str) -> ServerError {
     ServerError::config_invalid("reverse_onion", reason)
+}
+
+fn default_reverse_onion_max_in_flight() -> usize {
+    4
+}
+
+impl ReverseOnionQueueConfig {
+    /// Returns whether startup may consider the signed private-recipient
+    /// admission experiment. Legacy ID-only queue configuration is retained
+    /// for parsing but must never be promoted by composition.
+    pub(crate) fn signed_private_admission_configured(&self) -> bool {
+        !self.relay_descriptor_b64.is_empty()
+            || !self.recipient_descriptor_b64.is_empty()
+            || !self.recipient_authorization_b64.is_empty()
+    }
+}
+
+fn decode_descriptor_blob(value: &str) -> Result<SignedNodeDescriptor> {
+    let bytes = decode_canonical_blob(value, MAX_SIGNED_NODE_DESCRIPTOR_BYTES)?;
+    SignedNodeDescriptor::decode_canonical(&bytes)
+        .map_err(|_| invalid("invalid canonical reverse-onion descriptor"))
+}
+
+fn decode_authorization_blob(
+    value: &str,
+) -> Result<SignedPrivateOnionRecipientAuthorizationV1> {
+    let bytes = decode_canonical_blob(
+        value,
+        MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_BYTES,
+    )?;
+    SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(&bytes)
+        .map_err(|_| invalid("invalid canonical reverse-onion authorization"))
+}
+
+fn decode_canonical_blob(value: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    if value.is_empty() {
+        return Err(invalid("reverse-onion signed authority is required"));
+    }
+    let max_encoded = max_bytes
+        .checked_add(2)
+        .and_then(|value| value.checked_div(3))
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| invalid("reverse-onion signed authority bound is invalid"))?;
+    if value.len() > max_encoded {
+        return Err(invalid("reverse-onion signed authority exceeds bound"));
+    }
+    let bytes = BASE64
+        .decode(value)
+        .map_err(|_| invalid("reverse-onion signed authority encoding is invalid"))?;
+    if bytes.is_empty() || bytes.len() > max_bytes || BASE64.encode(&bytes) != value {
+        return Err(invalid("reverse-onion signed authority encoding is non-canonical"));
+    }
+    Ok(bytes)
 }
 
 fn node_id(value: &str) -> Result<[u8; 32]> {
