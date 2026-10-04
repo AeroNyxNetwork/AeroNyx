@@ -10,6 +10,8 @@
 //! mandatory integration boundaries; these pure types perform no I/O.
 //! [RECIPIENT-LEASE-AUTHORITY 2026-10-04 by Codex] Recipient lease proof
 //! authenticates relay execution authority, never the hidden source route.
+//! [SOURCE-EVIDENCE-V1 2026-10-04 by Codex] Additive source-signed read-only
+//! evidence queries and relay-signed bounded parts; no queue/network authority.
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -588,6 +590,320 @@ impl ReverseOnionFrameV1 {
 
 // [REVERSE-ONION-CONTRACT 2026-10-04 by Codex] Bounds are checked before any
 // attacker-selected allocation; exact remaining length excludes trailing data.
+// [SOURCE-EVIDENCE-V1 2026-10-04 by Codex] Separate wire and domains: no
+// changes to AXRD, onion caps, request commitments, or execution authority.
+const SOURCE_QUERY_MAGIC: &[u8; 4] = b"AXRQ";
+const SOURCE_EVIDENCE_MAGIC: &[u8; 4] = b"AXRE";
+const SOURCE_QUERY_SIGN: &[u8] = b"AeroNyx-Reverse-Source-Query-Sign-v1\0";
+const SOURCE_QUERY_COMMIT: &[u8] = b"AeroNyx-Reverse-Source-Query-Commit-v1\0";
+const SOURCE_EVIDENCE_SIGN: &[u8] = b"AeroNyx-Reverse-Source-Evidence-Sign-v1\0";
+pub const REVERSE_ONION_SOURCE_QUERY_BYTES: usize = 4 + 1 + 32 + 32 + 16 + 32 + 1 + 32 + 8 + 8 + 64;
+pub const REVERSE_ONION_SOURCE_EVIDENCE_OVERHEAD: usize = 4 + 1 + 32 + 32 + 32 + 1 + 1 + 8 + 8 + 32 + 32 + 32 + 4 + 64;
+/// New endpoint-only cap. Never apply it to existing AXRD/onion/HTTP carriers.
+pub const MAX_REVERSE_ONION_SOURCE_EVIDENCE_BYTES: usize =
+    REVERSE_ONION_SOURCE_EVIDENCE_OVERHEAD + MAX_REVERSE_ONION_FRAME_BYTES;
+pub const REVERSE_ONION_SOURCE_QUERY_LIFETIME_SECS: u64 = 30;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SourceEvidencePartV1 { Claim = 1, Lease = 2, Result = 3 }
+
+impl SourceEvidencePartV1 {
+    fn decode(value: u8) -> Result<Self, ReverseOnionError> {
+        match value { 1 => Ok(Self::Claim), 2 => Ok(Self::Lease), 3 => Ok(Self::Result), _ => Err(ReverseOnionError::Rejected) }
+    }
+    fn limit(self) -> usize {
+        match self {
+            Self::Claim => MAX_REVERSE_ONION_CLAIM_BYTES,
+            Self::Lease => REVERSE_ONION_HEADER_BYTES + REVERSE_ONION_SIGNATURE_BYTES + MAX_REVERSE_ONION_ENVELOPE_BYTES,
+            Self::Result => MAX_REVERSE_ONION_FRAME_BYTES,
+        }
+    }
+    fn kind(self) -> ReverseOnionKindV1 {
+        match self { Self::Claim => ReverseOnionKindV1::Claim, Self::Lease => ReverseOnionKindV1::Lease, Self::Result => ReverseOnionKindV1::Result }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SourceEvidenceStateV1 { Pending = 1, Available = 2, Unavailable = 3 }
+
+impl SourceEvidenceStateV1 {
+    fn decode(value: u8) -> Result<Self, ReverseOnionError> {
+        match value { 1 => Ok(Self::Pending), 2 => Ok(Self::Available), 3 => Ok(Self::Unavailable), _ => Err(ReverseOnionError::Rejected) }
+    }
+}
+
+/// No Debug/serde. Original commitment is the EXISTING authenticated full
+/// PeerBlindRelayRequest bincode commitment, not JSON or envelope-only hash.
+pub struct ReverseOnionSourceQueryV1 {
+    source: [u8; 32], relay: [u8; 32], route: [u8; 16], original_request: [u8; 32],
+    part: SourceEvidencePartV1, nonce: [u8; 32], issued_at: u64, expires_at: u64,
+    signature: [u8; 64],
+}
+
+/// Crypto binding only. The caller MUST obtain expected fields from the
+/// original durable authenticated S admission, never from the query itself.
+/// This token cannot prove database authorization or grant queue mutation.
+pub struct VerifiedSourceQuery<'a> { query: &'a ReverseOnionSourceQueryV1 }
+
+impl ReverseOnionSourceQueryV1 {
+    pub fn sign(source: &IdentityKeyPair, relay: [u8; 32], route: [u8; 16],
+        original_request: [u8; 32], part: SourceEvidencePartV1, nonce: [u8; 32],
+        issued_at: u64, expires_at: u64) -> Result<Self, ReverseOnionError> {
+        let mut query = Self { source: source.public_key_bytes(), relay, route, original_request,
+            part, nonce, issued_at, expires_at, signature: [0; 64] };
+        query.shape()?;
+        query.signature = source.sign(&source_evidence_transcript(SOURCE_QUERY_SIGN, &query.unsigned()));
+        Ok(query)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ReverseOnionError> {
+        if bytes.len() != REVERSE_ONION_SOURCE_QUERY_BYTES { return Err(ReverseOnionError::Rejected); }
+        let mut c = ReverseOnionCursor(bytes);
+        if c.take(4)? != SOURCE_QUERY_MAGIC || c.array::<1>()? != [1] { return Err(ReverseOnionError::Rejected); }
+        let query = Self { source: c.array()?, relay: c.array()?, route: c.array()?, original_request: c.array()?,
+            part: SourceEvidencePartV1::decode(c.array::<1>()?[0])?, nonce: c.array()?,
+            issued_at: u64::from_be_bytes(c.array()?), expires_at: u64::from_be_bytes(c.array()?), signature: c.array()? };
+        query.verify_signature()?;
+        Ok(query)
+    }
+
+    pub fn verify_binding(&self, source: [u8; 32], relay: [u8; 32], route: [u8; 16],
+        original_request: [u8; 32], now: u64) -> Result<VerifiedSourceQuery<'_>, ReverseOnionError> {
+        self.verify_at(now)?;
+        if self.source != source || self.relay != relay || self.route != route || self.original_request != original_request {
+            return Err(ReverseOnionError::Rejected);
+        }
+        Ok(VerifiedSourceQuery { query: self })
+    }
+
+    pub fn source(&self) -> [u8; 32] { self.source }
+    pub fn relay(&self) -> [u8; 32] { self.relay }
+    pub fn route_id(&self) -> [u8; 16] { self.route }
+    pub fn original_request_commitment(&self) -> [u8; 32] { self.original_request }
+    pub fn part(&self) -> SourceEvidencePartV1 { self.part }
+    pub fn nonce(&self) -> [u8; 32] { self.nonce }
+    pub fn issued_at(&self) -> u64 { self.issued_at }
+    pub fn expires_at(&self) -> u64 { self.expires_at }
+    pub fn encode(&self) -> Vec<u8> { let mut out = self.unsigned(); out.extend_from_slice(&self.signature); out }
+    pub fn commitment(&self) -> [u8; 32] {
+        let mut h = Sha256::new(); h.update(SOURCE_QUERY_COMMIT); h.update(self.encode()); h.finalize().into()
+    }
+    fn unsigned(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(REVERSE_ONION_SOURCE_QUERY_BYTES - 64);
+        out.extend_from_slice(SOURCE_QUERY_MAGIC); out.push(1);
+        out.extend_from_slice(&self.source); out.extend_from_slice(&self.relay); out.extend_from_slice(&self.route);
+        out.extend_from_slice(&self.original_request); out.push(self.part as u8); out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&self.issued_at.to_be_bytes()); out.extend_from_slice(&self.expires_at.to_be_bytes()); out
+    }
+    fn shape(&self) -> Result<(), ReverseOnionError> {
+        source_evidence_window(self.issued_at, self.expires_at)?;
+        if self.source == [0; 32] || self.relay == [0; 32] || self.source == self.relay
+            || self.route == [0; 16] || self.original_request == [0; 32] || self.nonce == [0; 32] {
+            return Err(ReverseOnionError::Rejected);
+        }
+        IdentityPublicKey::from_bytes(&self.source).map_err(|_| ReverseOnionError::Rejected)?;
+        IdentityPublicKey::from_bytes(&self.relay).map_err(|_| ReverseOnionError::Rejected)?;
+        Ok(())
+    }
+    fn verify_signature(&self) -> Result<(), ReverseOnionError> {
+        self.shape()?;
+        source_evidence_verify(self.source, SOURCE_QUERY_SIGN, &self.unsigned(), &self.signature)
+    }
+    fn verify_at(&self, now: u64) -> Result<(), ReverseOnionError> {
+        self.verify_signature()?;
+        if now < self.issued_at || now >= self.expires_at { return Err(ReverseOnionError::Expired); }
+        Ok(())
+    }
+}
+
+/// No endpoint/terminal/source metadata beyond adjacent R and the query hash.
+/// Available commits to the SAME complete immutable durable snapshot on all
+/// three parts. Core validates signatures/linkage, but cannot attest fsync.
+pub struct ReverseOnionSourceEvidenceV1 {
+    relay: [u8; 32], query_commitment: [u8; 32], nonce: [u8; 32], part: SourceEvidencePartV1,
+    state: SourceEvidenceStateV1, issued_at: u64, expires_at: u64,
+    commitments: [[u8; 32]; 3], payload: Vec<u8>, signature: [u8; 64],
+}
+
+/// Only produced after fresh query/response verification. Retaining a proof
+/// after query expiry does not extend execution or Result retention windows.
+pub struct VerifiedSourceEvidencePart<'a> {
+    query: &'a ReverseOnionSourceQueryV1,
+    response: &'a ReverseOnionSourceEvidenceV1,
+}
+
+impl VerifiedSourceEvidencePart<'_> {
+    pub fn state(&self) -> SourceEvidenceStateV1 { self.response.state }
+}
+
+impl ReverseOnionSourceEvidenceV1 {
+    pub fn pending(query: &VerifiedSourceQuery<'_>, now: u64, expires_at: u64, relay: &IdentityKeyPair)
+        -> Result<Self, ReverseOnionError> {
+        Self::signed(query, SourceEvidenceStateV1::Pending, [[0; 32]; 3], Vec::new(), now, expires_at, relay)
+    }
+    /// A signed unavailability statement is NOT authenticated absence of an
+    /// earlier effect, and MUST NOT authorize another route/lease/execution.
+    pub fn unavailable(query: &VerifiedSourceQuery<'_>, now: u64, expires_at: u64, relay: &IdentityKeyPair)
+        -> Result<Self, ReverseOnionError> {
+        Self::signed(query, SourceEvidenceStateV1::Unavailable, [[0; 32]; 3], Vec::new(), now, expires_at, relay)
+    }
+    /// R must load the complete original-S-authorized durable chain. Arbitrary
+    /// caller hashes/frames do not bypass full signature/linkage verification.
+    /// `admitted_deadline` is R's immutable authenticated admission bound.
+    pub fn available(query: &VerifiedSourceQuery<'_>, claim: &ReverseOnionFrameV1,
+        lease: &ReverseOnionFrameV1, result: &ReverseOnionFrameV1, admitted_deadline: u64,
+        now: u64, expires_at: u64, relay: &IdentityKeyPair) -> Result<Self, ReverseOnionError> {
+        verify_source_chain(query.query.relay, query.query.route, claim, lease, result, admitted_deadline, now)?;
+        let frames = [claim, lease, result];
+        let commitments = [claim.commitment(), lease.commitment(), result.commitment()];
+        let payload = frames[query.query.part as usize - 1].encode();
+        Self::signed(query, SourceEvidenceStateV1::Available, commitments, payload, now, expires_at, relay)
+    }
+    fn signed(query: &VerifiedSourceQuery<'_>, state: SourceEvidenceStateV1,
+        commitments: [[u8; 32]; 3], payload: Vec<u8>, now: u64, expires_at: u64,
+        relay: &IdentityKeyPair) -> Result<Self, ReverseOnionError> {
+        query.query.verify_at(now)?;
+        if relay.public_key_bytes() != query.query.relay || expires_at > query.query.expires_at {
+            return Err(ReverseOnionError::Rejected);
+        }
+        let mut response = Self { relay: relay.public_key_bytes(), query_commitment: query.query.commitment(),
+            nonce: query.query.nonce, part: query.query.part, state, issued_at: now, expires_at,
+            commitments, payload, signature: [0; 64] };
+        response.shape()?;
+        response.signature = relay.sign(&source_evidence_transcript(SOURCE_EVIDENCE_SIGN, &response.unsigned()));
+        Ok(response)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ReverseOnionError> {
+        if bytes.len() < REVERSE_ONION_SOURCE_EVIDENCE_OVERHEAD || bytes.len() > MAX_REVERSE_ONION_SOURCE_EVIDENCE_BYTES {
+            return Err(ReverseOnionError::Rejected);
+        }
+        let mut c = ReverseOnionCursor(bytes);
+        if c.take(4)? != SOURCE_EVIDENCE_MAGIC || c.array::<1>()? != [1] { return Err(ReverseOnionError::Rejected); }
+        let relay = c.array()?; let query_commitment = c.array()?; let nonce = c.array()?;
+        let part = SourceEvidencePartV1::decode(c.array::<1>()?[0])?;
+        let state = SourceEvidenceStateV1::decode(c.array::<1>()?[0])?;
+        let issued_at = u64::from_be_bytes(c.array()?); let expires_at = u64::from_be_bytes(c.array()?);
+        let commitments = [c.array()?, c.array()?, c.array()?];
+        let length = u32::from_be_bytes(c.array()?) as usize;
+        // All size/state admission precedes allocation AND signature work.
+        source_evidence_payload_admission(part, state, length, bytes.len())?;
+        source_evidence_window(issued_at, expires_at)?;
+        let payload = c.take(length)?; let signature = c.array()?;
+        source_evidence_verify(relay, SOURCE_EVIDENCE_SIGN, &bytes[..bytes.len() - 64], &signature)?;
+        let response = Self { relay, query_commitment, nonce, part, state, issued_at, expires_at,
+            commitments, payload: payload.to_vec(), signature };
+        response.shape()?;
+        Ok(response)
+    }
+
+    pub fn verify_for_query<'a>(&'a self, query: &'a ReverseOnionSourceQueryV1, now: u64)
+        -> Result<VerifiedSourceEvidencePart<'a>, ReverseOnionError> {
+        query.verify_at(now)?; self.shape()?;
+        source_evidence_verify(self.relay, SOURCE_EVIDENCE_SIGN, &self.unsigned(), &self.signature)?;
+        if self.relay != query.relay || self.query_commitment != query.commitment() || self.nonce != query.nonce
+            || self.part != query.part || self.issued_at < query.issued_at || self.expires_at > query.expires_at
+        { return Err(ReverseOnionError::Rejected); }
+        if now < self.issued_at || now >= self.expires_at { return Err(ReverseOnionError::Expired); }
+        Ok(VerifiedSourceEvidencePart { query, response: self })
+    }
+    pub fn state(&self) -> SourceEvidenceStateV1 { self.state }
+    pub fn encode(&self) -> Vec<u8> { let mut out = self.unsigned(); out.extend_from_slice(&self.signature); out }
+    fn unsigned(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(REVERSE_ONION_SOURCE_EVIDENCE_OVERHEAD - 64 + self.payload.len());
+        out.extend_from_slice(SOURCE_EVIDENCE_MAGIC); out.push(1); out.extend_from_slice(&self.relay);
+        out.extend_from_slice(&self.query_commitment); out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&[self.part as u8, self.state as u8]);
+        out.extend_from_slice(&self.issued_at.to_be_bytes()); out.extend_from_slice(&self.expires_at.to_be_bytes());
+        for commitment in &self.commitments { out.extend_from_slice(commitment); }
+        out.extend_from_slice(&(self.payload.len() as u32).to_be_bytes()); out.extend_from_slice(&self.payload); out
+    }
+    fn shape(&self) -> Result<(), ReverseOnionError> {
+        source_evidence_window(self.issued_at, self.expires_at)?;
+        source_evidence_payload_admission(self.part, self.state, self.payload.len(),
+            REVERSE_ONION_SOURCE_EVIDENCE_OVERHEAD.checked_add(self.payload.len()).ok_or(ReverseOnionError::Rejected)?)?;
+        if self.query_commitment == [0; 32] || self.nonce == [0; 32] { return Err(ReverseOnionError::Rejected); }
+        IdentityPublicKey::from_bytes(&self.relay).map_err(|_| ReverseOnionError::Rejected)?;
+        if self.state == SourceEvidenceStateV1::Available {
+            if self.commitments.iter().any(|c| *c == [0; 32]) { return Err(ReverseOnionError::Rejected); }
+            let frame = ReverseOnionFrameV1::decode_for_recovery(&self.payload)?;
+            if frame.kind() != self.part.kind() || frame.relay() != self.relay || frame.encode() != self.payload
+                || frame.commitment() != self.commitments[self.part as usize - 1]
+            { return Err(ReverseOnionError::Rejected); }
+        } else if self.commitments != [[0; 32]; 3] { return Err(ReverseOnionError::Rejected); }
+        Ok(())
+    }
+}
+
+/// Full adjacent proof only, never a source-sealed terminal result. The source
+/// must still compare its pre-send retained-envelope expectation, then consume
+/// its own reply session. Query freshness is checked when collecting parts;
+/// execution deadline and Result retention are independently checked here.
+pub struct VerifiedSourceEvidenceChain {
+    claim: ReverseOnionFrameV1, lease: ReverseOnionFrameV1, result: ReverseOnionFrameV1,
+}
+impl VerifiedSourceEvidenceChain {
+    pub fn claim(&self) -> &ReverseOnionFrameV1 { &self.claim }
+    pub fn lease(&self) -> &ReverseOnionFrameV1 { &self.lease }
+    pub fn result(&self) -> &ReverseOnionFrameV1 { &self.result }
+    pub fn verify(parts: [&VerifiedSourceEvidencePart<'_>; 3], source_admitted_deadline: u64, now: u64)
+        -> Result<Self, ReverseOnionError> {
+        let first = parts[0];
+        for (index, part) in parts.iter().enumerate() {
+            if part.response.state != SourceEvidenceStateV1::Available || part.response.part as usize != index + 1
+                || part.query.source != first.query.source || part.query.relay != first.query.relay
+                || part.query.route != first.query.route || part.query.original_request != first.query.original_request
+                || part.response.commitments != first.response.commitments
+            { return Err(ReverseOnionError::Conflict); }
+        }
+        let chain = Self { claim: ReverseOnionFrameV1::decode_for_recovery(&parts[0].response.payload)?,
+            lease: ReverseOnionFrameV1::decode_for_recovery(&parts[1].response.payload)?,
+            result: ReverseOnionFrameV1::decode_for_recovery(&parts[2].response.payload)? };
+        verify_source_chain(first.query.relay, first.query.route, &chain.claim, &chain.lease, &chain.result, source_admitted_deadline, now)?;
+        Ok(chain)
+    }
+}
+
+fn verify_source_chain(relay: [u8; 32], route: [u8; 16], claim: &ReverseOnionFrameV1,
+    lease: &ReverseOnionFrameV1, result: &ReverseOnionFrameV1, deadline: u64, now: u64) -> Result<(), ReverseOnionError> {
+    if lease.relay() != relay || lease.route_id() != route || route == [0; 16]
+        || lease.claim_id() == [0; 16] || lease.lease_id() == [0; 16]
+    { return Err(ReverseOnionError::Rejected); }
+    claim.verify_claim(relay, lease.immediate_recipient(), lease.issued_at())?;
+    lease.verify_lease(claim, deadline, lease.issued_at())?;
+    result.verify_result(claim, lease, deadline, now)?;
+    Ok(())
+}
+
+fn source_evidence_payload_admission(part: SourceEvidencePartV1, state: SourceEvidenceStateV1,
+    length: usize, total: usize) -> Result<(), ReverseOnionError> {
+    if length > part.limit() || REVERSE_ONION_SOURCE_EVIDENCE_OVERHEAD.checked_add(length) != Some(total)
+        || total > MAX_REVERSE_ONION_SOURCE_EVIDENCE_BYTES
+        || (state != SourceEvidenceStateV1::Available && length != 0)
+        || (state == SourceEvidenceStateV1::Available && length < MAX_REVERSE_ONION_CLAIM_BYTES)
+    { return Err(ReverseOnionError::Rejected); }
+    Ok(())
+}
+
+fn source_evidence_window(issued: u64, expires: u64) -> Result<(), ReverseOnionError> {
+    if issued == 0 || expires <= issued || issued.checked_add(REVERSE_ONION_SOURCE_QUERY_LIFETIME_SECS).is_none()
+        || expires - issued > REVERSE_ONION_SOURCE_QUERY_LIFETIME_SECS
+    { return Err(ReverseOnionError::Rejected); }
+    Ok(())
+}
+
+fn source_evidence_transcript(domain: &[u8], unsigned: &[u8]) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(domain.len() + 32);
+    transcript.extend_from_slice(domain); transcript.extend_from_slice(&Sha256::digest(unsigned)); transcript
+}
+fn source_evidence_verify(key: [u8; 32], domain: &[u8], unsigned: &[u8], signature: &[u8; 64])
+    -> Result<(), ReverseOnionError> {
+    IdentityPublicKey::from_bytes(&key).and_then(|key| key.verify(&source_evidence_transcript(domain, unsigned), signature))
+        .map_err(|_| ReverseOnionError::Rejected)
+}
+
 struct ReverseOnionCursor<'a>(&'a [u8]);
 
 impl<'a> ReverseOnionCursor<'a> {
@@ -953,6 +1269,177 @@ mod tests {
         let mut oversized = encoded;
         oversized.push(0);
         assert!(ReverseOnionFrameV1::result(&f.claim, &f.lease, &oversized, NOW + 600, NOW, &f.recipient).is_err());
+    }
+
+    // [SOURCE-EVIDENCE-V1 2026-10-04 by Codex] Authored / unexecuted.
+    fn evidence_query(f: &Fixture, part: SourceEvidencePartV1, now: u64) -> ReverseOnionSourceQueryV1 {
+        let source = IdentityKeyPair::from_bytes(&[33; 32]).unwrap();
+        ReverseOnionSourceQueryV1::sign(&source, f.relay.public_key_bytes(), f.lease.route_id(),
+            [9; 32], part, [part as u8; 32], now, now + 20).unwrap()
+    }
+
+    fn query_authority<'a>(f: &Fixture, query: &'a ReverseOnionSourceQueryV1, now: u64) -> VerifiedSourceQuery<'a> {
+        let source = IdentityKeyPair::from_bytes(&[33; 32]).unwrap();
+        query.verify_binding(source.public_key_bytes(), f.relay.public_key_bytes(),
+            f.lease.route_id(), [9; 32], now).unwrap()
+    }
+
+    #[test]
+    fn source_evidence_frozen_layout_domains_and_query_golden() {
+        assert_eq!(REVERSE_ONION_SOURCE_QUERY_BYTES, 230);
+        assert_eq!(REVERSE_ONION_SOURCE_EVIDENCE_OVERHEAD, 283);
+        assert_eq!(MAX_REVERSE_ONION_SOURCE_EVIDENCE_BYTES, 279126);
+        assert_eq!([SourceEvidencePartV1::Claim as u8, SourceEvidencePartV1::Lease as u8, SourceEvidencePartV1::Result as u8], [1, 2, 3]);
+        assert_eq!([SourceEvidenceStateV1::Pending as u8, SourceEvidenceStateV1::Available as u8, SourceEvidenceStateV1::Unavailable as u8], [1, 2, 3]);
+        // RFC8032 public test seed, not a production credential.
+        let seed: [u8; 32] = hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60").unwrap().try_into().unwrap();
+        let source = IdentityKeyPair::from_bytes(&seed).unwrap();
+        let relay: [u8; 32] = hex::decode("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c").unwrap().try_into().unwrap();
+        let query = ReverseOnionSourceQueryV1::sign(&source, relay, [2; 16], [3; 32],
+            SourceEvidencePartV1::Lease, [4; 32], 1, 2).unwrap();
+        let golden = hex::decode(concat!(
+            "4158525101",
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+            "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+            "0202020202020202", "0202020202020202",
+            "0303030303030303", "0303030303030303", "0303030303030303", "0303030303030303",
+            "02",
+            "0404040404040404", "0404040404040404", "0404040404040404", "0404040404040404",
+            "00000000000000010000000000000002"
+        )).unwrap();
+        assert_eq!(golden.len(), REVERSE_ONION_SOURCE_QUERY_BYTES - 64);
+        assert_eq!(query.unsigned(), golden);
+        let mut sign_transcript = b"AeroNyx-Reverse-Source-Query-Sign-v1\0".to_vec();
+        sign_transcript.extend_from_slice(&Sha256::digest(&golden));
+        assert_eq!(query.signature, source.sign(&sign_transcript));
+        let mut commitment = Sha256::new();
+        commitment.update(b"AeroNyx-Reverse-Source-Query-Commit-v1\0"); commitment.update(query.encode());
+        assert_eq!(query.commitment(), <[u8; 32]>::from(commitment.finalize()));
+        let abc = hex::decode("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad").unwrap();
+        let mut frozen = b"AeroNyx-Reverse-Source-Evidence-Sign-v1\0".to_vec(); frozen.extend_from_slice(&abc);
+        assert_eq!(source_evidence_transcript(SOURCE_EVIDENCE_SIGN, b"abc"), frozen);
+        assert_eq!(ReverseOnionSourceQueryV1::decode(&query.encode()).unwrap().encode(), query.encode());
+        assert_ne!(source_evidence_transcript(SOURCE_QUERY_SIGN, &golden), source_evidence_transcript(REVERSE_ONION_SIGN_DOMAIN, &golden));
+    }
+
+    #[test]
+    fn source_query_bounds_signature_binding_and_freshness_fail_closed() {
+        let f = Fixture::new(); let query = evidence_query(&f, SourceEvidencePartV1::Claim, NOW);
+        let bytes = query.encode();
+        for end in 0..bytes.len() { assert!(ReverseOnionSourceQueryV1::decode(&bytes[..end]).is_err()); }
+        for offset in [0, 4, 5, 37, 69, 85, 117, 118, 150, 166, 229] {
+            let mut changed = bytes.clone(); changed[offset] ^= 0xff;
+            assert!(ReverseOnionSourceQueryV1::decode(&changed).is_err());
+        }
+        let mut long = bytes.clone(); long.push(0);
+        assert!(ReverseOnionSourceQueryV1::decode(&long).is_err());
+        assert!(query.verify_binding(query.source(), query.relay(), [8; 16], [9; 32], NOW).is_err());
+        assert!(query.verify_binding(query.source(), query.relay(), query.route_id(), [8; 32], NOW).is_err());
+        assert!(query.verify_binding(query.relay(), query.source(), query.route_id(), [9; 32], NOW).is_err());
+        assert!(query.verify_binding(f.recipient.public_key_bytes(), query.relay(), query.route_id(), [9; 32], NOW).is_err());
+        assert!(query.verify_binding(query.source(), f.recipient.public_key_bytes(), query.route_id(), [9; 32], NOW).is_err());
+        assert!(query.verify_binding(query.source(), query.relay(), query.route_id(), [9; 32], NOW - 1).is_err());
+        assert!(query.verify_binding(query.source(), query.relay(), query.route_id(), [9; 32], NOW + 20).is_err());
+        assert!(source_evidence_window(0, 1).is_err());
+        assert!(source_evidence_window(u64::MAX - 1, u64::MAX).is_err());
+        assert!(source_evidence_window(NOW, NOW + 31).is_err());
+    }
+
+    #[test]
+    fn available_requires_complete_chain_before_signing_and_snapshot_agreement() {
+        let f = Fixture::new(); let (result, _) = f.result(NOW + 601);
+        let now = NOW + 610;
+        let queries = [evidence_query(&f, SourceEvidencePartV1::Claim, now),
+            evidence_query(&f, SourceEvidencePartV1::Lease, now), evidence_query(&f, SourceEvidencePartV1::Result, now)];
+        let responses: Vec<_> = queries.iter().map(|query| ReverseOnionSourceEvidenceV1::available(
+            &query_authority(&f, query, now), &f.claim, &f.lease, &result, NOW + 600, now, now + 20, &f.relay).unwrap()).collect();
+        let parts: Vec<_> = responses.iter().zip(&queries).map(|(response, query)| response.verify_for_query(query, now).unwrap()).collect();
+        let chain = VerifiedSourceEvidenceChain::verify([&parts[0], &parts[1], &parts[2]], NOW + 600, NOW + 899).unwrap();
+        assert_eq!(chain.claim().encode(), f.claim.encode());
+        assert_eq!(chain.lease().encode(), f.lease.encode());
+        assert_eq!(chain.result().encode(), result.encode());
+        // Query freshness is acquisition-only, never a replacement for Result
+        // grace or the independent source admission deadline.
+        assert!(VerifiedSourceEvidenceChain::verify([&parts[0], &parts[1], &parts[2]], NOW + 599, now).is_err());
+        assert!(VerifiedSourceEvidenceChain::verify([&parts[0], &parts[1], &parts[2]], NOW + 600, NOW + 900).is_err());
+        let authority = query_authority(&f, &queries[0], now);
+        let other_claim = ReverseOnionFrameV1::claim(f.relay.public_key_bytes(), [8; 16], NOW, NOW + 30, &f.recipient).unwrap();
+        assert!(ReverseOnionSourceEvidenceV1::available(&authority, &other_claim, &f.lease, &result, NOW + 600, now, now + 20, &f.relay).is_err());
+        let mut bad = ReverseOnionFrameV1::decode_for_recovery(&f.lease.encode()).unwrap(); bad.signature[0] ^= 1;
+        assert!(ReverseOnionSourceEvidenceV1::available(&authority, &f.claim, &bad, &result, NOW + 600, now, now + 20, &f.relay).is_err());
+        assert!(ReverseOnionSourceEvidenceV1::available(&authority, &f.claim, &f.lease, &result, NOW + 600, now, now + 20, &f.recipient).is_err());
+        let (different, _) = f.result(NOW + 602);
+        let swapped = ReverseOnionSourceEvidenceV1::available(&query_authority(&f, &queries[2], now),
+            &f.claim, &f.lease, &different, NOW + 600, now, now + 20, &f.relay).unwrap();
+        let swapped_part = swapped.verify_for_query(&queries[2], now).unwrap();
+        assert!(VerifiedSourceEvidenceChain::verify([&parts[0], &parts[1], &swapped_part], NOW + 600, now).is_err());
+        assert!(VerifiedSourceEvidenceChain::verify([&parts[1], &parts[0], &parts[2]], NOW + 600, now).is_err());
+    }
+
+    #[test]
+    fn pending_unavailable_and_query_swap_never_supply_effect_authority() {
+        let f = Fixture::new(); let query = evidence_query(&f, SourceEvidencePartV1::Claim, NOW);
+        let authority = query_authority(&f, &query, NOW);
+        let pending = ReverseOnionSourceEvidenceV1::pending(&authority, NOW, NOW + 20, &f.relay).unwrap();
+        let unavailable = ReverseOnionSourceEvidenceV1::unavailable(&authority, NOW, NOW + 20, &f.relay).unwrap();
+        for response in [&pending, &unavailable] {
+            let encoded = response.encode();
+            assert_eq!(encoded.len(), 283); assert_eq!(&encoded[..5], b"AXRE\x01");
+            assert_eq!(encoded[101], 1); assert_eq!(&encoded[119..215], &[0; 96]);
+            assert_eq!(&encoded[215..219], &[0; 4]);
+            assert_eq!(ReverseOnionSourceEvidenceV1::decode(&encoded).unwrap().encode(), encoded);
+            let proof = response.verify_for_query(&query, NOW).unwrap();
+            assert!(VerifiedSourceEvidenceChain::verify([&proof, &proof, &proof], NOW + 600, NOW).is_err());
+            assert!(response.verify_for_query(&query, NOW + 20).is_err());
+        }
+        let source = IdentityKeyPair::from_bytes(&[33; 32]).unwrap();
+        let different_nonce = ReverseOnionSourceQueryV1::sign(&source, f.relay.public_key_bytes(), f.lease.route_id(),
+            [9; 32], SourceEvidencePartV1::Claim, [99; 32], NOW, NOW + 20).unwrap();
+        assert!(pending.verify_for_query(&different_nonce, NOW).is_err());
+        let other_part = evidence_query(&f, SourceEvidencePartV1::Lease, NOW);
+        assert!(pending.verify_for_query(&other_part, NOW).is_err());
+        let (result, _) = f.result(NOW + 1);
+        let available = ReverseOnionSourceEvidenceV1::available(&query_authority(&f, &query, NOW + 1),
+            &f.claim, &f.lease, &result, NOW + 600, NOW + 1, NOW + 20, &f.relay).unwrap();
+        assert_eq!(available.verify_for_query(&query, NOW + 1).unwrap().response.state, SourceEvidenceStateV1::Available);
+    }
+
+    #[test]
+    fn source_evidence_actual_maximum_and_preallocation_admission_are_bounded() {
+        let f = Fixture::new(); let query = evidence_query(&f, SourceEvidencePartV1::Result, NOW);
+        let opaque = OnionSealedResponse { version: 1, ephemeral_public_key: [9; 32], nonce: [0; 24],
+            ciphertext: vec![0; ONION_REPLY_RESPONSE_SIZE_CLASSES[3] + 16] };
+        let result = ReverseOnionFrameV1::result(&f.claim, &f.lease, &encode_onion_sealed_response(&opaque).unwrap(),
+            NOW + 600, NOW, &f.recipient).unwrap();
+        let response = ReverseOnionSourceEvidenceV1::available(&query_authority(&f, &query, NOW),
+            &f.claim, &f.lease, &result, NOW + 600, NOW, NOW + 20, &f.relay).unwrap();
+        let bytes = response.encode();
+        assert_eq!(bytes.len(), MAX_REVERSE_ONION_SOURCE_EVIDENCE_BYTES);
+        assert_eq!(ReverseOnionSourceEvidenceV1::decode(&bytes).unwrap().encode(), bytes);
+        let mut long = bytes.clone(); long.push(0);
+        assert!(ReverseOnionSourceEvidenceV1::decode(&long).is_err());
+        for offset in [0, 4, 5, 37, 69, 101, 102, 215, bytes.len() - 1] {
+            let mut changed = bytes.clone(); changed[offset] ^= 0xff;
+            assert!(ReverseOnionSourceEvidenceV1::decode(&changed).is_err());
+        }
+        assert!(source_evidence_payload_admission(SourceEvidencePartV1::Result, SourceEvidenceStateV1::Available, usize::MAX, usize::MAX).is_err());
+        assert!(source_evidence_payload_admission(SourceEvidencePartV1::Claim, SourceEvidenceStateV1::Available, 235, 283 + 235).is_err());
+        assert!(source_evidence_payload_admission(SourceEvidencePartV1::Result, SourceEvidenceStateV1::Pending, 1, 284).is_err());
+        for part in [SourceEvidencePartV1::Claim, SourceEvidencePartV1::Lease, SourceEvidencePartV1::Result] {
+            let maximum = part.limit();
+            assert!(source_evidence_payload_admission(part, SourceEvidenceStateV1::Available,
+                maximum, REVERSE_ONION_SOURCE_EVIDENCE_OVERHEAD + maximum).is_ok());
+            assert!(source_evidence_payload_admission(part, SourceEvidenceStateV1::Available,
+                maximum + 1, REVERSE_ONION_SOURCE_EVIDENCE_OVERHEAD + maximum + 1).is_err());
+            // Invalid length must fail even with no payload and invalid outer
+            // signature: decoder admission precedes copy and signature checks.
+            let mut malformed = bytes[..REVERSE_ONION_SOURCE_EVIDENCE_OVERHEAD].to_vec();
+            malformed[101] = part as u8;
+            malformed[215..219].copy_from_slice(&u32::MAX.to_be_bytes());
+            assert!(ReverseOnionSourceEvidenceV1::decode(&malformed).is_err());
+        }
+        let mut truncated = bytes; truncated.truncate(282);
+        assert!(ReverseOnionSourceEvidenceV1::decode(&truncated).is_err());
     }
 
     #[test]
