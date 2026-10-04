@@ -30,18 +30,11 @@
 use std::sync::Arc;
 
 use aeronyx_core::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
-use aeronyx_core::protocol::chat::{
-    decode_blind_relay_envelope, encode_blind_relay_envelope, BlindRelayEnvelope,
-};
+use aeronyx_core::protocol::chat::decode_blind_relay_envelope;
 use aeronyx_core::protocol::onion::reverse_delivery::{
     ReverseOnionFrameV1, ReverseOnionKindV1, ReverseOnionSourceEvidenceV1,
-    ReverseOnionSourceQueryV1, SourceEvidencePartV1, SourceEvidenceStateV1,
-    MAX_REVERSE_ONION_FRAME_BYTES,
+    ReverseOnionSourceQueryV1, MAX_REVERSE_ONION_FRAME_BYTES,
     MAX_REVERSE_ONION_SOURCE_EVIDENCE_BYTES, REVERSE_ONION_SOURCE_QUERY_BYTES,
-};
-use aeronyx_core::protocol::onion_reply::{
-    encode_onion_sealed_response, seal_onion_reply, OnionReplySession,
-    ONION_REPLY_RESPONSE_SIZE_CLASSES,
 };
 use axum::body::Bytes;
 use axum::http::StatusCode;
@@ -232,16 +225,18 @@ fn handle_source_query_blocking(
     {
         return ReverseOnionApiReply::empty(StatusCode::BAD_REQUEST);
     }
-    let authority = match query.verify_binding(
-        query.source(),
-        relay.public_key_bytes(),
-        query.route_id(),
-        query.original_request_commitment(),
-        now,
-    ) {
-        Ok(authority) => authority,
-        Err(_) => return ReverseOnionApiReply::empty(StatusCode::BAD_REQUEST),
-    };
+    if query
+        .verify_binding(
+            query.source(),
+            relay.public_key_bytes(),
+            query.route_id(),
+            query.original_request_commitment(),
+            now,
+        )
+        .is_err()
+    {
+        return ReverseOnionApiReply::empty(StatusCode::BAD_REQUEST);
+    }
     let snapshot = match queue.lookup_source(
         query.source(),
         query.route_id(),
@@ -254,6 +249,16 @@ fn handle_source_query_blocking(
     if snapshot.immediate_recipient() != recipient {
         return ReverseOnionApiReply::empty(StatusCode::BAD_REQUEST);
     }
+    let authority = match query.verify_binding(
+        snapshot.source_node_id(),
+        relay.public_key_bytes(),
+        snapshot.route_id(),
+        snapshot.request_commitment(),
+        now,
+    ) {
+        Ok(authority) => authority,
+        Err(_) => return ReverseOnionApiReply::empty(StatusCode::BAD_REQUEST),
+    };
     let (Some(claim_bytes), Some(lease_bytes), Some(result_bytes)) = (
         snapshot.claim_frame(),
         snapshot.lease_frame(),
@@ -286,6 +291,15 @@ fn handle_source_query_blocking(
         Ok(frame) => frame,
         Err(_) => return ReverseOnionApiReply::empty(StatusCode::SERVICE_UNAVAILABLE),
     };
+    if !source_frames_match_recipient(
+        &claim,
+        &lease,
+        &result,
+        relay.public_key_bytes(),
+        snapshot.immediate_recipient(),
+    ) {
+        return ReverseOnionApiReply::empty(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let evidence = match ReverseOnionSourceEvidenceV1::available(
         &authority,
         &claim,
@@ -304,6 +318,25 @@ fn handle_source_query_blocking(
         return ReverseOnionApiReply::empty(StatusCode::SERVICE_UNAVAILABLE);
     }
     ReverseOnionApiReply::frame(StatusCode::OK, encoded)
+}
+
+fn source_frames_match_recipient(
+    claim: &ReverseOnionFrameV1,
+    lease: &ReverseOnionFrameV1,
+    result: &ReverseOnionFrameV1,
+    relay: [u8; 32],
+    recipient: [u8; 32],
+) -> bool {
+    [claim.relay(), lease.relay(), result.relay()]
+        .into_iter()
+        .all(|relay_id| relay_id == relay)
+        && [
+            claim.immediate_recipient(),
+            lease.immediate_recipient(),
+            result.immediate_recipient(),
+        ]
+        .into_iter()
+        .all(|recipient_id| recipient_id == recipient)
 }
 
 fn handle_claim_blocking(
@@ -502,6 +535,16 @@ fn map_queue_db_error(error: ReverseOnionQueueDbError) -> ReverseOnionApiReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aeronyx_core::protocol::chat::{
+        encode_blind_relay_envelope, BlindRelayEnvelope,
+    };
+    use aeronyx_core::protocol::onion::reverse_delivery::{
+        SourceEvidencePartV1, SourceEvidenceStateV1,
+    };
+    use aeronyx_core::protocol::onion_reply::{
+        encode_onion_sealed_response, seal_onion_reply, OnionReplySession,
+        ONION_REPLY_RESPONSE_SIZE_CLASSES,
+    };
     use crate::services::reverse_onion_queue::{
         ReverseOnionQueueItem, ReverseOnionQueueLeaseMaterial, ReverseOnionQueueLimits,
         ReverseOnionQueueIssue,
@@ -808,6 +851,77 @@ mod tests {
         let query = ReverseOnionSourceQueryV1::decode(&query_bytes).unwrap();
         assert_eq!(evidence.state(), SourceEvidenceStateV1::Available);
         evidence.verify_for_query(&query, NOW + 2).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_query_rejects_internally_valid_chain_bound_to_wrong_p() {
+        let relay = IdentityKeyPair::from_bytes(&[0x74; 32]).unwrap();
+        let configured = IdentityKeyPair::from_bytes(&[0x75; 32]).unwrap();
+        let wrong = IdentityKeyPair::from_bytes(&[0x78; 32]).unwrap();
+        let envelope = BlindRelayEnvelope {
+            route_id: [21; 16],
+            next_hop: configured.public_key_bytes(),
+            ttl: 1,
+            encrypted_blob: vec![22; 4],
+            timestamp: NOW,
+            signature: [0; 64],
+        }
+        .sign_with(&relay);
+        let claim = ReverseOnionFrameV1::claim(
+            relay.public_key_bytes(),
+            [23; 16],
+            NOW,
+            NOW + 30,
+            &wrong,
+        )
+        .unwrap();
+        let lease = ReverseOnionFrameV1::lease(
+            &claim,
+            &envelope,
+            [24; 16],
+            NOW + 60,
+            NOW,
+            &relay,
+        )
+        .unwrap();
+        let sealed = seal_onion_reply(
+            lease.route_id(),
+            &OnionReplySession::prepare_source_sealed(
+                lease.route_id(),
+                wrong.public_key_bytes(),
+                ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
+                vec![25; 3],
+            )
+            .unwrap()
+            .0,
+            b"opaque wrong recipient",
+            &wrong,
+        )
+        .unwrap();
+        let result = ReverseOnionFrameV1::result(
+            &claim,
+            &lease,
+            &encode_onion_sealed_response(&sealed).unwrap(),
+            NOW + 60,
+            NOW + 1,
+            &wrong,
+        )
+        .unwrap();
+        assert!(!source_frames_match_recipient(
+            &claim,
+            &lease,
+            &result,
+            relay.public_key_bytes(),
+            configured.public_key_bytes(),
+        ));
+        assert!(source_frames_match_recipient(
+            &claim,
+            &lease,
+            &result,
+            relay.public_key_bytes(),
+            wrong.public_key_bytes(),
+        ));
     }
 }
 
