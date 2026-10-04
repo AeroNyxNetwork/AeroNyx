@@ -467,6 +467,7 @@ pub(super) fn verify_private_custody_response_for_envelope(
             response.ttl_remaining,
             None,
             None,
+            None,
             expected_responder,
         )
         .map_err(|_| BlindRelayReplayCodecError::InvalidCompletedState)
