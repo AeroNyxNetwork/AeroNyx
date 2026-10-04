@@ -46,6 +46,8 @@ pub mod config_blind_vault;
 pub mod config_chat_relay;
 pub mod config_infra;
 pub mod config_memchain;
+// [REVERSE-ONION-CONFIG 2026-10-04 by Codex] Policy module only; no runtime activation.
+pub mod config_reverse_onion;
 pub mod config_saas;
 
 // v2.5.0+SuperNode: SuperNode LLM configuration types.

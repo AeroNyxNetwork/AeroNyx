@@ -1221,6 +1221,8 @@ mod background_tasks;
 // assembly and management task construction in a focused child while keeping
 // startup call sites and failure ordering stable.
 mod api_runtime;
+// [REVERSE-ONION-CARRIER 2026-10-04 by Codex] Bounded carrier; startup remains opt-in.
+mod reverse_onion_runtime;
 // [SERVER-SESSION-RUNTIME-SPLIT 2026-09-25 by Codex] Keep VPN service
 // initialization and transport shutdown in one focused child; data-plane
 // handshake/session task bodies remain in data_plane_runtime.
