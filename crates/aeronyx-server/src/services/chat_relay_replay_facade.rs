@@ -34,6 +34,8 @@
 //   - Reservation and response persistence failures must remain fail-closed.
 //
 // Last Modified:
+//   [VERIFIED-SUBMIT-BLOCKING 2026-10-04 by Codex] Return owned single-flight
+//   guards so ongoing DB work retains exclusion after caller cancellation.
 //   v1.0.0-DurableReplayFacade - Initial durable replay facade extraction
 // ============================================
 
@@ -52,10 +54,12 @@ impl ChatRelayService {
     /// Unrelated submissions remain concurrent across fixed lock lanes. The
     /// caller must hold the returned guard through lookup, relay/custody, and
     /// response insertion so duplicate requests cannot both become leaders.
+    // [VERIFIED-SUBMIT-BLOCKING 2026-10-04 by Codex] This crate-private guard
+    // can move into a blocking closure; the lock key and lane count are stable.
     pub(crate) async fn lock_verified_submit(
         &self,
         request: &ChatRelayVerifiedSubmitRequestV1,
-    ) -> tokio::sync::MutexGuard<'_, ()> {
+    ) -> tokio::sync::OwnedMutexGuard<()> {
         self.verified_submit.lock(request).await
     }
 

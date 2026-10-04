@@ -39,6 +39,8 @@
 //   - Entry recovery telemetry remains service-owned and aggregate-only.
 //
 // Last Modified:
+//   [VERIFIED-SUBMIT-BLOCKING 2026-10-04 by Codex] Transfer owned lane guards
+//   across bounded blocking DB phases without changing replay decisions.
 //   v1.0.0-VerifiedSubmitCoordinator - Initial use-case composition
 // ============================================
 
@@ -81,10 +83,12 @@ impl VerifiedSubmitCoordinator {
     }
 
     /// Serializes requests sharing one private sender/request-id cache key.
+    // [VERIFIED-SUBMIT-BLOCKING 2026-10-04 by Codex] Ownership follows the
+    // active DB phase rather than the lifetime of its awaiting request task.
     pub(crate) async fn lock(
         &self,
         request: &ChatRelayVerifiedSubmitRequestV1,
-    ) -> tokio::sync::MutexGuard<'_, ()> {
+    ) -> tokio::sync::OwnedMutexGuard<()> {
         self.replay.lock(request).await
     }
 

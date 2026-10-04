@@ -37,11 +37,14 @@
 //   - A replacement protector must authenticate both private fingerprints.
 //
 // Last Modified:
+//   [VERIFIED-SUBMIT-BLOCKING 2026-10-04 by Codex] Owned single-flight guards
+//   preserve lane exclusion across cancellable async/blocking boundaries.
 //   v1.1.0-CoordinatorComposition - Documented use-case coordinator ownership
 //   v1.0.0-VerifiedSubmitReplayDomain - Initial trait/composition extraction
 // ============================================
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use aeronyx_core::protocol::memchain::{
     ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1,
@@ -304,7 +307,9 @@ pub(crate) struct VerifiedSubmitReplay<P = XChaChaVerifiedSubmitResponseProtecto
     node_secret: [u8; 32],
     protector: P,
     cache: Mutex<VerifiedSubmitResponseCache>,
-    lanes: Box<[tokio::sync::Mutex<()>]>,
+    // [VERIFIED-SUBMIT-BLOCKING 2026-10-04 by Codex] Owned guards keep the
+    // same private lane locked while a cancelled caller's DB worker finishes.
+    lanes: Box<[Arc<tokio::sync::Mutex<()>>]>,
 }
 
 impl VerifiedSubmitReplay<XChaChaVerifiedSubmitResponseProtector> {
@@ -321,7 +326,7 @@ impl<P: VerifiedSubmitResponseProtector> VerifiedSubmitReplay<P> {
             protector,
             cache: Mutex::new(VerifiedSubmitResponseCache::new(capacity)),
             lanes: (0..SINGLE_FLIGHT_LANES)
-                .map(|_| tokio::sync::Mutex::new(()))
+                .map(|_| Arc::new(tokio::sync::Mutex::new(())))
                 .collect(),
         }
     }
@@ -346,10 +351,12 @@ impl<P: VerifiedSubmitResponseProtector> VerifiedSubmitReplay<P> {
         mac.finalize().into_bytes().into()
     }
 
+    // [VERIFIED-SUBMIT-BLOCKING 2026-10-04 by Codex] The same keyed lane now
+    // has transferable ownership; no DB worker borrows an async caller's guard.
     pub(crate) async fn lock(
         &self,
         request: &ChatRelayVerifiedSubmitRequestV1,
-    ) -> tokio::sync::MutexGuard<'_, ()> {
+    ) -> tokio::sync::OwnedMutexGuard<()> {
         let cache_key = self.cache_key(request);
         let lane_seed = u64::from_le_bytes(
             cache_key[..8]
@@ -357,7 +364,7 @@ impl<P: VerifiedSubmitResponseProtector> VerifiedSubmitReplay<P> {
                 .expect("verified submit cache key has eight prefix bytes"),
         );
         let lane = usize::try_from(lane_seed).unwrap_or(usize::MAX) % self.lanes.len();
-        self.lanes[lane].lock().await
+        Arc::clone(&self.lanes[lane]).lock_owned().await
     }
 
     pub(crate) fn lookup_cached(

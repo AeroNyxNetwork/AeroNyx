@@ -1,7 +1,83 @@
-// [ARCH-SPLIT 2026-10-02]
-// Authenticated chat submit entry. Replay and storage gates stay in this path.
-// Bodies are unchanged. Private items are pub(super) so the parent flow can call them.
+// File: crates/aeronyx-server/src/server/verified_submit_ingress.rs
+// Purpose: Authenticated submit admission, exact replay, and custody completion.
+// Dependencies: relay replay facade, owned Tokio lanes/permits, blocking workers.
+// Flow: authenticate -> bounded lane -> DB admission -> onion -> DB completion.
+// Boundary: no wire/schema changes; cancelled DB work retains its lane and permit.
+// [ARCH-SPLIT 2026-10-02] Private entry points remain available to the parent.
+// [VERIFIED-SUBMIT-BLOCKING 2026-10-04 by Codex] No SQLite on async workers.
+// Last Modified: 2026-10-04.
 use super::*;
+
+use std::sync::OnceLock;
+
+use crate::services::chat_relay::{ChatRelayError, ChatRelayResult};
+use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+
+// [VERIFIED-SUBMIT-BLOCKING 2026-10-04 by Codex] One process-wide budget
+// bounds queued/running DB work AND lane waiters. Do not release a permit on
+// cancellation while its non-cancellable blocking closure is still running.
+const VERIFIED_SUBMIT_MAX_IN_FLIGHT: usize = 32;
+
+fn verified_submit_admission() -> Arc<Semaphore> {
+    static ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(ADMISSION.get_or_init(|| Arc::new(Semaphore::new(VERIFIED_SUBMIT_MAX_IN_FLIGHT))))
+}
+
+struct VerifiedSubmitExecutionLease {
+    _lane: OwnedMutexGuard<()>,
+    _permit: OwnedSemaphorePermit,
+}
+
+enum VerifiedSubmitDbFailure {
+    Storage(ChatRelayError),
+    WorkerUnavailable,
+}
+
+impl VerifiedSubmitDbFailure {
+    fn reason_bucket(&self) -> &'static str {
+        match self {
+            Self::Storage(error) => error.reason_bucket(),
+            Self::WorkerUnavailable => "verified_submit_worker_unavailable",
+        }
+    }
+}
+
+// The async owner has no lease while the worker owns it. A cancelled JoinHandle
+// detaches work; its eventual result drops the lease instead of reopening the
+// lane early. Worker loss leaves this executor unusable, never reacquiring it.
+struct VerifiedSubmitExecution {
+    lease: Option<VerifiedSubmitExecutionLease>,
+}
+
+impl VerifiedSubmitExecution {
+    async fn run<T, F>(
+        &mut self,
+        relay: &Arc<ChatRelayService>,
+        request: &ChatRelayVerifiedSubmitRequestV1,
+        operation: F,
+    ) -> Result<T, VerifiedSubmitDbFailure>
+    where
+        T: Send + 'static,
+        F: FnOnce(&ChatRelayService, &ChatRelayVerifiedSubmitRequestV1) -> ChatRelayResult<T>
+            + Send
+            + 'static,
+    {
+        let relay = Arc::clone(relay);
+        let request = request.clone();
+        let lease = self
+            .lease
+            .take()
+            .ok_or(VerifiedSubmitDbFailure::WorkerUnavailable)?;
+        let (lease, result) = tokio::task::spawn_blocking(move || {
+            let result = operation(relay.as_ref(), &request);
+            (lease, result)
+        })
+        .await
+        .map_err(|_| VerifiedSubmitDbFailure::WorkerUnavailable)?;
+        self.lease = Some(lease);
+        result.map_err(VerifiedSubmitDbFailure::Storage)
+    }
+}
 
 impl Server {
     pub(super) async fn handle_verified_chat_submit(
@@ -77,7 +153,27 @@ impl Server {
         // lane. Exact retries replay the first response without repeating
         // onion relay or entry custody. Reuse for another envelope fails
         // closed before route, wallet-route, or durable-state mutation.
-        let _single_flight = relay.lock_verified_submit(&request).await;
+        // [VERIFIED-SUBMIT-BLOCKING 2026-10-04 by Codex] Admit before waiting
+        // for a lane; waiting requests cannot grow a detached worker backlog.
+        let permit = match verified_submit_admission().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let response = rejected();
+                relay.record_verified_submit_result(unix_now_secs(), response.result);
+                warn!(
+                    reason = "verified_submit_backpressure",
+                    "[CHAT_RELAY] Verified submit rejected"
+                );
+                return response;
+            }
+        };
+        let lane = relay.lock_verified_submit(&request).await;
+        let mut execution = VerifiedSubmitExecution {
+            lease: Some(VerifiedSubmitExecutionLease {
+                _lane: lane,
+                _permit: permit,
+            }),
+        };
         let now = clock();
         // [VERIFIED-SUBMIT-STALE-REPLAY 2026-09-07 by Codex] Preserve the
         // existing symmetric freshness window for new effects. Only too-old
@@ -87,7 +183,12 @@ impl Server {
             > aeronyx_core::protocol::auth::TIMESTAMP_WINDOW_SECS
         {
             if request.request_timestamp < now {
-                match relay.verified_submit_completed_readonly(&request, now) {
+                match execution
+                    .run(relay, &request, move |relay, request| {
+                        relay.verified_submit_completed_readonly(request, now)
+                    })
+                    .await
+                {
                     Ok(Some(response)) => {
                         relay.record_verified_submit_replay(now, response.result);
                         return response;
@@ -105,7 +206,12 @@ impl Server {
             relay.record_verified_submit_result(now, response.result);
             return response;
         }
-        match relay.verified_submit_cache_lookup(&request) {
+        match execution
+            .run(relay, &request, |relay, request| {
+                relay.verified_submit_cache_lookup(request)
+            })
+            .await
+        {
             Ok(VerifiedSubmitCacheLookup::Exact(response)) => {
                 relay.record_verified_submit_replay(unix_now_secs(), response.result);
                 return response;
@@ -141,7 +247,12 @@ impl Server {
         // bounded durable replay capacity before wallet-route, network, or
         // custody mutation. Saturation and crash-left pending work reject here;
         // unexpired evidence is never evicted to make room for new effects.
-        let entry_recovery = match relay.reserve_verified_submit(&request) {
+        let entry_recovery = match execution
+            .run(relay, &request, |relay, request| {
+                relay.reserve_verified_submit(request)
+            })
+            .await
+        {
             Ok(VerifiedSubmitAdmission::Reserved) => false,
             Ok(VerifiedSubmitAdmission::ReservedForEntryRecovery) => true,
             Ok(VerifiedSubmitAdmission::Pending) => {
@@ -172,7 +283,12 @@ impl Server {
                 return response;
             }
             Ok(VerifiedSubmitAdmission::Completed) => {
-                match relay.verified_submit_cache_lookup(&request) {
+                match execution
+                    .run(relay, &request, |relay, request| {
+                        relay.verified_submit_cache_lookup(request)
+                    })
+                    .await
+                {
                     Ok(VerifiedSubmitCacheLookup::Exact(response)) => {
                         relay.record_verified_submit_replay(unix_now_secs(), response.result);
                         return response;
@@ -198,6 +314,21 @@ impl Server {
                 return response;
             }
         };
+
+        // [VERIFIED-SUBMIT-BLOCKING 2026-10-04 by Codex] DB queue/lock waits
+        // must not lend stale authentication to new route or custody effects.
+        // Keep any reserved slot fail-closed; do not release it for a new leader.
+        if request.request_timestamp.abs_diff(clock())
+            > aeronyx_core::protocol::auth::TIMESTAMP_WINDOW_SECS
+        {
+            let response = rejected();
+            relay.record_verified_submit_result(unix_now_secs(), response.result);
+            warn!(
+                reason = "verified_submit_expired_before_effect",
+                "[CHAT_RELAY] Verified submit rejected"
+            );
+            return response;
+        }
 
         let (onion_delivered, terminal_receipt) = if entry_recovery {
             // [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Recovery
@@ -237,6 +368,50 @@ impl Server {
             );
         }
 
+        // [VERIFIED-SUBMIT-BLOCKING 2026-10-04 by Codex] Custody and response
+        // persistence stay in ONE closure, with no newly cancellable gap. If
+        // the worker is lost, retain only independently verified remote proof;
+        // unknown local custody must never be reported as established.
+        let worker_failure_response = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            request.request_id,
+            request.envelope.message_id,
+            verified_onion && onion_delivered,
+            false,
+            terminal_receipt.clone(),
+        );
+        match execution
+            .run(relay, &request, move |relay, request| {
+                Ok(Self::complete_verified_submit_custody(
+                    relay,
+                    request,
+                    verified_onion && onion_delivered,
+                    terminal_receipt,
+                    entry_recovery,
+                ))
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(
+                    reason = error.reason_bucket(),
+                    "[CHAT_RELAY] Verified submit completion unavailable"
+                );
+                worker_failure_response
+            }
+        }
+    }
+
+    // [VERIFIED-SUBMIT-BLOCKING 2026-10-04 by Codex] Called only inside the
+    // owned blocking executor. Preserve custody -> evidence -> replay ordering
+    // and the existing result when durable replay persistence returns an error.
+    fn complete_verified_submit_custody(
+        relay: &ChatRelayService,
+        request: &ChatRelayVerifiedSubmitRequestV1,
+        verified_onion: bool,
+        terminal_receipt: Option<BlindRelayDeliveryReceipt>,
+        entry_recovery: bool,
+    ) -> ChatRelayVerifiedSubmitResponseV1 {
         let entry_custody = match relay.store_pending(&request.envelope) {
             Ok(()) => true,
             Err(error) => {
@@ -250,7 +425,7 @@ impl Server {
         let response = ChatRelayVerifiedSubmitResponseV1::from_evidence(
             request.request_id,
             request.envelope.message_id,
-            verified_onion && onion_delivered,
+            verified_onion,
             entry_custody,
             terminal_receipt,
         );
@@ -258,7 +433,7 @@ impl Server {
         // status records only the closed result bucket, never identifiers.
         let completed_at = unix_now_secs();
         relay.record_verified_submit_result(completed_at, response.result);
-        let persistence = relay.remember_verified_submit_response(&request, &response);
+        let persistence = relay.remember_verified_submit_response(request, &response);
         if entry_recovery {
             // [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] Recovery
             // closes exactly once: successful custody plus durable replay is
