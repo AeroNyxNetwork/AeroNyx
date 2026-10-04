@@ -14,6 +14,10 @@
 //! commitment. Result recovery uses the queue's read-only authenticated
 //! context lookup and calls the core Result verifier before any CAS write.
 //!
+//! [REVERSE-ONION-CLAIM-RETRY 2026-10-04 by Codex] Historical exact Claim
+//! bytes are admitted through queue idempotence after signature/R/P checks;
+//! only a genuinely new Claim is subjected to fresh 30-second validation.
+//!
 //! Last Modified: v0.1.0-ReverseOnionApiAdapter - Unregistered Claim/Result
 //! boundary with bounded blocking and deterministic coarse replies.
 
@@ -172,7 +176,7 @@ fn handle_claim_blocking(
     body: &[u8],
     now: u64,
 ) -> ReverseOnionApiReply {
-    let claim = match ReverseOnionFrameV1::decode(body, now) {
+    let claim = match ReverseOnionFrameV1::decode_for_recovery(body) {
         Ok(claim) => claim,
         Err(_) => return ReverseOnionApiReply::empty(StatusCode::BAD_REQUEST),
     };
@@ -182,9 +186,6 @@ fn handle_claim_blocking(
         || relay.public_key_bytes() == recipient
         || claim.encode().as_slice() != body
     {
-        return ReverseOnionApiReply::empty(StatusCode::BAD_REQUEST);
-    }
-    if claim.verify_claim(relay.public_key_bytes(), recipient, now).is_err() {
         return ReverseOnionApiReply::empty(StatusCode::BAD_REQUEST);
     }
     let claim_id = claim.claim_id();
