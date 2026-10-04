@@ -349,7 +349,10 @@ impl ReverseOnionRecipientJournal {
                 last = Some(id);
                 let row = self.load(tx, id)?.ok_or(RecipientJournalError::Corrupt)?;
                 let next = match row.phase {
-                    Phase::Poll if now < row.claim.expires_at() => Some(RecipientRecovery::Poll {
+                    // [RECIPIENT-HISTORICAL-POLL 2026-10-04 by Codex]
+                    // Claim expiry does not prove R issued no Lease. Preserve
+                    // exact recovery through the entire immutable horizon.
+                    Phase::Poll if now < row.retain_until => Some(RecipientRecovery::Poll {
                         claim_id: id, exact_bytes: row.claim.encode(),
                     }),
                     Phase::Lease if now < row.lease.as_ref().ok_or(RecipientJournalError::Corrupt)?.expires_at() =>
@@ -942,6 +945,30 @@ mod tests {
         assert_eq!(journal.record_relay_lease(proof, NOW + 10).err(), Some(RecipientJournalError::Rejected));
         let page = journal.resume(None, 1, NOW + 10).unwrap();
         assert!(matches!(page.items.first(), Some(RecipientRecovery::Poll { .. })));
+    }
+
+    // [RECIPIENT-HISTORICAL-POLL 2026-10-04 by Codex] Authored, unexecuted.
+    #[test]
+    fn historical_poll_remains_exact_until_evidence_horizon_not_claim_expiry() {
+        let f = Fixture::new(NOW + 10);
+        let journal = f.open(NOW).unwrap();
+        let bytes = journal.prepare_poll(&f.claim, NOW).unwrap();
+        drop(journal);
+        let journal = f.open(NOW + 31).unwrap();
+        let horizon = f.claim.expires_at() + UNLEASED_EVIDENCE_SECS;
+        for now in [NOW + 31, horizon - 1] {
+            let page = journal.resume(None, 1, now).unwrap();
+            assert_eq!(page.items.len(), 1);
+            match &page.items[0] {
+                RecipientRecovery::Poll { exact_bytes, .. } => assert_eq!(exact_bytes, &bytes),
+                _ => panic!("expected retained poll"),
+            }
+        }
+        assert!(f.lease.verify_recipient_lease(&f.claim, f.relay.public_key_bytes(),
+            f.recipient.public_key_bytes(), horizon - 1).is_err());
+        assert!(journal.arm(f.claim.claim_id(), horizon - 1).is_err());
+        assert!(journal.resume(None, 1, horizon).unwrap().items.is_empty());
+        assert_eq!(journal.cleanup(1, horizon).unwrap(), 1);
     }
 
     #[test]
