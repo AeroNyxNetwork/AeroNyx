@@ -9,6 +9,8 @@
 //   relay service without changing its public API or SQLite schema.
 //
 // Main Functionality:
+//   [PENDING-CUSTODY-BOUNDED-RETRY 2026-10-04 by Codex] Resolve durable
+//   retry equality through a bounded scalar projection, not a stored BLOB copy.
 //   - Defines the pending-message custody policy as a domain value.
 //   - Defines a replaceable repository trait for durable store and ACK writes.
 //   - Implements idempotence, quotas, monotonic sequence allocation, and ACKs.
@@ -32,12 +34,14 @@
 //   - Never log or expose message IDs, wallet keys, envelopes, or ciphertext.
 //
 // Last Modified:
+//   [PENDING-CUSTODY-BOUNDED-RETRY 2026-10-04 by Codex] Preserve exact retry
+//   before quota while rejecting malformed durable shapes without mutation.
 //   v1.0.0-PendingCustodyDomain - Initial custody repository composition
 // ============================================
 
 use std::collections::HashSet;
 
-use aeronyx_core::protocol::chat::{encode_envelope, ChatEnvelope};
+use aeronyx_core::protocol::chat::{encode_envelope, ChatEnvelope, MAX_CHAT_ENVELOPE_BYTES};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::config::ChatRelayConfig;
@@ -92,6 +96,28 @@ pub(crate) enum PendingMessageStoreOutcome {
     AlreadyStored,
 }
 
+// [PENDING-CUSTODY-BOUNDED-RETRY 2026-10-04 by Codex] These discriminants
+// are private SQL results, not persisted state or wire values. Never interpret
+// an unknown result as an absent row or permission to insert another effect.
+enum StoredPendingEnvelopeMatch {
+    Exact,
+    Conflict,
+    Corrupt,
+}
+
+impl StoredPendingEnvelopeMatch {
+    fn from_sql(value: i64) -> ChatRelayResult<Self> {
+        match value {
+            0 => Ok(Self::Conflict),
+            1 => Ok(Self::Exact),
+            2 => Ok(Self::Corrupt),
+            _ => Err(ChatRelayError::CorruptStoredData {
+                field: "pending_message_retry_result",
+            }),
+        }
+    }
+}
+
 /// Replaceable persistence capability for pending-message custody.
 ///
 /// [CHAT-PENDING-CUSTODY-DOMAIN 2026-08-25 by Codex] The domain owns input
@@ -128,19 +154,47 @@ impl PendingMessageCustodyRepository for SqlitePendingMessageCustodyRepository {
 
         // Retry identity is resolved before quotas so an already-durable write
         // remains successful even while the node or mailbox is full.
-        let existing_envelope = tx
+        // [PENDING-CUSTODY-BOUNDED-RETRY 2026-10-04 by Codex] CASE checks
+        // storage class, then the existing core ceiling, before exact BLOB
+        // equality. Only the scalar decision crosses into Rust, never the
+        // durable envelope. Do not use a lowered operator size limit to reject
+        // historical rows. SQLite's own pager/comparison memory is not covered
+        // by this returned-projection bound.
+        let existing = tx
             .query_row(
-                "SELECT envelope FROM pending_messages WHERE message_id = ?1",
-                params![write.message_id.as_slice()],
-                |row| row.get::<_, Vec<u8>>(0),
+                "SELECT CASE
+                    WHEN typeof(envelope) != 'blob' THEN 2
+                    WHEN length(envelope) > ?2 THEN 2
+                    WHEN envelope = ?3 THEN 1
+                    ELSE 0
+                 END
+                 FROM pending_messages WHERE message_id = ?1",
+                params![
+                    write.message_id.as_slice(),
+                    MAX_CHAT_ENVELOPE_BYTES,
+                    write.envelope.as_slice(),
+                ],
+                |row| row.get::<_, i64>(0),
             )
-            .optional()?;
-        if let Some(existing_envelope) = existing_envelope {
-            if existing_envelope == write.envelope {
+            .optional()?
+            .map(StoredPendingEnvelopeMatch::from_sql)
+            .transpose()?;
+        match existing {
+            Some(StoredPendingEnvelopeMatch::Exact) => {
                 tx.commit()?;
                 return Ok(PendingMessageStoreOutcome::AlreadyStored);
             }
-            return Err(ChatRelayError::MessageIdConflict);
+            Some(StoredPendingEnvelopeMatch::Conflict) => {
+                return Err(ChatRelayError::MessageIdConflict);
+            }
+            Some(StoredPendingEnvelopeMatch::Corrupt) => {
+                // Leave the original row intact for existing Pull/maintenance
+                // evidence. The transaction drops without any custody mutation.
+                return Err(ChatRelayError::CorruptStoredData {
+                    field: "pending_message_retry_envelope",
+                });
+            }
+            None => {}
         }
 
         let (pending_messages, pending_message_bytes) = read_pending_usage(&tx)?;
