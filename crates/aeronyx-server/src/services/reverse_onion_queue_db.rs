@@ -23,13 +23,17 @@
 //! exposes only the queue's authenticated read-only recovery context and
 //! retains the durable post-operation fence before publication.
 //!
+//! [REVERSE-ONION-SOURCE-INDEX 2026-10-04 by Codex] Source reads additionally
+//! fence observed time in memory under the operation lock. This fence is lost
+//! on restart; only SQL mutation-clock observations are durable.
+//!
 //! [REVERSE-ONION-SOURCE-BINDING 2026-10-04 by Codex] Source snapshots are
 //! exposed only through the exact source/route/request tuple and never carry
 //! the persisted envelope.
 
 use std::path::{Path, PathBuf};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags};
@@ -174,6 +178,10 @@ pub(crate) struct ReverseOnionQueueDb {
     queue: SqliteReverseOnionQueue,
     connection: Mutex<Connection>,
     operation: Mutex<()>,
+    // [REVERSE-ONION-SOURCE-INDEX 2026-10-04 by Codex] Accessed only while
+    // operation is held. Read observations are process-local, not durable;
+    // reopening restores only the SQL mutation-clock floor.
+    source_read_high_water: AtomicU64,
     poisoned: AtomicBool,
     db_path: PathBuf,
     physical_bytes: u64,
@@ -185,6 +193,14 @@ pub(crate) struct ReverseOnionQueueDb {
     _inode_lock: File,
     #[cfg(unix)]
     _parent: File,
+}
+
+// [REVERSE-ONION-SOURCE-INDEX 2026-10-04 by Codex] Only source lookup may
+// omit the full database integrity scan; all pre-existing callers retain it.
+#[derive(Clone, Copy)]
+enum OperationFence {
+    FullIntegrity,
+    BoundedSourceRead,
 }
 
 impl std::fmt::Debug for ReverseOnionQueueDb {
@@ -262,6 +278,7 @@ impl ReverseOnionQueueDb {
             queue: SqliteReverseOnionQueue::new(config.limits),
             connection: Mutex::new(connection),
             operation: Mutex::new(()),
+            source_read_high_water: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
             db_path: target.resolved_path,
             physical_bytes: config.physical_bytes,
@@ -394,10 +411,20 @@ impl ReverseOnionQueueDb {
         request_commitment: [u8; 32],
         now: u64,
     ) -> Result<Option<ReverseOnionQueueSourceSnapshot>, ReverseOnionQueueDbError> {
-        self.with_operation(true, |queue, connection| {
-            queue
+        self.with_operation_fence(true, OperationFence::BoundedSourceRead, |queue, connection| {
+            // Reject invalid times before touching the memory fence. Advancing
+            // before the post-operation fence is conservative: fence failure
+            // poisons this wrapper, so no subsequent read can observe success.
+            if now == 0 || i64::try_from(now).is_err()
+                || now < self.source_read_high_water.load(Ordering::Relaxed)
+            {
+                return Err(ReverseOnionQueueDbError::Rejected);
+            }
+            let snapshot = queue
                 .lookup_source(connection, source_node_id, route_id, request_commitment, now)
-                .map_err(ReverseOnionQueueDbError::from)
+                .map_err(ReverseOnionQueueDbError::from)?;
+            self.source_read_high_water.store(now, Ordering::Relaxed);
+            Ok(snapshot)
         })
     }
 
@@ -437,6 +464,18 @@ impl ReverseOnionQueueDb {
             &Mutex<Connection>,
         ) -> Result<T, ReverseOnionQueueDbError>,
     ) -> Result<T, ReverseOnionQueueDbError> {
+        self.with_operation_fence(durable, OperationFence::FullIntegrity, action)
+    }
+
+    fn with_operation_fence<T>(
+        &self,
+        durable: bool,
+        fence: OperationFence,
+        action: impl FnOnce(
+            &SqliteReverseOnionQueue,
+            &Mutex<Connection>,
+        ) -> Result<T, ReverseOnionQueueDbError>,
+    ) -> Result<T, ReverseOnionQueueDbError> {
         let _operation = self.operation.lock();
         if self.poisoned.load(Ordering::Acquire) {
             return Err(ReverseOnionQueueDbError::Unavailable);
@@ -444,7 +483,7 @@ impl ReverseOnionQueueDb {
         let outcome = catch_unwind(AssertUnwindSafe(|| action(&self.queue, &self.connection)));
         let result = match outcome {
             Ok(Ok(value)) => {
-                if let Err(error) = self.post_operation_fence() {
+                if let Err(error) = self.post_operation_fence(fence) {
                     self.poisoned.store(true, Ordering::Release);
                     return Err(if durable {
                         ReverseOnionQueueDbError::Ambiguous
@@ -464,7 +503,7 @@ impl ReverseOnionQueueDb {
                         ReverseOnionQueueDbError::NoWork | ReverseOnionQueueDbError::Ambiguous
                     )
                 {
-                    if self.post_operation_fence().is_err() {
+                    if self.post_operation_fence(fence).is_err() {
                         self.poisoned.store(true, Ordering::Release);
                         return Err(ReverseOnionQueueDbError::Ambiguous);
                     }
@@ -488,7 +527,7 @@ impl ReverseOnionQueueDb {
     }
 
     #[cfg(unix)]
-    fn post_operation_fence(&self) -> Result<(), ReverseOnionQueueDbError> {
+    fn post_operation_fence(&self, fence: OperationFence) -> Result<(), ReverseOnionQueueDbError> {
         #[cfg(test)]
         if FORCE_POST_OPERATION_FENCE_FAILURE.with(std::cell::Cell::get) {
             return Err(ReverseOnionQueueDbError::Unavailable);
@@ -514,7 +553,11 @@ impl ReverseOnionQueueDb {
         validate_path_identity(&path_metadata, self.inode_identity, self.physical_bytes)?;
         audit_sidecars(&self.db_path, self.physical_bytes, path_metadata.len())?;
         let connection = self.connection.lock();
-        audit_sqlite(&connection, self.physical_bytes, configured_max_page_count(&connection)?)?;
+        let max_page_count = configured_max_page_count(&connection)?;
+        match fence {
+            OperationFence::FullIntegrity => audit_sqlite(&connection, self.physical_bytes, max_page_count)?,
+            OperationFence::BoundedSourceRead => audit_sqlite_pages(&connection, self.physical_bytes, max_page_count)?,
+        }
         drop(connection);
         self._parent
             .sync_all()
@@ -522,7 +565,7 @@ impl ReverseOnionQueueDb {
     }
 
     #[cfg(not(unix))]
-    fn post_operation_fence(&self) -> Result<(), ReverseOnionQueueDbError> {
+    fn post_operation_fence(&self, _fence: OperationFence) -> Result<(), ReverseOnionQueueDbError> {
         Err(ReverseOnionQueueDbError::Rejected)
     }
 }
@@ -730,6 +773,34 @@ fn audit_sqlite(
     physical_bytes: u64,
     max_page_count: i64,
 ) -> Result<(), ReverseOnionQueueDbError> {
+    audit_sqlite_pages(connection, physical_bytes, max_page_count)?;
+    // quick_check(1) bounds reported errors, NOT pages scanned. Keep it at
+    // open/maintenance and existing operations, never the source-read fence.
+    #[cfg(test)]
+    FULL_INTEGRITY_AUDITS.with(|count| count.set(count.get() + 1));
+    let integrity: String = connection
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .map_err(|_| ReverseOnionQueueDbError::Corrupt)?;
+    if integrity != "ok" {
+        return Err(ReverseOnionQueueDbError::Corrupt);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FULL_INTEGRITY_AUDITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// [REVERSE-ONION-SOURCE-INDEX 2026-10-04 by Codex] Header/page-budget reads
+// do not scan unrelated B-trees. Source reads lose per-read unrelated-page
+// auditing; startup, maintenance and mutation integrity checks remain intact.
+#[cfg(unix)]
+fn audit_sqlite_pages(
+    connection: &Connection,
+    physical_bytes: u64,
+    max_page_count: i64,
+) -> Result<(), ReverseOnionQueueDbError> {
     let page_size: i64 = connection
         .query_row("PRAGMA page_size", [], |row| row.get(0))
         .map_err(|_| ReverseOnionQueueDbError::Unavailable)?;
@@ -746,12 +817,6 @@ fn audit_sqlite(
         .ok_or(ReverseOnionQueueDbError::Capacity)?;
     if bytes > physical_bytes {
         return Err(ReverseOnionQueueDbError::Capacity);
-    }
-    let integrity: String = connection
-        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
-        .map_err(|_| ReverseOnionQueueDbError::Corrupt)?;
-    if integrity != "ok" {
-        return Err(ReverseOnionQueueDbError::Corrupt);
     }
     Ok(())
 }
@@ -855,6 +920,62 @@ mod tests {
             NOW + 60,
         )
         .expect("valid opaque queue item")
+    }
+
+    // [REVERSE-ONION-SOURCE-INDEX 2026-10-04 by Codex] Authored, unexecuted.
+    #[cfg(unix)]
+    #[test]
+    fn source_read_clock_is_process_local_invalid_times_do_not_advance() {
+        let (_directory, config) = fixture();
+        let source = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap().public_key_bytes();
+        let db = ReverseOnionQueueDb::open(config.clone(), NOW).unwrap();
+        db.enqueue(&queue_item(), NOW).unwrap();
+        for invalid in [0, u64::MAX] {
+            assert!(matches!(db.lookup_source(source, [2; 16], [3; 32], invalid),
+                Err(ReverseOnionQueueDbError::Rejected)));
+        }
+        assert_eq!(db.source_read_high_water.load(Ordering::Relaxed), 0);
+        assert!(db.lookup_source(source, [2; 16], [3; 32], NOW + 70).unwrap().is_none());
+        assert!(matches!(db.lookup_source(source, [2; 16], [3; 32], NOW + 50),
+            Err(ReverseOnionQueueDbError::Rejected)));
+        drop(db);
+        // No read timestamp was written to SQL: a restart at an earlier time
+        // above the durable mutation floor can expose the still-retained row.
+        let reopened = ReverseOnionQueueDb::open(config, NOW + 50).unwrap();
+        assert!(reopened.lookup_source(source, [2; 16], [3; 32], NOW + 50).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_read_fence_failure_poisons_before_any_later_publication() {
+        let (_directory, config) = fixture();
+        let db = ReverseOnionQueueDb::open(config, NOW).unwrap();
+        let source = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap().public_key_bytes();
+        force_fence(true);
+        let outcome = db.lookup_source(source, [2; 16], [3; 32], NOW + 1);
+        force_fence(false);
+        assert!(matches!(outcome, Err(ReverseOnionQueueDbError::Ambiguous)));
+        assert!(matches!(db.lookup_source(source, [2; 16], [3; 32], NOW + 2),
+            Err(ReverseOnionQueueDbError::Unavailable)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_read_fence_skips_full_integrity_but_open_mutation_cleanup_retain_it() {
+        let (_directory, config) = fixture();
+        FULL_INTEGRITY_AUDITS.with(|count| count.set(0));
+        let db = ReverseOnionQueueDb::open(config, NOW).unwrap();
+        assert!(FULL_INTEGRITY_AUDITS.with(std::cell::Cell::get) > 0);
+        FULL_INTEGRITY_AUDITS.with(|count| count.set(0));
+        db.enqueue(&queue_item(), NOW).unwrap();
+        assert!(FULL_INTEGRITY_AUDITS.with(std::cell::Cell::get) > 0);
+        FULL_INTEGRITY_AUDITS.with(|count| count.set(0));
+        let source = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap().public_key_bytes();
+        assert!(db.lookup_source(source, [2; 16], [3; 32], NOW + 1).unwrap().is_some());
+        assert!(db.lookup_source(source, [9; 16], [10; 32], NOW + 1).unwrap().is_none());
+        assert_eq!(FULL_INTEGRITY_AUDITS.with(std::cell::Cell::get), 0);
+        db.cleanup(NOW + 2).unwrap();
+        assert!(FULL_INTEGRITY_AUDITS.with(std::cell::Cell::get) > 0);
     }
 
     #[cfg(unix)]

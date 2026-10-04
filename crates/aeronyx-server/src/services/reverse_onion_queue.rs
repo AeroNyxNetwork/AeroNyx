@@ -42,8 +42,10 @@
 //! read-only outcome never issues a lease, inserts no-work, or authorizes
 //! completion without the core Result verifier.
 //!
-//! Last Modified: v1.2.0-SourceBinding - Trusted local time high-water and
-//! explicit owned metadata/source-binding migrations.
+//! [REVERSE-ONION-SOURCE-INDEX 2026-10-04 by Codex] Schema v4 adds an exact
+//! source-tuple covering index. Source reads validate only their bounded row;
+//! startup and maintenance retain the full audit. No source read writes SQL.
+//! Last Modified: v1.3.0-SourceIndex - Explicit v3/v4 index migration.
 
 use aeronyx_core::crypto::keys::IdentityPublicKey;
 use aeronyx_core::protocol::onion::reverse_delivery::{
@@ -58,11 +60,14 @@ use thiserror::Error;
 const TABLE: &str = "reverse_onion_delivery_queue_v1";
 const NO_WORK_TABLE: &str = "reverse_onion_delivery_queue_v1_no_work";
 const META_TABLE: &str = "reverse_onion_delivery_queue_v1_meta";
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+const SOURCE_BINDING_SCHEMA_VERSION: i64 = 3;
 const CLOCK_SCHEMA_VERSION: i64 = 2;
 const LEGACY_SCHEMA_VERSION: i64 = 1;
 const OWNERSHIP_TAG: &[u8] = b"AeroNyx-ReverseOnionQueue-v1";
-const MAX_APPLICATION_OBJECTS: usize = 7;
+const LEGACY_MAX_APPLICATION_OBJECTS: usize = 7;
+const MAX_APPLICATION_OBJECTS: usize = 8;
+const SOURCE_ROUTE_INDEX: &str = "idx_reverse_onion_delivery_queue_v1_source_route";
 const MAX_APPLICATION_OBJECT_NAME_BYTES: i64 = 128;
 const PENDING: i64 = 0;
 const LEASED: i64 = 1; // Reserved for fail-closed recovery; never issued externally.
@@ -493,18 +498,26 @@ impl SqliteReverseOnionQueue {
             create_meta_schema(&tx)?;
             create_main_schema(&tx)?;
             create_no_work_schema(&tx)?;
+            create_source_route_index(&tx)?;
         } else {
             if meta_object.as_deref() != Some("table") {
                 return Err(ReverseOnionQueueError::Corrupt);
             }
             let objects = application_objects(&tx)?;
             validate_owned_objects(&objects)?;
+            let version = metadata_schema_version(&tx)?;
+            if version < SCHEMA_VERSION
+                && (objects.len() > LEGACY_MAX_APPLICATION_OBJECTS
+                    || objects.iter().any(|name| name == SOURCE_ROUTE_INDEX))
+            {
+                return Err(ReverseOnionQueueError::Corrupt);
+            }
             if named_object_type(&tx, TABLE)?.as_deref() != Some("table")
                 || named_object_type(&tx, NO_WORK_TABLE)?.as_deref() != Some("table")
             {
                 return Err(ReverseOnionQueueError::Corrupt);
             }
-            match metadata_schema_version(&tx)? {
+            match version {
                 LEGACY_SCHEMA_VERSION => {
                     let Some(trusted_now) = trusted_now else {
                         return Err(ReverseOnionQueueError::MigrationRequired);
@@ -525,8 +538,24 @@ impl SqliteReverseOnionQueue {
                     validate_all_rows(&tx, &self.limits)?;
                     validate_all_no_work_rows(&tx, &self.limits)?;
                 }
-                SCHEMA_VERSION => validate_meta_schema(&tx)?,
+                SOURCE_BINDING_SCHEMA_VERSION => {
+                    validate_meta_schema_version(&tx, SOURCE_BINDING_SCHEMA_VERSION)?;
+                    validate_schema(&tx)?;
+                    validate_no_work_schema(&tx)?;
+                }
+                SCHEMA_VERSION => {
+                    validate_meta_schema(&tx)?;
+                    // A v4 database cannot silently recreate a missing index.
+                    if named_object_type(&tx, SOURCE_ROUTE_INDEX)?.as_deref() != Some("index") {
+                        return Err(ReverseOnionQueueError::Corrupt);
+                    }
+                }
                 _ => return Err(ReverseOnionQueueError::Corrupt),
+            }
+            if version < SCHEMA_VERSION {
+                validate_all_rows(&tx, &self.limits)?;
+                validate_all_no_work_rows(&tx, &self.limits)?;
+                migrate_source_index_v3_to_v4(&tx)?;
             }
         }
         let existing_main_indexes = validate_schema(&tx)?;
@@ -541,6 +570,8 @@ impl SqliteReverseOnionQueue {
         validate_meta_schema(&tx)?;
         validate_schema(&tx)?;
         validate_no_work_schema(&tx)?;
+        validate_all_rows(&tx, &self.limits)?;
+        validate_all_no_work_rows(&tx, &self.limits)?;
         tx.commit()?;
         Ok(())
     }
@@ -1030,8 +1061,6 @@ impl SqliteReverseOnionQueue {
         if clock_high_water < 0 || now < clock_high_water {
             return Err(ReverseOnionQueueError::Rejected);
         }
-        validate_all_rows(&tx, &self.limits)?;
-        validate_all_no_work_rows(&tx, &self.limits)?;
         let row = load_by_source_route(&tx, &source_node_id, &route_id, &request_commitment)?;
         let snapshot = if let Some(row) = row {
             validate_row(&row)?;
@@ -1263,7 +1292,16 @@ fn insert_no_work_marker(
     Ok(())
 }
 
+// [REVERSE-ONION-SOURCE-INDEX 2026-10-04 by Codex] Test-only per-thread seam
+// counts bounded row projections, without timing or shared-test interference.
+#[cfg(test)]
+thread_local! {
+    static SOURCE_TEST_ROW_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn load_row(connection: &Connection, key: &[u8; COMMITMENT_BYTES]) -> Result<Option<StoredRow>, ReverseOnionQueueError> {
+    #[cfg(test)]
+    SOURCE_TEST_ROW_LOADS.with(|count| count.set(count.get() + 1));
     let Some(shape) = connection
         .query_row(
             &format!(
@@ -1394,16 +1432,27 @@ fn load_by_source_route(
     request_commitment: &[u8; COMMITMENT_BYTES],
 ) -> Result<Option<StoredRow>, ReverseOnionQueueError> {
     let mut statement = connection.prepare(&format!(
-        "SELECT queue_key FROM {TABLE}
+        "SELECT typeof(queue_key), length(queue_key),
+                CASE WHEN typeof(queue_key) = 'blob' AND length(queue_key) = 32
+                     THEN queue_key ELSE NULL END
+         FROM {TABLE} INDEXED BY {SOURCE_ROUTE_INDEX}
          WHERE source_node_id = ?1 AND route_id = ?2 AND request_commitment = ?3
          ORDER BY queue_key ASC LIMIT 2"
     ))?;
     let keys = statement
         .query_map(
             params![source_node_id.as_slice(), route_id.as_slice(), request_commitment.as_slice()],
-            |row| row.get::<_, Vec<u8>>(0),
+            |row| {
+                let class: String = row.get(0)?;
+                let length: Option<i64> = row.get(1)?;
+                if class != "blob" || length != Some(COMMITMENT_BYTES as i64) {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                row.get::<_, Vec<u8>>(2)
+            },
         )?
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ReverseOnionQueueError::Corrupt)?;
     if keys.len() > 1 {
         return Err(ReverseOnionQueueError::Corrupt);
     }
@@ -1659,6 +1708,7 @@ fn validate_owned_objects(objects: &[String]) -> Result<(), ReverseOnionQueueErr
         "idx_reverse_onion_delivery_queue_v1_recipient",
         "idx_reverse_onion_delivery_queue_v1_retention",
         "idx_reverse_onion_delivery_queue_v1_no_work_retention",
+        SOURCE_ROUTE_INDEX,
     ];
     if objects
         .iter()
@@ -1862,8 +1912,30 @@ fn migrate_source_binding_v2_to_v3(
     )?;
     connection.execute(
         &format!("UPDATE {META_TABLE} SET schema_version = ?1 WHERE id = 1"),
-        params![SCHEMA_VERSION],
+        params![SOURCE_BINDING_SCHEMA_VERSION],
     )?;
+    Ok(())
+}
+
+// [REVERSE-ONION-SOURCE-INDEX 2026-10-04 by Codex] Metadata and index change
+// in the caller's immediate transaction; no row or NULL source is rewritten.
+fn create_source_route_index(connection: &Connection) -> Result<(), ReverseOnionQueueError> {
+    connection.execute_batch(&format!(
+        "CREATE INDEX {SOURCE_ROUTE_INDEX} ON {TABLE}
+         (source_node_id, route_id, request_commitment, queue_key);"
+    ))?;
+    Ok(())
+}
+
+fn migrate_source_index_v3_to_v4(connection: &Connection) -> Result<(), ReverseOnionQueueError> {
+    validate_meta_schema_version(connection, SOURCE_BINDING_SCHEMA_VERSION)?;
+    create_source_route_index(connection)?;
+    if connection.execute(
+        &format!("UPDATE {META_TABLE} SET schema_version = ?1 WHERE id = 1 AND schema_version = ?2"),
+        params![SCHEMA_VERSION, SOURCE_BINDING_SCHEMA_VERSION],
+    )? != 1 {
+        return Err(ReverseOnionQueueError::Corrupt);
+    }
     Ok(())
 }
 
@@ -2044,11 +2116,16 @@ fn validate_main_indexes(connection: &Connection) -> Result<bool, ReverseOnionQu
         .query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?
         .collect::<Result<Vec<_>, _>>()?;
     let auto = format!("sqlite_autoindex_{TABLE}_1");
-    let expected = [
+    let mut expected = vec![
         (format!("idx_{TABLE}_claim_id"), true, true, vec!["claim_id".to_owned()]),
         (format!("idx_{TABLE}_recipient"), false, false, vec!["immediate_recipient".to_owned(), "state".to_owned(), "route_deadline".to_owned()]),
         (format!("idx_{TABLE}_retention"), false, false, vec!["state".to_owned(), "route_deadline".to_owned(), "retained_until".to_owned()]),
     ];
+    if metadata_schema_version(connection)? == SCHEMA_VERSION {
+        expected.push((SOURCE_ROUTE_INDEX.to_owned(), false, false,
+            vec!["source_node_id".to_owned(), "route_id".to_owned(),
+                 "request_commitment".to_owned(), "queue_key".to_owned()]));
+    }
     let mut complete = true;
     for (name, unique, _origin, partial) in &indexes {
         if name == &auto {
@@ -2167,9 +2244,181 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
+    // [REVERSE-ONION-SOURCE-INDEX 2026-10-04 by Codex] Authored, unexecuted.
+    fn downgrade_fixture_to_v3(connection: &Mutex<Connection>) {
+        connection.lock().execute_batch(&format!(
+            "DROP INDEX {SOURCE_ROUTE_INDEX}; UPDATE {META_TABLE} SET schema_version = 3;"
+        )).unwrap();
+    }
+
+    #[test]
+    fn source_index_v3_migration_preserves_rows_and_rolls_back_damage() {
+        let (queue, connection) = initialized_queue(4, 600, 120);
+        let row = item(81, 200);
+        queue.enqueue(&connection, &row, 100).unwrap();
+        downgrade_fixture_to_v3(&connection);
+        queue.initialize(&connection).unwrap();
+        assert_eq!(metadata_schema_version(&connection.lock()).unwrap(), 4);
+        assert_eq!(application_objects(&connection.lock()).unwrap().len(), 8);
+        let snapshot = queue.lookup_source(&connection, source_node_id(), row.route_id,
+            row.request_commitment, 101).unwrap().unwrap();
+        assert_eq!(snapshot.route_deadline(), 200);
+        queue.initialize(&connection).unwrap();
+        downgrade_fixture_to_v3(&connection);
+        connection.lock().execute(&format!("UPDATE {TABLE} SET envelope = X''"), []).unwrap();
+        assert!(matches!(queue.initialize(&connection), Err(ReverseOnionQueueError::Corrupt)));
+        assert_eq!(metadata_schema_version(&connection.lock()).unwrap(), 3);
+        assert!(named_object_type(&connection.lock(), SOURCE_ROUTE_INDEX).unwrap().is_none());
+        let count: i64 = connection.lock().query_row(&format!("SELECT COUNT(*) FROM {TABLE}"), [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "migration must not delete damaged data");
+    }
+
+    #[test]
+    fn source_index_v4_missing_wrong_or_unknown_schema_is_not_repaired() {
+        for mode in 0..3 {
+            let (queue, connection) = initialized_queue(4, 600, 120);
+            match mode {
+                0 => connection.lock().execute_batch(&format!("DROP INDEX {SOURCE_ROUTE_INDEX}")),
+                1 => connection.lock().execute_batch(&format!(
+                    "DROP INDEX {SOURCE_ROUTE_INDEX}; CREATE INDEX {SOURCE_ROUTE_INDEX} ON {TABLE}(route_id);")),
+                _ => connection.lock().execute_batch(&format!("UPDATE {META_TABLE} SET schema_version = 99")),
+            }.unwrap();
+            assert!(matches!(queue.initialize(&connection), Err(ReverseOnionQueueError::Corrupt)));
+        }
+        let (queue, connection) = initialized_queue(4, 600, 120);
+        // A v4 index cannot be smuggled into the v3 seven-object inventory.
+        connection.lock().execute(&format!("UPDATE {META_TABLE} SET schema_version = 3"), []).unwrap();
+        assert!(matches!(queue.initialize(&connection), Err(ReverseOnionQueueError::Corrupt)));
+        assert_eq!(metadata_schema_version(&connection.lock()).unwrap(), 3);
+    }
+
+    #[test]
+    fn source_index_reads_only_target_projection_and_bounds_key_before_load() {
+        let (queue, connection) = initialized_queue(128, 600, 120);
+        for seed in 1..65 { queue.enqueue(&connection, &item(seed, 200), 100).unwrap(); }
+        let target = item(32, 200);
+        let changes_before: i64 = connection.lock().query_row("SELECT total_changes()", [], |r| r.get(0)).unwrap();
+        SOURCE_TEST_ROW_LOADS.with(|count| count.set(0));
+        assert!(queue.lookup_source(&connection, source_node_id(), [100; 16], [101; 32], 101).unwrap().is_none());
+        assert_eq!(SOURCE_TEST_ROW_LOADS.with(Cell::get), 0);
+        assert!(queue.lookup_source(&connection, source_node_id(), target.route_id, target.request_commitment, 101).unwrap().is_some());
+        assert_eq!(SOURCE_TEST_ROW_LOADS.with(Cell::get), 1);
+        let changes_after: i64 = connection.lock().query_row("SELECT total_changes()", [], |r| r.get(0)).unwrap();
+        assert_eq!(changes_after, changes_before, "lookup must not advance SQL clock or clean rows");
+        // Corrupt local data must not be copied into a Vec before admission.
+        connection.lock().execute(&format!("UPDATE {TABLE} SET queue_key = zeroblob(1048576) WHERE queue_key = ?1"),
+            params![target.queue_key.as_slice()]).unwrap();
+        SOURCE_TEST_ROW_LOADS.with(|count| count.set(0));
+        assert!(matches!(queue.lookup_source(&connection, source_node_id(), target.route_id,
+            target.request_commitment, 101), Err(ReverseOnionQueueError::Corrupt)));
+        assert_eq!(SOURCE_TEST_ROW_LOADS.with(Cell::get), 0);
+    }
+
+    #[test]
+    fn source_snapshot_real_core_signed_chain_interoperates_with_axre() {
+        use aeronyx_core::crypto::IdentityKeyPair;
+        use aeronyx_core::protocol::chat::{decode_blind_relay_envelope, encode_blind_relay_envelope};
+        use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
+        use aeronyx_core::protocol::onion::reverse_delivery::{ReverseOnionFrameV1,
+            ReverseOnionSourceQueryV1, ReverseOnionSourceEvidenceV1,
+            SourceEvidencePartV1, VerifiedSourceEvidenceChain};
+        use aeronyx_core::protocol::onion_reply::{OnionReplySession, seal_onion_reply,
+            encode_onion_sealed_response, ONION_REPLY_RESPONSE_SIZE_CLASSES};
+        use sha2::{Digest, Sha256};
+
+        const NOW: u64 = 1_800_000_000;
+        let relay = IdentityKeyPair::from_bytes(&[11; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[22; 32]).unwrap();
+        let source = IdentityKeyPair::from_bytes(&[33; 32]).unwrap();
+        let claim = ReverseOnionFrameV1::claim(relay.public_key_bytes(), [1; 16],
+            NOW, NOW + 30, &recipient).unwrap();
+        let (_, kem) = recipient.to_x25519();
+        let envelope = build_onion_envelope(&[OnionHop { node_id: recipient.public_key_bytes(),
+            kem_pub: kem.to_bytes() }], b"opaque request", [2; 16], 1, NOW, &relay).unwrap();
+        let envelope_bytes = encode_blind_relay_envelope(&envelope).unwrap();
+        let envelope_hash: [u8; 32] = Sha256::digest(&envelope_bytes).into();
+        let row = ReverseOnionQueueItem::new([3; 32], [2; 16], [4; 32],
+            source.public_key_bytes(), [5; 32], recipient.public_key_bytes(),
+            envelope_hash, envelope_bytes, NOW + 600).unwrap();
+        let (queue, connection) = initialized_queue(4, 600, 120);
+        queue.enqueue(&connection, &row, NOW).unwrap();
+        let verify_claim = |bytes: &[u8]| {
+            let frame = ReverseOnionFrameV1::decode(bytes, NOW)
+                .map_err(|_| ReverseOnionQueueError::Rejected)?;
+            frame.verify_claim(relay.public_key_bytes(), recipient.public_key_bytes(), NOW)
+                .map_err(|_| ReverseOnionQueueError::Rejected)?;
+            Ok(frame.commitment())
+        };
+        let mut damaged = claim.encode();
+        *damaged.last_mut().unwrap() ^= 1;
+        assert!(verify_claim(&damaged).is_err());
+        assert!(matches!(queue.issue_lease(&connection, recipient.public_key_bytes(),
+            claim.claim_id(), claim.commitment(), damaged, NOW, &verify_claim,
+            |_, _| panic!("invalid signature must not reach lease constructor")),
+            Err(ReverseOnionQueueError::Rejected)));
+        let pending = queue.lookup_source(&connection, source.public_key_bytes(), [2; 16],
+            [4; 32], NOW).unwrap().unwrap();
+        assert!(pending.claim_frame().is_none(), "bad signature must leave durable state unchanged");
+        let issued = queue.issue_lease(&connection, recipient.public_key_bytes(),
+            claim.claim_id(), claim.commitment(), claim.encode(), NOW, &verify_claim,
+            |stored, bytes| {
+                let checked_claim = ReverseOnionFrameV1::decode(bytes, NOW)
+                    .map_err(|_| ReverseOnionQueueError::Rejected)?;
+                let checked_envelope = decode_blind_relay_envelope(stored.envelope())
+                    .map_err(|_| ReverseOnionQueueError::Rejected)?;
+                let lease = ReverseOnionFrameV1::lease(&checked_claim, &checked_envelope,
+                    [6; 16], stored.route_deadline(), NOW, &relay)
+                    .map_err(|_| ReverseOnionQueueError::Rejected)?;
+                ReverseOnionQueueLeaseMaterial::new(lease.lease_id(), lease.commitment(),
+                    lease.encode(), lease.expires_at(), lease.result_retention_deadline()
+                        .map_err(|_| ReverseOnionQueueError::Rejected)?)
+            }).unwrap();
+        let issued = match issued { ReverseOnionQueueIssue::Issued(value) => value,
+            _ => panic!("expected real signed lease") };
+        let lease = ReverseOnionFrameV1::decode_for_recovery(issued.frame()).unwrap();
+        let (reply_request, _session) = OnionReplySession::prepare_source_sealed([2; 16],
+            recipient.public_key_bytes(), ONION_REPLY_RESPONSE_SIZE_CLASSES[0], b"operation".to_vec()).unwrap();
+        let reply = seal_onion_reply([2; 16], &reply_request, b"opaque result", &recipient).unwrap();
+        let result = ReverseOnionFrameV1::result(&claim, &lease,
+            &encode_onion_sealed_response(&reply).unwrap(), NOW + 600, NOW + 1, &recipient).unwrap();
+        queue.complete(&connection, &issued, &result.encode(), NOW + 1, |context, bytes| {
+            let claim = ReverseOnionFrameV1::decode_for_recovery(context.claim_frame())
+                .map_err(|_| ReverseOnionQueueError::Rejected)?;
+            let lease = ReverseOnionFrameV1::decode_for_recovery(context.lease_frame())
+                .map_err(|_| ReverseOnionQueueError::Rejected)?;
+            let result = ReverseOnionFrameV1::decode_for_recovery(bytes)
+                .map_err(|_| ReverseOnionQueueError::Rejected)?;
+            result.verify_result(&claim, &lease, context.route_deadline(), NOW + 1)
+                .map_err(|_| ReverseOnionQueueError::Rejected)?;
+            Ok(result.commitment())
+        }).unwrap();
+        let snapshot = queue.lookup_source(&connection, source.public_key_bytes(), [2; 16],
+            [4; 32], NOW + 2).unwrap().unwrap();
+        let stored_claim = ReverseOnionFrameV1::decode_for_recovery(snapshot.claim_frame().unwrap()).unwrap();
+        let stored_lease = ReverseOnionFrameV1::decode_for_recovery(snapshot.lease_frame().unwrap()).unwrap();
+        let stored_result = ReverseOnionFrameV1::decode_for_recovery(snapshot.result_frame().unwrap()).unwrap();
+        assert_eq!(stored_lease.immediate_recipient(), snapshot.immediate_recipient());
+        let queries: Vec<_> = [SourceEvidencePartV1::Claim, SourceEvidencePartV1::Lease,
+            SourceEvidencePartV1::Result].into_iter().map(|part|
+                ReverseOnionSourceQueryV1::sign(&source, relay.public_key_bytes(), snapshot.route_id(),
+                    snapshot.request_commitment(), part, [7; 32], NOW + 2, NOW + 20).unwrap()).collect();
+        let responses: Vec<_> = queries.iter().map(|query| {
+            let authority = query.verify_binding(snapshot.source_node_id(), relay.public_key_bytes(),
+                snapshot.route_id(), snapshot.request_commitment(), NOW + 2).unwrap();
+            let response = ReverseOnionSourceEvidenceV1::available(&authority, &stored_claim,
+                &stored_lease, &stored_result, snapshot.route_deadline(), NOW + 2, NOW + 20, &relay).unwrap();
+            ReverseOnionSourceEvidenceV1::decode(&response.encode()).unwrap()
+        }).collect();
+        let parts: Vec<_> = responses.iter().zip(&queries).map(|(response, query)|
+            response.verify_for_query(query, NOW + 2).unwrap()).collect();
+        let verified = VerifiedSourceEvidenceChain::verify([&parts[0], &parts[1], &parts[2]],
+            snapshot.route_deadline(), NOW + 2).unwrap();
+        assert_eq!(verified.result().encode(), result.encode());
+    }
+
     // [REVERSE-ONION-QUEUE-REGRESSIONS 2026-10-04 by Codex] These fixtures
-    // are opaque commitments/frames only; no route, identity, or plaintext
-    // payload is represented.
+    // below use opaque structural placeholders. The separate source snapshot
+    // interoperability fixture above uses actual core-signed frames.
     fn limits(max_items: u64, lease_max_secs: u64, recovery_retention_secs: u64) -> ReverseOnionQueueLimits {
         ReverseOnionQueueLimits::new(
             max_items,
@@ -2426,7 +2675,9 @@ mod tests {
 
     #[test]
     fn source_snapshot_is_exact_and_distinguishes_partial_from_complete() {
-        let (queue, connection) = initialized_queue(4, 60, 120);
+        // [REVERSE-ONION-SOURCE-INDEX 2026-10-04 by Codex] The admitted
+        // deadline must fit the fixture's actual configured route window.
+        let (queue, connection) = initialized_queue(4, 600, 120);
         let item = item(60, 200);
         queue.enqueue(&connection, &item, 100).unwrap();
         let partial = queue
@@ -2503,7 +2754,7 @@ mod tests {
 
     #[test]
     fn source_lookup_rejects_duplicate_source_tuple_fail_closed() {
-        let (queue, connection) = initialized_queue(4, 60, 120);
+        let (queue, connection) = initialized_queue(4, 600, 120);
         let item = item(71, 300);
         queue.enqueue(&connection, &item, 100).unwrap();
         let duplicate = ReverseOnionQueueItem::new(
@@ -2532,8 +2783,8 @@ mod tests {
     }
 
     #[test]
-    fn source_lookup_rejects_clock_rollback_and_invalid_persisted_source() {
-        let (queue, connection) = initialized_queue(4, 60, 120);
+    fn source_lookup_rejects_clock_rollback_and_startup_audits_unmatched_corruption() {
+        let (queue, connection) = initialized_queue(4, 600, 120);
         let item = item(80, 300);
         queue.enqueue(&connection, &item, 100).unwrap();
         queue.cleanup(&connection, 200).unwrap();
@@ -2565,21 +2816,21 @@ mod tests {
                 params![vec![1u8; 31], item.queue_key.as_slice()],
             )
             .unwrap();
-        assert!(matches!(
-            queue.lookup_source(&connection, source_node_id(), item.route_id, item.request_commitment, 200),
-            Err(ReverseOnionQueueError::Corrupt)
-        ));
+        // A malformed source no longer matches this exact tuple. Hot reads
+        // return no data; startup/maintenance, not unrelated reads, audit it.
+        assert!(queue.lookup_source(&connection, source_node_id(), item.route_id,
+            item.request_commitment, 200).unwrap().is_none());
+        assert!(matches!(queue.initialize(&connection), Err(ReverseOnionQueueError::Corrupt)));
         connection
             .lock()
             .execute(
                 &format!("UPDATE {TABLE} SET source_node_id = ?1 WHERE queue_key = ?2"),
-                params![vec![1u8; 32], item.queue_key.as_slice()],
+                params![vec![0u8; 32], item.queue_key.as_slice()],
             )
             .unwrap();
-        assert!(matches!(
-            queue.lookup_source(&connection, source_node_id(), item.route_id, item.request_commitment, 200),
-            Err(ReverseOnionQueueError::Corrupt)
-        ));
+        assert!(queue.lookup_source(&connection, source_node_id(), item.route_id,
+            item.request_commitment, 200).unwrap().is_none());
+        assert!(matches!(queue.initialize(&connection), Err(ReverseOnionQueueError::Corrupt)));
     }
 
     #[test]
