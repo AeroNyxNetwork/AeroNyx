@@ -540,10 +540,14 @@ use aeronyx_core::protocol::chat::{
     BlindRelaySuccessReceipt, ChatEnvelope, BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION,
 };
 use aeronyx_core::protocol::codec::encode_data_packet;
-use aeronyx_core::protocol::discovery::{NodeProtocolFeature, SignedNodeDescriptor};
+use aeronyx_core::protocol::discovery::{
+    NodeProtocolFeature, SignedNodeDescriptor, SignedPrivateOnionRecipientAuthorizationV1,
+};
 use aeronyx_core::protocol::memchain::MEMCHAIN_MAGIC;
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
-use aeronyx_core::protocol::onion::{is_onion_blob, try_open_onion_layer, OnionRoutePurpose};
+use aeronyx_core::protocol::onion::{
+    is_onion_blob, try_open_onion_layer, OnionRoutePurpose, VerifiedOnionRoute,
+};
 use aeronyx_core::protocol::{
     decode_blind_vault_frame, is_blind_vault_frame, is_onion_reply_request, BlindVaultFrame,
     BlindVaultPutRequest, DataPacket, NodeCapability, OnionReplyProofMode,
@@ -607,6 +611,10 @@ use crate::services::{
     BlindVaultPutFailureClass, BlindVaultServiceError, ChatRelayService, Session, SessionManager,
     SharedBlindVaultService,
 };
+use crate::services::reverse_onion_queue::{
+    ReverseOnionQueueAdmission, ReverseOnionQueueItem,
+};
+use crate::services::reverse_onion_queue_db::{ReverseOnionQueueDb, ReverseOnionQueueDbError};
 
 mod outbound_transport;
 use outbound_transport::{
@@ -745,6 +753,178 @@ const BLIND_RELAY_MAX_ENVELOPE_AGE_SECS: u64 = 10 * 60;
 
 /// Small clock-skew allowance for peers whose clocks run slightly ahead.
 const BLIND_RELAY_MAX_FUTURE_SKEW_SECS: u64 = 120;
+
+/// Trusted, source-local admission for the one supported private hop shape
+/// S -> local relay R -> configured private recipient P.
+///
+/// [PRIVATE-RECIPIENT-ADMISSION 2026-10-04 by Codex] This capability is never
+/// decoded from a peer request. Startup must construct it from configured,
+/// authenticated R/P descriptors and P-signed authorization; ordinary public
+/// relay remains unchanged when it is `None`.
+#[derive(Clone)]
+pub(crate) struct PrivateBlindRelayAdmission {
+    local_relay_node_id: [u8; 32],
+    relay_descriptor: SignedNodeDescriptor,
+    recipient_descriptor: SignedNodeDescriptor,
+    authorization: SignedPrivateOnionRecipientAuthorizationV1,
+    purpose: OnionRoutePurpose,
+    allowed_sources: Arc<[[u8; 32]]>,
+    queue: Arc<ReverseOnionQueueDb>,
+    queue_admission: Arc<Semaphore>,
+    authority_commitment: [u8; 32],
+    route_cap_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum PrivateBlindRelayAdmissionError {
+    #[error("private recipient admission rejected")]
+    Rejected,
+}
+
+impl PrivateBlindRelayAdmission {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        local_relay_node_id: [u8; 32],
+        relay_descriptor: SignedNodeDescriptor,
+        recipient_descriptor: SignedNodeDescriptor,
+        authorization: SignedPrivateOnionRecipientAuthorizationV1,
+        purpose: OnionRoutePurpose,
+        allowed_sources: Vec<[u8; 32]>,
+        queue: Arc<ReverseOnionQueueDb>,
+        queue_max_in_flight: usize,
+        route_cap_secs: u64,
+        now: u64,
+    ) -> Result<Self, PrivateBlindRelayAdmissionError> {
+        if local_relay_node_id == [0; 32]
+            || relay_descriptor.node_id() != local_relay_node_id
+            || recipient_descriptor.node_id() == [0; 32]
+            || recipient_descriptor.node_id() == local_relay_node_id
+            || recipient_descriptor.descriptor.public_endpoint.is_some()
+            || allowed_sources.is_empty()
+            || queue_max_in_flight == 0
+            || route_cap_secs == 0
+            || purpose != OnionRoutePurpose::BlindVaultPull
+        {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        if relay_descriptor.verify_at(now).is_err()
+            || recipient_descriptor.verify_at(now).is_err()
+            || authorization
+                .verify_at(
+                    &relay_descriptor,
+                    &recipient_descriptor,
+                    purpose.as_str(),
+                    now,
+                )
+                .is_err()
+        {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        let mut authority_hasher = Sha256::new();
+        authority_hasher.update(b"AeroNyx-PrivateBlindRelay-Admission-v1");
+        authority_hasher.update(purpose.as_str().as_bytes());
+        authority_hasher.update(
+            relay_descriptor
+                .encode_canonical()
+                .map_err(|_| PrivateBlindRelayAdmissionError::Rejected)?,
+        );
+        authority_hasher.update(
+            recipient_descriptor
+                .encode_canonical()
+                .map_err(|_| PrivateBlindRelayAdmissionError::Rejected)?,
+        );
+        authority_hasher.update(
+            authorization
+                .encode_canonical()
+                .map_err(|_| PrivateBlindRelayAdmissionError::Rejected)?,
+        );
+        let authority_commitment: [u8; 32] = authority_hasher.finalize().into();
+        for source in &allowed_sources {
+            if *source == [0; 32]
+                || *source == local_relay_node_id
+                || *source == recipient_descriptor.node_id()
+                || VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                    *source,
+                    &relay_descriptor,
+                    &recipient_descriptor,
+                    &authorization,
+                    purpose,
+                    now,
+                )
+                .is_err()
+            {
+                return Err(PrivateBlindRelayAdmissionError::Rejected);
+            }
+        }
+        Ok(Self {
+            local_relay_node_id,
+            relay_descriptor,
+            recipient_descriptor,
+            authorization,
+            purpose,
+            allowed_sources: allowed_sources.into(),
+            queue,
+            queue_admission: Arc::new(Semaphore::new(queue_max_in_flight)),
+            authority_commitment,
+            route_cap_secs,
+        })
+    }
+
+    pub(crate) fn recipient_node_id(&self) -> [u8; 32] {
+        self.recipient_descriptor.node_id()
+    }
+
+    pub(crate) fn source_allowed(&self, source: [u8; 32]) -> bool {
+        self.allowed_sources.iter().any(|allowed| *allowed == source)
+    }
+
+    pub(crate) fn route_deadline(
+        &self,
+        envelope_timestamp: u64,
+        now: u64,
+    ) -> Result<u64, PrivateBlindRelayAdmissionError> {
+        let freshness = envelope_timestamp
+            .checked_add(BLIND_RELAY_MAX_ENVELOPE_AGE_SECS)
+            .ok_or(PrivateBlindRelayAdmissionError::Rejected)?;
+        let local_cap = envelope_timestamp
+            .checked_add(self.route_cap_secs)
+            .ok_or(PrivateBlindRelayAdmissionError::Rejected)?;
+        let deadline = self
+            .authorization
+            .expires_at()
+            .min(self.relay_descriptor.descriptor.expires_at)
+            .min(self.recipient_descriptor.descriptor.expires_at)
+            .min(freshness)
+            .min(local_cap);
+        if envelope_timestamp >= deadline || deadline <= now {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        Ok(deadline)
+    }
+
+    pub(crate) fn queue(&self) -> &Arc<ReverseOnionQueueDb> {
+        &self.queue
+    }
+
+    pub(crate) fn try_queue_permit(&self) -> Result<OwnedSemaphorePermit, PrivateBlindRelayAdmissionError> {
+        self.queue_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| PrivateBlindRelayAdmissionError::Rejected)
+    }
+
+    pub(crate) fn local_relay_node_id(&self) -> [u8; 32] {
+        self.local_relay_node_id
+    }
+
+    pub(crate) fn authority_commitment(&self) -> [u8; 32] {
+        self.authority_commitment
+    }
+
+    pub(crate) fn purpose(&self) -> OnionRoutePurpose {
+        self.purpose
+    }
+}
 // ============================================
 // State / Request / Response Types
 // ============================================
@@ -756,6 +936,7 @@ struct ChatPeerState {
     /// terminal frames. Absence is fail-closed and never falls back to chat.
     blind_vault: Option<SharedBlindVaultService>,
     anonymous_mailbox: Option<Arc<dyn AnonymousMailboxCustodyRepository>>,
+    private_recipient_admission: Option<Arc<PrivateBlindRelayAdmission>>,
     sessions: Arc<SessionManager>,
     udp: Arc<UdpTransport>,
     peer_store: Arc<PeerStore>,
@@ -1756,7 +1937,7 @@ use blind_relay::authenticate_peer_blind_relay_request;
 use blind_relay::authenticate_peer_blind_relay_request_with_admission;
 use blind_relay::authenticate_peer_blind_relay_request_with_permits;
 use blind_relay::begin_blind_relay_route;
-use blind_relay::blind_relay_authenticated_request_commitment;
+pub(crate) use blind_relay::blind_relay_authenticated_request_commitment;
 use blind_relay::blind_relay_crypto_admission;
 use blind_relay::blind_relay_crypto_capacity;
 use blind_relay::blind_relay_failure_response;
@@ -1847,6 +2028,7 @@ pub fn build_chat_peer_router(
         http_client,
         blind_vault,
         None,
+        None,
     )
 }
 
@@ -1861,6 +2043,33 @@ pub fn build_chat_peer_router_with_anonymous_mailbox(
     http_client: Arc<reqwest::Client>,
     blind_vault: Option<SharedBlindVaultService>,
     anonymous_mailbox: Option<Arc<dyn AnonymousMailboxCustodyRepository>>,
+) -> Router {
+    build_chat_peer_router_with_private_recipient_admission(
+        chat_relay,
+        sessions,
+        udp,
+        peer_store,
+        node_identity,
+        http_client,
+        blind_vault,
+        anonymous_mailbox,
+        None,
+    )
+}
+
+/// Builds peer routes with an optional trusted direct S -> R -> private-P
+/// admission capability. Existing callers remain default-off via the builder
+/// above; no wire field or generic endpoint rule opts this path in.
+pub(crate) fn build_chat_peer_router_with_private_recipient_admission(
+    chat_relay: Option<Arc<ChatRelayService>>,
+    sessions: Arc<SessionManager>,
+    udp: Arc<UdpTransport>,
+    peer_store: Arc<PeerStore>,
+    node_identity: Arc<IdentityKeyPair>,
+    http_client: Arc<reqwest::Client>,
+    blind_vault: Option<SharedBlindVaultService>,
+    anonymous_mailbox: Option<Arc<dyn AnonymousMailboxCustodyRepository>>,
+    private_recipient_admission: Option<Arc<PrivateBlindRelayAdmission>>,
 ) -> Router {
     let peer_relay_requests_per_minute = chat_relay
         .as_ref()
@@ -1879,6 +2088,7 @@ pub fn build_chat_peer_router_with_anonymous_mailbox(
         chat_relay,
         blind_vault,
         anonymous_mailbox,
+        private_recipient_admission,
         sessions,
         udp,
         peer_store,
@@ -2060,12 +2270,17 @@ mod tests {
 
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::blind_vault::{
-        BlindVaultAdmissionTicket, BlindVaultLeaseAdmissionRequest,
+        BlindVaultAdmissionTicket, BlindVaultLeaseAdmissionRequest, BlindVaultOnionPullSession,
+        BlindVaultPullRequest, BLIND_VAULT_PROTOCOL_VERSION,
     };
     use aeronyx_core::protocol::chat::ChatContentType;
     use aeronyx_core::protocol::{
         encode_blind_vault_frame, BlindVaultFrame, BlindVaultLeaseCreateRequest,
         BlindVaultPutRequest, NodeCapability, NodeCapacity, NodeDescriptor, SignedNodeDescriptor,
+    };
+    use aeronyx_core::protocol::discovery::SignedPrivateOnionRecipientAuthorizationV1;
+    use aeronyx_core::protocol::onion::{
+        open_onion_layer, OnionRoutePurpose, VerifiedOnionRoute,
     };
     use aeronyx_transport::UdpTransport;
     use axum::body::{to_bytes, Body};
@@ -2283,5 +2498,96 @@ mod tests {
             source.contains("let reason = error.reason_bucket()"),
             "store failures should use service-owned stable reason buckets"
         );
+    }
+
+    #[test]
+    fn private_pull_core_shape_is_one_route_and_relay_signed() {
+        // [PRIVATE-BLIND-VAULT-PULL-RELAY-FIXTURE 2026-10-04 by Codex]
+        // This is the real core private Pull shape: one route id, no optional
+        // onward carrier, and R re-signs the peeled ttl=1 envelope.
+        const NOW: u64 = 1_800_000_000;
+        let source = IdentityKeyPair::from_bytes(&[0x91; 32]).unwrap();
+        let relay = IdentityKeyPair::from_bytes(&[0x92; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[0x93; 32]).unwrap();
+        let purpose = OnionRoutePurpose::BlindVaultPull;
+        let mut relay_body = NodeDescriptor::new(
+            relay.public_key_bytes(),
+            1,
+            NOW - 1,
+            NOW + 10_000,
+            "test",
+        )
+        .with_x25519_kem(relay.x25519_public_key_bytes())
+        .with_protocol_features(purpose.required_path_protocol_features().iter().copied());
+        relay_body.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
+        relay_body.public_endpoint = Some("https://relay.invalid".to_owned());
+        let mut recipient_body = NodeDescriptor::new(
+            recipient.public_key_bytes(),
+            1,
+            NOW - 1,
+            NOW + 10_000,
+            "test",
+        )
+        .with_x25519_kem(recipient.x25519_public_key_bytes())
+        .with_protocol_features(
+            purpose
+                .required_terminal_protocol_features()
+                .iter()
+                .copied(),
+        );
+        recipient_body.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica];
+        recipient_body.public_endpoint = None;
+        let relay_descriptor = SignedNodeDescriptor::sign(relay_body, &relay).unwrap();
+        let recipient_descriptor = SignedNodeDescriptor::sign(recipient_body, &recipient).unwrap();
+        let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &relay_descriptor,
+            &recipient_descriptor,
+            purpose.as_str(),
+            NOW,
+            NOW + 9_000,
+            &recipient,
+        )
+        .unwrap();
+        let route = VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+            source.public_key_bytes(),
+            &relay_descriptor,
+            &recipient_descriptor,
+            &authorization,
+            purpose,
+            NOW,
+        )
+        .unwrap();
+        let (terminal, _) = BlindVaultOnionPullSession::prepare(
+            [0x94; 16],
+            recipient.public_key_bytes(),
+            BlindVaultPullRequest {
+                version: BLIND_VAULT_PROTOCOL_VERSION,
+                lease_id: [0x95; 32],
+                read_capability: [0x96; 32],
+                continuation_cursor: Vec::new(),
+                limit: 1,
+            },
+        )
+        .unwrap();
+        let envelope = route
+            .build_envelope(&terminal, [0x94; 16], NOW, &source)
+            .unwrap();
+        let (relay_secret, _) = relay.to_x25519();
+        let peeled = open_onion_layer(&envelope.encrypted_blob, &relay_secret).unwrap();
+        assert_eq!(envelope.route_id, [0x94; 16]);
+        assert_eq!(envelope.ttl, 2);
+        assert_eq!(peeled.next_hop, Some(recipient.public_key_bytes()));
+        let forwarded = build_forwarded_onion_envelope_from_seed(
+            BlindRelayForwardSeed::from(&envelope),
+            recipient.public_key_bytes(),
+            peeled.inner,
+            &relay,
+        );
+        assert_eq!(forwarded.route_id, envelope.route_id);
+        assert_eq!(forwarded.timestamp, envelope.timestamp);
+        assert_eq!(forwarded.ttl, 1);
+        forwarded
+            .verify_signature_from(&IdentityPublicKey::from_bytes(&relay.public_key_bytes()).unwrap())
+            .unwrap();
     }
 }
