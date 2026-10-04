@@ -65,7 +65,11 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.72.0-CoreBuildBoundary - Restored the explicit onion
+//! Last Modified: v1.73.0-SourceReservationSeal - Exported purpose-fixed local
+//! reservation sealing, not workflow readiness or dispatch authority.
+//! [SOURCE-RESERVATION-SEAL 2026-10-04 by Codex] Public opaque local seal/open
+//! boundary with fixed private-body and container limits; generic helpers stay private.
+//! v1.72.0-CoreBuildBoundary - Restored the explicit onion
 //! purpose dependency required by the dispatch contract.
 //! v1.71.0-TotalRuntimeStateGate - Removed the terminal runtime
 //! panic branch in favor of exhaustive typed state handling.
@@ -309,6 +313,13 @@ pub use recovery::{
 pub use recovery_loader::{
     load_blind_vault_replica_recovery, BlindVaultReplicaLoadedRecovery,
     BlindVaultReplicaRecoveryLoadError,
+};
+// [SOURCE-RESERVATION-SEAL 2026-10-04 by Codex] Narrow source-local facade;
+// do not export the caller-configurable identity-bound container helpers.
+pub use sealed_local::{
+    open_blind_vault_source_reservation, seal_blind_vault_source_reservation,
+    BlindVaultSourceReservationSealError, MAX_BLIND_VAULT_SOURCE_RESERVATION_BODY_BYTES,
+    MAX_BLIND_VAULT_SOURCE_RESERVATION_SEALED_BYTES,
 };
 
 use std::fmt;
