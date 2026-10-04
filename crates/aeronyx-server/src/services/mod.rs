@@ -292,6 +292,12 @@ mod chat_relay_verified_submit;
 mod chat_relay_verified_submit_coordinator;
 mod chat_relay_verified_submit_store;
 pub mod deny_list;
+// [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] No constructor side effects;
+// source admission and queue HTTP composition remain separate milestones.
+pub(crate) mod reverse_onion_queue;
+pub(crate) mod reverse_onion_queue_db;
+pub(crate) mod reverse_onion_recipient;
+pub(crate) mod reverse_onion_source;
 // [PERMISSIONLESS-ENDPOINT-VERIFICATION 2026-09-24 by Codex] Bounded,
 // composition-only challenge issuance and one-time proof consumption.
 pub mod directory_chain;

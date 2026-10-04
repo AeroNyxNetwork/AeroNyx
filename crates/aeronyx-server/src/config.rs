@@ -1814,6 +1814,10 @@ impl Default for DiscoveryConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Intermediate,
+    /// recipient-only composition. Queue admission is not enabled by this field.
+    #[serde(default)]
+    pub reverse_onion: crate::config_reverse_onion::ReverseOnionConfig,
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
@@ -1864,6 +1868,25 @@ impl ServerConfig {
     /// Validate all sub-configs in dependency order.
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
+        // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Reject incomplete
+        // queue composition before any startup side effects, even if paths exist.
+        if self.reverse_onion.queue.enabled {
+            return Err(ServerError::config_invalid("reverse_onion", "queue admission composition unavailable"));
+        }
+        self.reverse_onion.validate()?;
+        if self.reverse_onion.recipient.enabled {
+            if !self.blind_vault.enabled || !self.blind_vault.public_api_enabled {
+                return Err(ServerError::config_invalid("reverse_onion", "recipient requires mounted terminal capability"));
+            }
+            let path = self.reverse_onion.recipient.state_db_path.trim();
+            if [self.memchain.db_path.as_str(), self.memchain.chat_relay.db_path.as_str(),
+                self.blind_vault.db_path.as_str(), self.reverse_onion.queue.db_path.as_str()]
+                .into_iter().any(|other| !other.is_empty() && other.trim() == path)
+                || self.discovery.directory_chain_path.as_deref().is_some_and(|other| other.trim() == path)
+            {
+                return Err(ServerError::config_invalid("reverse_onion", "recipient requires a dedicated private database"));
+            }
+        }
         self.vpn.validate()?;
         self.tun.validate()?;
         self.limits.validate()?;
@@ -2012,6 +2035,7 @@ impl ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            reverse_onion: crate::config_reverse_onion::ReverseOnionConfig::default(),
             network: NetworkConfig::default(),
             vpn: VpnConfig::default(),
             tun: TunConfig::default(),
@@ -2034,6 +2058,35 @@ impl Default for ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Authored, unexecuted.
+    #[test]
+    fn reverse_recipient_omitted_config_stays_disabled_and_queue_cannot_opt_in() {
+        let config: ServerConfig = toml::from_str("").unwrap();
+        assert!(!config.reverse_onion.recipient.enabled);
+        assert!(!config.reverse_onion.queue.enabled);
+        let mut queue = ServerConfig::default();
+        queue.reverse_onion.queue.enabled = true;
+        assert!(queue.validate().is_err());
+        let mut recipient = ServerConfig::default();
+        recipient.reverse_onion.recipient.enabled = true;
+        assert!(recipient.validate().is_err());
+    }
+
+    #[test]
+    fn reverse_recipient_missing_terminal_and_db_collision_fail_closed() {
+        let mut config = ServerConfig::default();
+        config.reverse_onion.recipient.enabled = true;
+        config.reverse_onion.recipient.relay_node_id = hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[41; 32]).unwrap().public_key_bytes());
+        config.reverse_onion.recipient.relay_endpoint = "https://8.8.8.8".into();
+        config.reverse_onion.recipient.state_db_path = "/private/tmp/recipient-test.sqlite".into();
+        assert!(config.validate().is_err());
+        config.blind_vault.enabled = true;
+        config.blind_vault.public_api_enabled = true;
+        config.blind_vault.db_path = config.reverse_onion.recipient.state_db_path.clone();
+        assert!(config.validate().is_err());
+    }
 
     // ── Full-stack default validation ─────────────────────────────────────
 

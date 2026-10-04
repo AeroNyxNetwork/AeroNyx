@@ -484,6 +484,10 @@ mod tests {
 
 // ── Core MPI module (state, auth, router) ──
 pub mod mpi;
+// [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Compile private capabilities;
+// registration here mounts no HTTP route. Queue handlers remain unmounted.
+pub(crate) mod reverse_onion;
+pub(crate) mod reverse_onion_terminal;
 // ── Handler modules ──
 pub mod mpi_graph_handlers;
 pub mod mpi_handlers;

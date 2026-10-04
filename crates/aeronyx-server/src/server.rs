@@ -1684,6 +1684,9 @@ struct AnonymousMailboxSourceRuntime {
 }
 
 pub struct Server {
+    // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Never placed in the
+    // generic abortable task registry. Disabled mode has no lifecycle object.
+    reverse_recipient: Option<Arc<reverse_onion_runtime::RecipientServerLifecycle>>,
     config: ServerConfig,
     identity: IdentityKeyPair,
     config_path: Option<PathBuf>,
@@ -1871,6 +1874,8 @@ impl Server {
             config.discovery.custody_audit_witness_max_age_secs,
         ));
         Self {
+            reverse_recipient: config.reverse_onion.recipient.enabled
+                .then(|| Arc::new(reverse_onion_runtime::RecipientServerLifecycle::new())),
             config,
             identity,
             config_path,
@@ -1881,6 +1886,33 @@ impl Server {
     }
 
     pub async fn run(&self) -> Result<()> {
+        if self.config.reverse_onion.queue.enabled || self.config.reverse_onion.recipient.enabled {
+            self.config.validate()?;
+        }
+        if self.config.reverse_onion.recipient.enabled
+            && self.config.reverse_onion.recipient.relay_node_id.eq_ignore_ascii_case(&hex::encode(self.identity.public_key_bytes()))
+        { return Err(ServerError::startup_failed("Recipient relay identity must differ from local identity")); }
+        // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] A cancelled public
+        // startup waiter requests stop, never drops the owned startup stack.
+        // That stack retains registry/dependencies through explicit worker drain.
+        let Some(lifecycle) = self.reverse_recipient.as_ref() else {
+            return self.run_owned().await;
+        };
+        if lifecycle.active.swap(true, Ordering::SeqCst) {
+            return Err(ServerError::startup_failed("Recipient lifecycle already started"));
+        }
+        let owner = Self { config: self.config.clone(), identity: self.identity.clone(),
+            config_path: self.config_path.clone(), shutdown: Arc::clone(&self.shutdown),
+            shutdown_tx: self.shutdown_tx.clone(), custody_witness_runtime: Arc::clone(&self.custody_witness_runtime),
+            reverse_recipient: Some(Arc::clone(lifecycle)) };
+        let cancellation = reverse_onion_runtime::RecipientRunCancellation(Arc::clone(lifecycle));
+        let outcome = tokio::spawn(async move { owner.run_owned().await }).await
+            .map_err(|_| ServerError::startup_failed("Recipient-owned server task failed"));
+        drop(cancellation);
+        outcome?
+    }
+
+    async fn run_owned(&self) -> Result<()> {
         info!("Starting AeroNyx server v{}", env!("CARGO_PKG_VERSION"));
         // [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex] Static config parsing
         // cannot compare trust pins with the public key derived from the
@@ -2404,6 +2436,9 @@ impl Server {
         // infrastructure, not a MemChain side effect. Track whether the rich
         // MemChain branch started it and fall back to the same router without
         // MPI routes when memory services are disabled.
+        // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] All fallible work
+        // after recipient creation returns here before generic dependencies stop.
+        let api_runtime_result: Result<Option<CriticalRuntimeFailure>> = async {
         let mut node_api_started = false;
         if let (Some(ref st), Some(ref vi), Some(ref mp), Some(ref aw)) =
             (&storage, &vector_index, &mempool, &aof_writer)
@@ -2864,10 +2899,30 @@ impl Server {
             if let Some(failure) = take_pre_ready_runtime_failure(&mut critical_failure_rx) {
                 Some(failure)
             } else {
+                if self.reverse_recipient.as_ref().is_some_and(|owner| owner.is_cancelled()) {
+                    return Ok(None);
+                }
+                if let Some(owner) = self.reverse_recipient.as_ref() {
+                    owner.verify_ready().await.map_err(|_| ServerError::startup_failed("Recipient readiness unavailable"))?;
+                }
                 systemd_notifier.ready("AeroNyx privacy node is ready")?;
                 info!("Server started successfully");
-                self.wait_for_shutdown(&mut critical_failure_rx).await
+                if let Some(owner) = self.reverse_recipient.as_ref() {
+                    tokio::select! {
+                        failure = self.wait_for_shutdown(&mut critical_failure_rx) => failure,
+                        _ = owner.cancelled() => None,
+                    }
+                } else { self.wait_for_shutdown(&mut critical_failure_rx).await }
             };
+        Ok(runtime_failure)
+        }.await;
+        // Stop only reverse intake first. Keep peer router dependencies and the
+        // generic task registry alive until worker + adapter + DB drain finishes.
+        let reverse_drain = if let Some(owner) = self.reverse_recipient.as_ref() {
+            owner.drain().await.map_err(|_| ServerError::startup_failed("Recipient drain failed"))
+        } else { Ok(()) };
+        let runtime_failure = api_runtime_result?;
+        reverse_drain?;
         if let Some(failure) = runtime_failure.as_ref() {
             error!(
                 task = failure.task,
@@ -2966,6 +3021,20 @@ impl std::fmt::Debug for Server {
 
 #[cfg(test)]
 mod tests {
+    // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Authored, unexecuted.
+    #[tokio::test]
+    async fn incomplete_reverse_queue_is_rejected_without_starting_server() {
+        let mut config = crate::config::ServerConfig::default();
+        let identity = aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[41; 32]).unwrap();
+        let disabled = super::Server::new(config.clone(), identity.clone(), None);
+        assert!(disabled.reverse_recipient.is_none());
+        config.reverse_onion.queue.enabled = true;
+        let server = super::Server::new(config, identity, None);
+        assert!(server.reverse_recipient.is_none());
+        assert!(server.run().await.is_err());
+        assert!(!server.shutdown.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     use super::data_plane_runtime::{
         client_hello_wire_version_is_supported, handshake_rejection_class, log_handshake_rejection,
         HandshakeRejectionClass,

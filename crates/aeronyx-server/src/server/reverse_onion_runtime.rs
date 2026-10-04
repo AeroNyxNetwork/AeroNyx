@@ -228,8 +228,18 @@ impl ReverseOnionRecipientWorker {
     }
 
     pub(crate) async fn shutdown_and_drain(&self) -> Result<(), RecipientWorkerError> {
+        self.request_stop();
+        self.wait_completion().await
+    }
+
+    // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Supervision may wait
+    // without closing intake; shutdown closes it BEFORE waiting on the joiner.
+    pub(crate) fn request_stop(&self) {
         self.stop.closed.store(true, Ordering::SeqCst);
         self.stop.wake.notify_one();
+    }
+
+    pub(crate) async fn wait_completion(&self) -> Result<(), RecipientWorkerError> {
         let _waiter = self.drain_waiter.lock().await;
         if let Some(result) = *self.finished.lock().map_err(|_| RecipientWorkerError::Unavailable)? {
             return result;
@@ -251,6 +261,68 @@ impl ReverseOnionRecipientWorker {
             }
         }).await
     }
+}
+
+// [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Dedicated ownership outside
+// RuntimeTaskRegistry's abort-on-drop policy. No DB/task is created by new().
+pub(super) struct RecipientServerLifecycle {
+    worker: Mutex<Option<Arc<ReverseOnionRecipientWorker>>>,
+    pub(super) active: AtomicBool,
+    cancelled: AtomicBool,
+    wake: Notify,
+}
+
+impl RecipientServerLifecycle {
+    pub(super) fn new() -> Self {
+        Self { worker: Mutex::new(None), active: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false), wake: Notify::new() }
+    }
+
+    pub(super) fn install(&self, worker: Arc<ReverseOnionRecipientWorker>) -> Result<(), RecipientWorkerError> {
+        let mut slot = self.worker.lock().map_err(|_| RecipientWorkerError::Unavailable)?;
+        if slot.is_some() || !self.active.load(Ordering::SeqCst) {
+            return Err(RecipientWorkerError::Rejected);
+        }
+        if self.cancelled.load(Ordering::SeqCst) { worker.request_stop(); }
+        *slot = Some(worker);
+        Ok(())
+    }
+
+    pub(super) fn request_stop(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Ok(slot) = self.worker.lock() {
+            if let Some(worker) = slot.as_ref() { worker.request_stop(); }
+        }
+        self.wake.notify_one();
+    }
+
+    pub(super) fn is_cancelled(&self) -> bool { self.cancelled.load(Ordering::SeqCst) }
+
+    pub(super) async fn cancelled(&self) {
+        loop {
+            let wake = self.wake.notified();
+            if self.is_cancelled() { return; }
+            wake.await;
+        }
+    }
+
+    pub(super) async fn drain(&self) -> Result<(), RecipientWorkerError> {
+        self.request_stop();
+        let worker = self.worker.lock().map_err(|_| RecipientWorkerError::Unavailable)?.clone();
+        if let Some(worker) = worker { worker.shutdown_and_drain().await?; }
+        Ok(())
+    }
+
+    pub(super) async fn verify_ready(&self) -> Result<(), RecipientWorkerError> {
+        let worker = self.worker.lock().map_err(|_| RecipientWorkerError::Unavailable)?.clone()
+            .ok_or(RecipientWorkerError::Unavailable)?;
+        worker.wait_ready().await
+    }
+}
+
+pub(super) struct RecipientRunCancellation(pub(super) Arc<RecipientServerLifecycle>);
+impl Drop for RecipientRunCancellation {
+    fn drop(&mut self) { self.0.request_stop(); }
 }
 
 impl Drop for ReverseOnionRecipientWorker {
@@ -400,6 +472,43 @@ mod recipient_worker_tests {
     use super::*;
     const NOW: u64 = 1_800_000_000;
 
+    // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Cancelling a startup
+    // waiter closes intake but leaves the owned dependency stack to drain.
+    #[tokio::test]
+    async fn startup_waiter_cancellation_keeps_owned_stack_until_drain() {
+        let owner = Arc::new(RecipientServerLifecycle::new());
+        let held = Arc::new(AtomicBool::new(true));
+        struct Dependency(Arc<AtomicBool>);
+        impl Drop for Dependency { fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); } }
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task_owner = Arc::clone(&owner);
+        let dependency = Dependency(Arc::clone(&held));
+        let task = tokio::spawn(async move {
+            let _dependency = dependency;
+            let _ = opened_tx.send(());
+            task_owner.cancelled().await;
+            release_rx.await.unwrap();
+            task_owner.drain().await.unwrap();
+        });
+        opened_rx.await.unwrap();
+        drop(RecipientRunCancellation(Arc::clone(&owner)));
+        assert!(owner.is_cancelled());
+        assert!(held.load(Ordering::SeqCst));
+        release_tx.send(()).unwrap();
+        task.await.unwrap();
+        assert!(!held.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_without_opened_worker_cannot_claim_ready() {
+        let owner = RecipientServerLifecycle::new();
+        assert_eq!(owner.verify_ready().await, Err(RecipientWorkerError::Unavailable));
+        owner.request_stop();
+        owner.drain().await.unwrap();
+        assert!(owner.is_cancelled());
+    }
+
     // [REVERSE-ONION-RECIPIENT-WORKER 2026-10-04 by Codex] Authored only;
     // no sockets and no manufactured receipt can establish business success.
     #[test]
@@ -464,6 +573,13 @@ mod recipient_worker_tests {
             finished: Mutex::new(None) };
         worker.wait_ready().await.unwrap();
         started_rx.await.unwrap();
+        // A critical-task observer must not stop intake just by waiting.
+        {
+            let completion = worker.wait_completion();
+            tokio::pin!(completion);
+            assert!(futures::poll!(&mut completion).is_pending());
+            assert!(!worker.stop.closed.load(Ordering::SeqCst));
+        }
         {
             let shutdown = worker.shutdown_and_drain();
             tokio::pin!(shutdown);

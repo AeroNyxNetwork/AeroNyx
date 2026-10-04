@@ -282,11 +282,61 @@ impl Server {
         let public_endpoint_proof_ttl_secs =
             self.config.discovery.permissionless_endpoint_proof_ttl_secs;
 
+        // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Construct ONE local
+        // peer router before spawn/readiness. Adapter and ordinary local listener
+        // use clones of this exact router, identity and admission/shared state.
+        let custody_store_opened = local_anonymous_mailbox.is_some();
+        let ticket_terminal_router = build_chat_peer_router_with_anonymous_mailbox(
+            chat_relay.clone(), Arc::clone(&sessions), Arc::clone(&udp),
+            Arc::clone(&peer_store), Arc::clone(&node_identity), Arc::clone(&peer_http_client),
+            blind_vault_public_api_enabled.then(|| blind_vault.clone()).flatten(),
+            local_anonymous_mailbox.map(|store| store as Arc<dyn AnonymousMailboxCustodyRepository>),
+        );
+        let ticket_terminal_wired = custody_store_opened;
+        let reverse_worker = if self.config.reverse_onion.recipient.enabled {
+            let owner = self.reverse_recipient.as_ref().filter(|owner| owner.active.load(Ordering::SeqCst))
+                .ok_or_else(|| ServerError::startup_failed("Recipient requires owned server lifecycle"))?;
+            let mut relay = [0; 32];
+            hex::decode_to_slice(&self.config.reverse_onion.recipient.relay_node_id, &mut relay)
+                .map_err(|_| ServerError::startup_failed("Recipient identity policy unavailable"))?;
+            let adapter = Arc::new(crate::api::reverse_onion_terminal::ReverseOnionTerminalAdapter::new(
+                ticket_terminal_router.clone(), Arc::clone(&node_identity), relay,
+                Duration::from_secs(self.config.reverse_onion.recipient.request_timeout_secs))
+                .map_err(|_| ServerError::startup_failed("Recipient adapter unavailable"))?);
+            let worker = Arc::new(reverse_onion_runtime::ReverseOnionRecipientWorker::start(
+                &self.config.reverse_onion, Arc::clone(&node_identity), adapter)
+                .map_err(|_| ServerError::startup_failed("Recipient worker unavailable"))?);
+            if owner.install(Arc::clone(&worker)).is_err() {
+                let _ = worker.shutdown_and_drain().await;
+                return Err(ServerError::startup_failed("Recipient lifecycle unavailable"));
+            }
+            // On error the outer run-owned funnel drains before task registry
+            // destruction; cancellation of run() cannot cancel this owned await.
+            worker.wait_ready().await
+                .map_err(|_| ServerError::startup_failed("Recipient startup audit failed"))?;
+            Some((worker, Arc::clone(owner)))
+        } else { None };
+
+        let reverse_shutdown_rx = self.config.reverse_onion.recipient.enabled
+            .then(|| self.shutdown_tx.subscribe());
         Ok(tokio::spawn(async move {
             // [RUNTIME-SUPERVISION 2026-07-29 by Codex] Required listeners
             // live in one JoinSet. No listener may outlive or disappear behind
             // a detached task that the process cannot observe.
             let mut listener_tasks = JoinSet::new();
+            // Only the non-stopping observer belongs to the abortable listener
+            // group. The worker is retained by the dedicated server owner.
+            if let Some((worker, owner)) = reverse_worker {
+                listener_tasks.spawn(async move {
+                    let _ = worker.wait_completion().await;
+                    if owner.is_cancelled() {
+                        if let Some(mut rx) = reverse_shutdown_rx { let _ = rx.recv().await; }
+                        return RequiredApiListenerExit { role: "reverse-recipient", address: listen_addr, result: Ok(()) };
+                    }
+                    RequiredApiListenerExit { role: "reverse-recipient", address: listen_addr,
+                        result: Err(std::io::Error::new(std::io::ErrorKind::Other, "Recipient worker stopped")) }
+                });
+            }
             if let Some((public_addr, public_listener)) = public_api_listener {
                 let public_deps = PublicNodeRouterDependencies {
                     peer_store: Arc::clone(&peer_store),
@@ -427,21 +477,6 @@ impl Server {
             // route, so service activity cannot be inferred from storage alone.
             let witness_carrier_route_enabled =
                 directory_chain_store.is_some() && directory_replica_store.is_some();
-            let custody_store_opened = local_anonymous_mailbox.is_some();
-            let ticket_terminal_router = build_chat_peer_router_with_anonymous_mailbox(
-                chat_relay.clone(),
-                Arc::clone(&sessions),
-                udp,
-                Arc::clone(&peer_store),
-                Arc::clone(&node_identity),
-                Arc::clone(&peer_http_client),
-                blind_vault_public_api_enabled
-                    .then(|| blind_vault.clone())
-                    .flatten(),
-                local_anonymous_mailbox
-                    .map(|store| store as Arc<dyn AnonymousMailboxCustodyRepository>),
-            );
-            let ticket_terminal_wired = custody_store_opened;
             let app = axum::Router::new()
                 .merge(build_voice_router(Arc::clone(&sessions)))
                 .merge(chat_blob_router)
