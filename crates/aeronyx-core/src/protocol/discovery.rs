@@ -167,6 +167,8 @@
 //!   targets because the selected target identity is part of the signature.
 //!
 //! ## Last Modified
+//! [PRIVATE-BLIND-VAULT-PULL 2026-10-04 by Codex] Explicit private Pull
+//! authorization policy; canonical V1 transcript and descriptor ABI unchanged.
 //! v0.35.0-OnionBlindVaultEncryptedFailure - Added signed negotiation for
 //! source-only authenticated terminal failure replies
 //! v0.34.0-OnionBlindVaultLeaseInventory - Added signed negotiation for
@@ -1481,6 +1483,8 @@ impl std::fmt::Debug for SignedPrivateOnionRecipientAuthorizationV1 {
 
 impl SignedPrivateOnionRecipientAuthorizationV1 {
     /// Creates a P-signed authorization binding exact R/P descriptor versions.
+    /// Only canonical `anonymous_mailbox_v1` and `blind_vault_pull` purposes
+    /// are admitted. Aliases and other purposes do not grant a private role.
     pub fn new_signed(
         relay: &SignedNodeDescriptor,
         recipient: &SignedNodeDescriptor,
@@ -1491,15 +1495,13 @@ impl SignedPrivateOnionRecipientAuthorizationV1 {
     ) -> Result<Self, CoreError> {
         relay.verify_signature()?;
         recipient.verify_signature()?;
+        validate_private_recipient_purpose(relay, recipient, purpose)?;
         if purpose.is_empty()
             || purpose.len() > MAX_PRIVATE_ONION_RECIPIENT_PURPOSE_BYTES
             || issued_at == 0
             || expires_at <= issued_at
             || expires_at - issued_at > MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_LIFETIME_SECS_V1
             || recipient.descriptor.node_id != recipient_identity.public_key_bytes()
-            || !recipient
-                .descriptor
-                .advertises_protocol_feature(NodeProtocolFeature::AnonymousMailboxV1)
         {
             return Err(CoreError::malformed(
                 "private onion recipient authorization claims are invalid",
@@ -1560,6 +1562,7 @@ impl SignedPrivateOnionRecipientAuthorizationV1 {
         }
         relay.verify_at(now)?;
         recipient.verify_at(now)?;
+        validate_private_recipient_purpose(relay, recipient, purpose)?;
         if relay.node_id() != self.relay_node_id
             || recipient.node_id() != self.recipient_node_id
             || !self.relay_descriptor.matches_signed_descriptor(relay)?
@@ -1568,9 +1571,6 @@ impl SignedPrivateOnionRecipientAuthorizationV1 {
             || self.issued_at < recipient.descriptor.issued_at
             || self.expires_at > relay.descriptor.expires_at
             || self.expires_at > recipient.descriptor.expires_at
-            || !recipient
-                .descriptor
-                .advertises_protocol_feature(NodeProtocolFeature::AnonymousMailboxV1)
         {
             return Err(CoreError::malformed(
                 "private onion recipient authorization descriptor mismatch",
@@ -1639,6 +1639,43 @@ impl SignedPrivateOnionRecipientAuthorizationV1 {
         bytes.extend_from_slice(&self.expires_at.to_le_bytes());
         bytes
     }
+}
+
+// [PRIVATE-BLIND-VAULT-PULL 2026-10-04 by Codex] Shared sign/verify policy,
+// not a codec or public-route relaxation. Preserve the mailbox branch's
+// original feature semantics; Pull alone adds its exact existing role/path
+// contract. Do not normalize aliases before hashing an authorization purpose.
+fn validate_private_recipient_purpose(
+    relay: &SignedNodeDescriptor,
+    recipient: &SignedNodeDescriptor,
+    purpose: &str,
+) -> Result<(), CoreError> {
+    use crate::protocol::onion::{OnionRoutePurpose, ONION_FORWARD_HOP_REQUIRED_CAPABILITIES};
+    let purpose = match purpose {
+        "anonymous_mailbox_v1" => OnionRoutePurpose::AnonymousMailboxV1,
+        "blind_vault_pull" => OnionRoutePurpose::BlindVaultPull,
+        _ => return Err(CoreError::malformed("private onion recipient purpose is unsupported")),
+    };
+    let admitted = match purpose {
+        OnionRoutePurpose::AnonymousMailboxV1 => recipient.descriptor
+            .advertises_protocol_feature(NodeProtocolFeature::AnonymousMailboxV1),
+        OnionRoutePurpose::BlindVaultPull => {
+            recipient.descriptor.capabilities.contains(&NodeCapability::ChatRelay)
+                && purpose.specialized_terminal_capability().is_some_and(|capability|
+                    recipient.descriptor.capabilities.contains(&capability))
+                && purpose.required_terminal_protocol_features().iter().all(|feature|
+                    recipient.descriptor.advertises_protocol_feature(*feature))
+                && ONION_FORWARD_HOP_REQUIRED_CAPABILITIES.iter().all(|capability|
+                    relay.descriptor.capabilities.contains(capability))
+                && purpose.required_path_protocol_features().iter().all(|feature|
+                    relay.descriptor.advertises_protocol_feature(*feature))
+        }
+        _ => false,
+    };
+    if !admitted {
+        return Err(CoreError::malformed("private onion recipient purpose features are invalid"));
+    }
+    Ok(())
 }
 
 fn private_onion_recipient_purpose_hash(purpose: &str) -> [u8; 32] {
@@ -4994,6 +5031,29 @@ mod tests {
             &recipient,
         )
         .unwrap();
+        // [PRIVATE-BLIND-VAULT-PULL 2026-10-04 by Codex] Independent legacy
+        // field-order/domain reference: adding Pull must not re-sign mailbox
+        // authorizations with a new transcript or normalized purpose.
+        let mut purpose_digest = Sha256::new();
+        purpose_digest.update(b"AeroNyx-PrivateOnionRecipientPurpose-v1");
+        purpose_digest.update(20u16.to_le_bytes());
+        purpose_digest.update(b"anonymous_mailbox_v1");
+        let purpose_digest: [u8; 32] = purpose_digest.finalize().into();
+        let mut legacy = b"AeroNyx-PrivateOnionRecipientAuthorization-v1".to_vec();
+        legacy.extend_from_slice(&1u16.to_le_bytes());
+        legacy.extend_from_slice(&relay.public_key_bytes());
+        legacy.extend_from_slice(&authorization.relay_descriptor.node_id);
+        legacy.extend_from_slice(&authorization.relay_descriptor.sequence.to_le_bytes());
+        legacy.extend_from_slice(&authorization.relay_descriptor.descriptor_hash);
+        legacy.extend_from_slice(&recipient.public_key_bytes());
+        legacy.extend_from_slice(&authorization.recipient_descriptor.node_id);
+        legacy.extend_from_slice(&authorization.recipient_descriptor.sequence.to_le_bytes());
+        legacy.extend_from_slice(&authorization.recipient_descriptor.descriptor_hash);
+        legacy.extend_from_slice(&purpose_digest);
+        legacy.extend_from_slice(&1_700_000_100u64.to_le_bytes());
+        legacy.extend_from_slice(&1_700_001_000u64.to_le_bytes());
+        assert_eq!(authorization.signing_bytes(), legacy);
+        assert_eq!(authorization.signature, recipient.sign(&legacy));
         authorization
             .verify_at(
                 &relay_descriptor,
@@ -5048,6 +5108,101 @@ mod tests {
                 1_700_000_500,
             )
             .is_err());
+    }
+
+    // [PRIVATE-BLIND-VAULT-PULL 2026-10-04 by Codex] Authored, unexecuted:
+    // re-sign modified descriptor pins so negative checks exercise the policy,
+    // not merely stale descriptor commitments or invalid signatures.
+    #[test]
+    fn private_pull_authorization_requires_exact_roles_features_and_purpose() {
+        use crate::protocol::onion::{OnionRoutePurpose, ONION_FORWARD_HOP_REQUIRED_CAPABILITIES};
+        let purpose = OnionRoutePurpose::BlindVaultPull;
+        let relay = IdentityKeyPair::from_bytes(&[0x51; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[0x52; 32]).unwrap();
+        let mut relay_body = descriptor_for(&relay)
+            .with_protocol_features(purpose.required_path_protocol_features().iter().copied());
+        relay_body.capabilities = ONION_FORWARD_HOP_REQUIRED_CAPABILITIES.to_vec();
+        let mut recipient_body = descriptor_for(&recipient)
+            .with_protocol_features(purpose.required_terminal_protocol_features().iter().copied());
+        recipient_body.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica];
+        recipient_body.public_endpoint = None;
+        let signed_relay = SignedNodeDescriptor::sign(relay_body.clone(), &relay).unwrap();
+        let signed_recipient = SignedNodeDescriptor::sign(recipient_body.clone(), &recipient).unwrap();
+        let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &signed_relay, &signed_recipient, purpose.as_str(),
+            1_700_000_100, 1_700_001_000, &recipient).unwrap();
+        authorization.verify_at(&signed_relay, &signed_recipient,
+            purpose.as_str(), 1_700_000_500).unwrap();
+        assert!(!signed_recipient.descriptor.advertises_protocol_feature(NodeProtocolFeature::AnonymousMailboxV1));
+        let bytes = authorization.encode_canonical().unwrap();
+        let decoded = SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(&bytes).unwrap();
+        assert_eq!(decoded, authorization);
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(&trailing).is_err());
+
+        let reject_policy = |r: NodeDescriptor, p: NodeDescriptor| {
+            let r = SignedNodeDescriptor::sign(r, &relay).unwrap();
+            let p = SignedNodeDescriptor::sign(p, &recipient).unwrap();
+            assert!(SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+                &r, &p, purpose.as_str(), 1_700_000_100, 1_700_001_000, &recipient).is_err());
+            let mut signed_bad_policy = authorization.clone();
+            signed_bad_policy.relay_descriptor = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&r).unwrap();
+            signed_bad_policy.recipient_descriptor = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&p).unwrap();
+            signed_bad_policy.signature = recipient.sign(&signed_bad_policy.signing_bytes());
+            assert!(signed_bad_policy.verify_at(&r, &p, purpose.as_str(), 1_700_000_500).is_err());
+        };
+        for removed in purpose.required_terminal_protocol_features() {
+            let mut p = recipient_body.clone();
+            // with_protocol_features merges metadata; clear the test feature
+            // tokens first, otherwise this would never remove the old token.
+            p.software_version = "test".to_owned();
+            let p = p.with_protocol_features(purpose.required_terminal_protocol_features()
+                .iter().copied().filter(|feature| feature != removed));
+            reject_policy(relay_body.clone(), p);
+        }
+        for removed in purpose.required_path_protocol_features() {
+            let mut r = relay_body.clone();
+            r.software_version = "test".to_owned();
+            let r = r.with_protocol_features(purpose.required_path_protocol_features()
+                .iter().copied().filter(|feature| feature != removed));
+            reject_policy(r, recipient_body.clone());
+        }
+        for removed in [NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica] {
+            let mut p = recipient_body.clone();
+            p.capabilities.retain(|capability| *capability != removed);
+            reject_policy(relay_body.clone(), p);
+        }
+        for removed in ONION_FORWARD_HOP_REQUIRED_CAPABILITIES {
+            let mut r = relay_body.clone();
+            r.capabilities.retain(|capability| *capability != removed);
+            reject_policy(r, recipient_body.clone());
+        }
+        for denied in ["", "blind-vault-pull", "BLIND_VAULT_PULL", "message_relay", "blind_vault_put", "blind_vault_delete"] {
+            assert!(SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+                &signed_relay, &signed_recipient, denied, 1_700_000_100, 1_700_001_000, &recipient).is_err());
+            assert!(authorization.verify_at(&signed_relay, &signed_recipient, denied, 1_700_000_500).is_err());
+        }
+        assert!(SignedPrivateOnionRecipientAuthorizationV1::new_signed(&signed_relay, &signed_recipient,
+            purpose.as_str(), 1_700_000_100, 1_700_001_000, &relay).is_err());
+        assert!(authorization.verify_at(&signed_relay, &signed_recipient, purpose.as_str(), 1_700_001_000).is_err());
+        let mut rotated = recipient_body.clone();
+        rotated.sequence += 1;
+        let rotated = SignedNodeDescriptor::sign(rotated, &recipient).unwrap();
+        assert!(authorization.verify_at(&signed_relay, &rotated, purpose.as_str(), 1_700_000_500).is_err());
+
+        let both = recipient_body.with_protocol_features(purpose.required_terminal_protocol_features()
+            .iter().copied().chain([NodeProtocolFeature::AnonymousMailboxV1]));
+        let both = SignedNodeDescriptor::sign(both, &recipient).unwrap();
+        for original in ["anonymous_mailbox_v1", "blind_vault_pull"] {
+            let auth = SignedPrivateOnionRecipientAuthorizationV1::new_signed(&signed_relay, &both,
+                original, 1_700_000_100, 1_700_001_000, &recipient).unwrap();
+            let other = if original == "anonymous_mailbox_v1" { "blind_vault_pull" } else { "anonymous_mailbox_v1" };
+            assert!(auth.verify_at(&signed_relay, &both, other, 1_700_000_500).is_err());
+            let mut substituted = auth;
+            substituted.purpose_hash = private_onion_recipient_purpose_hash(other);
+            assert!(substituted.verify_at(&signed_relay, &both, other, 1_700_000_500).is_err());
+        }
     }
 
     fn work_policy_descriptor(identity: &IdentityKeyPair) -> NodeDescriptor {

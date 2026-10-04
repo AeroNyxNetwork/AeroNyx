@@ -84,6 +84,8 @@
 //!   operations may inspect the authenticated terminal identity at source.
 //!
 //! ## Last Modified
+//! [PRIVATE-BLIND-VAULT-PULL 2026-10-04 by Codex] Explicit private Pull
+//! role admission reuses existing fixed-class reply features; no codec change.
 //! v1.15.0-ForwardExpectationJournalBinding — Private captured blob hash.
 //! [REVERSE-ONION-TYPED-EXPECTATION 2026-10-04 by Codex] No wire changes.
 //! v1.14.0-ReverseDeliveryContract — Bounded signed adjacent-hop claim/lease/
@@ -522,8 +524,8 @@ pub enum OnionRoutePlanError {
     /// with an ordinary reachable terminal role.
     #[error("private onion recipient has a public endpoint")]
     PrivateRecipientHasPublicEndpoint,
-    /// The private recipient builder is intentionally restricted to AMST.
-    #[error("private onion recipient route requires anonymous mailbox purpose")]
+    /// Only explicit mailbox or fixed-class Pull private roles are admitted.
+    #[error("private onion recipient route requires an explicit supported purpose")]
     PrivateRecipientPurposeRequired,
     /// The signing identity supplied at construction differs from the plan.
     #[error("onion route source identity does not match the verified plan")]
@@ -755,7 +757,9 @@ impl VerifiedOnionRoute {
         purpose: OnionRoutePurpose,
         now: u64,
     ) -> Result<Self, OnionRoutePlanError> {
-        if purpose != OnionRoutePurpose::AnonymousMailboxV1 {
+        // [PRIVATE-BLIND-VAULT-PULL 2026-10-04 by Codex] Explicit allowlist;
+        // this does not authorize generic private Put/Delete/message routing.
+        if !matches!(purpose, OnionRoutePurpose::AnonymousMailboxV1 | OnionRoutePurpose::BlindVaultPull) {
             return Err(OnionRoutePlanError::PrivateRecipientPurposeRequired);
         }
         relay
@@ -790,6 +794,13 @@ impl VerifiedOnionRoute {
                 hop_number: 2,
                 capability: NodeCapability::ChatRelay,
             });
+        }
+        // Pull requires BlindVaultReplica in addition to the base ChatRelay.
+        // For mailbox this is the already-required ChatRelay role.
+        if let Some(capability) = purpose.specialized_terminal_capability() {
+            if !recipient.descriptor.capabilities.contains(&capability) {
+                return Err(OnionRoutePlanError::MissingCapability { hop_number: 2, capability });
+            }
         }
         for feature in purpose.required_terminal_protocol_features() {
             if !recipient.descriptor.advertises_protocol_feature(*feature) {
@@ -1572,6 +1583,139 @@ mod tests {
         descriptor.capabilities = capabilities;
         descriptor = descriptor.with_protocol_features(features.iter().copied());
         SignedNodeDescriptor::sign(descriptor, identity).unwrap()
+    }
+
+    // [PRIVATE-BLIND-VAULT-PULL 2026-10-04 by Codex] Authored, unexecuted.
+    #[test]
+    fn private_pull_builder_enforces_each_role_feature_and_public_boundary() {
+        let source = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap();
+        let relay = IdentityKeyPair::from_bytes(&[0x72; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[0x73; 32]).unwrap();
+        let r = private_route_descriptor(&relay, Some("relay.example:443"),
+            ONION_FORWARD_HOP_REQUIRED_CAPABILITIES.to_vec(), &BLIND_VAULT_LARGE_PULL_PATH_FEATURES);
+        let p = private_route_descriptor(&recipient, None,
+            vec![NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica], &BLIND_VAULT_PULL_FEATURES);
+        let auth = SignedPrivateOnionRecipientAuthorizationV1::new_signed(&r, &p,
+            "blind_vault_pull", 1_700_000_100, 1_700_001_000, &recipient).unwrap();
+        let build = |r: &SignedNodeDescriptor, p: &SignedNodeDescriptor, purpose| {
+            VerifiedOnionRoute::from_signed_private_recipient_descriptors(source.public_key_bytes(),
+                r, p, &auth, purpose, 1_700_000_500)
+        };
+        let route = build(&r, &p, OnionRoutePurpose::BlindVaultPull).unwrap();
+        assert_eq!(route.purpose(), OnionRoutePurpose::BlindVaultPull);
+        assert_eq!(route.hop_count(), 2);
+        assert_eq!(route.valid_until(), 1_700_001_000);
+        assert!(VerifiedOnionRoute::from_signed_descriptors(source.public_key_bytes(),
+            [&r, &p], OnionRoutePurpose::BlindVaultPull, 1_700_000_500).is_err());
+        for removed in BLIND_VAULT_PULL_FEATURES {
+            let features: Vec<_> = BLIND_VAULT_PULL_FEATURES.into_iter().filter(|f| *f != removed).collect();
+            let missing = private_route_descriptor(&recipient, None,
+                vec![NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica], &features);
+            assert!(matches!(build(&r, &missing, OnionRoutePurpose::BlindVaultPull),
+                Err(OnionRoutePlanError::MissingProtocolFeature { hop_number: 2, feature }) if feature == removed));
+        }
+        for removed in BLIND_VAULT_LARGE_PULL_PATH_FEATURES {
+            let features: Vec<_> = BLIND_VAULT_LARGE_PULL_PATH_FEATURES.into_iter().filter(|f| *f != removed).collect();
+            let missing = private_route_descriptor(&relay, Some("relay.example:443"),
+                ONION_FORWARD_HOP_REQUIRED_CAPABILITIES.to_vec(), &features);
+            assert!(matches!(build(&missing, &p, OnionRoutePurpose::BlindVaultPull),
+                Err(OnionRoutePlanError::MissingProtocolFeature { hop_number: 1, feature }) if feature == removed));
+        }
+        for removed in [NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica] {
+            let caps = [NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica].into_iter()
+                .filter(|c| *c != removed).collect();
+            let missing = private_route_descriptor(&recipient, None, caps, &BLIND_VAULT_PULL_FEATURES);
+            assert!(matches!(build(&r, &missing, OnionRoutePurpose::BlindVaultPull),
+                Err(OnionRoutePlanError::MissingCapability { hop_number: 2, capability }) if capability == removed));
+        }
+        for removed in ONION_FORWARD_HOP_REQUIRED_CAPABILITIES {
+            let caps = ONION_FORWARD_HOP_REQUIRED_CAPABILITIES.into_iter().filter(|c| *c != removed).collect();
+            let missing = private_route_descriptor(&relay, Some("relay.example:443"), caps, &BLIND_VAULT_LARGE_PULL_PATH_FEATURES);
+            assert!(matches!(build(&missing, &p, OnionRoutePurpose::BlindVaultPull),
+                Err(OnionRoutePlanError::MissingCapability { hop_number: 1, capability }) if capability == removed));
+        }
+        for purpose in [OnionRoutePurpose::MessageRelay, OnionRoutePurpose::BlindVaultPut,
+            OnionRoutePurpose::BlindVaultDelete, OnionRoutePurpose::BlindVaultLeaseAdmission] {
+            assert!(matches!(build(&r, &p, purpose), Err(OnionRoutePlanError::PrivateRecipientPurposeRequired)));
+        }
+        let public_p = private_route_descriptor(&recipient, Some("recipient.example:443"),
+            vec![NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica], &BLIND_VAULT_PULL_FEATURES);
+        assert!(matches!(build(&r, &public_p, OnionRoutePurpose::BlindVaultPull),
+            Err(OnionRoutePlanError::PrivateRecipientHasPublicEndpoint)));
+    }
+
+    #[test]
+    fn private_pull_fixed_class_chain_verifies_page_signature_and_source_seal() {
+        use crate::crypto::IdentityPublicKey;
+        use crate::protocol::blind_vault::{BlindVaultOnionPullSession, BlindVaultPullRequest,
+            BlindVaultPullResponse, BlindVaultRecoveredObject, BlindVaultFrame,
+            encode_blind_vault_frame, BLIND_VAULT_PROTOCOL_VERSION, BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES};
+        use crate::protocol::onion_reply::{decode_onion_reply_request, encode_onion_sealed_response,
+            seal_onion_reply, OnionReplyProofMode};
+        use reverse_delivery::ReverseOnionFrameV1;
+        use sha2::{Digest, Sha256};
+        const NOW: u64 = 1_700_000_500;
+        const ROUTE: [u8; 16] = [0x31; 16];
+        let source = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap();
+        let relay = IdentityKeyPair::from_bytes(&[0x72; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[0x73; 32]).unwrap();
+        let r = private_route_descriptor(&relay, Some("relay.example:443"),
+            ONION_FORWARD_HOP_REQUIRED_CAPABILITIES.to_vec(), &BLIND_VAULT_LARGE_PULL_PATH_FEATURES);
+        let p = private_route_descriptor(&recipient, None,
+            vec![NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica], &BLIND_VAULT_PULL_FEATURES);
+        let auth = SignedPrivateOnionRecipientAuthorizationV1::new_signed(&r, &p,
+            "blind_vault_pull", NOW, NOW + 500, &recipient).unwrap();
+        let route = VerifiedOnionRoute::from_signed_private_recipient_descriptors(source.public_key_bytes(),
+            &r, &p, &auth, OnionRoutePurpose::BlindVaultPull, NOW).unwrap();
+        let (request, session) = BlindVaultOnionPullSession::prepare(ROUTE, recipient.public_key_bytes(),
+            BlindVaultPullRequest { version: BLIND_VAULT_PROTOCOL_VERSION, lease_id: [7; 32],
+                read_capability: [8; 32], continuation_cursor: vec![], limit: 1 }).unwrap();
+        let restart = session.seal_restart(&source, ROUTE, recipient.public_key_bytes(), &request).unwrap();
+        let (outer, expectation) = route.build_envelope_with_forward_expectation(&request, ROUTE, NOW, &source).unwrap();
+        outer.verify_signature_from(&IdentityPublicKey::from_bytes(&source.public_key_bytes()).unwrap()).unwrap();
+        assert_eq!(outer.ttl, 2);
+        let peeled_r = open_onion_layer(&outer.encrypted_blob, &x25519_secret(&relay)).unwrap();
+        assert_eq!(peeled_r.next_hop, Some(recipient.public_key_bytes()));
+        let retained = crate::protocol::chat::BlindRelayEnvelope { route_id: ROUTE,
+            next_hop: recipient.public_key_bytes(), ttl: outer.ttl - 1, timestamp: outer.timestamp,
+            encrypted_blob: peeled_r.inner, signature: [0; 64] }.sign_with(&relay);
+        expectation.unwrap().verify_relay_produced_envelope(&retained).unwrap();
+        let claim = ReverseOnionFrameV1::claim(relay.public_key_bytes(), [9; 16], NOW, NOW + 30, &recipient).unwrap();
+        let lease = ReverseOnionFrameV1::lease(&claim, &retained, [10; 16], route.valid_until(), NOW, &relay).unwrap();
+        lease.verify_recipient_lease(&claim, relay.public_key_bytes(), recipient.public_key_bytes(), NOW).unwrap();
+        let peeled_p = open_onion_layer(&retained.encrypted_blob, &x25519_secret(&recipient)).unwrap();
+        assert!(peeled_p.next_hop.is_none());
+        assert_eq!(peeled_p.inner, request);
+        let reply_request = decode_onion_reply_request(&request).unwrap();
+        assert_eq!(reply_request.proof_mode(), OnionReplyProofMode::SourceSealedTerminalProof);
+        let ciphertext = vec![0x5a; BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES[0]];
+        let object = BlindVaultRecoveredObject { object_id: [11; 32],
+            ciphertext_commitment: Sha256::digest(&ciphertext).into(), ciphertext,
+            expires_at_ms: (NOW + 1000) * 1000 };
+        let mut page = BlindVaultPullResponse::new([7; 32], vec![object], vec![],
+            (NOW + 1) * 1000, recipient.public_key_bytes());
+        page.sign(&recipient).unwrap();
+        page.validate_and_verify(&IdentityPublicKey::from_bytes(&recipient.public_key_bytes()).unwrap()).unwrap();
+        let encode_reply = |page: BlindVaultPullResponse| {
+            let payload = encode_blind_vault_frame(&BlindVaultFrame::PullResponse(page)).unwrap();
+            encode_onion_sealed_response(&seal_onion_reply(ROUTE, &reply_request, &payload, &recipient).unwrap()).unwrap()
+        };
+        let sealed = encode_reply(page.clone());
+        let result = ReverseOnionFrameV1::result(&claim, &lease, &sealed, route.valid_until(), NOW + 1, &recipient).unwrap();
+        let verified_payload = result.verify_result(&claim, &lease, route.valid_until(), NOW + 1).unwrap();
+        assert_eq!(session.open(verified_payload).unwrap(), page);
+
+        // Test-only restores permit independent negative cases; production
+        // must first commit its one-shot Opening CAS before any restore/open.
+        let restore = || BlindVaultOnionPullSession::restore_restart(&source, &restart,
+            ROUTE, recipient.public_key_bytes(), &request).unwrap();
+        let mut bad_page = page;
+        bad_page.signature[0] ^= 1;
+        // Valid outer source seal does not excuse an invalid inner page.
+        assert!(restore().open(&encode_reply(bad_page)).is_err());
+        let mut bad_seal = sealed;
+        *bad_seal.last_mut().unwrap() ^= 1;
+        assert!(restore().open(&bad_seal).is_err());
     }
 
     #[test]
