@@ -4,6 +4,8 @@
 // Version: 1.0.0-Membership
 //
 // Modification Reason:
+//   [LINUX-TUN-TRAIT-SCOPE 2026-10-04 by Codex] Restore the Linux TUN
+//   trait method scope shared by the extracted session/data-plane children.
 //   [CHILD-SELECTION-GUARD 2026-10-02 by Codex] Require one named successful
 //   child test; preserve intentional crash exit checks independently.
 //   [CHAT-PULL-ROUTE-AUTHORITY 2026-10-01 by Codex] Preserves signed
@@ -1011,6 +1013,10 @@ use aeronyx_core::protocol::{
 use aeronyx_transport::traits::{Transport, TunConfig};
 use aeronyx_transport::UdpTransport;
 
+// [LINUX-TUN-TRAIT-SCOPE 2026-10-04 by Codex] Child modules use super::*;
+// LinuxTun up/name/read/write are trait methods, not inherent methods.
+#[cfg(target_os = "linux")]
+use aeronyx_transport::traits::TunDevice;
 #[cfg(target_os = "linux")]
 use aeronyx_transport::LinuxTun;
 
