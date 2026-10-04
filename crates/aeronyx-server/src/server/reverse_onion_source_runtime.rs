@@ -135,7 +135,9 @@ impl SourcePinnedRelayPolicy {
     /// The journal has already authenticated the retained authorization at its
     /// historical envelope timestamp; this constructor only repeats signature,
     /// role, feature, endpoint, and identity checks without requiring the
-    /// authorization to remain within its original wall-clock window.
+    /// authorization to remain within its original wall-clock window. The
+    /// caller must use this only after journal metadata recovery, which
+    /// authenticates the retained authorization at its historical anchor.
     pub(crate) fn new_for_recovery(
         source: [u8; 32],
         relay: SignedNodeDescriptor,
@@ -157,6 +159,8 @@ impl SourcePinnedRelayPolicy {
             || source == relay.node_id()
             || source == recipient.node_id()
             || relay.node_id() == recipient.node_id()
+            || relay.verify_signature().is_err()
+            || recipient.verify_signature().is_err()
             || !relay
                 .descriptor
                 .capabilities
@@ -187,14 +191,6 @@ impl SourcePinnedRelayPolicy {
         if !peer_endpoint_is_public_ip(endpoint) {
             return Err(SourceRuntimeError::Rejected);
         }
-        authorization
-            .verify_at(
-                &relay,
-                &recipient,
-                OnionRoutePurpose::BlindVaultPull.as_str(),
-                authorization.issued_at(),
-            )
-            .map_err(|_| SourceRuntimeError::Rejected)?;
         Ok(Self {
             source,
             relay,
@@ -463,19 +459,22 @@ impl ReverseOnionSourceRuntime {
             || metadata.relay() != self.policy.relay_id()
             || metadata.recipient() != self.policy.recipient_id()
             || metadata.target() != self.policy.recipient_id()
-            || metadata.recipient_descriptor_commitment() != self.policy.descriptor_commitment()?
-            || metadata.relay_descriptor_commitment() != self.policy.relay_descriptor_commitment()?
         {
             return Err(SourceRuntimeError::Unavailable);
         }
         if observed_at >= metadata.retain_until() {
             return Err(SourceRuntimeError::Expired);
         }
-        self.policy.validate_relay_at(observed_at)?;
         match metadata.phase() {
             SourcePhase::ResultReady => self.open_result(route, observed_at, Arc::clone(&permit)).await,
             SourcePhase::Verified => self.read_verified(route, observed_at, Arc::clone(&permit)).await,
             SourcePhase::Armed | SourcePhase::DispatchAmbiguous => {
+                if metadata.recipient_descriptor_commitment() != self.policy.descriptor_commitment()?
+                    || metadata.relay_descriptor_commitment() != self.policy.relay_descriptor_commitment()?
+                {
+                    return Err(SourceRuntimeError::Unavailable);
+                }
+                self.policy.validate_relay_at(observed_at)?;
                 self.collect_and_open(route, observed_at, Arc::clone(&permit)).await
             }
             SourcePhase::Prepared => Err(SourceRuntimeError::Ambiguous),
@@ -509,6 +508,9 @@ impl ReverseOnionSourceRuntime {
                 .try_acquire_owned()
                 .map_err(|_| SourceRuntimeError::Busy)?,
         );
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(SourceRuntimeError::Stopped);
+        }
         let admission = self.prepare_and_arm(
             request,
             expected,
@@ -540,6 +542,22 @@ impl ReverseOnionSourceRuntime {
         if self.stopped.load(Ordering::Acquire) {
             self.mark_ambiguous(route, observed_now(now), Arc::clone(&permit)).await;
             return Err(SourceRuntimeError::Stopped);
+        }
+        let post_now = observed_now(now);
+        let policy = Arc::clone(&self.policy);
+        let blocking_permit = Arc::clone(&permit);
+        let post_gate = tokio::task::spawn_blocking(move || {
+            let _permit = blocking_permit;
+            if post_now >= _deadline {
+                return Err(SourceRuntimeError::Expired);
+            }
+            policy.validate_at(post_now)
+        })
+        .await
+        .map_err(|_| SourceRuntimeError::Unavailable)?;
+        if let Err(error) = post_gate {
+            self.mark_ambiguous(route, post_now, Arc::clone(&permit)).await;
+            return Err(error);
         }
         let response = match tokio::time::timeout(
             self.timeout,
@@ -599,7 +617,8 @@ impl ReverseOnionSourceRuntime {
         let blocking_permit = Arc::clone(&permit);
         let result = tokio::task::spawn_blocking(move || {
             let _permit = blocking_permit;
-            policy.validate_at(now)?;
+            let admission_now = observed_now(now);
+            policy.validate_at(admission_now)?;
             if request_for_plan.previous_hop_node_id != identity.public_key_bytes()
                 || request_for_plan.envelope.next_hop != policy.relay_id()
             {
@@ -625,11 +644,11 @@ impl ReverseOnionSourceRuntime {
             )
             .map_err(SourceRuntimeError::from)?;
             let phase = journal
-                .prepare(plan, session, now)
+                .prepare(plan, session, admission_now)
                 .map_err(SourceRuntimeError::from)?;
             match phase {
                 SourcePhase::Prepared => {
-                    let dispatch = journal.arm(request_for_plan.envelope.route_id, now)
+                    let dispatch = journal.arm(request_for_plan.envelope.route_id, admission_now)
                         .map_err(SourceRuntimeError::from)?;
                     let url = policy.relay_url(BLIND_RELAY_PATH)?;
                     Ok(SourceAdmission::Send(PreparedDispatch {
@@ -885,11 +904,11 @@ struct PreparedDispatch {
     url: reqwest::Url,
 }
 
-fn observed_now(fallback: u64) -> u64 {
+fn observed_now(_fallback: u64) -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
-        .unwrap_or(fallback)
+        .unwrap_or(u64::MAX)
 }
 
 /// The successful source-side result is intentionally typed; callers cannot
@@ -1039,8 +1058,24 @@ mod tests {
             1_700_000_002,
         )
         .is_ok());
+        let mut wrong_ttl = response.clone();
+        wrong_ttl.ttl_remaining = 0;
+        assert_eq!(
+            verify_success_response(&request, &wrong_ttl, relay.public_key_bytes(), 1_700_000_002),
+            Err(SourceRuntimeError::Ambiguous)
+        );
         let mut stale = response;
-        stale.success_receipt.as_mut().unwrap().accepted_at = 1_700_000_002 - 121;
+        stale.success_receipt = Some(
+            aeronyx_core::protocol::chat::BlindRelaySuccessReceipt::forwarded(
+                &envelope,
+                1,
+                None,
+                None,
+                None,
+                1_700_000_002 - 121,
+                &relay,
+            ),
+        );
         assert_eq!(
             verify_success_response(&request, &stale, relay.public_key_bytes(), 1_700_000_002),
             Err(SourceRuntimeError::Ambiguous)
