@@ -8,6 +8,8 @@
 //! Existing onion/envelope wire, source-sealed replies and SSRF remain unchanged.
 //! Durable queue CAS, quotas, transport admission and source verification remain
 //! mandatory integration boundaries; these pure types perform no I/O.
+//! [RECIPIENT-LEASE-AUTHORITY 2026-10-04 by Codex] Recipient lease proof
+//! authenticates relay execution authority, never the hidden source route.
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -93,7 +95,44 @@ pub struct ReverseOnionFrameV1 {
     signature: [u8; 64],
 }
 
+/// [RECIPIENT-LEASE-AUTHORITY 2026-10-04 by Codex] Borrowed, private-field
+/// proof of a pinned relay's execution lease. No scalar deadline constructor,
+/// serialization, or Debug. It is not a source-route proof or durable arm token.
+/// A retained proof must still pass the journal's fresh execution check.
+pub struct VerifiedRecipientLease<'a> {
+    lease: &'a ReverseOnionFrameV1,
+}
+
+impl VerifiedRecipientLease<'_> {
+    pub fn lease(&self) -> &ReverseOnionFrameV1 { self.lease }
+    pub fn relay_execution_expiry(&self) -> u64 { self.lease.expires_at }
+}
+
 impl ReverseOnionFrameV1 {
+    /// [RECIPIENT-LEASE-AUTHORITY 2026-10-04 by Codex] Fresh acquisition
+    /// only. Claim freshness is checked at lease issuance, not response arrival.
+    /// R admission and S verification must separately enforce source deadlines.
+    /// This API deliberately accepts no caller-provided execution deadline.
+    pub fn verify_recipient_lease(
+        &self,
+        claim: &Self,
+        pinned_relay: [u8; 32],
+        local_recipient: [u8; 32],
+        now: u64,
+    ) -> Result<VerifiedRecipientLease<'_>, ReverseOnionError> {
+        if self.relay != pinned_relay || self.recipient != local_recipient
+            || self.kind != ReverseOnionKindV1::Lease || self.claim_id == [0; 16]
+            || self.route_id == [0; 16] || self.lease_id == [0; 16]
+            || self.issued_at == 0
+        { return Err(ReverseOnionError::Rejected); }
+        claim.verify_claim(pinned_relay, local_recipient, self.issued_at)?;
+        self.verify_at(now)?;
+        // The equal bound here represents R authority only, NOT independent
+        // source-route evidence. Legacy R/S verifier semantics stay unchanged.
+        self.verify_lease_binding(claim, self.expires_at)?;
+        Ok(VerifiedRecipientLease { lease: self })
+    }
+
     /// Sign a one-item poll. Does not allocate queue capacity or grant custody.
     pub fn claim(
         relay: [u8; 32],
@@ -788,6 +827,42 @@ mod tests {
         assert_eq!(restored.commitment(), f.claim.commitment());
         assert_eq!(f.lease.encode()[5], 2);
         assert_eq!(f.result(NOW + 1).0.encode()[5], 3);
+    }
+
+    // [RECIPIENT-LEASE-AUTHORITY 2026-10-04 by Codex] Authored, unexecuted.
+    #[test]
+    fn recipient_authority_is_pinned_fresh_and_not_source_deadline_evidence() {
+        let f = Fixture::new();
+        let proof = f.lease.verify_recipient_lease(&f.claim,
+            f.relay.public_key_bytes(), f.recipient.public_key_bytes(), NOW + 31).unwrap();
+        assert_eq!(proof.relay_execution_expiry(), f.lease.expires_at());
+        assert_eq!(proof.lease().encode(), f.lease.encode());
+        assert!(f.lease.verify_recipient_lease(&f.claim,
+            f.recipient.public_key_bytes(), f.relay.public_key_bytes(), NOW).is_err());
+        assert!(f.lease.verify_recipient_lease(&f.claim,
+            f.relay.public_key_bytes(), f.recipient.public_key_bytes(), NOW + 600).is_err());
+        // Relay authority must not weaken independently enforced R/S bounds.
+        assert!(f.lease.verify_lease(&f.claim, NOW + 599, NOW).is_err());
+        let (result, _) = f.result(NOW + 601);
+        assert!(result.verify_result(&f.claim, &f.lease, NOW + 600, NOW + 601).is_ok());
+    }
+
+    #[test]
+    fn recipient_proof_rejects_wrong_parent_signature_and_zero_identifiers() {
+        let f = Fixture::new();
+        let other = ReverseOnionFrameV1::claim(f.relay.public_key_bytes(),
+            [9; 16], NOW, NOW + 30, &f.recipient).unwrap();
+        assert!(f.lease.verify_recipient_lease(&other,
+            f.relay.public_key_bytes(), f.recipient.public_key_bytes(), NOW).is_err());
+        let mut bad = ReverseOnionFrameV1::decode_for_recovery(&f.lease.encode()).unwrap();
+        bad.signature[0] ^= 1;
+        assert!(bad.verify_recipient_lease(&f.claim,
+            f.relay.public_key_bytes(), f.recipient.public_key_bytes(), NOW).is_err());
+        let mut zero = ReverseOnionFrameV1::decode_for_recovery(&f.lease.encode()).unwrap();
+        zero.lease_id = [0; 16];
+        let zero = zero.signed(&f.relay).unwrap();
+        assert!(zero.verify_recipient_lease(&f.claim,
+            f.relay.public_key_bytes(), f.recipient.public_key_bytes(), NOW).is_err());
     }
 
     #[test]

@@ -12,13 +12,15 @@
 //! Last Modified: v1.1.0 — Nonmutating preflight and observed aggregate fence.
 //! [REVERSE-ONION-RECIPIENT-DB-BOUNDARY 2026-10-04 by Codex] Phase/schema
 //! semantics unchanged; a sampled physical bound is not an OS hard quota.
+//! [RECIPIENT-LEASE-AUTHORITY 2026-10-04 by Codex] Typed relay admission
+//! stores R's execution expiry, not an independently authenticated source route.
 
 use std::path::Path;
 use std::sync::Mutex;
 
 use aeronyx_core::protocol::chat::BlindRelayEnvelope;
 use aeronyx_core::protocol::onion::reverse_delivery::{
-    ReverseOnionFrameV1, MAX_REVERSE_ONION_FRAME_BYTES,
+    ReverseOnionFrameV1, VerifiedRecipientLease, MAX_REVERSE_ONION_FRAME_BYTES,
     REVERSE_ONION_ENVELOPE_LIFETIME_SECS, REVERSE_ONION_RESULT_RETENTION_SECS,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
@@ -86,6 +88,9 @@ pub(crate) struct RecipientDispatch {
     pub(crate) envelope: BlindRelayEnvelope,
     pub(crate) claim: ReverseOnionFrameV1,
     pub(crate) lease: ReverseOnionFrameV1,
+    // [RECIPIENT-LEASE-AUTHORITY 2026-10-04 by Codex] On record_relay_lease
+    // admission this legacy-named field is R's signed execution bound only.
+    // It does not attest hidden source admission; terminal must not infer that.
     pub(crate) route_deadline: u64,
 }
 
@@ -254,6 +259,25 @@ impl ReverseOnionRecipientJournal {
     /// The deadline is already authenticated by route admission, not taken
     /// from an untrusted HTTP query. It becomes immutable with the exact lease.
     pub(crate) fn record_lease(&self, id: [u8; 16], lease: &ReverseOnionFrameV1,
+        authenticated_route_deadline: u64, now: u64) -> Result<()> {
+        self.record_bound_lease(id, lease, authenticated_route_deadline, now)
+    }
+
+    /// [RECIPIENT-LEASE-AUTHORITY 2026-10-04 by Codex] Consume pinned relay
+    /// authority, recheck against this journal's identities and durable Claim,
+    /// and store the signed expiry immutably. No caller scalar can extend it.
+    /// Existing exact replay may recover evidence but never rearms execution.
+    pub(crate) fn record_relay_lease(&self, proof: VerifiedRecipientLease<'_>, now: u64) -> Result<()> {
+        let lease = proof.lease();
+        if lease.relay() != self.relay || lease.immediate_recipient() != self.recipient {
+            return Err(RecipientJournalError::Rejected);
+        }
+        self.record_bound_lease(lease.claim_id(), lease, proof.relay_execution_expiry(), now)
+    }
+
+    // Shared persistence only; the two entry points retain distinct authority
+    // contracts. Existing schema, exact retries, retention and phase CAS remain.
+    fn record_bound_lease(&self, id: [u8; 16], lease: &ReverseOnionFrameV1,
         authenticated_route_deadline: u64, now: u64) -> Result<()> {
         self.transaction(now, |tx| {
             let row = self.load(tx, id)?.ok_or(RecipientJournalError::Rejected)?;
@@ -884,6 +908,40 @@ mod tests {
         assert_eq!(std::fs::metadata(f.directory.path()).unwrap().mode(), parent_mode);
         assert_eq!(std::fs::metadata(f.path()).unwrap().mode() & 0o777, 0o600);
         assert_eq!(std::fs::metadata(sidecar).unwrap().mode() & 0o777, 0o600);
+    }
+
+    // [RECIPIENT-LEASE-AUTHORITY 2026-10-04 by Codex] Authored, unexecuted.
+    #[test]
+    fn relay_authority_survives_restart_without_reviving_execution() {
+        let f = Fixture::new(NOW + 600);
+        let journal = f.open(NOW).unwrap();
+        journal.prepare_poll(&f.claim, NOW).unwrap();
+        let proof = f.lease.verify_recipient_lease(&f.claim,
+            f.relay.public_key_bytes(), f.recipient.public_key_bytes(), NOW + 31).unwrap();
+        journal.record_relay_lease(proof, NOW + 31).unwrap();
+        drop(journal);
+        let journal = f.open(NOW + 32).unwrap();
+        let armed = journal.arm(f.claim.claim_id(), NOW + 32).unwrap();
+        assert_eq!(armed.route_deadline, f.lease.expires_at());
+        assert_eq!(journal.arm(f.claim.claim_id(), NOW + 33).err(), Some(RecipientJournalError::Ambiguous));
+        journal.record_result(f.claim.claim_id(), &f.result(NOW + 601), NOW + 601).unwrap();
+        drop(journal);
+        let journal = f.open(NOW + 602).unwrap();
+        let page = journal.resume(None, 1, NOW + 602).unwrap();
+        assert!(matches!(page.items.first(), Some(RecipientRecovery::Result { .. })));
+        assert!(journal.arm(f.claim.claim_id(), NOW + 602).is_err());
+    }
+
+    #[test]
+    fn retained_relay_proof_cannot_admit_expired_execution() {
+        let f = Fixture::new(NOW + 10);
+        let journal = f.open(NOW).unwrap();
+        journal.prepare_poll(&f.claim, NOW).unwrap();
+        let proof = f.lease.verify_recipient_lease(&f.claim,
+            f.relay.public_key_bytes(), f.recipient.public_key_bytes(), NOW).unwrap();
+        assert_eq!(journal.record_relay_lease(proof, NOW + 10).err(), Some(RecipientJournalError::Rejected));
+        let page = journal.resume(None, 1, NOW + 10).unwrap();
+        assert!(matches!(page.items.first(), Some(RecipientRecovery::Poll { .. })));
     }
 
     #[test]
