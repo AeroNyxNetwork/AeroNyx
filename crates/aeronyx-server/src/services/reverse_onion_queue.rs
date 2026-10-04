@@ -2177,6 +2177,36 @@ mod tests {
         Mutex::new(Connection::open_in_memory().unwrap())
     }
 
+    fn create_legacy_main_schema(connection: &Connection) {
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE {TABLE} (
+                    queue_key BLOB PRIMARY KEY,
+                    route_id BLOB NOT NULL,
+                    request_commitment BLOB NOT NULL,
+                    route_body_commitment BLOB NOT NULL,
+                    immediate_recipient BLOB NOT NULL,
+                    envelope_commitment BLOB NOT NULL,
+                    envelope BLOB NOT NULL,
+                    state INTEGER NOT NULL,
+                    claim_id BLOB,
+                    claim_commitment BLOB,
+                    claim_frame BLOB,
+                    lease_id BLOB,
+                    lease_commitment BLOB,
+                    lease_frame BLOB,
+                    execution_deadline INTEGER,
+                    route_deadline INTEGER NOT NULL,
+                    result_frame BLOB,
+                    result_commitment BLOB,
+                    completed_at INTEGER,
+                    retained_until INTEGER NOT NULL
+                );"
+            ))
+            .unwrap();
+        create_main_indexes(connection).unwrap();
+    }
+
     fn initialized_queue(
         max_items: u64,
         lease_max_secs: u64,
@@ -2207,7 +2237,7 @@ mod tests {
                         VALUES (1, 1, X'4165726F4E79782D526576657273654F6E696F6E51756575652D7631');"
                 ))
                 .unwrap();
-            create_main_schema(&connection).unwrap();
+            create_legacy_main_schema(&connection);
             create_no_work_schema(&connection).unwrap();
             connection
                 .execute(
@@ -2231,10 +2261,75 @@ mod tests {
         connection
     }
 
+    fn legacy_connection_with_main_row(state: i64) -> Mutex<Connection> {
+        let connection = legacy_connection(120);
+        let connection_guard = connection.lock();
+        connection_guard
+            .execute(
+                &format!(
+                    "INSERT INTO {TABLE} (
+                        queue_key, route_id, request_commitment, route_body_commitment,
+                        immediate_recipient, envelope_commitment, envelope, state,
+                        claim_id, claim_commitment, claim_frame, lease_id,
+                        lease_commitment, lease_frame, execution_deadline, route_deadline,
+                        result_frame, result_commitment, completed_at, retained_until
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                               ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                               ?17, ?18, ?19, ?20)"
+                ),
+                params![
+                    [40; 32].as_slice(),
+                    [41; 16].as_slice(),
+                    [42; 32].as_slice(),
+                    [43; 32].as_slice(),
+                    [44; 32].as_slice(),
+                    [45; 32].as_slice(),
+                    [46; 3].as_slice(),
+                    state,
+                    [47; 16].as_slice(),
+                    [48; 32].as_slice(),
+                    [49; 5].as_slice(),
+                    [50; 16].as_slice(),
+                    [51; 32].as_slice(),
+                    [52; 5].as_slice(),
+                    150i64,
+                    200i64,
+                    if state == RESULT { Some([53; 6].as_slice()) } else { None },
+                    if state == RESULT { Some([54; 32].as_slice()) } else { None },
+                    if state == RESULT { Some(160i64) } else { None },
+                    300i64,
+                ],
+            )
+            .unwrap();
+        drop(connection_guard);
+        connection
+    }
+
+    fn v2_connection_with_main_row(state: i64) -> Mutex<Connection> {
+        let connection = legacy_connection_with_main_row(state);
+        let connection_guard = connection.lock();
+        connection_guard
+            .execute(
+                &format!(
+                    "ALTER TABLE {META_TABLE} ADD COLUMN clock_high_water INTEGER NOT NULL DEFAULT 0"
+                ),
+                [],
+            )
+            .unwrap();
+        connection_guard
+            .execute(
+                &format!(
+                    "UPDATE {META_TABLE} SET schema_version = 2, clock_high_water = 120 WHERE id = 1"
+                ),
+                [],
+            )
+            .unwrap();
+        drop(connection_guard);
+        connection
+    }
+
     fn item(seed: u8, route_deadline: u64) -> ReverseOnionQueueItem {
-        let source_node_id = aeronyx_core::crypto::IdentityKeyPair::from_bytes(&[0x71; 32])
-            .expect("valid source identity")
-            .public_key_bytes();
+        let source_node_id = source_node_id();
         ReverseOnionQueueItem::new(
             [seed; COMMITMENT_BYTES],
             [seed.wrapping_add(1); ID_BYTES],
@@ -2247,6 +2342,12 @@ mod tests {
             route_deadline,
         )
         .unwrap()
+    }
+
+    fn source_node_id() -> [u8; COMMITMENT_BYTES] {
+        aeronyx_core::crypto::IdentityKeyPair::from_bytes(&[0x71; 32])
+            .expect("valid source identity")
+            .public_key_bytes()
     }
 
     fn no_work_issue(
@@ -2272,6 +2373,203 @@ mod tests {
             },
             |_, _| Err(ReverseOnionQueueError::Rejected),
         )
+    }
+
+    #[test]
+    fn v1_migration_preserves_legacy_null_and_recipient_replay() {
+        let connection = legacy_connection_with_main_row(ARMED);
+        let queue = SqliteReverseOnionQueue::new(limits(4, 60, 120));
+        queue.initialize_at(&connection, 150).unwrap();
+        let lease = queue
+            .lookup_armed(&connection, [40; 32], [45; 32], [44; 32], 170)
+            .unwrap()
+            .expect("legacy armed lease remains replayable");
+        assert_eq!(lease.frame(), [52; 5].as_slice());
+        assert!(queue
+            .lookup_source(&connection, source_node_id(), [41; 16], [42; 32], 170)
+            .unwrap()
+            .is_none());
+        let connection = connection.lock();
+        let source: Option<Vec<u8>> = connection
+            .query_row(
+                &format!("SELECT source_node_id FROM {TABLE} WHERE queue_key = ?1"),
+                params![[40; 32].as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(source.is_none(), "legacy NULL source must not be backfilled");
+    }
+
+    #[test]
+    fn v2_migration_preserves_legacy_result_replay_and_null_source() {
+        let connection = v2_connection_with_main_row(RESULT);
+        let queue = SqliteReverseOnionQueue::new(limits(4, 60, 120));
+        queue.initialize(&connection).unwrap();
+        let result = queue
+            .lookup_result(&connection, [40; 32], [45; 32], [44; 32], 170)
+            .unwrap()
+            .expect("legacy result remains replayable");
+        assert_eq!(result.frame(), [53; 6].as_slice());
+        assert!(queue
+            .lookup_source(&connection, source_node_id(), [41; 16], [42; 32], 170)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn source_snapshot_is_exact_and_distinguishes_partial_from_complete() {
+        let (queue, connection) = initialized_queue(4, 60, 120);
+        let item = item(60, 200);
+        queue.enqueue(&connection, &item, 100).unwrap();
+        let partial = queue
+            .lookup_source(&connection, source_node_id(), item.route_id, item.request_commitment, 110)
+            .unwrap()
+            .expect("pending source row");
+        assert_eq!(partial.source_node_id(), source_node_id());
+        assert_eq!(partial.route_id(), item.route_id);
+        assert_eq!(partial.request_commitment(), item.request_commitment);
+        assert!(partial.claim_frame().is_none());
+        assert!(partial.lease_frame().is_none());
+        assert!(partial.result_frame().is_none());
+        let claim_commitment = [63; 32];
+        let lease = match queue
+            .issue_lease(
+                &connection,
+                item.immediate_recipient,
+                [61; 16],
+                claim_commitment,
+                vec![62; 5],
+                110,
+                |_| Ok(claim_commitment),
+                |_, _| {
+                    ReverseOnionQueueLeaseMaterial::new(
+                        [64; 16],
+                        [65; 32],
+                        vec![66; 5],
+                        150,
+                        300,
+                    )
+                },
+            )
+            .unwrap()
+        {
+            ReverseOnionQueueIssue::Issued(lease) => lease,
+            _ => panic!("expected issued lease"),
+        };
+        queue
+            .complete(&connection, &lease, &[67; 6], 120, |_, _| Ok([68; 32]))
+            .unwrap();
+        let complete = queue
+            .lookup_source(&connection, source_node_id(), item.route_id, item.request_commitment, 130)
+            .unwrap()
+            .expect("complete source row");
+        assert_eq!(complete.claim_frame(), Some([62; 5].as_slice()));
+        assert_eq!(complete.lease_frame(), Some([66; 5].as_slice()));
+        assert_eq!(complete.result_frame(), Some([67; 6].as_slice()));
+    }
+
+    #[test]
+    fn source_lookup_rejects_wrong_source_and_expiry_without_mutation() {
+        let (queue, connection) = initialized_queue(4, 60, 120);
+        let item = item(70, 110);
+        queue.enqueue(&connection, &item, 100).unwrap();
+        let wrong_source = aeronyx_core::crypto::IdentityKeyPair::from_bytes(&[0x72; 32])
+            .unwrap()
+            .public_key_bytes();
+        assert!(queue
+            .lookup_source(&connection, wrong_source, item.route_id, item.request_commitment, 105)
+            .unwrap()
+            .is_none());
+        assert!(queue
+            .lookup_source(&connection, source_node_id(), item.route_id, item.request_commitment, 110)
+            .unwrap()
+            .is_none());
+        let remaining: i64 = connection
+            .lock()
+            .query_row(&format!("SELECT COUNT(*) FROM {TABLE}"), [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "read-only expiry lookup must not delete");
+    }
+
+    #[test]
+    fn source_lookup_rejects_duplicate_source_tuple_fail_closed() {
+        let (queue, connection) = initialized_queue(4, 60, 120);
+        let item = item(71, 300);
+        queue.enqueue(&connection, &item, 100).unwrap();
+        let duplicate = ReverseOnionQueueItem::new(
+            [72; 32],
+            item.route_id,
+            item.request_commitment,
+            item.source_node_id,
+            item.route_body_commitment,
+            item.immediate_recipient,
+            item.envelope_commitment,
+            item.envelope.clone(),
+            item.route_deadline,
+        )
+        .unwrap();
+        queue.enqueue(&connection, &duplicate, 105).unwrap();
+        assert!(matches!(
+            queue.lookup_source(
+                &connection,
+                source_node_id(),
+                item.route_id,
+                item.request_commitment,
+                106,
+            ),
+            Err(ReverseOnionQueueError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn source_lookup_rejects_clock_rollback_and_invalid_persisted_source() {
+        let (queue, connection) = initialized_queue(4, 60, 120);
+        let item = item(80, 300);
+        queue.enqueue(&connection, &item, 100).unwrap();
+        queue.cleanup(&connection, 200).unwrap();
+        let before: i64 = connection
+            .lock()
+            .query_row(
+                &format!("SELECT clock_high_water FROM {META_TABLE} WHERE id = 1"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            queue.lookup_source(&connection, source_node_id(), item.route_id, item.request_commitment, 150),
+            Err(ReverseOnionQueueError::Rejected)
+        ));
+        let after: i64 = connection
+            .lock()
+            .query_row(
+                &format!("SELECT clock_high_water FROM {META_TABLE} WHERE id = 1"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        connection
+            .lock()
+            .execute(
+                &format!("UPDATE {TABLE} SET source_node_id = ?1 WHERE queue_key = ?2"),
+                params![vec![1u8; 31], item.queue_key.as_slice()],
+            )
+            .unwrap();
+        assert!(matches!(
+            queue.lookup_source(&connection, source_node_id(), item.route_id, item.request_commitment, 200),
+            Err(ReverseOnionQueueError::Corrupt)
+        ));
+        connection
+            .lock()
+            .execute(
+                &format!("UPDATE {TABLE} SET source_node_id = ?1 WHERE queue_key = ?2"),
+                params![vec![1u8; 32], item.queue_key.as_slice()],
+            )
+            .unwrap();
+        assert!(matches!(
+            queue.lookup_source(&connection, source_node_id(), item.route_id, item.request_commitment, 200),
+            Err(ReverseOnionQueueError::Corrupt)
+        ));
     }
 
     #[test]
