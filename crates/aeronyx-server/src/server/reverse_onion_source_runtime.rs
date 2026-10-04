@@ -571,7 +571,12 @@ impl ReverseOnionSourceRuntime {
                 return Err(SourceRuntimeError::Expired);
             }
             policy.validate_at(post_now)?;
-            Ok(policy.current_validity_bounds())
+            let (policy_from, policy_until) = policy.current_validity_bounds();
+            // The successful current validation also proves the private
+            // authorization's issued-at bound, which is intentionally not
+            // exposed as a public field. Keep that exact worker observation
+            // as the rollback floor for the post-await cheap gate.
+            Ok((post_now.max(policy_from), policy_until))
         })
         .await
         .map_err(|_| SourceRuntimeError::Unavailable)?;
