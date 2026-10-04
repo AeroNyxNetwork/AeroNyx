@@ -420,6 +420,13 @@ impl SourcePreparedPull {
     }
 
     fn fresh(&self, now: u64) -> Result<()> {
+        // [REVERSE-ONION-SOURCE-HISTORICAL-AUTH 2026-10-04 by Codex] The
+        // immutable envelope timestamp is the admission anchor: an
+        // authorization issued after that signed envelope must never be
+        // admitted only to fail closed on restart. Current-time validation is
+        // still required for a new prepare/arm, while restart/grace reads use
+        // the historical anchor above without extending the lease.
+        self.validate_at(self.expected.timestamp)?;
         self.validate_at(now)?;
         let request: PeerBlindRelayRequest = serde_json::from_slice(&self.dispatch)
             .map_err(|_| SourceJournalError::Corrupt)?;
@@ -1500,6 +1507,41 @@ mod tests {
         assert_eq!(journal.prepare(purpose_drift, f.session(), NOW).err(), Some(SourceJournalError::Rejected));
     }
 
+    // [REVERSE-ONION-SOURCE-V1-MIGRATION-FIXTURE 2026-10-04 by Codex]
+    // Encode the genuine historical body shape, rather than only changing a
+    // v2 tag. This proves the migration gate is reached before v2 validation.
+    fn encode_v1_fixture(row: &Record) -> Zeroizing<Vec<u8>> {
+        const V1_FIXED: usize = 4 + 2 + 1 + 8 + 8 + 8 + 32 + 16 + 32 * 4
+            + 8 + 8 + 1 + 8 + 32 * 2 + 7 * 4;
+        let fields: [&[u8]; 7] = [
+            &row.plan.dispatch, &row.plan.terminal, &row.restart, &row.claim,
+            &row.lease, &row.result, &row.verified,
+        ];
+        let mut bytes = Vec::with_capacity(V1_FIXED + fields.iter().map(|field| field.len()).sum::<usize>());
+        bytes.extend_from_slice(b"AXSJ");
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.push(row.phase as u8);
+        for value in [row.generation, row.reserved, row.retain_until] {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes.extend_from_slice(&row.plan.source);
+        bytes.extend_from_slice(&row.plan.expected.route);
+        for value in [row.plan.target, row.plan.descriptor, row.plan.expected.relay, row.plan.expected.recipient] {
+            bytes.extend_from_slice(&value);
+        }
+        bytes.extend_from_slice(&row.plan.deadline.to_be_bytes());
+        bytes.extend_from_slice(&row.plan.original_expiry.to_be_bytes());
+        bytes.push(row.plan.expected.ttl);
+        bytes.extend_from_slice(&row.plan.expected.timestamp.to_be_bytes());
+        bytes.extend_from_slice(&row.plan.expected.blob_hash);
+        bytes.extend_from_slice(&row.plan.expected.signing_commitment);
+        for field in fields {
+            bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(field);
+        }
+        Zeroizing::new(bytes)
+    }
+
     #[test]
     fn historical_v1_payload_is_migration_required_without_rewrite() {
         let f = Fixture::new();
@@ -1507,9 +1549,8 @@ mod tests {
         f.prepare(&journal, NOW);
         journal.with_inner(|inner| journal.transaction(inner, NOW + 1, |tx| {
             let row = journal.load(tx, f.route())?.ok_or(SourceJournalError::Corrupt)?;
-            let mut clear = row.encode()?.to_vec();
-            clear[4..6].copy_from_slice(&1u16.to_be_bytes());
-            let sealed = seal_blind_vault_source_pull_journal(&journal.identity, &Zeroizing::new(clear))
+            let clear = encode_v1_fixture(&row);
+            let sealed = seal_blind_vault_source_pull_journal(&journal.identity, &clear)
                 .map_err(|_| SourceJournalError::Corrupt)?;
             one(tx.execute("UPDATE source_jobs SET sealed=?1 WHERE route=?2",
                 params![sealed, f.route().as_slice()]).map_err(unavailable)?)
@@ -1518,6 +1559,43 @@ mod tests {
         assert_eq!(ReverseOnionSourceJournal::open(&f.path(), f.source.clone(),
             SourceJournalLimits { max_entries: 8, max_bytes: RESERVED_PER_JOB * 8 }, NOW + 2).err(),
             Some(SourceJournalError::MigrationRequired));
+    }
+
+    #[test]
+    fn mixed_v2_and_v1_migration_failure_preserves_v2_phase_and_clock() {
+        let f = Fixture::new();
+        let journal = f.open(NOW);
+        f.prepare(&journal, NOW);
+        journal.arm(f.route(), NOW + 1).unwrap();
+        let (sealed, reserved, retain_until) = journal.with_inner(|inner| {
+            journal.transaction(inner, NOW + 1, |tx| {
+                let row = journal.load(tx, f.route())?.ok_or(SourceJournalError::Corrupt)?;
+                let clear = encode_v1_fixture(&row);
+                let sealed = seal_blind_vault_source_pull_journal(&journal.identity, &clear)
+                    .map_err(|_| SourceJournalError::Corrupt)?;
+                Ok((sealed, row.reserved, row.retain_until))
+            })
+        }).unwrap();
+        journal.with_inner(|inner| journal.transaction(inner, NOW + 1, |tx| {
+            one(tx.execute(
+                "INSERT INTO source_jobs(route,phase,generation,reserved,retain_until,sealed) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![[12u8; 16].as_slice(), SourcePhase::Prepared as u8, 1i64,
+                    reserved as i64, retain_until as i64, sealed],
+            ).map_err(unavailable)?)
+        })).unwrap();
+        drop(journal);
+        assert_eq!(ReverseOnionSourceJournal::open(&f.path(), f.source.clone(),
+            SourceJournalLimits { max_entries: 8, max_bytes: RESERVED_PER_JOB * 8 }, NOW + 2).err(),
+            Some(SourceJournalError::MigrationRequired));
+        let connection = Connection::open(&f.path()).unwrap();
+        let clock: i64 = connection.query_row(
+            "SELECT clock FROM source_meta WHERE singleton=1", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(clock, (NOW + 1) as i64);
+        let phase: i64 = connection.query_row(
+            "SELECT phase FROM source_jobs WHERE route=?1", params![f.route().as_slice()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(phase, SourcePhase::Armed as i64);
     }
 
     #[test]
