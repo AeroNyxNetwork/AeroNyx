@@ -22,6 +22,10 @@
 //! [REVERSE-ONION-RESULT-CONTEXT-LOOKUP 2026-10-04 by Codex] The wrapper
 //! exposes only the queue's authenticated read-only recovery context and
 //! retains the durable post-operation fence before publication.
+//!
+//! [REVERSE-ONION-SOURCE-BINDING 2026-10-04 by Codex] Source snapshots are
+//! exposed only through the exact source/route/request tuple and never carry
+//! the persisted envelope.
 
 use std::path::{Path, PathBuf};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -38,6 +42,7 @@ use super::reverse_onion_queue::{
     ReverseOnionQueueAdmission, ReverseOnionQueueCompletion, ReverseOnionQueueError,
     ReverseOnionQueueIssue, ReverseOnionQueueItem, ReverseOnionQueueIssuedLease,
     ReverseOnionQueueLimits, ReverseOnionQueueResult, ReverseOnionQueueResultContext,
+    ReverseOnionQueueSourceSnapshot,
     ReverseOnionQueueStoredResultContext,
     SqliteReverseOnionQueue,
 };
@@ -378,6 +383,20 @@ impl ReverseOnionQueueDb {
                     route_id,
                     now,
                 )
+                .map_err(ReverseOnionQueueDbError::from)
+        })
+    }
+
+    pub(crate) fn lookup_source(
+        &self,
+        source_node_id: [u8; 32],
+        route_id: [u8; 16],
+        request_commitment: [u8; 32],
+        now: u64,
+    ) -> Result<Option<ReverseOnionQueueSourceSnapshot>, ReverseOnionQueueDbError> {
+        self.with_operation(true, |queue, connection| {
+            queue
+                .lookup_source(connection, source_node_id, route_id, request_commitment, now)
                 .map_err(ReverseOnionQueueDbError::from)
         })
     }
@@ -795,6 +814,7 @@ use std::os::fd::AsRawFd;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aeronyx_core::crypto::IdentityKeyPair;
     use rusqlite::Connection;
     use tempfile::TempDir;
 
@@ -820,10 +840,14 @@ mod tests {
     }
 
     fn queue_item() -> ReverseOnionQueueItem {
+        let source_node_id = IdentityKeyPair::from_bytes(&[0x71; 32])
+            .expect("valid source identity")
+            .public_key_bytes();
         ReverseOnionQueueItem::new(
             [1; 32],
             [2; 16],
             [3; 32],
+            source_node_id,
             [4; 32],
             [5; 32],
             [6; 32],

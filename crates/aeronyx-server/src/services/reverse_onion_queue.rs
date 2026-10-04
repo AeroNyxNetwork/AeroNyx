@@ -29,6 +29,10 @@
 //! callbacks receive the original bounded envelope and route binding loaded
 //! from the durable row, never caller-supplied substitutions.
 //!
+//! [REVERSE-ONION-SOURCE-BINDING 2026-10-04 by Codex] Schema v3 carries an
+//! optional authenticated source identity. Legacy rows remain readable but
+//! are never backfilled or eligible for source-bound lookup.
+//!
 //! [REVERSE-ONION-QUEUE-DURABLE-CLOCK 2026-10-04 by Codex] The owned metadata
 //! clock is a persisted local high-water. Only semantically observed
 //! timestamps establish legacy history; future expiry fields never do.
@@ -38,9 +42,10 @@
 //! read-only outcome never issues a lease, inserts no-work, or authorizes
 //! completion without the core Result verifier.
 //!
-//! Last Modified: v1.1.0-DurableClock - Trusted local time high-water and
-//! explicit owned metadata migration.
+//! Last Modified: v1.2.0-SourceBinding - Trusted local time high-water and
+//! explicit owned metadata/source-binding migrations.
 
+use aeronyx_core::crypto::keys::IdentityPublicKey;
 use aeronyx_core::protocol::onion::reverse_delivery::{
     MAX_REVERSE_ONION_CLAIM_BYTES, MAX_REVERSE_ONION_ENVELOPE_BYTES,
     MAX_REVERSE_ONION_FRAME_BYTES,
@@ -53,7 +58,8 @@ use thiserror::Error;
 const TABLE: &str = "reverse_onion_delivery_queue_v1";
 const NO_WORK_TABLE: &str = "reverse_onion_delivery_queue_v1_no_work";
 const META_TABLE: &str = "reverse_onion_delivery_queue_v1_meta";
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+const CLOCK_SCHEMA_VERSION: i64 = 2;
 const LEGACY_SCHEMA_VERSION: i64 = 1;
 const OWNERSHIP_TAG: &[u8] = b"AeroNyx-ReverseOnionQueue-v1";
 const MAX_APPLICATION_OBJECTS: usize = 7;
@@ -165,6 +171,7 @@ pub(crate) struct ReverseOnionQueueItem {
     queue_key: [u8; COMMITMENT_BYTES],
     route_id: [u8; ID_BYTES],
     request_commitment: [u8; COMMITMENT_BYTES],
+    source_node_id: [u8; COMMITMENT_BYTES],
     route_body_commitment: [u8; COMMITMENT_BYTES],
     immediate_recipient: [u8; COMMITMENT_BYTES],
     envelope_commitment: [u8; COMMITMENT_BYTES],
@@ -174,10 +181,14 @@ pub(crate) struct ReverseOnionQueueItem {
 
 impl ReverseOnionQueueItem {
     #[allow(clippy::too_many_arguments)]
+    /// `source_node_id` is the authenticated original source for the
+    /// explicitly supported direct source-to-recipient topology. Callers
+    /// handling multihop routes must not substitute the previous hop here.
     pub(crate) fn new(
         queue_key: [u8; COMMITMENT_BYTES],
         route_id: [u8; ID_BYTES],
         request_commitment: [u8; COMMITMENT_BYTES],
+        source_node_id: [u8; COMMITMENT_BYTES],
         route_body_commitment: [u8; COMMITMENT_BYTES],
         immediate_recipient: [u8; COMMITMENT_BYTES],
         envelope_commitment: [u8; COMMITMENT_BYTES],
@@ -187,6 +198,7 @@ impl ReverseOnionQueueItem {
         if is_zero(&queue_key)
             || is_zero(&route_id)
             || is_zero(&request_commitment)
+            || !valid_source_node_id(&source_node_id)
             || is_zero(&route_body_commitment)
             || is_zero(&immediate_recipient)
             || is_zero(&envelope_commitment)
@@ -200,6 +212,7 @@ impl ReverseOnionQueueItem {
             queue_key,
             route_id,
             request_commitment,
+            source_node_id,
             route_body_commitment,
             immediate_recipient,
             envelope_commitment,
@@ -280,6 +293,7 @@ pub(crate) struct ReverseOnionQueueStoredItem {
     queue_key: [u8; COMMITMENT_BYTES],
     route_id: [u8; ID_BYTES],
     request_commitment: [u8; COMMITMENT_BYTES],
+    source_node_id: Option<[u8; COMMITMENT_BYTES]>,
     route_body_commitment: [u8; COMMITMENT_BYTES],
     immediate_recipient: [u8; COMMITMENT_BYTES],
     envelope_commitment: [u8; COMMITMENT_BYTES],
@@ -300,6 +314,9 @@ impl ReverseOnionQueueStoredItem {
     pub(crate) fn request_commitment(&self) -> [u8; COMMITMENT_BYTES] {
         self.request_commitment
     }
+    pub(crate) fn source_node_id(&self) -> Option<[u8; COMMITMENT_BYTES]> {
+        self.source_node_id
+    }
     pub(crate) fn route_body_commitment(&self) -> [u8; COMMITMENT_BYTES] {
         self.route_body_commitment
     }
@@ -312,6 +329,26 @@ impl ReverseOnionQueueStoredItem {
     pub(crate) fn route_deadline(&self) -> u64 {
         self.route_deadline
     }
+}
+
+/// Bounded immutable evidence selected by an exact authenticated source,
+/// route, and original request tuple. The envelope is deliberately omitted.
+pub(crate) struct ReverseOnionQueueSourceSnapshot {
+    source_node_id: [u8; COMMITMENT_BYTES],
+    route_id: [u8; ID_BYTES],
+    request_commitment: [u8; COMMITMENT_BYTES],
+    claim_frame: Option<Vec<u8>>,
+    lease_frame: Option<Vec<u8>>,
+    result_frame: Option<Vec<u8>>,
+}
+
+impl ReverseOnionQueueSourceSnapshot {
+    pub(crate) fn source_node_id(&self) -> [u8; COMMITMENT_BYTES] { self.source_node_id }
+    pub(crate) fn route_id(&self) -> [u8; ID_BYTES] { self.route_id }
+    pub(crate) fn request_commitment(&self) -> [u8; COMMITMENT_BYTES] { self.request_commitment }
+    pub(crate) fn claim_frame(&self) -> Option<&[u8]> { self.claim_frame.as_deref() }
+    pub(crate) fn lease_frame(&self) -> Option<&[u8]> { self.lease_frame.as_deref() }
+    pub(crate) fn result_frame(&self) -> Option<&[u8]> { self.result_frame.as_deref() }
 }
 
 /// Exact persisted Claim/Lease context supplied to the core Result verifier.
@@ -469,11 +506,20 @@ impl SqliteReverseOnionQueue {
                         return Err(ReverseOnionQueueError::MigrationRequired);
                     };
                     validate_meta_schema_v1(&tx)?;
-                    validate_schema(&tx)?;
+                    validate_schema_legacy(&tx)?;
                     validate_no_work_schema(&tx)?;
+                    migrate_meta_v1_to_v2(&tx, trusted_now, self.limits.max_items)?;
+                    migrate_source_binding_v2_to_v3(&tx)?;
                     validate_all_rows(&tx, &self.limits)?;
                     validate_all_no_work_rows(&tx, &self.limits)?;
-                    migrate_meta_v1_to_v2(&tx, trusted_now, self.limits.max_items)?;
+                }
+                CLOCK_SCHEMA_VERSION => {
+                    validate_meta_schema_version(&tx, CLOCK_SCHEMA_VERSION)?;
+                    validate_schema_legacy(&tx)?;
+                    validate_no_work_schema(&tx)?;
+                    migrate_source_binding_v2_to_v3(&tx)?;
+                    validate_all_rows(&tx, &self.limits)?;
+                    validate_all_no_work_rows(&tx, &self.limits)?;
                 }
                 SCHEMA_VERSION => validate_meta_schema(&tx)?,
                 _ => return Err(ReverseOnionQueueError::Corrupt),
@@ -546,10 +592,11 @@ impl SqliteReverseOnionQueue {
                     immediate_recipient, envelope_commitment, envelope, state,
                     claim_id, claim_commitment, claim_frame, lease_id,
                     lease_commitment, lease_frame, execution_deadline, route_deadline,
-                    result_frame, result_commitment, completed_at, retained_until
+                    result_frame, result_commitment, completed_at, retained_until,
+                    source_node_id
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                            NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?9,
-                           NULL, NULL, NULL, ?9)"
+                           NULL, NULL, NULL, ?9, ?10)"
             ),
             params![
                 item.queue_key.as_slice(),
@@ -561,6 +608,7 @@ impl SqliteReverseOnionQueue {
                 item.envelope.as_slice(),
                 PENDING,
                 route_deadline,
+                item.source_node_id.as_slice(),
             ],
         )?;
         tx.commit()?;
@@ -948,6 +996,61 @@ impl SqliteReverseOnionQueue {
         Ok(result)
     }
 
+    /// Returns only exact source-bound signed parts. Absence is an internal
+    /// Option and is never serialized as an unsigned proof.
+    pub(crate) fn lookup_source(
+        &self,
+        connection: &Mutex<Connection>,
+        source_node_id: [u8; COMMITMENT_BYTES],
+        route_id: [u8; ID_BYTES],
+        request_commitment: [u8; COMMITMENT_BYTES],
+        now: u64,
+    ) -> Result<Option<ReverseOnionQueueSourceSnapshot>, ReverseOnionQueueError> {
+        validate_now(now)?;
+        if !valid_source_node_id(&source_node_id)
+            || is_zero(&route_id)
+            || is_zero(&request_commitment)
+        {
+            return Err(ReverseOnionQueueError::Rejected);
+        }
+        let now = sqlite_integer(now)?;
+        let mut connection = connection.lock();
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        validate_all_rows(&tx, &self.limits)?;
+        validate_all_no_work_rows(&tx, &self.limits)?;
+        let row = load_by_source_route(&tx, &source_node_id, &route_id, &request_commitment)?;
+        let snapshot = if let Some(row) = row {
+            validate_row(&row)?;
+            let expired = match row.state {
+                PENDING => row.route_deadline <= now,
+                LEASED | ARMED | RESULT | TOMBSTONE => row.retained_until <= now,
+                _ => true,
+            };
+            if expired {
+                None
+            } else {
+                Some(ReverseOnionQueueSourceSnapshot {
+                    source_node_id: <[u8; COMMITMENT_BYTES]>::try_from(
+                        row.source_node_id.as_deref()
+                            .ok_or(ReverseOnionQueueError::Rejected)?,
+                    )
+                    .map_err(|_| ReverseOnionQueueError::Corrupt)?,
+                    route_id: row.route_id.as_slice().try_into()
+                        .map_err(|_| ReverseOnionQueueError::Corrupt)?,
+                    request_commitment: row.request_commitment.as_slice().try_into()
+                        .map_err(|_| ReverseOnionQueueError::Corrupt)?,
+                    claim_frame: row.claim_frame,
+                    lease_frame: row.lease_frame,
+                    result_frame: row.result_frame,
+                })
+            }
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
     pub(crate) fn cleanup(
         &self,
         connection: &Mutex<Connection>,
@@ -970,6 +1073,7 @@ struct StoredRow {
     queue_key: Vec<u8>,
     route_id: Vec<u8>,
     request_commitment: Vec<u8>,
+    source_node_id: Option<Vec<u8>>,
     route_body_commitment: Vec<u8>,
     immediate_recipient: Vec<u8>,
     envelope_commitment: Vec<u8>,
@@ -1149,6 +1253,7 @@ fn load_row(connection: &Connection, key: &[u8; COMMITMENT_BYTES]) -> Result<Opt
                     typeof(queue_key), length(queue_key),
                     typeof(route_id), length(route_id),
                     typeof(request_commitment), length(request_commitment),
+                    typeof(source_node_id), length(source_node_id),
                     typeof(route_body_commitment), length(route_body_commitment),
                     typeof(immediate_recipient), length(immediate_recipient),
                     typeof(envelope_commitment), length(envelope_commitment),
@@ -1167,8 +1272,8 @@ fn load_row(connection: &Connection, key: &[u8; COMMITMENT_BYTES]) -> Result<Opt
             ),
             params![key.as_slice()],
             |row| {
-                let mut shapes = Vec::with_capacity(15);
-                for index in 0..15 {
+                let mut shapes = Vec::with_capacity(16);
+                for index in 0..16 {
                     shapes.push((
                         row.get::<_, String>(index * 2)?,
                         row.get::<_, Option<i64>>(index * 2 + 1)?,
@@ -1176,11 +1281,11 @@ fn load_row(connection: &Connection, key: &[u8; COMMITMENT_BYTES]) -> Result<Opt
                 }
                 Ok((
                     shapes,
-                    row.get::<_, i64>(30)?,
-                    row.get::<_, i64>(31)?,
-                    row.get::<_, Option<i64>>(32)?,
-                    row.get::<_, Option<i64>>(33)?,
-                    row.get::<_, i64>(34)?,
+                    row.get::<_, i64>(32)?,
+                    row.get::<_, i64>(33)?,
+                    row.get::<_, Option<i64>>(34)?,
+                    row.get::<_, Option<i64>>(35)?,
+                    row.get::<_, i64>(36)?,
                 ))
             },
         )
@@ -1190,30 +1295,36 @@ fn load_row(connection: &Connection, key: &[u8; COMMITMENT_BYTES]) -> Result<Opt
     };
     let (shapes, state, route_deadline, execution_deadline, completed_at, retained_until) = shape;
     for (index, expected) in [
-        32, 16, 32, 32, 32, 32, MAX_REVERSE_ONION_QUEUE_ITEM_BYTES,
-    ]
-    .into_iter()
-    .enumerate()
-    {
+        (0, 32),
+        (1, 16),
+        (2, 32),
+        (4, 32),
+        (5, 32),
+        (6, 32),
+        (7, MAX_REVERSE_ONION_QUEUE_ITEM_BYTES),
+    ] {
         if shapes[index].0 != "blob"
             || shapes[index].1.is_none_or(|length| {
                 length < 0 || usize::try_from(length).map_or(true, |value| value > expected)
             })
-            || (index < 6
-                && shapes[index].1 != Some(i64::try_from(expected).unwrap_or(i64::MAX)))
+            || index != 3 && index != 7
+                && shapes[index].1 != Some(i64::try_from(expected).unwrap_or(i64::MAX))
         {
             return Err(ReverseOnionQueueError::Corrupt);
         }
     }
+    if !optional_blob_shape(&shapes[3].0, shapes[3].1, COMMITMENT_BYTES) {
+        return Err(ReverseOnionQueueError::Corrupt);
+    }
     for (index, maximum) in [
-        (7, ID_BYTES),
-        (8, COMMITMENT_BYTES),
-        (9, MAX_CLAIM_BYTES),
-        (10, ID_BYTES),
-        (11, COMMITMENT_BYTES),
-        (12, MAX_LEASE_BYTES),
-        (13, MAX_RESULT_BYTES),
-        (14, COMMITMENT_BYTES),
+        (8, ID_BYTES),
+        (9, COMMITMENT_BYTES),
+        (10, MAX_CLAIM_BYTES),
+        (11, ID_BYTES),
+        (12, COMMITMENT_BYTES),
+        (13, MAX_LEASE_BYTES),
+        (14, MAX_RESULT_BYTES),
+        (15, COMMITMENT_BYTES),
     ] {
         if !optional_blob_shape(&shapes[index].0, shapes[index].1, maximum) {
             return Err(ReverseOnionQueueError::Corrupt);
@@ -1228,9 +1339,9 @@ fn load_row(connection: &Connection, key: &[u8; COMMITMENT_BYTES]) -> Result<Opt
     {
         return Err(ReverseOnionQueueError::Corrupt);
     }
-    connection.query_row(&format!("SELECT queue_key, route_id, request_commitment, route_body_commitment, immediate_recipient, envelope_commitment, envelope, state, claim_id, claim_commitment, claim_frame, lease_id, lease_commitment, lease_frame, execution_deadline, route_deadline, result_frame, result_commitment, completed_at, retained_until FROM {TABLE} WHERE queue_key = ?1"), params![key.as_slice()], |row| {
+    connection.query_row(&format!("SELECT queue_key, route_id, request_commitment, source_node_id, route_body_commitment, immediate_recipient, envelope_commitment, envelope, state, claim_id, claim_commitment, claim_frame, lease_id, lease_commitment, lease_frame, execution_deadline, route_deadline, result_frame, result_commitment, completed_at, retained_until FROM {TABLE} WHERE queue_key = ?1"), params![key.as_slice()], |row| {
         Ok(StoredRow {
-            queue_key: row.get(0)?, route_id: row.get(1)?, request_commitment: row.get(2)?, route_body_commitment: row.get(3)?, immediate_recipient: row.get(4)?, envelope_commitment: row.get(5)?, envelope: row.get(6)?, state: row.get(7)?, claim_id: row.get(8)?, claim_commitment: row.get(9)?, claim_frame: row.get(10)?, lease_id: row.get(11)?, lease_commitment: row.get(12)?, lease_frame: row.get(13)?, execution_deadline: row.get(14)?, route_deadline: row.get(15)?, result_frame: row.get(16)?, result_commitment: row.get(17)?, completed_at: row.get(18)?, retained_until: row.get(19)?,
+            queue_key: row.get(0)?, route_id: row.get(1)?, request_commitment: row.get(2)?, source_node_id: row.get(3)?, route_body_commitment: row.get(4)?, immediate_recipient: row.get(5)?, envelope_commitment: row.get(6)?, envelope: row.get(7)?, state: row.get(8)?, claim_id: row.get(9)?, claim_commitment: row.get(10)?, claim_frame: row.get(11)?, lease_id: row.get(12)?, lease_commitment: row.get(13)?, lease_frame: row.get(14)?, execution_deadline: row.get(15)?, route_deadline: row.get(16)?, result_frame: row.get(17)?, result_commitment: row.get(18)?, completed_at: row.get(19)?, retained_until: row.get(20)?,
         })
     }).optional().map_err(Into::into)
 }
@@ -1258,6 +1369,33 @@ fn load_by_claim_id(connection: &Connection, claim_id: &[u8; ID_BYTES]) -> Resul
     load_row(connection, &key)
 }
 
+fn load_by_source_route(
+    connection: &Connection,
+    source_node_id: &[u8; COMMITMENT_BYTES],
+    route_id: &[u8; ID_BYTES],
+    request_commitment: &[u8; COMMITMENT_BYTES],
+) -> Result<Option<StoredRow>, ReverseOnionQueueError> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT queue_key FROM {TABLE}
+         WHERE source_node_id = ?1 AND route_id = ?2 AND request_commitment = ?3
+         ORDER BY queue_key ASC LIMIT 2"
+    ))?;
+    let keys = statement
+        .query_map(
+            params![source_node_id.as_slice(), route_id.as_slice(), request_commitment.as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if keys.len() > 1 {
+        return Err(ReverseOnionQueueError::Corrupt);
+    }
+    let Some(key) = keys.into_iter().next() else {
+        return Ok(None);
+    };
+    let key: [u8; COMMITMENT_BYTES] = key.try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?;
+    load_row(connection, &key)
+}
+
 fn select_pending(connection: &Connection, recipient: &[u8; COMMITMENT_BYTES]) -> Result<Option<StoredRow>, ReverseOnionQueueError> {
     let key_shape: Option<(String, Option<i64>)> = connection.query_row(&format!("SELECT typeof(queue_key), length(queue_key) FROM {TABLE} WHERE immediate_recipient = ?1 AND state = ?2 ORDER BY route_deadline ASC, queue_key ASC LIMIT 1"), params![recipient.as_slice(), PENDING], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
     if let Some((class, length)) = key_shape {
@@ -1271,7 +1409,7 @@ fn select_pending(connection: &Connection, recipient: &[u8; COMMITMENT_BYTES]) -
 
 fn stored_item_from_row(row: &StoredRow) -> Result<ReverseOnionQueueStoredItem, ReverseOnionQueueError> {
     Ok(ReverseOnionQueueStoredItem {
-        queue_key: row.queue_key.as_slice().try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?, route_id: row.route_id.as_slice().try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?, request_commitment: row.request_commitment.as_slice().try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?, route_body_commitment: row.route_body_commitment.as_slice().try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?, immediate_recipient: row.immediate_recipient.as_slice().try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?, envelope_commitment: row.envelope_commitment.as_slice().try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?, envelope: row.envelope.clone(), route_deadline: u64::try_from(row.route_deadline).map_err(|_| ReverseOnionQueueError::Corrupt)?,
+        queue_key: row.queue_key.as_slice().try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?, route_id: row.route_id.as_slice().try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?, request_commitment: row.request_commitment.as_slice().try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?, source_node_id: row.source_node_id.as_deref().map(|bytes| <[u8; COMMITMENT_BYTES]>::try_from(bytes)).transpose().map_err(|_| ReverseOnionQueueError::Corrupt)?, route_body_commitment: row.route_body_commitment.as_slice().try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?, immediate_recipient: row.immediate_recipient.as_slice().try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?, envelope_commitment: row.envelope_commitment.as_slice().try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?, envelope: row.envelope.clone(), route_deadline: u64::try_from(row.route_deadline).map_err(|_| ReverseOnionQueueError::Corrupt)?,
     })
 }
 
@@ -1294,11 +1432,25 @@ fn ensure_item_context(row: &StoredRow, item: &ReverseOnionQueueItem) -> Result<
 }
 
 fn ensure_item_identity(row: &StoredRow, item: &ReverseOnionQueueItem) -> Result<(), ReverseOnionQueueError> {
-    if row.route_id.as_slice() != item.route_id.as_slice() || row.request_commitment.as_slice() != item.request_commitment.as_slice() || row.route_body_commitment.as_slice() != item.route_body_commitment.as_slice() || row.immediate_recipient.as_slice() != item.immediate_recipient.as_slice() || row.envelope_commitment.as_slice() != item.envelope_commitment.as_slice() || row.route_deadline != i64::try_from(item.route_deadline).unwrap_or(i64::MIN) { return Err(ReverseOnionQueueError::Conflict); }
+    if row.source_node_id.as_deref() != Some(item.source_node_id.as_slice())
+        || row.route_id.as_slice() != item.route_id.as_slice()
+        || row.request_commitment.as_slice() != item.request_commitment.as_slice()
+        || row.route_body_commitment.as_slice() != item.route_body_commitment.as_slice()
+        || row.immediate_recipient.as_slice() != item.immediate_recipient.as_slice()
+        || row.envelope_commitment.as_slice() != item.envelope_commitment.as_slice()
+        || row.route_deadline != i64::try_from(item.route_deadline).unwrap_or(i64::MIN)
+    {
+        return Err(ReverseOnionQueueError::Conflict);
+    }
     Ok(())
 }
 
 fn validate_row(row: &StoredRow) -> Result<(), ReverseOnionQueueError> {
+    if let Some(source_node_id) = row.source_node_id.as_deref() {
+        if !valid_source_node_id(source_node_id) {
+            return Err(ReverseOnionQueueError::Corrupt);
+        }
+    }
     if row.queue_key.len() != COMMITMENT_BYTES || row.route_id.len() != ID_BYTES || row.request_commitment.len() != COMMITMENT_BYTES || row.route_body_commitment.len() != COMMITMENT_BYTES || row.immediate_recipient.len() != COMMITMENT_BYTES || row.envelope_commitment.len() != COMMITMENT_BYTES || row.envelope.len() > MAX_REVERSE_ONION_QUEUE_ITEM_BYTES || row.route_deadline < 0 || row.retained_until < row.route_deadline || !matches!(row.state, PENDING | LEASED | ARMED | RESULT | TOMBSTONE) || is_zero(&row.queue_key) || is_zero(&row.route_id) || is_zero(&row.request_commitment) || is_zero(&row.route_body_commitment) || is_zero(&row.immediate_recipient) || is_zero(&row.envelope_commitment) { return Err(ReverseOnionQueueError::Corrupt); }
     match row.state {
         PENDING => {
@@ -1535,7 +1687,8 @@ fn create_main_schema(connection: &Connection) -> Result<(), ReverseOnionQueueEr
             result_frame BLOB,
             result_commitment BLOB,
             completed_at INTEGER,
-            retained_until INTEGER NOT NULL
+            retained_until INTEGER NOT NULL,
+            source_node_id BLOB
         );"
     ))?;
     create_main_indexes(connection)
@@ -1556,6 +1709,13 @@ fn create_no_work_schema(connection: &Connection) -> Result<(), ReverseOnionQueu
 }
 
 fn validate_meta_schema(connection: &Connection) -> Result<(), ReverseOnionQueueError> {
+    validate_meta_schema_version(connection, SCHEMA_VERSION)
+}
+
+fn validate_meta_schema_version(
+    connection: &Connection,
+    expected_version: i64,
+) -> Result<(), ReverseOnionQueueError> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({META_TABLE})"))?;
     let columns: Vec<(String, String, i64, i64)> = statement
         .query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(5)?)))?
@@ -1595,7 +1755,7 @@ fn validate_meta_schema(connection: &Connection) -> Result<(), ReverseOnionQueue
         )
         .map_err(|_| ReverseOnionQueueError::Corrupt)?;
     if row_count != 1
-        || version != SCHEMA_VERSION
+        || version != expected_version
         || tag.as_slice() != OWNERSHIP_TAG
         || clock_high_water < 0
     {
@@ -1670,7 +1830,21 @@ fn migrate_meta_v1_to_v2(
     )?;
     connection.execute(
         &format!("UPDATE {META_TABLE} SET schema_version = ?1, clock_high_water = ?2 WHERE id = 1"),
-        params![SCHEMA_VERSION, trusted_now],
+        params![CLOCK_SCHEMA_VERSION, trusted_now],
+    )?;
+    Ok(())
+}
+
+fn migrate_source_binding_v2_to_v3(
+    connection: &Connection,
+) -> Result<(), ReverseOnionQueueError> {
+    connection.execute(
+        &format!("ALTER TABLE {TABLE} ADD COLUMN source_node_id BLOB"),
+        [],
+    )?;
+    connection.execute(
+        &format!("UPDATE {META_TABLE} SET schema_version = ?1 WHERE id = 1"),
+        params![SCHEMA_VERSION],
     )?;
     Ok(())
 }
@@ -1720,6 +1894,47 @@ fn observed_clock_high_water(
 }
 
 fn validate_schema(connection: &Connection) -> Result<bool, ReverseOnionQueueError> {
+    let expected = [
+        ("queue_key", "BLOB", 0, 1),
+        ("route_id", "BLOB", 1, 0),
+        ("request_commitment", "BLOB", 1, 0),
+        ("route_body_commitment", "BLOB", 1, 0),
+        ("immediate_recipient", "BLOB", 1, 0),
+        ("envelope_commitment", "BLOB", 1, 0),
+        ("envelope", "BLOB", 1, 0),
+        ("state", "INTEGER", 1, 0),
+        ("claim_id", "BLOB", 0, 0),
+        ("claim_commitment", "BLOB", 0, 0),
+        ("claim_frame", "BLOB", 0, 0),
+        ("lease_id", "BLOB", 0, 0),
+        ("lease_commitment", "BLOB", 0, 0),
+        ("lease_frame", "BLOB", 0, 0),
+        ("execution_deadline", "INTEGER", 0, 0),
+        ("route_deadline", "INTEGER", 1, 0),
+        ("result_frame", "BLOB", 0, 0),
+        ("result_commitment", "BLOB", 0, 0),
+        ("completed_at", "INTEGER", 0, 0),
+        ("retained_until", "INTEGER", 1, 0),
+        ("source_node_id", "BLOB", 0, 0),
+    ];
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({TABLE})"))?;
+    let columns: Vec<(String, String, i64, i64)> = statement
+        .query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(5)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns.len() != expected.len()
+        || columns.iter().zip(expected).any(|(actual, expected)| {
+            actual.0 != expected.0
+                || actual.1.to_ascii_uppercase() != expected.1
+                || actual.2 != expected.2
+                || actual.3 != expected.3
+        })
+    {
+        return Err(ReverseOnionQueueError::Corrupt);
+    }
+    validate_main_indexes(connection)
+}
+
+fn validate_schema_legacy(connection: &Connection) -> Result<bool, ReverseOnionQueueError> {
     let expected = [
         ("queue_key", "BLOB", 0, 1),
         ("route_id", "BLOB", 1, 0),
@@ -1919,6 +2134,9 @@ fn advance_clock(connection: &Connection, now: i64) -> Result<(), ReverseOnionQu
 
 fn validate_now(now: u64) -> Result<(), ReverseOnionQueueError> { if now == 0 { Err(ReverseOnionQueueError::Rejected) } else { Ok(()) } }
 fn is_zero(bytes: &[u8]) -> bool { bytes.iter().all(|byte| *byte == 0) }
+fn valid_source_node_id(bytes: &[u8; COMMITMENT_BYTES]) -> bool {
+    !is_zero(bytes) && IdentityPublicKey::from_bytes(bytes).is_ok()
+}
 
 #[cfg(test)]
 mod tests {
@@ -1998,10 +2216,14 @@ mod tests {
     }
 
     fn item(seed: u8, route_deadline: u64) -> ReverseOnionQueueItem {
+        let source_node_id = aeronyx_core::crypto::IdentityKeyPair::from_bytes(&[0x71; 32])
+            .expect("valid source identity")
+            .public_key_bytes();
         ReverseOnionQueueItem::new(
             [seed; COMMITMENT_BYTES],
             [seed.wrapping_add(1); ID_BYTES],
             [seed.wrapping_add(2); COMMITMENT_BYTES],
+            source_node_id,
             [seed.wrapping_add(3); COMMITMENT_BYTES],
             [seed.wrapping_add(4); COMMITMENT_BYTES],
             [seed.wrapping_add(5); COMMITMENT_BYTES],
