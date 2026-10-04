@@ -84,6 +84,8 @@
 //!   operations may inspect the authenticated terminal identity at source.
 //!
 //! ## Last Modified
+//! v1.15.0-ForwardExpectationJournalBinding — Private captured blob hash.
+//! [REVERSE-ONION-TYPED-EXPECTATION 2026-10-04 by Codex] No wire changes.
 //! v1.14.0-ReverseDeliveryContract — Bounded signed adjacent-hop claim/lease/
 //! opaque-result frames and persistence transition contract (not runtime wiring)
 //! v1.13.0-VerifiedTerminalBinding — Exposed source-only authenticated
@@ -806,6 +808,16 @@ impl VerifiedOnionRoute {
         ),
         OnionRoutePlanError,
     > {
+        // [REVERSE-ONION-TYPED-EXPECTATION 2026-10-04 by Codex] The new
+        // expectation API must not manufacture an unusable journal binding.
+        // Legacy envelope-only construction keeps its existing contract.
+        if route_id == [0; 16] || now == 0
+            || now.checked_add(reverse_delivery::REVERSE_ONION_ENVELOPE_LIFETIME_SECS).is_none()
+        {
+            return Err(OnionRoutePlanError::EnvelopeConstruction {
+                source: CoreError::malformed("onion forward expectation: invalid route context"),
+            });
+        }
         if source.public_key_bytes() != self.source_node_id {
             return Err(OnionRoutePlanError::SourceIdentityMismatch);
         }
@@ -836,6 +848,9 @@ pub struct VerifiedOnionForwardExpectation {
     next_hop_node_id: [u8; 32],
     ttl: u8,
     timestamp: u64,
+    // [REVERSE-ONION-TYPED-EXPECTATION 2026-10-04 by Codex] Captured from
+    // the very same inner bytes as signing_data_commitment, not a rebuild.
+    encrypted_blob_hash: [u8; 32],
     signing_data_commitment: [u8; 32],
 }
 
@@ -852,6 +867,8 @@ impl VerifiedOnionForwardExpectation {
             || self.first_relay_node_id == self.next_hop_node_id
             || self.ttl == 0
             || self.timestamp == 0
+            || self.timestamp.checked_add(reverse_delivery::REVERSE_ONION_ENVELOPE_LIFETIME_SECS).is_none()
+            || self.encrypted_blob_hash == [0u8; 32]
             || self.signing_data_commitment == [0u8; 32]
         {
             return Err(CoreError::malformed(
@@ -862,6 +879,7 @@ impl VerifiedOnionForwardExpectation {
             || envelope.next_hop != self.next_hop_node_id
             || envelope.ttl != self.ttl
             || envelope.timestamp != self.timestamp
+            || Sha256::digest(&envelope.encrypted_blob).as_slice() != self.encrypted_blob_hash
         {
             return Err(CoreError::malformed(
                 "onion forward expectation: field mismatch",
@@ -906,6 +924,13 @@ impl VerifiedOnionForwardExpectation {
     #[must_use]
     pub const fn signing_data_commitment(&self) -> [u8; 32] {
         self.signing_data_commitment
+    }
+
+    /// Source-private journal projection, captured before first-hop wrapping.
+    /// Does not expose the encrypted inner frame or permit raw reconstruction.
+    #[must_use]
+    pub const fn encrypted_blob_hash(&self) -> [u8; 32] {
+        self.encrypted_blob_hash
     }
 }
 
@@ -1086,6 +1111,7 @@ fn build_onion_envelope_with_forward_expectation(
                     next_hop_node_id: path[1].node_id,
                     ttl: forward_ttl,
                     timestamp: now,
+                    encrypted_blob_hash: Sha256::digest(&forward.encrypted_blob).into(),
                     signing_data_commitment,
                 });
             }
@@ -1466,6 +1492,10 @@ mod tests {
             signature: [0; 64],
         }
         .sign_with(&entry_id);
+        // [REVERSE-ONION-TYPED-EXPECTATION 2026-10-04 by Codex] Proves the
+        // getter refers to THIS encryption pass, not fresh randomized wrapping.
+        assert_eq!(expectation.encrypted_blob_hash(),
+            <[u8; 32]>::from(Sha256::digest(&forwarded.encrypted_blob)));
         expectation
             .verify_relay_produced_envelope(&forwarded)
             .expect("forward expectation");
@@ -1529,6 +1559,21 @@ mod tests {
             .build_envelope_with_forward_expectation(b"opaque", [0x74; 16], 150, &wrong_source)
             .is_err());
         assert!(open_onion_layer(&outer.encrypted_blob, &x25519_secret(&entry_id)).is_ok());
+    }
+
+    // [REVERSE-ONION-TYPED-EXPECTATION 2026-10-04 by Codex] Authored only.
+    #[test]
+    fn forward_expectation_rejects_zero_and_overflow_context_without_changing_legacy_builder() {
+        let source = IdentityKeyPair::from_bytes(&[0x76; 32]).unwrap();
+        let (_, entry) = hop_keypair(); let (_, exit) = hop_keypair();
+        let route = VerifiedOnionRoute {
+            source_node_id: source.public_key_bytes(), purpose: OnionRoutePurpose::MessageRelay,
+            verified_at: 0, valid_until: u64::MAX, hops: vec![entry, exit],
+        };
+        for (id, now) in [([0; 16], 150), ([1; 16], 0), ([1; 16], u64::MAX - 1)] {
+            assert!(route.build_envelope_with_forward_expectation(b"opaque", id, now, &source).is_err());
+        }
+        assert!(route.build_envelope(b"legacy", [0; 16], 0, &source).is_ok());
     }
 
     #[test]

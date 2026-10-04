@@ -16,7 +16,8 @@
 //! by a hostile same-euid actor is NOT prevented without an external anchor.
 //! Evidence is bounded, not eternal: identifiers are protected through their
 //! admitted freshness horizon, not forever after all tombstones are deleted.
-//! Last Modified: v1.0.0 — Source Pull journal; implemented, unverified.
+//! Last Modified: v1.1.0 — Typed same-pass forward expectation intake.
+//! [REVERSE-ONION-TYPED-EXPECTATION 2026-10-04 by Codex] No raw production builder.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, TryLockError};
@@ -33,7 +34,7 @@ use aeronyx_core::protocol::blind_vault_replica_workflow::{
     MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_SEALED_BYTES,
 };
 use aeronyx_core::protocol::chat::{encode_blind_relay_envelope, BlindRelayEnvelope};
-use aeronyx_core::protocol::onion::{is_onion_blob, reverse_delivery::{
+use aeronyx_core::protocol::onion::{is_onion_blob, VerifiedOnionForwardExpectation, reverse_delivery::{
     ReverseOnionFrameV1, MAX_REVERSE_ONION_FRAME_BYTES,
     REVERSE_ONION_ENVELOPE_LIFETIME_SECS, REVERSE_ONION_RESULT_RETENTION_SECS,
 }};
@@ -102,9 +103,33 @@ pub(crate) struct ExpectedRetainedEnvelope {
 }
 
 impl ExpectedRetainedEnvelope {
+    /// Consumes the projection captured by the verified builder during the
+    /// SAME encryption pass as the outbound envelope. No relay secret, raw
+    /// inner frame, or post-response expectation derivation is accepted here.
+    /// Descriptor/deadline authority still belongs to runtime admission.
+    // [REVERSE-ONION-TYPED-EXPECTATION 2026-10-04 by Codex]
+    pub(crate) fn from_verified_forward_expectation(
+        expectation: &VerifiedOnionForwardExpectation,
+    ) -> Result<Self> {
+        let value = Self {
+            relay: expectation.first_relay_node_id(), recipient: expectation.next_hop_node_id(),
+            route: expectation.route_id(), ttl: expectation.ttl(), timestamp: expectation.timestamp(),
+            blob_hash: expectation.encrypted_blob_hash(), signing_commitment: expectation.signing_data_commitment(),
+        };
+        valid_key(value.relay)?; valid_key(value.recipient)?;
+        if value.relay == value.recipient || value.relay == [0; 32] || value.recipient == [0; 32]
+            || value.route == [0; 16] || value.ttl == 0 || value.timestamp == 0
+            || value.timestamp.checked_add(REVERSE_ONION_ENVELOPE_LIFETIME_SECS).is_none()
+            || value.blob_hash == [0; 32] || value.signing_commitment == [0; 32]
+        { return Err(SourceJournalError::Rejected); }
+        Ok(value)
+    }
+
     /// Inputs must be the deterministic R->P projection from trusted source
     /// route construction, not guessed or learned after the source send.
-    pub(crate) fn from_route_construction(
+    /// Test-only parity control; not available to any production caller.
+    #[cfg(test)]
+    fn from_route_construction(
         relay: [u8; 32], recipient: [u8; 32], route: [u8; 16], ttl: u8,
         timestamp: u64, exact_inner_onion: &[u8],
     ) -> Result<Self> {
@@ -174,6 +199,8 @@ impl SourcePreparedPull {
         if self.dispatch.is_empty() || self.dispatch.len() > MAX_DISPATCH_BYTES
             || self.terminal.is_empty() || self.terminal.len() > MAX_TERMINAL_BYTES
             || self.descriptor == [0; 32] || self.expected.route == [0; 16]
+            || self.expected.timestamp == 0 || self.expected.blob_hash == [0; 32]
+            || self.expected.signing_commitment == [0; 32]
             || self.expected.ttl == 0 || self.expected.relay == self.expected.recipient
             || self.deadline <= self.expected.timestamp
             || self.deadline > self.expected.timestamp.checked_add(REVERSE_ONION_ENVELOPE_LIFETIME_SECS)
@@ -186,6 +213,9 @@ impl SourcePreparedPull {
             || request.onward_descriptor_hint.is_some()
             || request.envelope.route_id != self.expected.route
             || request.envelope.next_hop != self.expected.relay || request.envelope.ttl == 0
+            || request.envelope.timestamp == 0
+            || request.envelope.timestamp != self.expected.timestamp
+            || request.envelope.ttl.checked_sub(1) != Some(self.expected.ttl)
             || !is_onion_blob(&request.envelope.encrypted_blob)
             || request.envelope.timestamp >= self.deadline
             || request.envelope.timestamp.checked_add(REVERSE_ONION_ENVELOPE_LIFETIME_SECS)
@@ -819,8 +849,8 @@ fn unavailable(_: rusqlite::Error) -> SourceJournalError { SourceJournalError::U
 fn one(n: usize) -> Result<()> { if n == 1 { Ok(()) } else { Err(SourceJournalError::Corrupt) } }
 
 // [REVERSE-ONION-SOURCE-JOURNAL 2026-10-04 by Codex] Authored only. These
-// tests use R's private key to establish independent expected fixture bytes;
-// production S must obtain the projection DURING trusted route construction.
+// tests use R's private key only to simulate actual relay delivery; expected
+// bytes now come from the production typed, same-pass verified builder.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -828,7 +858,8 @@ mod tests {
         BlindVaultPullRequest, BlindVaultRecoveredObject, BLIND_VAULT_PROTOCOL_VERSION,
         BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES,
     };
-    use aeronyx_core::protocol::onion::{build_onion_envelope, open_onion_layer, OnionHop};
+    use aeronyx_core::protocol::onion::{open_onion_layer, OnionRoutePurpose, VerifiedOnionRoute};
+    use aeronyx_core::protocol::discovery::{NodeCapability, NodeDescriptor, SignedNodeDescriptor};
     use aeronyx_core::protocol::onion_reply::{encode_onion_sealed_response, seal_onion_reply};
 
     const NOW: u64 = 1_800_000_000;
@@ -837,11 +868,24 @@ mod tests {
         directory: tempfile::TempDir,
         source: Arc<IdentityKeyPair>, relay: IdentityKeyPair, recipient: IdentityKeyPair,
         outbound: PeerBlindRelayRequest, retained: BlindRelayEnvelope,
+        expectation: VerifiedOnionForwardExpectation,
         terminal: Zeroizing<Vec<u8>>, snapshot: Zeroizing<Vec<u8>>,
         claim: ReverseOnionFrameV1, lease: ReverseOnionFrameV1,
     }
 
     impl Fixture {
+        // [REVERSE-ONION-TYPED-EXPECTATION 2026-10-04 by Codex] All route
+        // descriptors are signed; no server fixture constructs the core type.
+        fn descriptor(identity: &IdentityKeyPair) -> SignedNodeDescriptor {
+            let purpose = OnionRoutePurpose::BlindVaultPull;
+            let features = purpose.required_terminal_protocol_features().iter()
+                .chain(purpose.required_path_protocol_features()).copied();
+            let mut descriptor = NodeDescriptor::new(identity.public_key_bytes(), 1, NOW - 1, NOW + 600, "test")
+                .with_x25519_kem(identity.x25519_public_key_bytes()).with_protocol_features(features);
+            descriptor.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle, NodeCapability::BlindVaultReplica];
+            descriptor.public_endpoint = Some("https://1.1.1.1:443".into());
+            SignedNodeDescriptor::sign(descriptor, identity).unwrap()
+        }
         fn new() -> Self {
             Self::new_with_route(11)
         }
@@ -857,12 +901,16 @@ mod tests {
                     read_capability: [8; 32], continuation_cursor: vec![], limit: 1 }).unwrap();
             let terminal = Zeroizing::new(request);
             let snapshot = Zeroizing::new(session.seal_restart(&source, route, recipient.public_key_bytes(), &terminal).unwrap());
-            let (relay_secret, relay_kem) = relay.to_x25519();
-            let (_, recipient_kem) = recipient.to_x25519();
-            let envelope = build_onion_envelope(&[
-                OnionHop { node_id: relay.public_key_bytes(), kem_pub: relay_kem.to_bytes() },
-                OnionHop { node_id: recipient.public_key_bytes(), kem_pub: recipient_kem.to_bytes() },
-            ], &terminal, route, 2, NOW, &source).unwrap();
+            let descriptors = [Self::descriptor(&relay), Self::descriptor(&recipient)];
+            let verified_route = VerifiedOnionRoute::from_signed_descriptors(
+                source.public_key_bytes(), descriptors.iter(), OnionRoutePurpose::BlindVaultPull, NOW,
+            ).unwrap();
+            let (envelope, expectation) = verified_route.build_envelope_with_forward_expectation(
+                &terminal, route, NOW, &source,
+            ).unwrap();
+            let expectation = expectation.unwrap();
+            // R's secret is used ONLY after source construction to emulate R.
+            let (relay_secret, _) = relay.to_x25519();
             let peeled = open_onion_layer(&envelope.encrypted_blob, &relay_secret).unwrap();
             let retained = BlindRelayEnvelope { route_id: route, next_hop: recipient.public_key_bytes(), ttl: 1,
                 timestamp: NOW, encrypted_blob: peeled.inner, signature: [0; 64] }.sign_with(&relay);
@@ -870,14 +918,12 @@ mod tests {
             let lease = ReverseOnionFrameV1::lease(&claim, &retained, [13; 16], NOW + 600, NOW, &relay).unwrap();
             let outbound = PeerBlindRelayRequest { envelope, previous_hop_node_id: source.public_key_bytes(),
                 onward_envelope: None, onward_descriptor_hint: None };
-            Self { directory, source, relay, recipient, outbound, retained, terminal, snapshot, claim, lease }
+            Self { directory, source, relay, recipient, outbound, retained, expectation, terminal, snapshot, claim, lease }
         }
         fn path(&self) -> std::path::PathBuf { self.directory.path().join("source.sqlite") }
         fn route(&self) -> [u8; 16] { self.retained.route_id }
         fn expected(&self) -> ExpectedRetainedEnvelope {
-            ExpectedRetainedEnvelope::from_route_construction(self.relay.public_key_bytes(),
-                self.recipient.public_key_bytes(), self.route(), self.retained.ttl,
-                self.retained.timestamp, &self.retained.encrypted_blob).unwrap()
+            ExpectedRetainedEnvelope::from_verified_forward_expectation(&self.expectation).unwrap()
         }
         fn plan(&self) -> SourcePreparedPull {
             SourcePreparedPull::from_runtime_admission(&self.source, self.outbound.clone(), self.expected(),
@@ -1165,5 +1211,48 @@ mod tests {
         assert_eq!(page.items[0].0, third.route()); assert!(page.next_after.is_none());
         assert_eq!(journal.cleanup(1, NOW + 900).unwrap(), 1);
         assert_eq!(journal.recover(None, 64, NOW + 900).unwrap().items.len(), 2);
+    }
+
+    // [REVERSE-ONION-TYPED-EXPECTATION 2026-10-04 by Codex] Authored only.
+    #[test]
+    fn typed_projection_matches_same_pass_relay_bytes_and_preserves_record_schema() {
+        let f = Fixture::new();
+        f.expectation.verify_relay_produced_envelope(&f.retained).unwrap();
+        let typed = f.expected();
+        assert!(typed.matches(&f.retained));
+        let raw_control = ExpectedRetainedEnvelope::from_route_construction(
+            f.relay.public_key_bytes(), f.recipient.public_key_bytes(), f.route(), f.retained.ttl,
+            f.retained.timestamp, &f.retained.encrypted_blob,
+        ).unwrap();
+        let typed_plan = f.plan(); let mut control_plan = f.plan(); control_plan.expected = raw_control;
+        assert!(typed_plan.same(&control_plan));
+        assert_eq!(typed.blob_hash, hash(&f.retained.encrypted_blob));
+        let journal = f.open(NOW); f.prepare(&journal, NOW);
+        journal.with_inner(|inner| journal.transaction(inner, NOW, |tx| {
+            let row = journal.load(tx, f.route())?.unwrap();
+            let encoded = row.encode()?;
+            assert_eq!(&encoded[..6], b"AXSJ\x00\x01");
+            let restored = Record::decode(&encoded)?;
+            assert!(restored.plan.same(&typed_plan));
+            assert!(restored.plan.expected.matches(&f.retained));
+            Ok(())
+        })).unwrap();
+    }
+
+    #[test]
+    fn source_rejects_zero_or_inconsistent_projection_context_before_dispatch() {
+        let f = Fixture::new(); let journal = f.open(NOW);
+        for change in 0..5 {
+            let mut plan = f.plan();
+            match change {
+                0 => plan.expected.timestamp = 0,
+                1 => plan.expected.timestamp = u64::MAX,
+                2 => plan.expected.route = [0; 16],
+                3 => plan.expected.ttl += 1,
+                _ => plan.expected.blob_hash = [0; 32],
+            }
+            assert_eq!(journal.prepare(plan, f.session(), NOW).err(), Some(SourceJournalError::Rejected));
+        }
+        assert!(journal.recover(None, 1, NOW).unwrap().items.is_empty());
     }
 }
