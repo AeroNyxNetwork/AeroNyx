@@ -22,6 +22,9 @@
 //! [REVERSE-ONION-CONTRACT 2026-10-04 by Codex] The additive `AXRD` contract
 //! below transports that unchanged envelope through recipient-initiated
 //! delivery. It defines no HTTP endpoint, queue, poller, or persistence backend.
+//! [VERIFIED-ONION-FORWARD-EXPECTATION 2026-10-04 by Codex] Verified routes
+//! can capture one source-local first-forward transcript commitment during
+//! construction without changing the onion wire or repeating encryption.
 //!
 //! ## Construction (HPKE-style, RFC 9180 DHKEM shape)
 //! Each layer is a single-shot seal to the hop's KEM public key:
@@ -110,7 +113,7 @@ use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
-use crate::crypto::keys::{E2eSession, EphemeralKeyPair, IdentityKeyPair};
+use crate::crypto::keys::{E2eSession, EphemeralKeyPair, IdentityKeyPair, IdentityPublicKey};
 use crate::error::CoreError;
 use crate::protocol::chat::BlindRelayEnvelope;
 use crate::protocol::discovery::{NodeCapability, NodeProtocolFeature, SignedNodeDescriptor};
@@ -771,8 +774,138 @@ impl VerifiedOnionRoute {
         let ttl = u8::try_from(self.hops.len()).map_err(|_| OnionRoutePlanError::TooManyHops {
             max_hops: MAX_VERIFIED_ONION_ROUTE_HOPS,
         })?;
-        build_onion_envelope(&self.hops, final_payload, route_id, ttl, now, source)
-            .map_err(|source| OnionRoutePlanError::EnvelopeConstruction { source })
+        build_onion_envelope_with_forward_expectation(
+            &self.hops,
+            final_payload,
+            route_id,
+            ttl,
+            now,
+            source,
+        )
+        .map(|(envelope, _)| envelope)
+        .map_err(|source| OnionRoutePlanError::EnvelopeConstruction { source })
+    }
+
+    /// Builds one envelope and captures the exact first-forward expectation
+    /// from the same single-pass encryption loop.
+    ///
+    /// The expectation is source-local metadata only. It contains no inner
+    /// payload, relay secret, endpoint, or wire field and is `None` for a
+    /// single-hop route. The caller must persist it before sending the outer
+    /// envelope; it cannot be regenerated from a later randomized rebuild.
+    pub fn build_envelope_with_forward_expectation(
+        &self,
+        final_payload: &[u8],
+        route_id: [u8; 16],
+        now: u64,
+        source: &IdentityKeyPair,
+    ) -> Result<
+        (
+            BlindRelayEnvelope,
+            Option<VerifiedOnionForwardExpectation>,
+        ),
+        OnionRoutePlanError,
+    > {
+        if source.public_key_bytes() != self.source_node_id {
+            return Err(OnionRoutePlanError::SourceIdentityMismatch);
+        }
+        if now < self.verified_at || now >= self.valid_until {
+            return Err(OnionRoutePlanError::OutsideValidityWindow);
+        }
+        let ttl = u8::try_from(self.hops.len()).map_err(|_| OnionRoutePlanError::TooManyHops {
+            max_hops: MAX_VERIFIED_ONION_ROUTE_HOPS,
+        })?;
+        build_onion_envelope_with_forward_expectation(
+            &self.hops,
+            final_payload,
+            route_id,
+            ttl,
+            now,
+            source,
+        )
+        .map_err(|source| OnionRoutePlanError::EnvelopeConstruction { source })
+    }
+}
+
+/// Source-local proof of the exact envelope a first relay must produce when it
+/// peels a multi-hop request. Raw payloads and relay secrets are deliberately
+/// absent, and the type has no `Debug`/deserialization surface.
+pub struct VerifiedOnionForwardExpectation {
+    route_id: [u8; 16],
+    first_relay_node_id: [u8; 32],
+    next_hop_node_id: [u8; 32],
+    ttl: u8,
+    timestamp: u64,
+    signing_data_commitment: [u8; 32],
+}
+
+impl VerifiedOnionForwardExpectation {
+    /// Verifies one relay-produced forwarded envelope against this pinned
+    /// source-local expectation.
+    pub fn verify_relay_produced_envelope(
+        &self,
+        envelope: &BlindRelayEnvelope,
+    ) -> Result<(), CoreError> {
+        if self.route_id == [0u8; 16]
+            || self.first_relay_node_id == [0u8; 32]
+            || self.next_hop_node_id == [0u8; 32]
+            || self.first_relay_node_id == self.next_hop_node_id
+            || self.ttl == 0
+            || self.timestamp == 0
+            || self.signing_data_commitment == [0u8; 32]
+        {
+            return Err(CoreError::malformed(
+                "onion forward expectation: invalid pinned fields",
+            ));
+        }
+        if envelope.route_id != self.route_id
+            || envelope.next_hop != self.next_hop_node_id
+            || envelope.ttl != self.ttl
+            || envelope.timestamp != self.timestamp
+        {
+            return Err(CoreError::malformed(
+                "onion forward expectation: field mismatch",
+            ));
+        }
+        let commitment = Sha256::digest(envelope.signing_data());
+        if commitment.as_slice() != self.signing_data_commitment {
+            return Err(CoreError::malformed(
+                "onion forward expectation: signing commitment mismatch",
+            ));
+        }
+        let first_relay = IdentityPublicKey::from_bytes(&self.first_relay_node_id)
+            .map_err(|_| CoreError::malformed("onion forward expectation: invalid relay"))?;
+        envelope.verify_signature_from(&first_relay)
+    }
+
+    #[must_use]
+    pub const fn route_id(&self) -> [u8; 16] {
+        self.route_id
+    }
+
+    #[must_use]
+    pub const fn first_relay_node_id(&self) -> [u8; 32] {
+        self.first_relay_node_id
+    }
+
+    #[must_use]
+    pub const fn next_hop_node_id(&self) -> [u8; 32] {
+        self.next_hop_node_id
+    }
+
+    #[must_use]
+    pub const fn ttl(&self) -> u8 {
+        self.ttl
+    }
+
+    #[must_use]
+    pub const fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    #[must_use]
+    pub const fn signing_data_commitment(&self) -> [u8; 32] {
+        self.signing_data_commitment
     }
 }
 
@@ -899,18 +1032,64 @@ pub fn build_onion_envelope(
     now: u64,
     source: &IdentityKeyPair,
 ) -> Result<BlindRelayEnvelope, CoreError> {
+    build_onion_envelope_with_forward_expectation(
+        path,
+        final_payload,
+        route_id,
+        ttl,
+        now,
+        source,
+    )
+    .map(|(envelope, _)| envelope)
+}
+
+/// Shared one-pass construction for the legacy builder and the verified-route
+/// source expectation. The expectation is computed after the first relay's
+/// encrypted inner layer exists and before the outer layer is sealed.
+fn build_onion_envelope_with_forward_expectation(
+    path: &[OnionHop],
+    final_payload: &[u8],
+    route_id: [u8; 16],
+    ttl: u8,
+    now: u64,
+    source: &IdentityKeyPair,
+) -> Result<(BlindRelayEnvelope, Option<VerifiedOnionForwardExpectation>), CoreError> {
     if path.is_empty() {
         return Err(CoreError::malformed("onion path: empty"));
     }
 
     // Start with the raw payload; wrap one layer per hop from the exit inward.
     let mut inner = final_payload.to_vec();
+    let mut expectation = None;
     for i in (0..path.len()).rev() {
         let next_hop = if i + 1 < path.len() {
             Some(path[i + 1].node_id)
         } else {
             None
         };
+        if i == 0 && path.len() > 1 {
+            if let Some(forward_ttl) = ttl.checked_sub(1) {
+                let forward = BlindRelayEnvelope {
+                    route_id,
+                    next_hop: path[1].node_id,
+                    ttl: forward_ttl,
+                    encrypted_blob: inner.clone(),
+                    timestamp: now,
+                    signature: [0u8; 64],
+                };
+                let digest = Sha256::digest(forward.signing_data());
+                let mut signing_data_commitment = [0u8; 32];
+                signing_data_commitment.copy_from_slice(&digest);
+                expectation = Some(VerifiedOnionForwardExpectation {
+                    route_id,
+                    first_relay_node_id: path[0].node_id,
+                    next_hop_node_id: path[1].node_id,
+                    ttl: forward_ttl,
+                    timestamp: now,
+                    signing_data_commitment,
+                });
+            }
+        }
         let payload = OnionHopPayload { next_hop, inner };
         let encoded = encode_payload(&payload)?;
         inner = seal_layer(&path[i].kem_pub, &encoded)?;
@@ -926,7 +1105,7 @@ pub fn build_onion_envelope(
     }
     .sign_with(source);
 
-    Ok(envelope)
+    Ok((envelope, expectation))
 }
 
 // ============================================
@@ -1249,6 +1428,107 @@ mod tests {
         let exit_peel = open_onion_layer(&entry_peel.inner, &x25519_secret(&exit_id)).unwrap();
         assert_eq!(exit_peel.next_hop, None);
         assert_eq!(exit_peel.inner, payload);
+    }
+
+    #[test]
+    fn verified_route_captures_and_verifies_first_forward_expectation() {
+        let source = IdentityKeyPair::from_bytes(&[0x71; 32]).expect("source");
+        let (entry_id, entry_hop) = hop_keypair();
+        let (_exit_id, exit_hop) = hop_keypair();
+        let route = VerifiedOnionRoute {
+            source_node_id: source.public_key_bytes(),
+            purpose: OnionRoutePurpose::MessageRelay,
+            verified_at: 100,
+            valid_until: 200,
+            hops: vec![entry_hop.clone(), exit_hop.clone()],
+        };
+        let route_id = [0x72; 16];
+        let now = 150;
+        let (outer, expectation) = route
+            .build_envelope_with_forward_expectation(b"opaque", route_id, now, &source)
+            .expect("verified route envelope");
+        let expectation = expectation.expect("multi-hop expectation");
+        assert_eq!(expectation.route_id(), route_id);
+        assert_eq!(expectation.first_relay_node_id(), entry_hop.node_id);
+        assert_eq!(expectation.next_hop_node_id(), exit_hop.node_id);
+        assert_eq!(expectation.ttl(), outer.ttl - 1);
+        assert_eq!(expectation.timestamp(), now);
+        assert_ne!(expectation.signing_data_commitment(), [0; 32]);
+
+        let peeled = open_onion_layer(&outer.encrypted_blob, &x25519_secret(&entry_id))
+            .expect("entry peel");
+        let forwarded = BlindRelayEnvelope {
+            route_id,
+            next_hop: exit_hop.node_id,
+            ttl: outer.ttl - 1,
+            encrypted_blob: peeled.inner,
+            timestamp: now,
+            signature: [0; 64],
+        }
+        .sign_with(&entry_id);
+        expectation
+            .verify_relay_produced_envelope(&forwarded)
+            .expect("forward expectation");
+
+        for tampered in [
+            {
+                let mut value = forwarded.clone();
+                value.route_id[0] ^= 1;
+                value
+            },
+            {
+                let mut value = forwarded.clone();
+                value.next_hop[0] ^= 1;
+                value
+            },
+            {
+                let mut value = forwarded.clone();
+                value.ttl = value.ttl.saturating_sub(1);
+                value
+            },
+            {
+                let mut value = forwarded.clone();
+                value.timestamp += 1;
+                value
+            },
+            {
+                let mut value = forwarded.clone();
+                value.encrypted_blob[0] ^= 1;
+                value
+            },
+            {
+                let mut value = forwarded.clone();
+                value.signature[0] ^= 1;
+                value
+            },
+        ] {
+            assert!(expectation.verify_relay_produced_envelope(&tampered).is_err());
+        }
+    }
+
+    #[test]
+    fn verified_route_single_hop_has_no_forward_expectation_and_rejects_invalid_context() {
+        let source = IdentityKeyPair::from_bytes(&[0x73; 32]).expect("source");
+        let (entry_id, entry_hop) = hop_keypair();
+        let route = VerifiedOnionRoute {
+            source_node_id: source.public_key_bytes(),
+            purpose: OnionRoutePurpose::MessageRelay,
+            verified_at: 100,
+            valid_until: 200,
+            hops: vec![entry_hop],
+        };
+        let (outer, expectation) = route
+            .build_envelope_with_forward_expectation(b"opaque", [0x74; 16], 150, &source)
+            .expect("single-hop route");
+        assert!(expectation.is_none());
+        assert!(route
+            .build_envelope_with_forward_expectation(b"opaque", [0x74; 16], 99, &source)
+            .is_err());
+        let wrong_source = IdentityKeyPair::from_bytes(&[0x75; 32]).expect("wrong source");
+        assert!(route
+            .build_envelope_with_forward_expectation(b"opaque", [0x74; 16], 150, &wrong_source)
+            .is_err());
+        assert!(open_onion_layer(&outer.encrypted_blob, &x25519_secret(&entry_id)).is_ok());
     }
 
     #[test]
