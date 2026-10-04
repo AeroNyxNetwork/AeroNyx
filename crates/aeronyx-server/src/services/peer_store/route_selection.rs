@@ -7,10 +7,49 @@
 //! capability/TTL gates, network anti-affinity, routeability scoring, and
 //! strict multi-hop planning retain their existing public inherent API and
 //! selection order. This child does not own route-domain policy mutation.
+//! [DIRECT-RELAY-READMISSION 2026-10-04 by Codex] Revalidate a selected
+//! transport surface against current signed admission before outbound I/O.
 
 use super::*;
 
 impl PeerStore {
+    /// Re-admits a previously selected route without selecting a replacement.
+    ///
+    /// [DIRECT-RELAY-READMISSION 2026-10-04 by Codex] Authenticate the pin,
+    /// but apply time validity to the current descriptor: a signed same-surface
+    /// renewal may outlive the selected descriptor. Sequence/TTL alone must not
+    /// force endpoint replacement. Hold the peer read lock through the health
+    /// check (the existing peer -> health lock order), never through network I/O.
+    /// This is an admission point, not a lease preventing later route changes.
+    #[must_use]
+    pub(crate) fn readmit_selected_route(
+        &self,
+        selected: &SignedNodeDescriptor,
+        now: u64,
+    ) -> bool {
+        if selected.verify_signature().is_err() {
+            return false;
+        }
+        let Some(expected_surface) = Self::descriptor_routeability_surface_fingerprint(selected)
+        else {
+            return false;
+        };
+        let node_id = selected.node_id();
+        let peers = self.peers.read();
+        let Some(current) = peers.get(&node_id) else {
+            return false;
+        };
+        if current.verify_at(now).is_err()
+            || !self.permissionless_gate_allows(current, now, true)
+            || Self::descriptor_routeability_surface_fingerprint(current).as_deref()
+                != Some(expected_surface.as_str())
+        {
+            return false;
+        }
+        let route_health = self.route_health.read();
+        Self::routeability_state_and_ready(route_health.get(&node_id), now).1
+    }
+
     /// Returns a descriptor for a node id if present and valid at `now`.
     #[must_use]
     pub fn get_valid(&self, node_id: &[u8; 32], now: u64) -> Option<SignedNodeDescriptor> {

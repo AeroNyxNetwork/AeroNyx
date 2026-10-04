@@ -4,6 +4,8 @@
 // [CHAT-OUTBOUND-RUNTIME 2026-09-25 by Codex] Own signed-descriptor outbound
 // chat route selection, bounded onion/direct relay, receipt validation, and
 // ambiguity-safe retry. Caller startup/shutdown and public wire stay unchanged.
+// [DIRECT-RELAY-READMISSION 2026-10-04 by Codex] Re-admit the pinned direct
+// route before every send; local admission changes stop without replacement.
 use super::*;
 
 const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
@@ -110,6 +112,9 @@ pub(super) enum TargetBoundPeerRelayFailure {
     Transport(reqwest::Error),
     Http(reqwest::StatusCode),
     Ack(DirectPeerRelayAckFailure),
+    // [DIRECT-RELAY-READMISSION 2026-10-04 by Codex] Local selection became
+    // inadmissible; this carries no endpoint/identity and is not peer evidence.
+    AdmissionChanged,
 }
 
 impl TargetBoundPeerRelayFailure {
@@ -118,11 +123,13 @@ impl TargetBoundPeerRelayFailure {
             Self::Transport(_) => true,
             Self::Http(status) => status.as_u16() == HTTP_TOO_EARLY_STATUS_CODE,
             Self::Ack(error) => error.retryable_after_ambiguous_delivery(),
+            Self::AdmissionChanged => false,
         }
     }
 
     pub(super) fn is_local_runtime_failure(&self) -> bool {
-        matches!(self, Self::Ack(error) if error.is_local_runtime_failure())
+        matches!(self, Self::AdmissionChanged)
+            || matches!(self, Self::Ack(error) if error.is_local_runtime_failure())
     }
 }
 
@@ -795,11 +802,23 @@ impl Server {
         url: &str,
         request: &PreparedAuthenticatedPeerChatRelayHttpRequest,
         expected_request_commitment: &[u8; 32],
-        expected_node_id: &[u8; 32],
+        selected: &SignedNodeDescriptor,
+        peer_store: &PeerStore,
         require_signed_receipt: bool,
     ) -> TargetBoundPeerRelayDeliveryOutcome {
-        let mut attempt = 1usize;
+        // [DIRECT-RELAY-READMISSION 2026-10-04 by Codex] Count only actual
+        // sends. Every iteration, including the post-delay exact retry, checks
+        // current admission. No await or route substitution separates this
+        // check from initiating the prepared HTTP request.
+        let mut attempt = 0usize;
         loop {
+            if !peer_store.readmit_selected_route(selected, unix_now_secs()) {
+                return TargetBoundPeerRelayDeliveryOutcome {
+                    result: Err(TargetBoundPeerRelayFailure::AdmissionChanged),
+                    attempts: attempt,
+                };
+            }
+            attempt += 1;
             let outcome = match client
                 .post(url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -814,7 +833,7 @@ impl Server {
                 Ok(response) => Self::validate_direct_peer_relay_ack_typed(
                     response,
                     Some(expected_request_commitment),
-                    expected_node_id,
+                    &selected.node_id(),
                     require_signed_receipt,
                     unix_now_secs(),
                 )
@@ -832,7 +851,6 @@ impl Server {
                 };
             }
 
-            attempt = attempt.saturating_add(1);
             tokio::time::sleep(Duration::from_millis(
                 DIRECT_PEER_RELAY_V3_RETRY_DELAY_MILLIS,
             ))
@@ -1047,26 +1065,29 @@ impl Server {
                         }
                     };
                     let request_commitment = request.request_commitment();
-                    // [DIRECT-RELAY-ATTEMPT-BOUNDARY 2026-08-31 by Codex] Local
-                    // request preparation cannot affect peer reputation. Count an
-                    // attempt only after the exact signed request is ready and the
-                    // HTTP transport is about to observe it.
-                    attempted += 1;
+                    // [DIRECT-RELAY-READMISSION 2026-10-04 by Codex] Signing
+                    // awaits may outlive selection. The helper re-admits each
+                    // actual send, including the byte-exact bounded retry.
                     let outcome = Self::send_and_validate_target_bound_peer_relay(
                         client,
                         &url,
                         &request,
                         &request_commitment,
-                        &peer.node_id(),
+                        &peer,
+                        peer_store,
                         require_signed_receipt,
                     )
                     .await;
+                    // Preserve the aggregate count of attempted peers, excluding
+                    // local zero-send rejection; helper counts actual HTTP sends.
+                    attempted += usize::from(outcome.attempts > 0);
                     if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
                         if outcome.local_runtime_failure() {
                             // [DIRECT-RELAY-LOCAL-FAULT-ATTRIBUTION 2026-08-31 by
                             // Codex] Local verifier capacity says nothing about the
-                            // selected peer. Release half-open ownership without
-                            // advancing outage evidence.
+                            // selected peer. [DIRECT-RELAY-READMISSION 2026-10-04
+                            // by Codex] Admission changes also release half-open
+                            // ownership without advancing outage evidence.
                             relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
                         } else {
                             circuit_allows_more = relay.complete_direct_peer_delivery(
@@ -1078,7 +1099,23 @@ impl Server {
                             );
                         }
                     }
+                    // [DIRECT-RELAY-READMISSION 2026-10-04 by Codex] Stop the
+                    // round on a local admission change, including after an
+                    // ambiguous first send. Never replace URL/peer, fall back to
+                    // v2/v1, or turn that local rejection into outage evidence.
+                    if matches!(
+                        &outcome.result,
+                        Err(TargetBoundPeerRelayFailure::AdmissionChanged)
+                    ) {
+                        circuit_allows_more = false;
+                    }
                     outcome.result.map_err(|error| match error {
+                        TargetBoundPeerRelayFailure::AdmissionChanged => {
+                            DirectPeerRelayDeliveryFailure {
+                                reason: "peer_relay_request_unknown".to_string(),
+                                attribution: DirectPeerRelayFailureAttribution::LocalRuntime,
+                            }
+                        }
                         TargetBoundPeerRelayFailure::Transport(error) => {
                             DirectPeerRelayDeliveryFailure::selected_peer(
                                 Self::classify_reqwest_error("peer_relay_request", &error),
@@ -1110,6 +1147,13 @@ impl Server {
                             }
                         };
                         let request_commitment = request.request_commitment();
+                        // [DIRECT-RELAY-READMISSION 2026-10-04 by Codex] Shared
+                        // request preparation or a previous peer may have awaited.
+                        // Reject locally before this immutable URL observes bytes.
+                        if !peer_store.readmit_selected_route(&peer, unix_now_secs()) {
+                            last_failure_reason = Some("peer_relay_request_unknown".to_string());
+                            break;
+                        }
                         attempted += 1;
                         (
                             client
@@ -1132,6 +1176,12 @@ impl Server {
                                 continue;
                             }
                         };
+                        // [DIRECT-RELAY-READMISSION 2026-10-04 by Codex] Legacy
+                        // transport keeps its wire contract, not stale admission.
+                        if !peer_store.readmit_selected_route(&peer, unix_now_secs()) {
+                            last_failure_reason = Some("peer_relay_request_unknown".to_string());
+                            break;
+                        }
                         attempted += 1;
                         (
                             client
@@ -1167,6 +1217,10 @@ impl Server {
             let observed_at = unix_now_secs();
             match delivery_result {
                 Ok(()) => {
+                    // [DIRECT-RELAY-READMISSION 2026-10-04 by Codex] Admission
+                    // gates sends, not already-verified custody. A descriptor
+                    // rotation after send may fence the health write below, but
+                    // cannot revoke the valid receipt or cause another retry.
                     accepted += 1;
                     let _ =
                         peer_store.record_route_forward_success_for_descriptor(&peer, observed_at);
