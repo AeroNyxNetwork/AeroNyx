@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_peer_facade.rs
 // ============================================
-// Version: 1.1.0-OnlineAdmissionFacade
+// Version: 1.2.0-LegacyCustodyRetryFacade
 //
 // Creation Reason:
 //   [CHAT-PEER-FACADE-DOMAIN 2026-08-28 by Codex] Move privacy-safe relay
@@ -37,11 +37,17 @@
 //   - Compatibility strings must remain sanitized into the closed reason enum.
 //
 // Last Modified:
+//   [LEGACY-CUSTODY-RETRY 2026-10-04 by Codex] Exact-envelope owned admission.
 //   v1.1.0-OnlineAdmissionFacade - Co-located live-path duplicate admission
 //   v1.0.0-PeerRelayFacade - Initial peer relay facade extraction
 // ============================================
 
-use crate::services::chat_relay_message_dedup::OnlineMessageDeduplication;
+use aeronyx_core::protocol::chat::{encode_envelope, ChatEnvelope};
+use sha2::{Digest, Sha256};
+
+use crate::services::chat_relay_message_dedup::{
+    LegacyAdmissionError, LegacyDeliveryLease, OnlineMessageDeduplication,
+};
 use crate::services::chat_relay_peer_telemetry::{
     BlindRouteRecoveryEvent, OutboundRouteClass, PeerRelayTelemetrySink, VerifiedSubmitEvent,
 };
@@ -53,9 +59,25 @@ use super::{
 };
 
 impl ChatRelayService {
-    /// Returns `true` when this message was already admitted on the live path.
+    /// Returns `true` for an admitted ID or fail-closed dedup capacity exhaustion.
     pub fn is_online_duplicate(&self, message_id: &[u8; 16]) -> bool {
         self.dedup.check_and_insert(message_id)
+    }
+
+    // [LEGACY-CUSTODY-RETRY 2026-10-04 by Codex] Call after authenticating the
+    // envelope against the ingress session. Commit the entire canonical signed
+    // envelope, not just its ID; only the digest is retained in process memory.
+    pub(crate) fn begin_legacy_delivery(
+        &self,
+        envelope: &ChatEnvelope,
+    ) -> Result<LegacyDeliveryLease, LegacyAdmissionError> {
+        let encoded =
+            encode_envelope(envelope).map_err(|_| LegacyAdmissionError::InvalidEnvelope)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"AeroNyx/LegacyChatCustodyRetry/v1\0");
+        hasher.update(&encoded);
+        self.dedup
+            .begin_legacy(&envelope.message_id, hasher.finalize().into())
     }
 
     /// Records a compatibility direct node-to-node encrypted relay round.

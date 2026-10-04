@@ -8,7 +8,9 @@
 // preserving the existing single-envelope send path above the target.
 // [CHAT-V2-BYTE-PAGING 2026-10-03 by Codex] Budget V2 before cursor creation;
 // retain single-item compatibility and observe local write failure without ACK.
-// Last Modified: 2026-10-03.
+// [LEGACY-CUSTODY-RETRY 2026-10-04 by Codex] Failed/cancelled legacy sends
+// retain an exact-envelope local-custody-only retry barrier, not delivery proof.
+// Last Modified: 2026-10-04.
 use super::*;
 
 impl Server {
@@ -337,8 +339,35 @@ impl Server {
                     );
                     return;
                 };
-                if relay.is_online_duplicate(&envelope.message_id) {
-                    debug!(reason = "duplicate", "[CHAT_RELAY] Envelope dropped");
+                // [LEGACY-CUSTODY-RETRY 2026-10-04 by Codex] The owned lease
+                // holds no lock across delivery awaits. Drop (including task
+                // cancellation) conservatively permits only local custody retry.
+                let delivery_lease = match relay.begin_legacy_delivery(&envelope) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        debug!(
+                            reason = error.reason_bucket(),
+                            "[CHAT_RELAY] Envelope dropped"
+                        );
+                        return;
+                    }
+                };
+                if delivery_lease.custody_retry_only() {
+                    // Never announce, select a route, or dispatch on recovery.
+                    // A Completed duplicate is rejected before reaching here,
+                    // so it cannot recreate a pending row retired by ChatAck.
+                    match relay.store_pending(&envelope) {
+                        Ok(()) => {
+                            delivery_lease.complete_custody();
+                            debug!("[CHAT_RELAY] Local custody retry stored");
+                        }
+                        Err(error) => {
+                            warn!(
+                                reason = error.reason_bucket(),
+                                "[CHAT_RELAY] Local custody retry failed"
+                            );
+                        }
+                    }
                     return;
                 }
                 relay.wallet_routes.announce(
@@ -403,9 +432,12 @@ impl Server {
                                 "[CHAT_RELAY] Fallback store failed"
                             );
                         } else {
+                            delivery_lease.complete_custody();
                             debug!("[CHAT_RELAY] All routes stale; stored for offline delivery");
                         }
                     } else {
+                        // Legacy transport success only, not durable custody.
+                        delivery_lease.complete_online();
                         debug!(
                             devices = device_count,
                             "[CHAT_RELAY] Online delivery complete"
@@ -440,6 +472,7 @@ impl Server {
                             "[CHAT_RELAY] Pending store failed"
                         );
                     } else {
+                        delivery_lease.complete_custody();
                         debug!("[CHAT_RELAY] Stored for offline delivery");
                     }
                 }
