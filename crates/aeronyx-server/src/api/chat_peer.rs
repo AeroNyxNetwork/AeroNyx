@@ -2534,6 +2534,299 @@ mod tests {
         let _ = std::fs::remove_file(relay_path);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_onion_admission_persists_one_queue_row_and_replays_after_restart() {
+        // [PRIVATE-CUSTODY-REAL-ADMISSION 2026-10-04 by Codex] Exercise the
+        // production two-layer S->R->P AXON shape. The first handler call
+        // must enqueue exactly one opaque forwarded envelope; retries and a
+        // relay restart only replay the durable R-signed custody response.
+        let source = IdentityKeyPair::from_bytes(&[0xB1; 32]).unwrap();
+        let relay = Arc::new(IdentityKeyPair::from_bytes(&[0xB2; 32]).unwrap());
+        let recipient = IdentityKeyPair::from_bytes(&[0xB3; 32]).unwrap();
+        let now = now_secs();
+        let route_id = [0xB4; 16];
+        let purpose = OnionRoutePurpose::BlindVaultPull;
+
+        let mut relay_body = NodeDescriptor::new(
+            relay.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now + 600,
+            "test",
+        )
+        .with_x25519_kem(relay.x25519_public_key_bytes())
+        .with_protocol_features(purpose.required_path_protocol_features().iter().copied());
+        relay_body.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
+        relay_body.public_endpoint = Some("https://relay.invalid".to_owned());
+        let mut recipient_body = NodeDescriptor::new(
+            recipient.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now + 600,
+            "test",
+        )
+        .with_x25519_kem(recipient.x25519_public_key_bytes())
+        .with_protocol_features(
+            purpose
+                .required_terminal_protocol_features()
+                .iter()
+                .copied(),
+        );
+        recipient_body.capabilities = vec![
+            NodeCapability::ChatRelay,
+            NodeCapability::BlindVaultReplica,
+        ];
+        recipient_body.public_endpoint = None;
+        let relay_descriptor = SignedNodeDescriptor::sign(relay_body, relay.as_ref()).unwrap();
+        let recipient_descriptor = SignedNodeDescriptor::sign(recipient_body, &recipient).unwrap();
+        let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &relay_descriptor,
+            &recipient_descriptor,
+            purpose.as_str(),
+            now,
+            now + 300,
+            &recipient,
+        )
+        .unwrap();
+
+        let queue_directory = tempfile::Builder::new()
+            .prefix("private-onion-admission-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp")
+            .unwrap();
+        let limits = crate::services::reverse_onion_queue::ReverseOnionQueueLimits::new(
+            4,
+            2 * 1024 * 1024,
+            4,
+            300,
+            600,
+        )
+        .unwrap();
+        let queue_config =
+            crate::services::reverse_onion_queue_db::ReverseOnionQueueDbConfig::new(
+                queue_directory.path().join("queue.sqlite"),
+                16 * 1024 * 1024,
+                limits,
+            )
+            .unwrap();
+        let make_admission = |queue| {
+            Arc::new(
+                PrivateBlindRelayAdmission::new(
+                    relay.public_key_bytes(),
+                    relay_descriptor.clone(),
+                    recipient_descriptor.clone(),
+                    authorization.clone(),
+                    purpose,
+                    vec![source.public_key_bytes()],
+                    queue,
+                    1,
+                    300,
+                    now,
+                )
+                .unwrap(),
+            )
+        };
+        let queue = Arc::new(ReverseOnionQueueDb::open(queue_config.clone(), now).unwrap());
+        let admission = make_admission(Arc::clone(&queue));
+        let (relay_service, relay_path) = temp_chat_relay("private-onion-admission");
+        let (terminal, _) = BlindVaultOnionPullSession::prepare(
+            route_id,
+            recipient.public_key_bytes(),
+            BlindVaultPullRequest {
+                version: BLIND_VAULT_PROTOCOL_VERSION,
+                lease_id: [0xB5; 32],
+                read_capability: [0xB6; 32],
+                continuation_cursor: Vec::new(),
+                limit: 1,
+            },
+        )
+        .unwrap();
+        let route = VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+            source.public_key_bytes(),
+            &relay_descriptor,
+            &recipient_descriptor,
+            &authorization,
+            purpose,
+            now,
+        )
+        .unwrap();
+        let envelope = route
+            .build_envelope(&terminal, route_id, now, &source)
+            .unwrap();
+        assert_eq!(envelope.next_hop, relay.public_key_bytes());
+        assert_eq!(envelope.ttl, 2);
+        let request = PeerBlindRelayRequest {
+            envelope: envelope.clone(),
+            previous_hop_node_id: source.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        let request_commitment = blind_relay_authenticated_request_commitment(&request).unwrap();
+        let state = ChatPeerState {
+            chat_relay: Some(Arc::clone(&relay_service)),
+            blind_vault: None,
+            anonymous_mailbox: None,
+            private_recipient_admission: Some(Arc::clone(&admission)),
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::new(PeerStore::new()),
+            node_identity: Arc::clone(&relay),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        };
+        let first = process_onion_blind_relay(
+            state.clone(),
+            source.public_key_bytes(),
+            envelope.clone(),
+            request_commitment,
+            now,
+            &std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert!(first.accepted && first.forwarded && !first.terminal);
+        assert_eq!(first.reason, None);
+        assert!(first.delivery_receipt.is_none());
+        let first_bytes = serde_json::to_vec(&first).unwrap();
+
+        let snapshot = queue
+            .lookup_source(
+                source.public_key_bytes(),
+                route_id,
+                request_commitment,
+                now + 1,
+            )
+            .unwrap()
+            .expect("real private admission must create one source-bound queue row");
+        assert_eq!(snapshot.source_node_id(), source.public_key_bytes());
+        assert_eq!(snapshot.route_id(), route_id);
+        assert_eq!(snapshot.request_commitment(), request_commitment);
+        assert_eq!(snapshot.immediate_recipient(), recipient.public_key_bytes());
+        assert!(snapshot.claim_frame().is_none());
+        assert!(snapshot.lease_frame().is_none());
+        assert!(snapshot.result_frame().is_none());
+
+        let peeled = {
+            let (relay_secret, _) = relay.to_x25519();
+            open_onion_layer(&envelope.encrypted_blob, &relay_secret).unwrap()
+        };
+        let expected_forwarded = build_forwarded_onion_envelope_from_seed(
+            BlindRelayForwardSeed::from(&envelope),
+            recipient.public_key_bytes(),
+            peeled.inner,
+            relay.as_ref(),
+        );
+        let expected_forwarded_bytes =
+            aeronyx_core::protocol::chat::encode_blind_relay_envelope(&expected_forwarded)
+                .unwrap();
+        let queue_path = queue_directory.path().join("queue.sqlite");
+        drop(state);
+        drop(admission);
+        drop(queue);
+        let (row_count, stored_forwarded): (i64, Vec<u8>) = Connection::open(&queue_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*), envelope FROM reverse_onion_delivery_queue_v1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1);
+        assert_eq!(stored_forwarded, expected_forwarded_bytes);
+
+        let queue_reopened = Arc::new(ReverseOnionQueueDb::open(queue_config, now + 1).unwrap());
+        let admission_reopened = make_admission(Arc::clone(&queue_reopened));
+        let restarted_relay = Arc::new(
+            ChatRelayService::new(
+                test_chat_config(relay_path.to_string_lossy().into_owned()),
+                [7u8; 32],
+            )
+            .unwrap(),
+        );
+        let restarted_state = ChatPeerState {
+            chat_relay: Some(Arc::clone(&restarted_relay)),
+            blind_vault: None,
+            anonymous_mailbox: None,
+            private_recipient_admission: Some(admission_reopened),
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::new(PeerStore::new()),
+            node_identity: Arc::clone(&relay),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        };
+        let after_restart = process_onion_blind_relay(
+            restarted_state,
+            source.public_key_bytes(),
+            envelope.clone(),
+            request_commitment,
+            now + 1,
+            &std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(serde_json::to_vec(&after_restart).unwrap(), first_bytes);
+        let (row_count_after_restart, stored_after_restart): (i64, Vec<u8>) =
+            Connection::open(&queue_path)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*), envelope FROM reverse_onion_delivery_queue_v1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+        assert_eq!(row_count_after_restart, 1);
+        assert_eq!(stored_after_restart, expected_forwarded_bytes);
+
+        let mut wrong_responder = after_restart.clone();
+        wrong_responder
+            .success_receipt
+            .as_mut()
+            .unwrap()
+            .responder_node_id = recipient.public_key_bytes();
+        assert!(verify_private_custody_response_for_envelope(
+            &wrong_responder,
+            &envelope,
+            &relay.public_key_bytes(),
+            now + 1,
+        )
+        .is_err());
+        let mut wrong_envelope = envelope.clone();
+        wrong_envelope.route_id = [0xB7; 16];
+        assert!(verify_private_custody_response_for_envelope(
+            &after_restart,
+            &wrong_envelope,
+            &relay.public_key_bytes(),
+            now + 1,
+        )
+        .is_err());
+        let mut changed_ttl = after_restart.clone();
+        changed_ttl.ttl_remaining = changed_ttl.ttl_remaining.saturating_add(1);
+        assert!(verify_private_custody_response_for_envelope(
+            &changed_ttl,
+            &envelope,
+            &relay.public_key_bytes(),
+            now + 1,
+        )
+        .is_err());
+        let mut bad_signature = after_restart.clone();
+        bad_signature.success_receipt.as_mut().unwrap().signature[0] ^= 1;
+        assert!(verify_private_custody_response_for_envelope(
+            &bad_signature,
+            &envelope,
+            &relay.public_key_bytes(),
+            now + 1,
+        )
+        .is_err());
+
+        drop(restarted_relay);
+        let _ = std::fs::remove_file(relay_path);
+    }
+
     fn signed_envelope() -> ChatEnvelope {
         signed_envelope_at(now_secs())
     }
