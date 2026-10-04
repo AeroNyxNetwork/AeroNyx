@@ -1543,9 +1543,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(journal.prepare(plan, f.session(), NOW + 2).err(), Some(SourceJournalError::Rejected));
-        let connection = Connection::open(&f.path()).unwrap();
-        let count: i64 = connection.query_row("SELECT count(*) FROM source_jobs", [], |row| row.get(0)).unwrap();
-        let clock: i64 = connection.query_row("SELECT clock FROM source_meta WHERE singleton=1", [], |row| row.get(0)).unwrap();
+        let (count, clock) = journal.with_inner(|inner| {
+            let count = inner.connection.query_row("SELECT count(*) FROM source_jobs", [], |row| row.get::<_, i64>(0)).map_err(unavailable)?;
+            let clock = inner.connection.query_row("SELECT clock FROM source_meta WHERE singleton=1", [], |row| row.get::<_, i64>(0)).map_err(unavailable)?;
+            Ok((count, clock))
+        }).unwrap();
         assert_eq!(count, 0);
         assert_eq!(clock, NOW as i64);
     }
