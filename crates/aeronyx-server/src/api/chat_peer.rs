@@ -583,7 +583,8 @@ use super::chat_peer_anonymous_mailbox::{
 use super::chat_peer_replay::REPLAY_CAPACITY_FOR_TESTS as MAX_BLIND_RELAY_SEEN_ROUTES;
 use super::chat_peer_replay::{
     decode_durable_blind_relay_response, encode_durable_blind_relay_response,
-    validate_completed_blind_relay_response, BlindRelayReplayDomain, BlindRelayReplayMutation,
+    validate_completed_blind_relay_response, validate_completed_private_custody_response,
+    verify_private_custody_response_for_envelope, BlindRelayReplayDomain, BlindRelayReplayMutation,
     BlindRelayReplayRegistry, BlindRelayRouteReplayDecision,
 };
 use super::chat_peer_response::BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS;
@@ -2019,6 +2020,8 @@ pub fn build_chat_peer_router(
     http_client: Arc<reqwest::Client>,
     blind_vault: Option<SharedBlindVaultService>,
 ) -> Router {
+    // [PRIVATE-ROUTER-ARG-BOUNDARY 2026-10-04 by Codex] Keep the legacy
+    // default-off delegation aligned with the additive eight-argument builder.
     build_chat_peer_router_with_anonymous_mailbox(
         chat_relay,
         sessions,
@@ -2027,7 +2030,6 @@ pub fn build_chat_peer_router(
         node_identity,
         http_client,
         blind_vault,
-        None,
         None,
     )
 }
@@ -2280,7 +2282,7 @@ mod tests {
     };
     use aeronyx_core::protocol::discovery::SignedPrivateOnionRecipientAuthorizationV1;
     use aeronyx_core::protocol::onion::{
-        open_onion_layer, OnionRoutePurpose, VerifiedOnionRoute,
+        build_onion_envelope, open_onion_layer, OnionHop, OnionRoutePurpose, VerifiedOnionRoute,
     };
     use aeronyx_transport::UdpTransport;
     use axum::body::{to_bytes, Body};
@@ -2297,6 +2299,240 @@ mod tests {
     use crate::api::PEER_ACK_RESPONSE_MAX_BYTES;
     use crate::config::{BlindVaultConfig, ChatRelayConfig};
     use crate::services::{BlindVaultLeaseProvisionOutcome, BlindVaultService};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_onion_lost_ack_replays_exact_signed_response_at_later_clock() {
+        // [PRIVATE-CUSTODY-EXACT-REPLAY 2026-10-04 by Codex] Exercise the
+        // actual peeled-onion handler's completed-route branch. A stored
+        // private R->P custody response must be returned byte-for-byte on a
+        // retry at a later logical clock, rather than being re-signed.
+        let source = IdentityKeyPair::from_bytes(&[0xA1; 32]).unwrap();
+        let relay = Arc::new(IdentityKeyPair::from_bytes(&[0xA2; 32]).unwrap());
+        let recipient = IdentityKeyPair::from_bytes(&[0xA3; 32]).unwrap();
+        let now = now_secs();
+        let route_id = [0xA4; 16];
+        let purpose = OnionRoutePurpose::BlindVaultPull;
+
+        let mut relay_body = NodeDescriptor::new(
+            relay.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now + 600,
+            "test",
+        )
+        .with_x25519_kem(relay.x25519_public_key_bytes())
+        .with_protocol_features(purpose.required_path_protocol_features().iter().copied());
+        relay_body.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
+        relay_body.public_endpoint = Some("https://relay.invalid".to_owned());
+        let mut recipient_body = NodeDescriptor::new(
+            recipient.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now + 600,
+            "test",
+        )
+        .with_x25519_kem(recipient.x25519_public_key_bytes())
+        .with_protocol_features(
+            purpose
+                .required_terminal_protocol_features()
+                .iter()
+                .copied(),
+        );
+        recipient_body.capabilities = vec![
+            NodeCapability::ChatRelay,
+            NodeCapability::BlindVaultReplica,
+        ];
+        recipient_body.public_endpoint = None;
+        let relay_descriptor = SignedNodeDescriptor::sign(relay_body, relay.as_ref()).unwrap();
+        let recipient_descriptor = SignedNodeDescriptor::sign(recipient_body, &recipient).unwrap();
+        let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &relay_descriptor,
+            &recipient_descriptor,
+            purpose.as_str(),
+            now,
+            now + 300,
+            &recipient,
+        )
+        .unwrap();
+
+        let directory = tempfile::Builder::new()
+            .prefix("private-onion-exact-replay-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp")
+            .unwrap();
+        let limits = crate::services::reverse_onion_queue::ReverseOnionQueueLimits::new(
+            4,
+            2 * 1024 * 1024,
+            4,
+            300,
+            600,
+        )
+        .unwrap();
+        let queue_config =
+            crate::services::reverse_onion_queue_db::ReverseOnionQueueDbConfig::new(
+                directory.path().join("queue.sqlite"),
+                16 * 1024 * 1024,
+                limits,
+            )
+            .unwrap();
+        let queue = Arc::new(ReverseOnionQueueDb::open(queue_config, now).unwrap());
+        let admission = Arc::new(
+            PrivateBlindRelayAdmission::new(
+                relay.public_key_bytes(),
+                relay_descriptor,
+                recipient_descriptor,
+                authorization,
+                purpose,
+                vec![source.public_key_bytes()],
+                queue,
+                1,
+                300,
+                now,
+            )
+            .unwrap(),
+        );
+        let (relay_service, relay_path) = temp_chat_relay("private-onion-exact-replay");
+        let envelope = build_onion_envelope(
+            &[OnionHop {
+                node_id: relay.public_key_bytes(),
+                kem_pub: crate::services::onion_keys::current_public_key(),
+            }],
+            b"opaque private pull layer",
+            route_id,
+            2,
+            now,
+            &source,
+        )
+        .unwrap();
+        let request = PeerBlindRelayRequest {
+            envelope: envelope.clone(),
+            previous_hop_node_id: source.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        let request_commitment = blind_relay_authenticated_request_commitment(&request).unwrap();
+        assert_eq!(
+            relay_service
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .unwrap(),
+            BlindRelayRouteAdmission::Reserved
+        );
+        let stored = sign_blind_relay_success_receipt(
+            &envelope,
+            PeerBlindRelayResponse {
+                accepted: true,
+                terminal: false,
+                forwarded: true,
+                ttl_remaining: 1,
+                reason: None,
+                delivery_receipt: None,
+                success_receipt: None,
+                failure_receipt: None,
+                opaque_terminal_response_b64: None,
+            },
+            now,
+            relay.as_ref(),
+        )
+        .unwrap();
+        let encoded = encode_durable_blind_relay_response(&stored).unwrap();
+        relay_service
+            .remember_blind_relay_route_response(
+                &route_id,
+                &request_commitment,
+                &encoded,
+                now,
+            )
+            .unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        let state = ChatPeerState {
+            chat_relay: Some(Arc::clone(&relay_service)),
+            blind_vault: None,
+            anonymous_mailbox: None,
+            private_recipient_admission: Some(Arc::clone(&admission)),
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store,
+            node_identity: Arc::clone(&relay),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        };
+        let first = process_onion_blind_relay(
+            state.clone(),
+            source.public_key_bytes(),
+            envelope.clone(),
+            request_commitment,
+            now,
+            &std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+        let second = process_onion_blind_relay(
+            state.clone(),
+            source.public_key_bytes(),
+            envelope.clone(),
+            request_commitment,
+            now + 1,
+            &std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, stored);
+        assert_eq!(second, stored);
+        assert_eq!(
+            serde_json::to_vec(&first).unwrap(),
+            serde_json::to_vec(&second).unwrap(),
+            "lost-ACK retry must preserve exact signed response bytes"
+        );
+
+        drop(state);
+        drop(relay_service);
+        let restarted_relay = Arc::new(
+            ChatRelayService::new(
+                test_chat_config(relay_path.to_string_lossy().into_owned()),
+                [7u8; 32],
+            )
+            .unwrap(),
+        );
+        let restarted_state = ChatPeerState {
+            chat_relay: Some(Arc::clone(&restarted_relay)),
+            blind_vault: None,
+            anonymous_mailbox: None,
+            private_recipient_admission: Some(admission),
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::new(PeerStore::new()),
+            node_identity: Arc::clone(&relay),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        };
+        let after_restart = process_onion_blind_relay(
+            restarted_state,
+            source.public_key_bytes(),
+            envelope,
+            request_commitment,
+            now + 1,
+            &std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_restart, stored);
+        let durable_route_count: i64 = Connection::open(&relay_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM relay_blind_route_reservations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(durable_route_count, 1);
+
+        drop(restarted_relay);
+        let _ = std::fs::remove_file(relay_path);
+    }
 
     fn signed_envelope() -> ChatEnvelope {
         signed_envelope_at(now_secs())

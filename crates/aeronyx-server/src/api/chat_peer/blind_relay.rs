@@ -615,6 +615,7 @@ pub(super) async fn process_authenticated_peer_blind_relay(
             request_commitment,
             previous_hop_node_id,
             now,
+            false,
         )? {
             BlindRelayRouteStart::Acquired(lease) => lease,
             BlindRelayRouteStart::Completed(response) => {
@@ -712,17 +713,10 @@ pub(super) async fn process_authenticated_peer_blind_relay(
         request_commitment,
         previous_hop_node_id,
         now,
+        false,
     )? {
         BlindRelayRouteStart::Acquired(lease) => lease,
         BlindRelayRouteStart::Completed(response) => {
-            if state.private_recipient_admission.is_some()
-                && is_private_custody_response(&response)
-            {
-                // The durable response already carries this hop's exact
-                // signed custody receipt. Re-signing it with `now` would
-                // mutate replay bytes and weaken exact retry semantics.
-                return Ok(response);
-            }
             return attach_blind_relay_success_receipt(
                 Arc::clone(&original_envelope),
                 response,
@@ -837,9 +831,27 @@ pub(super) async fn process_onion_blind_relay(
         request_commitment,
         previous_hop_node_id,
         now,
+        state.private_recipient_admission.is_some(),
     )? {
         BlindRelayRouteStart::Acquired(lease) => lease,
         BlindRelayRouteStart::Completed(response) => {
+            if state.private_recipient_admission.is_some()
+                && is_private_custody_response(&response)
+            {
+                // [PRIVATE-CUSTODY-EXACT-REPLAY 2026-10-04 by Codex] The
+                // durable R->P custody response already carries the exact
+                // signed evidence for this route/request. Re-signing it with
+                // a retry's current clock would change the bytes after a
+                // lost ACK and weaken at-most-once replay semantics.
+                verify_private_custody_response_for_envelope(
+                    &response,
+                    envelope.as_ref(),
+                    &state.node_identity.public_key_bytes(),
+                    now,
+                )
+                .map_err(|_| record_blind_relay_replay_protection_failure(&state, now))?;
+                return Ok(response);
+            }
             return attach_blind_relay_success_receipt(
                 Arc::clone(&envelope),
                 response,
@@ -1485,6 +1497,7 @@ pub(super) async fn process_onion_middle_blind_relay(
         request_commitment,
         previous_hop_node_id,
         now,
+        false,
     )? {
         BlindRelayRouteStart::Acquired(lease) => lease,
         BlindRelayRouteStart::Completed(response) => {
@@ -1736,6 +1749,7 @@ pub(super) fn begin_blind_relay_route(
     request_commitment: [u8; 32],
     previous_hop: [u8; 32],
     now: u64,
+    allow_private_custody: bool,
 ) -> Result<BlindRelayRouteStart, BlindRelayError> {
     if let Some(relay) = state.chat_relay.as_ref() {
         let admission = relay
@@ -1791,8 +1805,16 @@ pub(super) fn begin_blind_relay_route(
                 }
                 let response = decode_durable_blind_relay_response(&response)
                     .map_err(|_| record_blind_relay_replay_protection_failure(state, now))?;
-                validate_completed_blind_relay_response(&response)
-                    .map_err(|_| record_blind_relay_replay_protection_failure(state, now))?;
+                if allow_private_custody {
+                    if validate_completed_blind_relay_response(&response).is_err() {
+                        validate_completed_private_custody_response(&response).map_err(|_| {
+                            record_blind_relay_replay_protection_failure(state, now)
+                        })?;
+                    }
+                } else {
+                    validate_completed_blind_relay_response(&response)
+                        .map_err(|_| record_blind_relay_replay_protection_failure(state, now))?;
+                }
                 state
                     .peer_store
                     .record_blind_relay_rejected(now, "duplicate_route");

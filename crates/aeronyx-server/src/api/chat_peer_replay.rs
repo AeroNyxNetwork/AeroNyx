@@ -51,12 +51,20 @@ use std::{
 };
 
 use aeronyx_core::protocol::chat::{
-    BlindRelayDeliveryReceipt, BlindRelayFailureReceipt, BlindRelaySuccessReceipt,
+    BlindRelayDeliveryReceipt, BlindRelayEnvelope, BlindRelayFailureReceipt,
+    BlindRelaySuccessReceipt,
 };
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 
-use super::{chat_peer::PeerBlindRelayResponse, BLIND_RELAY_ACK_RESPONSE_MAX_BYTES};
+use super::{
+    chat_peer::PeerBlindRelayResponse,
+    chat_peer_response::{
+        BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
+        BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS,
+    },
+    BLIND_RELAY_ACK_RESPONSE_MAX_BYTES,
+};
 use crate::services::chat_relay::{
     BLIND_RELAY_ROUTE_REPLAY_CAPACITY, BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
 };
@@ -403,6 +411,65 @@ pub(super) fn validate_completed_blind_relay_response(
         return Err(BlindRelayReplayCodecError::InvalidCompletedState);
     }
     Ok(())
+}
+
+/// Validates the private R->P custody shape without accepting it as a legacy
+/// completed response. Envelope and responder binding is performed by the
+/// onion handler once the original request is available.
+// [PRIVATE-CUSTODY-REPLAY-CODEC 2026-10-04 by Codex]
+pub(super) fn validate_completed_private_custody_response(
+    response: &PeerBlindRelayResponse,
+) -> Result<(), BlindRelayReplayCodecError> {
+    if !response.accepted
+        || response.terminal
+        || !response.forwarded
+        || response.reason.is_some()
+        || response.delivery_receipt.is_some()
+        || response.failure_receipt.is_some()
+        || response.opaque_terminal_response_b64.is_some()
+    {
+        return Err(BlindRelayReplayCodecError::InvalidCompletedState);
+    }
+    response
+        .success_receipt
+        .as_ref()
+        .ok_or(BlindRelayReplayCodecError::InvalidCompletedState)?
+        .verify_signature()
+        .map_err(|_| BlindRelayReplayCodecError::InvalidCompletedState)
+}
+
+/// Revalidates a persisted private custody ACK against the exact original
+/// onion envelope and local R identity before returning it unchanged.
+// [PRIVATE-CUSTODY-REPLAY-BINDING 2026-10-04 by Codex]
+pub(super) fn verify_private_custody_response_for_envelope(
+    response: &PeerBlindRelayResponse,
+    envelope: &BlindRelayEnvelope,
+    expected_responder: &[u8; 32],
+    observed_at: u64,
+) -> Result<(), BlindRelayReplayCodecError> {
+    validate_completed_private_custody_response(response)?;
+    let receipt = response
+        .success_receipt
+        .as_ref()
+        .ok_or(BlindRelayReplayCodecError::InvalidCompletedState)?;
+    if receipt.accepted_at
+        > observed_at.saturating_add(BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS)
+        || observed_at.saturating_sub(receipt.accepted_at)
+            > BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
+    {
+        return Err(BlindRelayReplayCodecError::InvalidCompletedState);
+    }
+    receipt
+        .verify_expected(
+            envelope,
+            false,
+            true,
+            response.ttl_remaining,
+            None,
+            None,
+            expected_responder,
+        )
+        .map_err(|_| BlindRelayReplayCodecError::InvalidCompletedState)
 }
 
 /// Result of observing one exact blind-route request.
