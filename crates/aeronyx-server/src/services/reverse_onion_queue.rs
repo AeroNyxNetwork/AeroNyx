@@ -337,6 +337,8 @@ pub(crate) struct ReverseOnionQueueSourceSnapshot {
     source_node_id: [u8; COMMITMENT_BYTES],
     route_id: [u8; ID_BYTES],
     request_commitment: [u8; COMMITMENT_BYTES],
+    immediate_recipient: [u8; COMMITMENT_BYTES],
+    route_deadline: u64,
     claim_frame: Option<Vec<u8>>,
     lease_frame: Option<Vec<u8>>,
     result_frame: Option<Vec<u8>>,
@@ -346,6 +348,8 @@ impl ReverseOnionQueueSourceSnapshot {
     pub(crate) fn source_node_id(&self) -> [u8; COMMITMENT_BYTES] { self.source_node_id }
     pub(crate) fn route_id(&self) -> [u8; ID_BYTES] { self.route_id }
     pub(crate) fn request_commitment(&self) -> [u8; COMMITMENT_BYTES] { self.request_commitment }
+    pub(crate) fn immediate_recipient(&self) -> [u8; COMMITMENT_BYTES] { self.immediate_recipient }
+    pub(crate) fn route_deadline(&self) -> u64 { self.route_deadline }
     pub(crate) fn claim_frame(&self) -> Option<&[u8]> { self.claim_frame.as_deref() }
     pub(crate) fn lease_frame(&self) -> Option<&[u8]> { self.lease_frame.as_deref() }
     pub(crate) fn result_frame(&self) -> Option<&[u8]> { self.result_frame.as_deref() }
@@ -1048,6 +1052,10 @@ impl SqliteReverseOnionQueue {
                     route_id: row.route_id.as_slice().try_into()
                         .map_err(|_| ReverseOnionQueueError::Corrupt)?,
                     request_commitment: row.request_commitment.as_slice().try_into()
+                        .map_err(|_| ReverseOnionQueueError::Corrupt)?,
+                    immediate_recipient: row.immediate_recipient.as_slice().try_into()
+                        .map_err(|_| ReverseOnionQueueError::Corrupt)?,
+                    route_deadline: u64::try_from(row.route_deadline)
                         .map_err(|_| ReverseOnionQueueError::Corrupt)?,
                     claim_frame: row.claim_frame,
                     lease_frame: row.lease_frame,
@@ -2428,6 +2436,8 @@ mod tests {
         assert_eq!(partial.source_node_id(), source_node_id());
         assert_eq!(partial.route_id(), item.route_id);
         assert_eq!(partial.request_commitment(), item.request_commitment);
+        assert_eq!(partial.immediate_recipient(), item.immediate_recipient);
+        assert_eq!(partial.route_deadline(), item.route_deadline);
         assert!(partial.claim_frame().is_none());
         assert!(partial.lease_frame().is_none());
         assert!(partial.result_frame().is_none());
