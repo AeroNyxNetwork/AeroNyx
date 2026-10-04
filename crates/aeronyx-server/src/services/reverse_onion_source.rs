@@ -16,7 +16,9 @@
 //! by a hostile same-euid actor is NOT prevented without an external anchor.
 //! Evidence is bounded, not eternal: identifiers are protected through their
 //! admitted freshness horizon, not forever after all tombstones are deleted.
-//! Last Modified: v1.1.0 — Typed same-pass forward expectation intake.
+//! Last Modified: v1.2.0 — Preflight and post-operation observed physical bound.
+//! [REVERSE-ONION-SOURCE-DB-BOUNDARY 2026-10-04 by Codex] Not an OS hard quota.
+//! v1.1.0 — Typed same-pass forward expectation intake.
 //! [REVERSE-ONION-TYPED-EXPECTATION 2026-10-04 by Codex] No raw production builder.
 
 use std::path::Path;
@@ -429,6 +431,10 @@ pub(crate) struct ReverseOnionSourceJournal {
     inner: Mutex<Inner>, identity: Arc<IdentityKeyPair>, limits: SourceJournalLimits,
     #[cfg(unix)] _inode_lock: File,
     #[cfg(unix)] _parent: File,
+    #[cfg(unix)] db_path: std::path::PathBuf,
+    #[cfg(unix)] physical_limit: u64,
+    #[cfg(unix)] inode_identity: (u64, u64),
+    #[cfg(unix)] parent_identity: (u64, u64),
     #[cfg(test)] commits_until_fence_error: std::sync::atomic::AtomicUsize,
 }
 
@@ -440,6 +446,11 @@ impl ReverseOnionSourceJournal {
             || limits.max_bytes == 0 || limits.max_bytes > MAX_BYTES || path == Path::new(":memory:")
         { return Err(SourceJournalError::Rejected); }
         sql(now)?;
+        // [REVERSE-ONION-SOURCE-DB-BOUNDARY 2026-10-04 by Codex] Do not
+        // create/chmod the primary or its parent before existing sidecars and
+        // their aggregate are admitted. This preflight has no write effects.
+        let physical_limit = source_physical_limit(&limits)?;
+        preflight_source_files(path, physical_limit)?;
         let target = prepare_private_sqlite_target(path).map_err(|_| SourceJournalError::Unavailable)?;
         verify_private_file(&target.resolved_path, true).map_err(|_| SourceJournalError::Rejected)?;
         let inode = std::fs::OpenOptions::new().read(true).write(true)
@@ -450,9 +461,6 @@ impl ReverseOnionSourceJournal {
         if !metadata.is_file() || metadata.uid() != unsafe { nix::libc::geteuid() }
             || metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o600
         { return Err(SourceJournalError::Rejected); }
-        let physical_limit = limits.max_bytes.checked_mul(2)
-            .and_then(|n| n.checked_add((MAX_ENTRIES as u64 + 256) * 4096))
-            .ok_or(SourceJournalError::Rejected)?;
         if metadata.len() > physical_limit { return Err(SourceJournalError::Capacity); }
         // SAFETY: valid owned fd; advisory cooperation, not hostile same-euid defense.
         if unsafe { nix::libc::flock(inode.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) } != 0 {
@@ -471,37 +479,27 @@ impl ReverseOnionSourceJournal {
                 || header[68..72] != (APPLICATION_ID as u32).to_be_bytes()
             { return Err(SourceJournalError::Corrupt); }
         }
-        for suffix in ["-journal", "-wal", "-shm"] {
-            let mut name = target.resolved_path.as_os_str().to_os_string(); name.push(suffix);
-            let sidecar = std::path::PathBuf::from(name);
-            match std::fs::symlink_metadata(&sidecar) {
-                Ok(_) if suffix != "-journal" => return Err(SourceJournalError::Corrupt),
-                Ok(meta) => {
-                    verify_private_file(&sidecar, true).map_err(|_| SourceJournalError::Rejected)?;
-                    if meta.len() > physical_limit { return Err(SourceJournalError::Capacity); }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(SourceJournalError::Unavailable),
-            }
-        }
+        audit_source_sidecars(&target.resolved_path, physical_limit, metadata.len())?;
+        let parent_metadata = target.parent.metadata().map_err(|_| SourceJournalError::Unavailable)?;
+        validate_source_parent(&parent_metadata)?;
         let mut connection = Connection::open_with_flags(&target.resolved_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW).map_err(unavailable)?;
         let after = std::fs::symlink_metadata(&target.resolved_path).map_err(|_| SourceJournalError::Unavailable)?;
         if metadata.dev() != after.dev() || metadata.ino() != after.ino() { return Err(SourceJournalError::Rejected); }
         verify_private_file(&target.resolved_path, true).map_err(|_| SourceJournalError::Rejected)?;
-        connection.execute_batch("PRAGMA busy_timeout=0; PRAGMA trusted_schema=OFF; PRAGMA temp_store=MEMORY; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; PRAGMA fullfsync=ON;").map_err(unavailable)?;
-        let sync: i64 = connection.query_row("PRAGMA synchronous", [], |r| r.get(0)).map_err(unavailable)?;
-        let mode: String = connection.query_row("PRAGMA journal_mode", [], |r| r.get(0)).map_err(unavailable)?;
-        let locking: String = connection.query_row("PRAGMA locking_mode", [], |r| r.get(0)).map_err(unavailable)?;
-        if sync != 3 || mode != "delete" || locking != "exclusive" { return Err(SourceJournalError::Unavailable); }
+        connection.execute_batch("PRAGMA busy_timeout=0; PRAGMA trusted_schema=OFF; PRAGMA temp_store=MEMORY; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; PRAGMA fullfsync=ON; PRAGMA foreign_keys=ON;").map_err(unavailable)?;
         let page_size: i64 = connection.query_row("PRAGMA page_size", [], |r| r.get(0)).map_err(unavailable)?;
         if !(512..=65536).contains(&page_size) || !(page_size as u64).is_power_of_two() { return Err(SourceJournalError::Corrupt); }
         connection.pragma_update(None, "max_page_count", (physical_limit / page_size as u64) as i64).map_err(unavailable)?;
+        audit_source_pragmas(&connection, physical_limit)?;
         let integrity: String = connection.query_row("PRAGMA quick_check", [], |r| r.get(0)).map_err(unavailable)?;
         if integrity != "ok" { return Err(SourceJournalError::Corrupt); }
         initialize_schema(&mut connection, identity.public_key_bytes(), now)?;
         let journal = Self { inner: Mutex::new(Inner { connection, poisoned: false }), identity, limits,
             _inode_lock: inode, _parent: target.parent,
+            db_path: target.resolved_path, physical_limit,
+            inode_identity: (metadata.dev(), metadata.ino()),
+            parent_identity: (parent_metadata.dev(), parent_metadata.ino()),
             #[cfg(test)] commits_until_fence_error: std::sync::atomic::AtomicUsize::new(0),
         };
         journal.with_inner(|inner| journal.transaction(inner, now, |tx| {
@@ -720,12 +718,51 @@ impl ReverseOnionSourceJournal {
                         if remaining == 1 { return Err(SourceJournalError::Unavailable); }
                     }
                 }
-                #[cfg(unix)] self._parent.sync_all().map_err(|_| SourceJournalError::Unavailable)?;
+                // Keep the caller's mutex until every observed file/pragma
+                // fence succeeds; a failed post-commit bound is ambiguous and
+                // poisons via Unavailable, NEVER a successful dispatch/result.
+                self.post_operation_fence(&inner.connection)
+                    .map_err(|_| SourceJournalError::Unavailable)?;
                 Ok(value)
             }
-            Err(error) => { tx.rollback().map_err(unavailable)?; Err(error) }
+            Err(error) => {
+                tx.rollback().map_err(unavailable)?;
+                self.post_operation_fence(&inner.connection)
+                    .map_err(|_| SourceJournalError::Unavailable)?;
+                Err(error)
+            }
         }
     }
+
+    // [REVERSE-ONION-SOURCE-DB-BOUNDARY 2026-10-04 by Codex] Observes the
+    // aggregate at this fence, not transient filesystem peak usage. Same-euid
+    // hostile pathname races require external isolation/a trusted SQLite VFS.
+    #[cfg(unix)]
+    fn post_operation_fence(&self, connection: &Connection) -> Result<()> {
+        let held = self._inode_lock.metadata().map_err(|_| SourceJournalError::Unavailable)?;
+        validate_source_file(&held)?;
+        if (held.dev(), held.ino()) != self.inode_identity { return Err(SourceJournalError::Rejected); }
+        let parent = self._parent.metadata().map_err(|_| SourceJournalError::Unavailable)?;
+        validate_source_parent(&parent)?;
+        if (parent.dev(), parent.ino()) != self.parent_identity { return Err(SourceJournalError::Rejected); }
+        let parent_path = self.db_path.parent().ok_or(SourceJournalError::Rejected)?;
+        let observed_parent = std::fs::symlink_metadata(parent_path).map_err(|_| SourceJournalError::Unavailable)?;
+        validate_source_parent(&observed_parent)?;
+        if (observed_parent.dev(), observed_parent.ino()) != self.parent_identity {
+            return Err(SourceJournalError::Rejected);
+        }
+        let observed = std::fs::symlink_metadata(&self.db_path).map_err(|_| SourceJournalError::Unavailable)?;
+        validate_source_file(&observed)?;
+        if (observed.dev(), observed.ino()) != self.inode_identity || observed.len() != held.len() {
+            return Err(SourceJournalError::Rejected);
+        }
+        audit_source_sidecars(&self.db_path, self.physical_limit, observed.len())?;
+        audit_source_pragmas(connection, self.physical_limit)?;
+        self._parent.sync_all().map_err(|_| SourceJournalError::Unavailable)
+    }
+
+    #[cfg(not(unix))]
+    fn post_operation_fence(&self, _connection: &Connection) -> Result<()> { Err(SourceJournalError::Rejected) }
 
     fn audit_bounds(&self, tx: &Transaction<'_>) -> Result<()> {
         let mut statement = tx.prepare("SELECT reserved,length(sealed),typeof(sealed),typeof(reserved) FROM source_jobs LIMIT ?1").map_err(unavailable)?;
@@ -777,6 +814,102 @@ impl ReverseOnionSourceJournal {
             || sql(row.retain_until)? != retain { return Err(SourceJournalError::Corrupt); }
         Ok(Some(row))
     }
+}
+
+// [REVERSE-ONION-SOURCE-DB-BOUNDARY 2026-10-04 by Codex] Local composition
+// of the reviewed queue boundary policy; no shared helper or owner changes.
+fn source_physical_limit(limits: &SourceJournalLimits) -> Result<u64> {
+    limits.max_bytes.checked_mul(2)
+        .and_then(|n| n.checked_add((MAX_ENTRIES as u64 + 256).checked_mul(4096)?))
+        .ok_or(SourceJournalError::Rejected)
+}
+
+#[cfg(unix)]
+fn validate_source_file(metadata: &std::fs::Metadata) -> Result<()> {
+    // SAFETY: geteuid has no arguments or pointer preconditions.
+    if !metadata.is_file() || metadata.uid() != unsafe { nix::libc::geteuid() }
+        || metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o600
+    { return Err(SourceJournalError::Rejected); }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_source_parent(metadata: &std::fs::Metadata) -> Result<()> {
+    // SAFETY: geteuid has no arguments or pointer preconditions.
+    if !metadata.is_dir() || metadata.uid() != unsafe { nix::libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    { return Err(SourceJournalError::Rejected); }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn preflight_source_files(path: &Path, physical_limit: u64) -> Result<()> {
+    let parent_path = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    match std::fs::symlink_metadata(parent_path) {
+        Ok(parent) => validate_source_parent(&parent)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(SourceJournalError::Unavailable),
+    }
+    let primary = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => { validate_source_file(&metadata)?; metadata.len() }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => return Err(SourceJournalError::Unavailable),
+    };
+    audit_source_sidecars(path, physical_limit, primary)
+}
+
+fn source_checked_aggregate(primary: u64, rollback: u64, limit: u64) -> Result<u64> {
+    let total = primary.checked_add(rollback).ok_or(SourceJournalError::Capacity)?;
+    if total > limit { return Err(SourceJournalError::Capacity); }
+    Ok(total)
+}
+
+#[cfg(unix)]
+fn source_sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string(); name.push(suffix); name.into()
+}
+
+#[cfg(unix)]
+fn audit_source_sidecars(path: &Path, physical_limit: u64, primary: u64) -> Result<()> {
+    let mut total = source_checked_aggregate(primary, 0, physical_limit)?;
+    for suffix in ["-journal", "-wal", "-shm"] {
+        match std::fs::symlink_metadata(source_sidecar(path, suffix)) {
+            Ok(_) if suffix != "-journal" => return Err(SourceJournalError::Corrupt),
+            Ok(metadata) => {
+                validate_source_file(&metadata)?;
+                total = source_checked_aggregate(total, metadata.len(), physical_limit)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(SourceJournalError::Unavailable),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn audit_source_pragmas(connection: &Connection, physical_limit: u64) -> Result<()> {
+    for (query, expected) in [
+        ("PRAGMA busy_timeout", 0i64), ("PRAGMA trusted_schema", 0),
+        ("PRAGMA temp_store", 2), ("PRAGMA synchronous", 3),
+        ("PRAGMA fullfsync", 1), ("PRAGMA foreign_keys", 1),
+    ] {
+        let actual: i64 = connection.query_row(query, [], |r| r.get(0)).map_err(unavailable)?;
+        if actual != expected { return Err(SourceJournalError::Unavailable); }
+    }
+    for (query, expected) in [("PRAGMA journal_mode", "delete"), ("PRAGMA locking_mode", "exclusive")] {
+        let actual: String = connection.query_row(query, [], |r| r.get(0)).map_err(unavailable)?;
+        if !actual.eq_ignore_ascii_case(expected) { return Err(SourceJournalError::Unavailable); }
+    }
+    let page_size: i64 = connection.query_row("PRAGMA page_size", [], |r| r.get(0)).map_err(unavailable)?;
+    let pages: i64 = connection.query_row("PRAGMA page_count", [], |r| r.get(0)).map_err(unavailable)?;
+    let maximum: i64 = connection.query_row("PRAGMA max_page_count", [], |r| r.get(0)).map_err(unavailable)?;
+    if !(512..=65536).contains(&page_size) || !(page_size as u64).is_power_of_two() {
+        return Err(SourceJournalError::Corrupt);
+    }
+    if pages < 0 || maximum <= 0 || pages > maximum || maximum as u64 > physical_limit / page_size as u64
+        || (pages as u64).checked_mul(page_size as u64).map_or(true, |n| n > physical_limit)
+    { return Err(SourceJournalError::Capacity); }
+    Ok(())
 }
 
 fn initialize_schema(connection: &mut Connection, source: [u8; 32], now: u64) -> Result<()> {
@@ -1254,5 +1387,92 @@ mod tests {
             assert_eq!(journal.prepare(plan, f.session(), NOW).err(), Some(SourceJournalError::Rejected));
         }
         assert!(journal.recover(None, 1, NOW).unwrap().items.is_empty());
+    }
+
+    // [REVERSE-ONION-SOURCE-DB-BOUNDARY 2026-10-04 by Codex] Authored only;
+    // sparse fixture files exercise metadata bounds without large allocations.
+    fn private_sparse(path: &Path, bytes: u64) {
+        std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)
+            .open(path).unwrap().set_len(bytes).unwrap();
+    }
+
+    #[test]
+    fn source_physical_preflight_rejects_individual_under_but_aggregate_over() {
+        let f = Fixture::new();
+        let limits = SourceJournalLimits { max_entries: 1, max_bytes: RESERVED_PER_JOB };
+        let bound = source_physical_limit(&limits).unwrap();
+        let primary_bytes = bound * 3 / 4; let rollback_bytes = bound / 2;
+        let rollback = source_sidecar(&f.path(), "-journal");
+        private_sparse(&f.path(), primary_bytes); private_sparse(&rollback, rollback_bytes);
+        let parent_before = std::fs::metadata(f.directory.path()).unwrap();
+        assert!(primary_bytes < bound && rollback_bytes < bound);
+        assert_eq!(f.open_limits(NOW, 1, RESERVED_PER_JOB).err(), Some(SourceJournalError::Capacity));
+        assert_eq!(std::fs::metadata(f.path()).unwrap().len(), primary_bytes);
+        assert_eq!(std::fs::metadata(&rollback).unwrap().len(), rollback_bytes);
+        assert_eq!(std::fs::metadata(f.directory.path()).unwrap().mode(), parent_before.mode());
+        assert_eq!(std::fs::metadata(f.path()).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(rollback).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn source_absent_primary_oversized_rollback_refusal_has_no_dirent_or_mode_effect() {
+        let f = Fixture::new();
+        let bound = source_physical_limit(&SourceJournalLimits { max_entries: 1, max_bytes: RESERVED_PER_JOB }).unwrap();
+        let rollback = source_sidecar(&f.path(), "-journal");
+        private_sparse(&rollback, bound + 1);
+        let parent_before = std::fs::metadata(f.directory.path()).unwrap();
+        let journal_before = std::fs::metadata(&rollback).unwrap();
+        let names_before: Vec<_> = std::fs::read_dir(f.directory.path()).unwrap()
+            .map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(f.open_limits(NOW, 1, RESERVED_PER_JOB).err(), Some(SourceJournalError::Capacity));
+        assert!(!f.path().exists());
+        let names_after: Vec<_> = std::fs::read_dir(f.directory.path()).unwrap()
+            .map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(names_before, names_after);
+        assert_eq!(std::fs::metadata(f.directory.path()).unwrap().mode(), parent_before.mode());
+        let after = std::fs::metadata(&rollback).unwrap();
+        assert_eq!(after.mode(), journal_before.mode()); assert_eq!(after.len(), journal_before.len());
+    }
+
+    #[test]
+    fn source_post_fence_observed_aggregate_failure_poisons_before_publication() {
+        let f = Fixture::new(); let journal = f.open(NOW); f.prepare(&journal, NOW);
+        let primary = std::fs::metadata(f.path()).unwrap().len();
+        assert!(primary > 1 && primary < journal.physical_limit);
+        let rollback = source_sidecar(&f.path(), "-journal");
+        private_sparse(&rollback, journal.physical_limit - 1);
+        let publication = journal.with_inner(|inner| {
+            journal.post_operation_fence(&inner.connection).map_err(|_| SourceJournalError::Unavailable)?;
+            Ok(())
+        });
+        assert_eq!(publication.err(), Some(SourceJournalError::Unavailable));
+        assert_eq!(journal.arm(f.route(), NOW + 1).err(), Some(SourceJournalError::Unavailable));
+        assert!(rollback.exists());
+    }
+
+    #[test]
+    fn source_critical_pragma_readback_detects_fullfsync_drift_before_dispatch_publication() {
+        let f = Fixture::new(); let journal = f.open(NOW); f.prepare(&journal, NOW);
+        journal.with_inner(|inner| {
+            audit_source_pragmas(&inner.connection, journal.physical_limit)?;
+            inner.connection.pragma_update(None, "fullfsync", 0).map_err(unavailable)
+        }).unwrap();
+        assert_eq!(journal.arm(f.route(), NOW + 1).err(), Some(SourceJournalError::Unavailable));
+        assert_eq!(journal.recover(None, 1, NOW + 1).err(), Some(SourceJournalError::Unavailable));
+        drop(journal);
+        let journal = f.open(NOW + 2);
+        assert_eq!(journal.recover(None, 1, NOW + 2).unwrap().items[0].1, SourcePhase::DispatchAmbiguous);
+    }
+
+    #[test]
+    fn source_aggregate_overflow_and_forbidden_sidecars_fail_closed_without_creation() {
+        assert_eq!(source_checked_aggregate(u64::MAX, 1, u64::MAX).err(), Some(SourceJournalError::Capacity));
+        assert_eq!(source_checked_aggregate(4, 5, 9).unwrap(), 9);
+        for suffix in ["-wal", "-shm"] {
+            let f = Fixture::new(); let sidecar = source_sidecar(&f.path(), suffix);
+            private_sparse(&sidecar, 1);
+            assert_eq!(f.open_limits(NOW, 1, RESERVED_PER_JOB).err(), Some(SourceJournalError::Corrupt));
+            assert!(!f.path().exists()); assert_eq!(std::fs::metadata(sidecar).unwrap().len(), 1);
+        }
     }
 }
