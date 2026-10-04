@@ -12,13 +12,16 @@
 //! link source and destination together.
 //!
 //! ## Relationship to the transport
-//! This module does NOT define a new wire frame. It restructures the opaque
+//! The original onion layer restructures the opaque
 //! `BlindRelayEnvelope::encrypted_blob` (see `chat.rs`). The envelope and all of
 //! its hardened guards (Ed25519 per-hop signature, freshness window, replay
 //! cache, abuse guard, routeability gate, TTL, loop detection, probes, counters)
 //! are reused unchanged. `envelope.next_hop` always addresses the node that
 //! receives *this* envelope; the privacy-sensitive forward target is hidden
 //! inside the peeled layer.
+//! [REVERSE-ONION-CONTRACT 2026-10-04 by Codex] The additive `AXRD` contract
+//! below transports that unchanged envelope through recipient-initiated
+//! delivery. It defines no HTTP endpoint, queue, poller, or persistence backend.
 //!
 //! ## Construction (HPKE-style, RFC 9180 DHKEM shape)
 //! Each layer is a single-shot seal to the hop's KEM public key:
@@ -78,6 +81,8 @@
 //!   operations may inspect the authenticated terminal identity at source.
 //!
 //! ## Last Modified
+//! v1.14.0-ReverseDeliveryContract — Bounded signed adjacent-hop claim/lease/
+//! opaque-result frames and persistence transition contract (not runtime wiring)
 //! v1.13.0-VerifiedTerminalBinding — Exposed source-only authenticated
 //! terminal identity for lifecycle-authorized route enforcement
 //! v1.12.0-RouteFailureDisposition — Centralized fail-closed route recovery
@@ -109,6 +114,9 @@ use crate::crypto::keys::{E2eSession, EphemeralKeyPair, IdentityKeyPair};
 use crate::error::CoreError;
 use crate::protocol::chat::BlindRelayEnvelope;
 use crate::protocol::discovery::{NodeCapability, NodeProtocolFeature, SignedNodeDescriptor};
+
+// [REVERSE-ONION-CONTRACT 2026-10-04 by Codex] Additive adjacent-hop contract.
+pub mod reverse_delivery;
 
 // ============================================
 // Constants
