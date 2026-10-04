@@ -861,7 +861,7 @@ mod tests {
         let wrong = IdentityKeyPair::from_bytes(&[0x78; 32]).unwrap();
         let envelope = BlindRelayEnvelope {
             route_id: [21; 16],
-            next_hop: configured.public_key_bytes(),
+            next_hop: wrong.public_key_bytes(),
             ttl: 1,
             encrypted_blob: vec![22; 4],
             timestamp: NOW,
