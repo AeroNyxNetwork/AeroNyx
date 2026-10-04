@@ -1564,6 +1564,8 @@ impl SignedPrivateOnionRecipientAuthorizationV1 {
             || recipient.node_id() != self.recipient_node_id
             || !self.relay_descriptor.matches_signed_descriptor(relay)?
             || !self.recipient_descriptor.matches_signed_descriptor(recipient)?
+            || self.issued_at < relay.descriptor.issued_at
+            || self.issued_at < recipient.descriptor.issued_at
             || self.expires_at > relay.descriptor.expires_at
             || self.expires_at > recipient.descriptor.expires_at
             || !recipient
@@ -5000,6 +5002,17 @@ mod tests {
                 1_700_000_500,
             )
             .unwrap();
+        let mut backdated = authorization.clone();
+        backdated.issued_at = 1_699_999_999;
+        backdated.signature = recipient.sign(&backdated.signing_bytes());
+        assert!(backdated
+            .verify_at(
+                &relay_descriptor,
+                &recipient_descriptor,
+                "anonymous_mailbox_v1",
+                1_700_000_500,
+            )
+            .is_err());
         let encoded = authorization.encode_canonical().unwrap();
         assert!(encoded.len() <= MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_BYTES);
         let decoded = SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(&encoded).unwrap();

@@ -1651,6 +1651,293 @@ mod tests {
     }
 
     #[test]
+    fn private_recipient_route_rejects_generic_and_stale_or_substituted_inputs() {
+        let source = IdentityKeyPair::from_bytes(&[0x64; 32]).unwrap();
+        let relay = IdentityKeyPair::from_bytes(&[0x65; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[0x66; 32]).unwrap();
+        let relay_descriptor = private_route_descriptor(
+            &relay,
+            Some("relay.example:443"),
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
+            &[
+                NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+                NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+            ],
+        );
+        let recipient_descriptor = private_route_descriptor(
+            &recipient,
+            None,
+            vec![NodeCapability::ChatRelay],
+            &ANONYMOUS_MAILBOX_FEATURES,
+        );
+        let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &relay_descriptor,
+            &recipient_descriptor,
+            OnionRoutePurpose::AnonymousMailboxV1.as_str(),
+            1_700_000_100,
+            1_700_001_000,
+            &recipient,
+        )
+        .unwrap();
+
+        assert_eq!(
+            VerifiedOnionRoute::from_signed_descriptors(
+                source.public_key_bytes(),
+                [&relay_descriptor, &recipient_descriptor],
+                OnionRoutePurpose::AnonymousMailboxV1,
+                1_700_000_500,
+            )
+            .unwrap_err()
+            .reason_bucket(),
+            "missing_public_endpoint"
+        );
+
+        let mut authorization_bytes = authorization.encode_canonical().unwrap();
+        *authorization_bytes.last_mut().unwrap() ^= 1;
+        let tampered = SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(
+            &authorization_bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                source.public_key_bytes(),
+                &relay_descriptor,
+                &recipient_descriptor,
+                &tampered,
+                OnionRoutePurpose::AnonymousMailboxV1,
+                1_700_000_500,
+            )
+            .unwrap_err()
+            .reason_bucket(),
+            "missing_private_recipient_authorization"
+        );
+
+        let mut rotated_body = relay_descriptor.descriptor.clone();
+        rotated_body.sequence += 1;
+        let rotated_relay = SignedNodeDescriptor::sign(rotated_body, &relay).unwrap();
+        assert_eq!(
+            VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                source.public_key_bytes(),
+                &rotated_relay,
+                &recipient_descriptor,
+                &authorization,
+                OnionRoutePurpose::AnonymousMailboxV1,
+                1_700_000_500,
+            )
+            .unwrap_err()
+            .reason_bucket(),
+            "missing_private_recipient_authorization"
+        );
+
+        let other_recipient = IdentityKeyPair::from_bytes(&[0x67; 32]).unwrap();
+        let other_descriptor = private_route_descriptor(
+            &other_recipient,
+            None,
+            vec![NodeCapability::ChatRelay],
+            &ANONYMOUS_MAILBOX_FEATURES,
+        );
+        assert_eq!(
+            VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                source.public_key_bytes(),
+                &relay_descriptor,
+                &other_descriptor,
+                &authorization,
+                OnionRoutePurpose::AnonymousMailboxV1,
+                1_700_000_500,
+            )
+            .unwrap_err()
+            .reason_bucket(),
+            "missing_private_recipient_authorization"
+        );
+
+        let expired_authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &relay_descriptor,
+            &recipient_descriptor,
+            OnionRoutePurpose::AnonymousMailboxV1.as_str(),
+            1_700_000_100,
+            1_700_000_400,
+            &recipient,
+        )
+        .unwrap();
+        assert_eq!(
+            VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                source.public_key_bytes(),
+                &relay_descriptor,
+                &recipient_descriptor,
+                &expired_authorization,
+                OnionRoutePurpose::AnonymousMailboxV1,
+                1_700_000_500,
+            )
+            .unwrap_err()
+            .reason_bucket(),
+            "missing_private_recipient_authorization"
+        );
+
+        let mut expired_body = recipient_descriptor.descriptor.clone();
+        expired_body.expires_at = 1_700_000_400;
+        let expired_recipient = SignedNodeDescriptor::sign(expired_body, &recipient).unwrap();
+        let expired_descriptor_authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &relay_descriptor,
+            &expired_recipient,
+            OnionRoutePurpose::AnonymousMailboxV1.as_str(),
+            1_700_000_100,
+            1_700_000_300,
+            &recipient,
+        )
+        .unwrap();
+        assert_eq!(
+            VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                source.public_key_bytes(),
+                &relay_descriptor,
+                &expired_recipient,
+                &expired_descriptor_authorization,
+                OnionRoutePurpose::AnonymousMailboxV1,
+                1_700_000_500,
+            )
+            .unwrap_err()
+            .reason_bucket(),
+            "descriptor_rejected"
+        );
+
+        let source_relay = private_route_descriptor(
+            &source,
+            Some("relay.example:443"),
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
+            &[
+                NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+                NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+            ],
+        );
+        assert_eq!(
+            VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                source.public_key_bytes(),
+                &source_relay,
+                &recipient_descriptor,
+                &authorization,
+                OnionRoutePurpose::AnonymousMailboxV1,
+                1_700_000_500,
+            )
+            .unwrap_err()
+            .reason_bucket(),
+            "source_included"
+        );
+    }
+
+    #[test]
+    fn private_recipient_route_rejects_same_node_kem_and_feature_gaps() {
+        let source = IdentityKeyPair::from_bytes(&[0x68; 32]).unwrap();
+        let relay = IdentityKeyPair::from_bytes(&[0x69; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[0x6a; 32]).unwrap();
+        let relay_descriptor = private_route_descriptor(
+            &relay,
+            Some("relay.example:443"),
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
+            &[
+                NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+                NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+            ],
+        );
+        let recipient_descriptor = private_route_descriptor(
+            &recipient,
+            None,
+            vec![NodeCapability::ChatRelay],
+            &ANONYMOUS_MAILBOX_FEATURES,
+        );
+        let mut no_kem_body = relay_descriptor.descriptor.clone();
+        no_kem_body.kem_alg = 0;
+        no_kem_body.kem_public = [0; 32];
+        let no_kem_relay = SignedNodeDescriptor::sign(no_kem_body, &relay).unwrap();
+        let no_kem_authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &no_kem_relay,
+            &recipient_descriptor,
+            OnionRoutePurpose::AnonymousMailboxV1.as_str(),
+            1_700_000_100,
+            1_700_001_000,
+            &recipient,
+        )
+        .unwrap();
+        assert_eq!(
+            VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                source.public_key_bytes(),
+                &no_kem_relay,
+                &recipient_descriptor,
+                &no_kem_authorization,
+                OnionRoutePurpose::AnonymousMailboxV1,
+                1_700_000_500,
+            )
+            .unwrap_err()
+            .reason_bucket(),
+            "missing_x25519_kem"
+        );
+
+        let no_feature_relay = private_route_descriptor(
+            &relay,
+            Some("relay.example:443"),
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
+            &[],
+        );
+        let no_feature_authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &no_feature_relay,
+            &recipient_descriptor,
+            OnionRoutePurpose::AnonymousMailboxV1.as_str(),
+            1_700_000_100,
+            1_700_001_000,
+            &recipient,
+        )
+        .unwrap();
+        assert_eq!(
+            VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                source.public_key_bytes(),
+                &no_feature_relay,
+                &recipient_descriptor,
+                &no_feature_authorization,
+                OnionRoutePurpose::AnonymousMailboxV1,
+                1_700_000_500,
+            )
+            .unwrap_err()
+            .reason_bucket(),
+            "missing_protocol_feature"
+        );
+
+        let same = IdentityKeyPair::from_bytes(&[0x6b; 32]).unwrap();
+        let same_relay = private_route_descriptor(
+            &same,
+            Some("relay.example:443"),
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
+            &[
+                NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+                NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+            ],
+        );
+        let mut same_recipient_body = same_relay.descriptor.clone();
+        same_recipient_body.public_endpoint = None;
+        same_recipient_body = same_recipient_body.with_protocol_features(ANONYMOUS_MAILBOX_FEATURES);
+        let same_recipient = SignedNodeDescriptor::sign(same_recipient_body, &same).unwrap();
+        let same_authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &same_relay,
+            &same_recipient,
+            OnionRoutePurpose::AnonymousMailboxV1.as_str(),
+            1_700_000_100,
+            1_700_001_000,
+            &same,
+        )
+        .unwrap();
+        assert_eq!(
+            VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                source.public_key_bytes(),
+                &same_relay,
+                &same_recipient,
+                &same_authorization,
+                OnionRoutePurpose::AnonymousMailboxV1,
+                1_700_000_500,
+            )
+            .unwrap_err()
+            .reason_bucket(),
+            "duplicate_node"
+        );
+    }
+
+    #[test]
     fn two_hop_round_trip_delivers_payload() {
         let source = IdentityKeyPair::generate();
         let (entry_id, entry_hop) = hop_keypair();
