@@ -717,3 +717,187 @@ impl ReverseOnionDeliveryStateV1 {
         }
     }
 }
+
+// [REVERSE-ONION-RECOVERY-TESTS 2026-10-04 by Codex] Authored only; execution
+// is deferred. Fixed clocks/identity seeds, no network or filesystem fixtures.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::onion::{build_onion_envelope, OnionHop};
+    use crate::protocol::onion_reply::{
+        encode_onion_sealed_response, seal_onion_reply, OnionReplySession,
+        OnionSealedResponse, ONION_REPLY_RESPONSE_SIZE_CLASSES,
+    };
+
+    const NOW: u64 = 1_800_000_000;
+
+    struct Fixture {
+        relay: IdentityKeyPair,
+        recipient: IdentityKeyPair,
+        claim: ReverseOnionFrameV1,
+        lease: ReverseOnionFrameV1,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let relay = IdentityKeyPair::from_bytes(&[11; 32]).unwrap();
+            let recipient = IdentityKeyPair::from_bytes(&[22; 32]).unwrap();
+            let claim = ReverseOnionFrameV1::claim(
+                relay.public_key_bytes(), [1; 16], NOW, NOW + 30, &recipient,
+            ).unwrap();
+            let (_, kem) = recipient.to_x25519();
+            let envelope = build_onion_envelope(
+                &[OnionHop { node_id: recipient.public_key_bytes(), kem_pub: kem.to_bytes() }],
+                b"opaque request", [2; 16], 1, NOW, &relay,
+            ).unwrap();
+            let lease = ReverseOnionFrameV1::lease(
+                &claim, &envelope, [3; 16], NOW + 600, NOW, &relay,
+            ).unwrap();
+            Self { relay, recipient, claim, lease }
+        }
+
+        fn result(&self, now: u64) -> (ReverseOnionFrameV1, OnionReplySession) {
+            let (request, session) = OnionReplySession::prepare_source_sealed(
+                self.lease.route_id(), self.recipient.public_key_bytes(),
+                ONION_REPLY_RESPONSE_SIZE_CLASSES[0], b"operation".to_vec(),
+            ).unwrap();
+            let sealed = seal_onion_reply(self.lease.route_id(), &request, b"result", &self.recipient).unwrap();
+            let result = ReverseOnionFrameV1::result(
+                &self.claim, &self.lease, &encode_onion_sealed_response(&sealed).unwrap(),
+                NOW + 600, now, &self.recipient,
+            ).unwrap();
+            (result, session)
+        }
+    }
+
+    #[test]
+    fn claim_layout_codes_and_exact_roundtrip_are_frozen() {
+        let f = Fixture::new();
+        let bytes = f.claim.encode();
+        assert_eq!(bytes.len(), 234);
+        assert_eq!(&bytes[..6], b"AXRD\x01\x01");
+        assert_eq!(&bytes[6..38], &f.relay.public_key_bytes());
+        assert_eq!(&bytes[38..70], &f.recipient.public_key_bytes());
+        assert_eq!(&bytes[70..86], &[1; 16]);
+        assert_eq!(&bytes[86..150], &[0; 64]);
+        assert_eq!(&bytes[150..158], &NOW.to_be_bytes());
+        assert_eq!(&bytes[158..166], &(NOW + 30).to_be_bytes());
+        assert_eq!(&bytes[166..170], &[0; 4]);
+        let restored = ReverseOnionFrameV1::decode(&bytes, NOW).unwrap();
+        assert!(restored.require_exact_retry(&f.claim).is_ok());
+        assert_eq!(restored.commitment(), f.claim.commitment());
+        assert_eq!(f.lease.encode()[5], 2);
+        assert_eq!(f.result(NOW + 1).0.encode()[5], 3);
+    }
+
+    #[test]
+    fn malformed_version_kind_length_trailing_and_signature_fail_closed() {
+        let f = Fixture::new();
+        let original = f.claim.encode();
+        for end in 0..original.len() {
+            assert!(ReverseOnionFrameV1::decode_for_recovery(&original[..end]).is_err());
+        }
+        for offset in [0, 4, 5, 6, 38, 70, 166, 233] {
+            let mut changed = original.clone();
+            changed[offset] ^= 0xff;
+            assert!(ReverseOnionFrameV1::decode_for_recovery(&changed).is_err());
+        }
+        let mut trailing = original.clone();
+        trailing.push(0);
+        assert!(ReverseOnionFrameV1::decode_for_recovery(&trailing).is_err());
+        assert!(ReverseOnionFrameV1::decode_for_recovery(&vec![0; MAX_REVERSE_ONION_FRAME_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn authenticated_substitution_and_self_relay_are_rejected() {
+        let f = Fixture::new();
+        let other = ReverseOnionFrameV1::claim(
+            f.relay.public_key_bytes(), [4; 16], NOW, NOW + 30, &f.recipient,
+        ).unwrap();
+        assert!(f.lease.verify_lease(&other, NOW + 600, NOW).is_err());
+        assert_eq!(f.claim.require_exact_retry(&other).err(), Some(ReverseOnionError::Conflict));
+        assert!(f.claim.verify_claim(f.recipient.public_key_bytes(), f.relay.public_key_bytes(), NOW).is_err());
+        assert!(ReverseOnionFrameV1::claim(
+            f.recipient.public_key_bytes(), [1; 16], NOW, NOW + 30, &f.recipient,
+        ).is_err());
+        assert!(ReverseOnionFrameV1::claim(
+            f.relay.public_key_bytes(), [1; 16], NOW, NOW + 31, &f.recipient,
+        ).is_err());
+        let mut envelope = f.lease.verify_lease(&f.claim, NOW + 600, NOW).unwrap();
+        envelope.next_hop = f.relay.public_key_bytes();
+        let envelope = envelope.sign_with(&f.relay);
+        assert!(ReverseOnionFrameV1::lease(&f.claim, &envelope, [3; 16], NOW + 600, NOW, &f.relay).is_err());
+    }
+
+    #[test]
+    fn historical_claim_does_not_truncate_execution_or_result_grace() {
+        let f = Fixture::new();
+        assert!(ReverseOnionFrameV1::decode(&f.claim.encode(), NOW + 30).is_err());
+        let historical = ReverseOnionFrameV1::decode_for_recovery(&f.claim.encode()).unwrap();
+        assert!(f.lease.verify_lease(&historical, NOW + 600, NOW + 599).is_ok());
+        assert!(f.lease.verify_lease(&historical, NOW + 600, NOW + 600).is_err());
+        let (result, source) = f.result(NOW + 610);
+        let bytes = result.verify_result(&historical, &f.lease, NOW + 600, NOW + 899).unwrap();
+        assert_eq!(source.open(bytes).unwrap().payload.as_slice(), b"result");
+        assert!(result.verify_result(&historical, &f.lease, NOW + 600, NOW + 900).is_err());
+        assert!(ReverseOnionFrameV1::decode_for_recovery(&result.encode()).is_ok());
+    }
+
+    #[test]
+    fn result_parent_substitution_requires_more_than_a_valid_sender_signature() {
+        let f = Fixture::new();
+        let (result, _) = f.result(NOW + 1);
+        let mut altered = ReverseOnionFrameV1::decode_for_recovery(&result.encode()).unwrap();
+        altered.parent_commitment[0] ^= 1;
+        let altered = altered.signed(&f.recipient).unwrap();
+        assert!(ReverseOnionFrameV1::decode(&altered.encode(), NOW + 1).is_ok());
+        assert!(altered.verify_result(&f.claim, &f.lease, NOW + 600, NOW + 1).is_err());
+        assert!(f.lease.verify_lease(&f.claim, NOW + 599, NOW).is_err());
+    }
+
+    #[test]
+    fn maximum_reply_carrier_fits_without_expanding_inner_caps() {
+        let f = Fixture::new();
+        // Structural opaque carrier only, not a terminal-execution proof.
+        let opaque = OnionSealedResponse {
+            version: 1, ephemeral_public_key: [9; 32], nonce: [0; 24],
+            ciphertext: vec![0; ONION_REPLY_RESPONSE_SIZE_CLASSES[3] + 16],
+        };
+        let encoded = encode_onion_sealed_response(&opaque).unwrap();
+        assert_eq!(encoded.len(), MAX_ONION_SEALED_RESPONSE_BYTES);
+        let result = ReverseOnionFrameV1::result(&f.claim, &f.lease, &encoded, NOW + 600, NOW, &f.recipient).unwrap();
+        assert_eq!(result.encode().len(), MAX_REVERSE_ONION_FRAME_BYTES);
+        assert!(ReverseOnionFrameV1::decode(&result.encode(), NOW).is_ok());
+        let mut oversized = encoded;
+        oversized.push(0);
+        assert!(ReverseOnionFrameV1::result(&f.claim, &f.lease, &oversized, NOW + 600, NOW, &f.recipient).is_err());
+    }
+
+    #[test]
+    fn typed_transitions_preserve_armed_barrier_and_never_revive_terminal_state() {
+        let f = Fixture::new();
+        let queued = ReverseOnionDeliveryStateV1::queued(&f.claim, &f.lease, NOW + 600, NOW).unwrap();
+        assert!(queued.arm(NOW - 1).is_err());
+        let armed = queued.arm(NOW + 31).unwrap();
+        assert!(armed.arm(NOW + 32).is_err());
+        assert_eq!(armed.exact_replay_bytes(&f.lease, NOW + 599).unwrap(), f.lease.encode());
+        assert!(armed.exact_replay_bytes(&f.lease, NOW + 600).is_err());
+        let (result, _) = f.result(NOW + 610);
+        let completed = armed.accept_result(&f.claim, &f.lease, &result, NOW + 600, NOW + 610).unwrap();
+        assert_eq!(completed.phase(), ReverseOnionPhaseV1::ResultAvailable);
+        assert!(completed.arm(NOW + 611).is_err());
+        assert!(armed.mark_ambiguous().unwrap().accept_result(&f.claim, &f.lease, &result, NOW + 600, NOW + 610).is_err());
+        assert!(armed.expire(NOW + 899).is_err());
+        assert_eq!(armed.expire(NOW + 900).unwrap().phase(), ReverseOnionPhaseV1::Expired);
+    }
+
+    #[test]
+    fn shortened_route_preserves_envelope_replay_evidence() {
+        let f = Fixture::new();
+        let envelope = f.lease.verify_lease(&f.claim, NOW + 600, NOW).unwrap();
+        let short = ReverseOnionFrameV1::lease(&f.claim, &envelope, [8; 16], NOW + 10, NOW, &f.relay).unwrap();
+        assert_eq!(short.expires_at(), NOW + 10);
+        assert_eq!(short.result_retention_deadline().unwrap(), NOW + 310);
+        assert_eq!(short.replay_evidence_deadline().unwrap(), NOW + 600);
+    }
+}

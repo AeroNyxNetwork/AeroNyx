@@ -496,3 +496,225 @@ fn unavailable(_: rusqlite::Error) -> RecipientJournalError { RecipientJournalEr
 fn changed(rows: usize) -> Result<()> {
     if rows == 1 { Ok(()) } else { Err(RecipientJournalError::Corrupt) }
 }
+
+// [REVERSE-ONION-RECOVERY-TESTS 2026-10-04 by Codex] Source-only authoring;
+// no execution claimed. Every filesystem fixture is a unique TempDir beneath
+// the explicitly approved external-volume test root, never default /tmp.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use aeronyx_core::crypto::IdentityKeyPair;
+    use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
+    use aeronyx_core::protocol::onion_reply::{
+        encode_onion_sealed_response, seal_onion_reply, OnionReplySession,
+        ONION_REPLY_RESPONSE_SIZE_CLASSES,
+    };
+
+    const NOW: u64 = 1_800_000_000;
+
+    struct Fixture {
+        directory: tempfile::TempDir,
+        relay: IdentityKeyPair,
+        recipient: IdentityKeyPair,
+        claim: ReverseOnionFrameV1,
+        lease: ReverseOnionFrameV1,
+        deadline: u64,
+    }
+
+    impl Fixture {
+        fn new(deadline: u64) -> Self {
+            let directory = tempfile::Builder::new()
+                .prefix("r1-recipient-test-")
+                .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+            let relay = IdentityKeyPair::from_bytes(&[31; 32]).unwrap();
+            let recipient = IdentityKeyPair::from_bytes(&[32; 32]).unwrap();
+            let claim = ReverseOnionFrameV1::claim(
+                relay.public_key_bytes(), [1; 16], NOW, NOW + 30, &recipient,
+            ).unwrap();
+            let (_, kem) = recipient.to_x25519();
+            let envelope = build_onion_envelope(
+                &[OnionHop { node_id: recipient.public_key_bytes(), kem_pub: kem.to_bytes() }],
+                b"request", [2; 16], 1, NOW, &relay,
+            ).unwrap();
+            let lease = ReverseOnionFrameV1::lease(
+                &claim, &envelope, [3; 16], deadline, NOW, &relay,
+            ).unwrap();
+            Self { directory, relay, recipient, claim, lease, deadline }
+        }
+
+        fn path(&self) -> std::path::PathBuf { self.directory.path().join("recipient.sqlite") }
+
+        fn open(&self, now: u64) -> Result<ReverseOnionRecipientJournal> {
+            self.open_with_limits(now, 8, 16 * 1024 * 1024)
+        }
+
+        fn open_with_limits(&self, now: u64, max_entries: usize, max_bytes: u64) -> Result<ReverseOnionRecipientJournal> {
+            ReverseOnionRecipientJournal::open(&self.path(), self.relay.public_key_bytes(),
+                self.recipient.public_key_bytes(), RecipientJournalLimits { max_entries, max_bytes }, now)
+        }
+
+        fn ready(&self, journal: &ReverseOnionRecipientJournal) {
+            assert_eq!(journal.prepare_poll(&self.claim, NOW).unwrap(), self.claim.encode());
+            journal.record_lease(self.claim.claim_id(), &self.lease, self.deadline, NOW + 1).unwrap();
+        }
+
+        fn result(&self, now: u64) -> ReverseOnionFrameV1 {
+            let (request, _source) = OnionReplySession::prepare_source_sealed(
+                self.lease.route_id(), self.recipient.public_key_bytes(),
+                ONION_REPLY_RESPONSE_SIZE_CLASSES[0], b"operation".to_vec(),
+            ).unwrap();
+            let sealed = seal_onion_reply(self.lease.route_id(), &request, b"reply", &self.recipient).unwrap();
+            ReverseOnionFrameV1::result(&self.claim, &self.lease,
+                &encode_onion_sealed_response(&sealed).unwrap(), self.deadline, now, &self.recipient).unwrap()
+        }
+    }
+
+    #[test]
+    fn exact_poll_replay_survives_restart_and_full_quota_conflicts_do_not_overwrite() {
+        let f = Fixture::new(NOW + 600);
+        let journal = f.open_with_limits(NOW, 1, 234).unwrap();
+        let exact = journal.prepare_poll(&f.claim, NOW).unwrap();
+        assert_eq!(journal.prepare_poll(&f.claim, NOW + 1).unwrap(), exact);
+        let changed_claim = ReverseOnionFrameV1::claim(f.relay.public_key_bytes(),
+            f.claim.claim_id(), NOW, NOW + 29, &f.recipient).unwrap();
+        assert_eq!(journal.prepare_poll(&changed_claim, NOW + 1).err(), Some(RecipientJournalError::Conflict));
+        let other = ReverseOnionFrameV1::claim(f.relay.public_key_bytes(),
+            [9; 16], NOW, NOW + 30, &f.recipient).unwrap();
+        assert_eq!(journal.prepare_poll(&other, NOW + 1).err(), Some(RecipientJournalError::Capacity));
+        drop(journal);
+        let journal = f.open_with_limits(NOW + 2, 1, 234).unwrap();
+        let page = journal.resume(None, 64, NOW + 2).unwrap();
+        assert_eq!(page.items.len(), 1);
+        match &page.items[0] {
+            RecipientRecovery::Poll { claim_id, exact_bytes } => {
+                assert_eq!(*claim_id, f.claim.claim_id());
+                assert_eq!(*exact_bytes, exact);
+            }
+            _ => panic!("expected exact durable poll"),
+        }
+    }
+
+    #[test]
+    fn arm_is_once_only_and_restart_without_result_is_ambiguous() {
+        let f = Fixture::new(NOW + 600);
+        let journal = f.open(NOW).unwrap();
+        f.ready(&journal);
+        let dispatch = journal.arm(f.claim.claim_id(), NOW + 2).unwrap();
+        assert_eq!(dispatch.envelope.route_id, f.lease.route_id());
+        assert_eq!(dispatch.claim.encode(), f.claim.encode());
+        assert_eq!(dispatch.lease.encode(), f.lease.encode());
+        assert_eq!(dispatch.route_deadline, f.deadline);
+        assert_eq!(journal.arm(f.claim.claim_id(), NOW + 2).err(), Some(RecipientJournalError::Ambiguous));
+        drop(journal);
+        let journal = f.open(NOW + 3).unwrap();
+        assert_eq!(journal.arm(f.claim.claim_id(), NOW + 3).err(), Some(RecipientJournalError::Ambiguous));
+        assert!(matches!(journal.resume(None, 64, NOW + 3).unwrap().items.as_slice(),
+            [RecipientRecovery::Ambiguous { .. }]));
+        assert_eq!(journal.record_result(f.claim.claim_id(), &f.result(NOW + 3), NOW + 3).err(),
+            Some(RecipientJournalError::Ambiguous));
+    }
+
+    #[test]
+    fn unarmed_lease_restart_uses_execution_deadline_not_claim_freshness() {
+        let f = Fixture::new(NOW + 600);
+        let journal = f.open(NOW).unwrap();
+        f.ready(&journal);
+        drop(journal);
+        let journal = f.open(NOW + 31).unwrap();
+        journal.record_lease(f.claim.claim_id(), &f.lease, f.deadline, NOW + 31).unwrap();
+        assert_eq!(journal.record_lease(f.claim.claim_id(), &f.lease, f.deadline + 1, NOW + 31).err(),
+            Some(RecipientJournalError::Conflict));
+        assert!(matches!(journal.resume(None, 64, NOW + 31).unwrap().items.as_slice(),
+            [RecipientRecovery::LeaseReady { .. }]));
+        assert!(journal.arm(f.claim.claim_id(), NOW + 32).is_ok());
+    }
+
+    #[test]
+    fn stored_result_replays_exact_bytes_after_restart_but_not_after_grace() {
+        let f = Fixture::new(NOW + 600);
+        let journal = f.open(NOW).unwrap();
+        f.ready(&journal);
+        journal.arm(f.claim.claim_id(), NOW + 2).unwrap();
+        let result = f.result(NOW + 610);
+        journal.record_result(f.claim.claim_id(), &result, NOW + 610).unwrap();
+        let exact = result.encode();
+        drop(journal);
+        let journal = f.open(NOW + 611).unwrap();
+        journal.record_result(f.claim.claim_id(), &result, NOW + 611).unwrap();
+        match journal.resume(None, 64, NOW + 611).unwrap().items.as_slice() {
+            [RecipientRecovery::Result { exact_bytes, .. }] => assert_eq!(*exact_bytes, exact),
+            _ => panic!("expected retained exact result"),
+        }
+        let different = f.result(NOW + 612);
+        assert_eq!(journal.record_result(f.claim.claim_id(), &different, NOW + 612).err(),
+            Some(RecipientJournalError::Conflict));
+        assert!(journal.resume(None, 64, NOW + 900).unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn clock_rollback_rejects_without_reopening_dispatch() {
+        let f = Fixture::new(NOW + 600);
+        let journal = f.open(NOW).unwrap();
+        f.ready(&journal);
+        assert_eq!(journal.arm(f.claim.claim_id(), NOW).err(), Some(RecipientJournalError::Rejected));
+        assert!(journal.arm(f.claim.claim_id(), NOW + 2).is_ok());
+        drop(journal);
+        assert_eq!(f.open(NOW + 1).err(), Some(RecipientJournalError::Rejected));
+        let journal = f.open(NOW + 3).unwrap();
+        assert_eq!(journal.arm(f.claim.claim_id(), NOW + 3).err(), Some(RecipientJournalError::Ambiguous));
+    }
+
+    #[test]
+    fn shortened_execution_does_not_shorten_replay_evidence_cleanup() {
+        let f = Fixture::new(NOW + 10);
+        let journal = f.open(NOW).unwrap();
+        f.ready(&journal);
+        assert_eq!(journal.cleanup(64, NOW + 310).unwrap(), 0);
+        assert!(journal.arm(f.claim.claim_id(), NOW + 310).is_err());
+        assert_eq!(journal.cleanup(64, NOW + 599).unwrap(), 0);
+        assert_eq!(journal.cleanup(64, NOW + 600).unwrap(), 1);
+        assert!(journal.resume(None, 64, NOW + 600).unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn recovery_cursor_advances_past_unacknowledged_polls() {
+        let f = Fixture::new(NOW + 600);
+        let journal = f.open(NOW).unwrap();
+        for value in 1..=3 {
+            let claim = ReverseOnionFrameV1::claim(f.relay.public_key_bytes(),
+                [value; 16], NOW, NOW + 30, &f.recipient).unwrap();
+            journal.prepare_poll(&claim, NOW).unwrap();
+        }
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let page = journal.resume(cursor, 1, NOW).unwrap();
+            match page.items.as_slice() {
+                [RecipientRecovery::Poll { claim_id, .. }] => ids.push(*claim_id),
+                _ => panic!("expected one recovery item"),
+            }
+            cursor = page.next_after;
+        }
+        assert_eq!(ids, vec![[1; 16], [2; 16], [3; 16]]);
+        assert!(cursor.is_none());
+        assert!(journal.resume(None, 65, NOW).is_err());
+    }
+
+    #[test]
+    fn exclusive_handle_and_oversized_corruption_fail_closed_without_cleanup() {
+        let f = Fixture::new(NOW + 600);
+        let journal = f.open(NOW).unwrap();
+        f.ready(&journal);
+        assert_eq!(f.open(NOW + 1).err(), Some(RecipientJournalError::Busy));
+        drop(journal);
+        let connection = Connection::open(f.path()).unwrap();
+        connection.execute("UPDATE recipient_jobs SET claim=zeroblob(?1)",
+            params![(MAX_REVERSE_ONION_FRAME_BYTES + 1) as i64]).unwrap();
+        drop(connection);
+        assert_eq!(f.open(NOW + 2).err(), Some(RecipientJournalError::Corrupt));
+        let connection = Connection::open(f.path()).unwrap();
+        let (count, phase): (i64, i64) = connection.query_row(
+            "SELECT count(*),min(phase) FROM recipient_jobs", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((count, phase), (1, Phase::Lease as i64));
+    }
+}
