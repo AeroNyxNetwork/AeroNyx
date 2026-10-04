@@ -8,6 +8,10 @@
 //! durable result before POST/dispatch. Cancellation never undoes Armed. An
 //! Armed row without a stored Result is ambiguous on restart, never executable.
 //! This module does not verify source replies, invent wire, or log identifiers.
+//!
+//! Last Modified: v1.1.0 — Nonmutating preflight and observed aggregate fence.
+//! [REVERSE-ONION-RECIPIENT-DB-BOUNDARY 2026-10-04 by Codex] Phase/schema
+//! semantics unchanged; a sampled physical bound is not an OS hard quota.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -115,6 +119,16 @@ pub(crate) struct ReverseOnionRecipientJournal {
     _inode_lock: File,
     #[cfg(unix)]
     _parent: File,
+    #[cfg(unix)]
+    db_path: std::path::PathBuf,
+    #[cfg(unix)]
+    physical_limit: u64,
+    #[cfg(unix)]
+    inode_identity: (u64, u64),
+    #[cfg(unix)]
+    parent_identity: (u64, u64),
+    #[cfg(test)]
+    post_commit_sidecar_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl ReverseOnionRecipientJournal {
@@ -137,6 +151,10 @@ impl ReverseOnionRecipientJournal {
             return Err(RecipientJournalError::Rejected);
         }
         to_sql(now)?;
+        // [REVERSE-ONION-RECIPIENT-DB-BOUNDARY 2026-10-04 by Codex]
+        // Check known existing boundaries before the helper creates/chmods.
+        let physical_limit = recipient_physical_limit(&limits)?;
+        preflight_recipient_files(path, physical_limit)?;
         let target = prepare_private_sqlite_target(path)
             .map_err(|_| RecipientJournalError::Unavailable)?;
         verify_private_file(&target.resolved_path, true)
@@ -154,9 +172,6 @@ impl ReverseOnionRecipientJournal {
         }
         // Bound even the integrity scan before SQLite touches an existing DB.
         // This is a logical/physical repository cap, not an OS hard quota.
-        let physical_limit = limits.max_bytes.checked_mul(2)
-            .and_then(|n| n.checked_add((MAX_ENTRIES as u64 + 256) * 4096))
-            .ok_or(RecipientJournalError::Rejected)?;
         if metadata.len() > physical_limit { return Err(RecipientJournalError::Capacity); }
         // SAFETY: inode owns a live fd retained for the complete journal lifetime.
         if unsafe { nix::libc::flock(inode.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) } != 0 {
@@ -164,20 +179,9 @@ impl ReverseOnionRecipientJournal {
         }
         // Existing rollback journal is allowed only after private-file checks.
         // WAL is not this schema's durability mode; do not silently convert it.
-        for suffix in ["-journal", "-wal", "-shm"] {
-            let mut name = target.resolved_path.as_os_str().to_os_string();
-            name.push(suffix);
-            let sidecar = std::path::PathBuf::from(name);
-            match std::fs::symlink_metadata(&sidecar) {
-                Ok(_) if suffix != "-journal" => return Err(RecipientJournalError::Corrupt),
-                Ok(meta) => {
-                    verify_private_file(&sidecar, true).map_err(|_| RecipientJournalError::Rejected)?;
-                    if meta.len() > physical_limit { return Err(RecipientJournalError::Capacity); }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(RecipientJournalError::Unavailable),
-            }
-        }
+        audit_recipient_sidecars(&target.resolved_path, physical_limit, metadata.len())?;
+        let parent_metadata = target.parent.metadata().map_err(|_| RecipientJournalError::Unavailable)?;
+        validate_recipient_parent(&parent_metadata)?;
         let mut connection = Connection::open_with_flags(&target.resolved_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW)
             .map_err(|_| RecipientJournalError::Unavailable)?;
@@ -188,20 +192,15 @@ impl ReverseOnionRecipientJournal {
         }
         verify_private_file(&target.resolved_path, true)
             .map_err(|_| RecipientJournalError::Rejected)?;
-        connection.execute_batch("PRAGMA busy_timeout=0; PRAGMA trusted_schema=OFF; PRAGMA temp_store=MEMORY; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; PRAGMA fullfsync=ON;")
+        connection.execute_batch("PRAGMA busy_timeout=0; PRAGMA trusted_schema=OFF; PRAGMA temp_store=MEMORY; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; PRAGMA fullfsync=ON; PRAGMA foreign_keys=ON;")
             .map_err(|_| RecipientJournalError::Unavailable)?;
-        let sync: i64 = connection.query_row("PRAGMA synchronous", [], |r| r.get(0)).map_err(unavailable)?;
-        let mode: String = connection.query_row("PRAGMA journal_mode", [], |r| r.get(0)).map_err(unavailable)?;
-        let locking: String = connection.query_row("PRAGMA locking_mode", [], |r| r.get(0)).map_err(unavailable)?;
-        if sync != 3 || mode != "delete" || locking != "exclusive" {
-            return Err(RecipientJournalError::Unavailable);
-        }
         let page_size: i64 = connection.query_row("PRAGMA page_size", [], |r| r.get(0)).map_err(unavailable)?;
         if !(512..=65536).contains(&page_size) || !(page_size as u64).is_power_of_two() {
             return Err(RecipientJournalError::Corrupt);
         }
         connection.pragma_update(None, "max_page_count", (physical_limit / page_size as u64) as i64)
             .map_err(unavailable)?;
+        audit_recipient_pragmas(&connection, physical_limit)?;
         let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))
             .map_err(|_| RecipientJournalError::Corrupt)?;
         if integrity != "ok" { return Err(RecipientJournalError::Corrupt); }
@@ -209,6 +208,11 @@ impl ReverseOnionRecipientJournal {
         let journal = Self {
             inner: Mutex::new(Inner { connection, poisoned: false }),
             relay, recipient, limits, _inode_lock: inode, _parent: target.parent,
+            db_path: target.resolved_path, physical_limit,
+            inode_identity: (metadata.dev(), metadata.ino()),
+            parent_identity: (parent_metadata.dev(), parent_metadata.ino()),
+            #[cfg(test)]
+            post_commit_sidecar_bytes: std::sync::atomic::AtomicU64::new(0),
         };
         // [REVERSE-ONION-RECIPIENT 2026-10-04 by Codex] Crash barrier: audit
         // all bounded rows first, then atomically retire unresolved dispatches.
@@ -385,11 +389,16 @@ impl ReverseOnionRecipientJournal {
                     tx.commit().map_err(unavailable)?;
                     // A failed post-commit durability fence is ambiguous, not
                     // permission for a second dispatch. Poison before returning.
-                    #[cfg(unix)]
-                    self._parent.sync_all().map_err(|_| RecipientJournalError::Unavailable)?;
+                    self.post_operation_fence(&inner.connection)
+                        .map_err(|_| RecipientJournalError::Unavailable)?;
                     Ok(value)
                 }
-                Err(error) => { tx.rollback().map_err(unavailable)?; Err(error) }
+                Err(error) => {
+                    tx.rollback().map_err(unavailable)?;
+                    self.post_operation_fence(&inner.connection)
+                        .map_err(|_| RecipientJournalError::Unavailable)?;
+                    Err(error)
+                }
             }
         })();
         if matches!(&outcome, Err(RecipientJournalError::Corrupt | RecipientJournalError::Unavailable)) {
@@ -397,6 +406,46 @@ impl ReverseOnionRecipientJournal {
         }
         outcome
     }
+
+    // [REVERSE-ONION-RECIPIENT-DB-BOUNDARY 2026-10-04 by Codex] Called
+    // while the transaction's original mutex is still held. No value escapes
+    // a failed fence; Unavailable poisons the handle before releasing the lock.
+    #[cfg(unix)]
+    fn post_operation_fence(&self, connection: &Connection) -> Result<()> {
+        // Test-only growth after SQLite commit, before any dispatch/result is
+        // published. This never changes production durability or admission.
+        #[cfg(test)] {
+            let bytes = self.post_commit_sidecar_bytes.swap(0, std::sync::atomic::Ordering::SeqCst);
+            if bytes != 0 {
+                std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)
+                    .open(recipient_sidecar(&self.db_path, "-journal"))
+                    .and_then(|file| file.set_len(bytes)).map_err(|_| RecipientJournalError::Unavailable)?;
+            }
+        }
+        let held = self._inode_lock.metadata().map_err(|_| RecipientJournalError::Unavailable)?;
+        validate_recipient_file(&held)?;
+        if (held.dev(), held.ino()) != self.inode_identity { return Err(RecipientJournalError::Rejected); }
+        let parent = self._parent.metadata().map_err(|_| RecipientJournalError::Unavailable)?;
+        validate_recipient_parent(&parent)?;
+        if (parent.dev(), parent.ino()) != self.parent_identity { return Err(RecipientJournalError::Rejected); }
+        let parent_path = self.db_path.parent().ok_or(RecipientJournalError::Rejected)?;
+        let observed_parent = std::fs::symlink_metadata(parent_path).map_err(|_| RecipientJournalError::Unavailable)?;
+        validate_recipient_parent(&observed_parent)?;
+        if (observed_parent.dev(), observed_parent.ino()) != self.parent_identity {
+            return Err(RecipientJournalError::Rejected);
+        }
+        let observed = std::fs::symlink_metadata(&self.db_path).map_err(|_| RecipientJournalError::Unavailable)?;
+        validate_recipient_file(&observed)?;
+        if (observed.dev(), observed.ino()) != self.inode_identity || observed.len() != held.len() {
+            return Err(RecipientJournalError::Rejected);
+        }
+        audit_recipient_sidecars(&self.db_path, self.physical_limit, observed.len())?;
+        audit_recipient_pragmas(connection, self.physical_limit)?;
+        self._parent.sync_all().map_err(|_| RecipientJournalError::Unavailable)
+    }
+
+    #[cfg(not(unix))]
+    fn post_operation_fence(&self, _connection: &Connection) -> Result<()> { Err(RecipientJournalError::Rejected) }
 
     fn audit_bounds(&self, tx: &Transaction<'_>) -> Result<()> {
         let (count, bytes): (i64, i64) = tx.query_row(
@@ -453,6 +502,100 @@ impl ReverseOnionRecipientJournal {
         if result.is_some() != (phase == Phase::Result) { return Err(RecipientJournalError::Corrupt); }
         Ok(Some(Record { claim, lease, result, deadline: deadline as u64, retain_until: retain as u64, phase }))
     }
+}
+
+// [REVERSE-ONION-RECIPIENT-DB-BOUNDARY 2026-10-04 by Codex] Local-only
+// policy composition; reuse the private target helper without editing it.
+fn recipient_physical_limit(limits: &RecipientJournalLimits) -> Result<u64> {
+    limits.max_bytes.checked_mul(2)
+        .and_then(|n| n.checked_add((MAX_ENTRIES as u64 + 256).checked_mul(4096)?))
+        .ok_or(RecipientJournalError::Rejected)
+}
+
+#[cfg(unix)]
+fn validate_recipient_file(metadata: &std::fs::Metadata) -> Result<()> {
+    // SAFETY: geteuid has no pointer arguments or preconditions.
+    if !metadata.is_file() || metadata.uid() != unsafe { nix::libc::geteuid() }
+        || metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o600
+    { return Err(RecipientJournalError::Rejected); }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_recipient_parent(metadata: &std::fs::Metadata) -> Result<()> {
+    // SAFETY: geteuid has no pointer arguments or preconditions.
+    if !metadata.is_dir() || metadata.uid() != unsafe { nix::libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    { return Err(RecipientJournalError::Rejected); }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn preflight_recipient_files(path: &Path, physical_limit: u64) -> Result<()> {
+    let parent_path = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    match std::fs::symlink_metadata(parent_path) {
+        Ok(parent) => validate_recipient_parent(&parent)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(RecipientJournalError::Unavailable),
+    }
+    let primary = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => { validate_recipient_file(&metadata)?; metadata.len() }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => return Err(RecipientJournalError::Unavailable),
+    };
+    audit_recipient_sidecars(path, physical_limit, primary)
+}
+
+fn recipient_checked_aggregate(primary: u64, rollback: u64, limit: u64) -> Result<u64> {
+    let total = primary.checked_add(rollback).ok_or(RecipientJournalError::Capacity)?;
+    if total > limit { return Err(RecipientJournalError::Capacity); }
+    Ok(total)
+}
+
+#[cfg(unix)]
+fn recipient_sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string(); name.push(suffix); name.into()
+}
+
+#[cfg(unix)]
+fn audit_recipient_sidecars(path: &Path, physical_limit: u64, primary: u64) -> Result<()> {
+    let mut total = recipient_checked_aggregate(primary, 0, physical_limit)?;
+    for suffix in ["-journal", "-wal", "-shm"] {
+        match std::fs::symlink_metadata(recipient_sidecar(path, suffix)) {
+            Ok(_) if suffix != "-journal" => return Err(RecipientJournalError::Corrupt),
+            Ok(metadata) => {
+                validate_recipient_file(&metadata)?;
+                total = recipient_checked_aggregate(total, metadata.len(), physical_limit)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(RecipientJournalError::Unavailable),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn audit_recipient_pragmas(connection: &Connection, physical_limit: u64) -> Result<()> {
+    for (query, expected) in [
+        ("PRAGMA busy_timeout", 0i64), ("PRAGMA trusted_schema", 0),
+        ("PRAGMA temp_store", 2), ("PRAGMA synchronous", 3),
+        ("PRAGMA fullfsync", 1), ("PRAGMA foreign_keys", 1),
+    ] {
+        let actual: i64 = connection.query_row(query, [], |r| r.get(0)).map_err(unavailable)?;
+        if actual != expected { return Err(RecipientJournalError::Unavailable); }
+    }
+    for (query, expected) in [("PRAGMA journal_mode", "delete"), ("PRAGMA locking_mode", "exclusive")] {
+        let actual: String = connection.query_row(query, [], |r| r.get(0)).map_err(unavailable)?;
+        if !actual.eq_ignore_ascii_case(expected) { return Err(RecipientJournalError::Unavailable); }
+    }
+    let page_size: i64 = connection.query_row("PRAGMA page_size", [], |r| r.get(0)).map_err(unavailable)?;
+    let pages: i64 = connection.query_row("PRAGMA page_count", [], |r| r.get(0)).map_err(unavailable)?;
+    let maximum: i64 = connection.query_row("PRAGMA max_page_count", [], |r| r.get(0)).map_err(unavailable)?;
+    if !(512..=65536).contains(&page_size) || !(page_size as u64).is_power_of_two() { return Err(RecipientJournalError::Corrupt); }
+    if pages < 0 || maximum <= 0 || pages > maximum || maximum as u64 > physical_limit / page_size as u64
+        || (pages as u64).checked_mul(page_size as u64).map_or(true, |n| n > physical_limit)
+    { return Err(RecipientJournalError::Capacity); }
+    Ok(())
 }
 
 // [REVERSE-ONION-RECIPIENT 2026-10-04 by Codex] Unknown schema is never
@@ -716,5 +859,91 @@ mod tests {
         let (count, phase): (i64, i64) = connection.query_row(
             "SELECT count(*),min(phase) FROM recipient_jobs", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!((count, phase), (1, Phase::Lease as i64));
+    }
+
+    // [REVERSE-ONION-RECIPIENT-DB-BOUNDARY 2026-10-04 by Codex] Authored
+    // only. Sparse files avoid allocating the physical byte ceiling in memory.
+    fn private_sparse(path: &Path, bytes: u64) {
+        std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)
+            .open(path).unwrap().set_len(bytes).unwrap();
+    }
+
+    #[test]
+    fn recipient_preflight_counts_primary_and_rollback_as_one_observed_budget() {
+        let f = Fixture::new(NOW + 600);
+        let logical = 1024 * 1024;
+        let bound = recipient_physical_limit(&RecipientJournalLimits { max_entries: 8, max_bytes: logical }).unwrap();
+        let primary = bound * 3 / 4; let rollback = bound / 2;
+        let sidecar = recipient_sidecar(&f.path(), "-journal");
+        private_sparse(&f.path(), primary); private_sparse(&sidecar, rollback);
+        let parent_mode = std::fs::metadata(f.directory.path()).unwrap().mode();
+        assert!(primary < bound && rollback < bound);
+        assert_eq!(f.open_with_limits(NOW, 8, logical).err(), Some(RecipientJournalError::Capacity));
+        assert_eq!(std::fs::metadata(f.path()).unwrap().len(), primary);
+        assert_eq!(std::fs::metadata(&sidecar).unwrap().len(), rollback);
+        assert_eq!(std::fs::metadata(f.directory.path()).unwrap().mode(), parent_mode);
+        assert_eq!(std::fs::metadata(f.path()).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(sidecar).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn recipient_absent_primary_oversized_sidecar_refusal_has_no_create_or_chmod() {
+        let f = Fixture::new(NOW + 600); let logical = 1024 * 1024;
+        let bound = recipient_physical_limit(&RecipientJournalLimits { max_entries: 8, max_bytes: logical }).unwrap();
+        let sidecar = recipient_sidecar(&f.path(), "-journal"); private_sparse(&sidecar, bound + 1);
+        let parent = std::fs::metadata(f.directory.path()).unwrap();
+        let before = std::fs::metadata(&sidecar).unwrap();
+        let names_before: Vec<_> = std::fs::read_dir(f.directory.path()).unwrap()
+            .map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(f.open_with_limits(NOW, 8, logical).err(), Some(RecipientJournalError::Capacity));
+        assert!(!f.path().exists());
+        let names_after: Vec<_> = std::fs::read_dir(f.directory.path()).unwrap()
+            .map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(names_before, names_after);
+        assert_eq!(std::fs::metadata(f.directory.path()).unwrap().mode(), parent.mode());
+        let after = std::fs::metadata(sidecar).unwrap();
+        assert_eq!(after.mode(), before.mode()); assert_eq!(after.len(), before.len());
+    }
+
+    #[test]
+    fn recipient_post_commit_aggregate_failure_never_publishes_dispatch_and_poisons() {
+        let f = Fixture::new(NOW + 600); let journal = f.open(NOW).unwrap(); f.ready(&journal);
+        let primary = std::fs::metadata(f.path()).unwrap().len();
+        assert!(primary > 1 && primary < journal.physical_limit);
+        journal.post_commit_sidecar_bytes.store(journal.physical_limit - 1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(journal.arm(f.claim.claim_id(), NOW + 2).err(), Some(RecipientJournalError::Unavailable));
+        let sidecar = recipient_sidecar(&f.path(), "-journal");
+        assert_eq!(std::fs::metadata(&sidecar).unwrap().len(), journal.physical_limit - 1);
+        assert_eq!(journal.arm(f.claim.claim_id(), NOW + 3).err(), Some(RecipientJournalError::Unavailable));
+        assert!(sidecar.exists());
+    }
+
+    #[test]
+    fn recipient_critical_pragma_drift_is_read_back_before_dispatch_publication() {
+        for (pragma, value) in [("fullfsync", 0), ("trusted_schema", 1), ("temp_store", 1), ("busy_timeout", 3)] {
+            let f = Fixture::new(NOW + 600); let journal = f.open(NOW).unwrap(); f.ready(&journal);
+            {
+                let inner = journal.inner.lock().unwrap();
+                audit_recipient_pragmas(&inner.connection, journal.physical_limit).unwrap();
+                inner.connection.pragma_update(None, pragma, value).unwrap();
+            }
+            assert_eq!(journal.arm(f.claim.claim_id(), NOW + 2).err(), Some(RecipientJournalError::Unavailable));
+            assert_eq!(journal.resume(None, 1, NOW + 2).err(), Some(RecipientJournalError::Unavailable));
+            drop(journal);
+            let journal = f.open(NOW + 3).unwrap();
+            assert_eq!(journal.arm(f.claim.claim_id(), NOW + 3).err(), Some(RecipientJournalError::Ambiguous));
+        }
+    }
+
+    #[test]
+    fn recipient_overflow_and_forbidden_sidecars_fail_closed_without_creation() {
+        assert_eq!(recipient_checked_aggregate(u64::MAX, 1, u64::MAX).err(), Some(RecipientJournalError::Capacity));
+        assert_eq!(recipient_checked_aggregate(4, 5, 9).unwrap(), 9);
+        for suffix in ["-wal", "-shm"] {
+            let f = Fixture::new(NOW + 600); let sidecar = recipient_sidecar(&f.path(), suffix);
+            private_sparse(&sidecar, 1);
+            assert_eq!(f.open(NOW).err(), Some(RecipientJournalError::Corrupt));
+            assert!(!f.path().exists()); assert_eq!(std::fs::metadata(sidecar).unwrap().len(), 1);
+        }
     }
 }
