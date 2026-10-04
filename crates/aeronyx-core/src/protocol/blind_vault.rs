@@ -67,7 +67,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.21.0-OnionPullSizeContract - Bound anonymous recovery to
+//! Last Modified: v1.22.0-PullRestart - Identity-sealed source session recovery.
+//! [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Snapshots grant no replay authority.
+//! v1.21.0-OnionPullSizeContract - Bound anonymous recovery to
 //! the negotiated maximum fixed-size response class.
 //! v1.20.0-PrivacySafeTypedDebug - Redacted direct formatting
 //! for capability-, topology-, and commitment-bearing protocol values.
@@ -118,6 +120,7 @@ use bincode::Options;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 
@@ -1616,7 +1619,202 @@ pub struct BlindVaultOnionPullSession {
     reply_session: OnionReplySession,
 }
 
+// [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Local snapshot framing,
+// unrelated to public Blind Vault wire kinds and compact mailbox sessions.
+const PULL_RESTART_BODY_MAGIC: [u8; 4] = *b"AXPS";
+const PULL_RESTART_BODY_VERSION: u16 = 1;
+const PULL_RESTART_PREFIX_BYTES: usize = 4 + 2 + 1 + 32 + 32 + 2;
+const PULL_RESTART_REQUEST_DOMAIN: &[u8] = b"AeroNyx-BlindVault-OnionPull-ExactRequest-v1";
+// Existing bincode fixed-int Pull: version, lease, capability, cursor length,
+// bounded cursor, limit. This is an admission bound, not a new wire encoding.
+const MAX_PULL_RESTART_FRAME_BYTES: usize =
+    FRAME_HEADER_BYTES + 2 + 32 + 32 + 8 + MAX_BLIND_VAULT_PULL_CURSOR_BYTES + 2;
+
+/// Fixed ceiling for an identity-sealed local Pull restart container.
+pub const MAX_BLIND_VAULT_ONION_PULL_RESTART_BYTES: usize =
+    super::blind_vault_replica_workflow::MAX_PULL_RESTART_SEALED_BYTES;
+
+/// Coarse local errors: no key, capability, route, identity or codec detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum BlindVaultOnionPullRestartError {
+    #[error("pull restart exceeds local size limit")]
+    TooLarge,
+    #[error("malformed pull restart")]
+    Malformed,
+    #[error("unsupported pull restart version")]
+    UnsupportedVersion,
+    #[error("pull restart authentication failed")]
+    AuthenticationFailed,
+    #[error("pull restart binding rejected")]
+    BindingMismatch,
+}
+
+// [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Borrowed admission checks
+// precede any nested deserialization. Fixed-int little-endian bincode fields
+// have one canonical shape; never materialize a capability or attacker-sized
+// cursor. The codec parity fixture below freezes this existing shape.
+fn pull_restart_lease(payload: &[u8]) -> Result<[u8; 32], BlindVaultOnionPullRestartError> {
+    use BlindVaultOnionPullRestartError as Error;
+    const CURSOR_LENGTH_OFFSET: usize = FRAME_HEADER_BYTES + 2 + 32 + 32;
+    const CURSOR_OFFSET: usize = CURSOR_LENGTH_OFFSET + 8;
+    if payload.len() < CURSOR_OFFSET + 2 || payload.len() > MAX_PULL_RESTART_FRAME_BYTES {
+        return Err(Error::Malformed);
+    }
+    if payload[..4] != FRAME_MAGIC
+        || payload[4..6] != BLIND_VAULT_PROTOCOL_VERSION.to_be_bytes()
+        || payload[6] != FRAME_KIND_PULL_REQUEST
+        || payload[7..9] != BLIND_VAULT_PROTOCOL_VERSION.to_le_bytes()
+    {
+        return Err(Error::BindingMismatch);
+    }
+    let cursor_len = u64::from_le_bytes(
+        payload[CURSOR_LENGTH_OFFSET..CURSOR_OFFSET]
+            .try_into()
+            .map_err(|_| Error::Malformed)?,
+    );
+    if cursor_len > MAX_BLIND_VAULT_PULL_CURSOR_BYTES as u64 {
+        return Err(Error::TooLarge);
+    }
+    let limit_offset = CURSOR_OFFSET + cursor_len as usize;
+    if payload.len() != limit_offset + 2
+        || payload[limit_offset..] != 1u16.to_le_bytes()
+        || payload[9..41].iter().all(|byte| *byte == 0)
+        || payload[41..73].iter().all(|byte| *byte == 0)
+    {
+        return Err(Error::BindingMismatch);
+    }
+    payload[9..41].try_into().map_err(|_| Error::Malformed)
+}
+
+fn pull_restart_request_digest(encoded: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(PULL_RESTART_REQUEST_DOMAIN);
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    hash.finalize().into()
+}
+
 impl BlindVaultOnionPullSession {
+    /// Seals local restart state; the returned ciphertext is not a send permit.
+    ///
+    /// [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Trusted route/terminal
+    /// and exact terminal request must come from the source's private journal.
+    /// Persist the returned bytes once; re-sealing intentionally uses a new nonce.
+    /// This proves neither fsync nor HTTP delivery. It grants no replay authority.
+    pub fn seal_restart(
+        &self,
+        source_identity: &IdentityKeyPair,
+        expected_route_id: [u8; 16],
+        expected_terminal_node_id: [u8; 32],
+        exact_terminal_request: &[u8],
+    ) -> Result<Vec<u8>, BlindVaultOnionPullRestartError> {
+        use super::blind_vault_replica_workflow::{seal_pull_restart, MAX_PULL_RESTART_BODY_BYTES};
+        use BlindVaultOnionPullRestartError as Error;
+        self.validate_restart_binding(
+            expected_route_id,
+            expected_terminal_node_id,
+            exact_terminal_request,
+        )?;
+        let state = self
+            .reply_session
+            .encode_restart_state()
+            .map_err(|_| Error::Malformed)?;
+        // Derive from the actual encoder, including prefix, then enforce the
+        // facade's 512 - header - tag budget BEFORE allocating a clear body.
+        let body_len = PULL_RESTART_PREFIX_BYTES
+            .checked_add(state.as_bytes().len())
+            .filter(|length| *length <= MAX_PULL_RESTART_BODY_BYTES)
+            .ok_or(Error::TooLarge)?;
+        let state_len = u16::try_from(state.as_bytes().len()).map_err(|_| Error::TooLarge)?;
+        let mut body = Zeroizing::new(Vec::with_capacity(body_len));
+        body.extend_from_slice(&PULL_RESTART_BODY_MAGIC);
+        body.extend_from_slice(&PULL_RESTART_BODY_VERSION.to_be_bytes());
+        body.push(BlindVaultTerminalOperation::Pull as u8);
+        body.extend_from_slice(&self.lease_id);
+        body.extend_from_slice(&pull_restart_request_digest(exact_terminal_request));
+        body.extend_from_slice(&state_len.to_be_bytes());
+        body.extend_from_slice(state.as_bytes());
+        if body.len() != body_len {
+            return Err(Error::Malformed);
+        }
+        seal_pull_restart(source_identity, &body)
+    }
+
+    /// Restores only the same identity-bound, fixed-class Pull session.
+    ///
+    /// A durable source CAS must reserve/consume response opening BEFORE calling
+    /// `open`. Restoring an old valid ciphertext twice is cryptographically
+    /// possible: anti-rollback, one-shot recovery and retry policy are journal
+    /// responsibilities, not properties of this container. No network is used.
+    /// [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Authenticated restore
+    /// delegates private session parsing to AXOR and all response checks to open.
+    pub fn restore_restart(
+        source_identity: &IdentityKeyPair,
+        sealed: &[u8],
+        expected_route_id: [u8; 16],
+        expected_terminal_node_id: [u8; 32],
+        exact_terminal_request: &[u8],
+    ) -> Result<Self, BlindVaultOnionPullRestartError> {
+        use super::blind_vault_replica_workflow::open_pull_restart;
+        use BlindVaultOnionPullRestartError as Error;
+        let body = open_pull_restart(source_identity, sealed)?;
+        if body.len() < PULL_RESTART_PREFIX_BYTES || body[..4] != PULL_RESTART_BODY_MAGIC {
+            return Err(Error::Malformed);
+        }
+        if body[4..6] != PULL_RESTART_BODY_VERSION.to_be_bytes() {
+            return Err(Error::UnsupportedVersion);
+        }
+        if body[6] != BlindVaultTerminalOperation::Pull as u8 {
+            return Err(Error::BindingMismatch);
+        }
+        let state_len = u16::from_be_bytes([body[71], body[72]]) as usize;
+        if body.len() != PULL_RESTART_PREFIX_BYTES + state_len {
+            return Err(Error::Malformed);
+        }
+        let restored = Self {
+            lease_id: body[7..39].try_into().map_err(|_| Error::Malformed)?,
+            // AXOR owns its own parsing; never duplicate its offsets here.
+            reply_session: OnionReplySession::decode_restart_state(
+                &body[PULL_RESTART_PREFIX_BYTES..],
+            )
+            .map_err(|_| Error::Malformed)?,
+        };
+        restored.validate_restart_binding(
+            expected_route_id,
+            expected_terminal_node_id,
+            exact_terminal_request,
+        )?;
+        if body[39..71] != pull_restart_request_digest(exact_terminal_request) {
+            return Err(Error::BindingMismatch);
+        }
+        Ok(restored)
+    }
+
+    fn validate_restart_binding(
+        &self,
+        route_id: [u8; 16],
+        terminal_node_id: [u8; 32],
+        exact_request: &[u8],
+    ) -> Result<(), BlindVaultOnionPullRestartError> {
+        use BlindVaultOnionPullRestartError as Error;
+        if !self.reply_session.matches_restart_binding(
+            route_id,
+            terminal_node_id,
+            BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS,
+            super::onion_reply::OnionReplyProofMode::SourceSealedTerminalProof,
+        ) {
+            return Err(Error::BindingMismatch);
+        }
+        let payload = self
+            .reply_session
+            .restart_request_payload(exact_request, MAX_PULL_RESTART_FRAME_BYTES)
+            .map_err(|_| Error::BindingMismatch)?;
+        if pull_restart_lease(payload)? != self.lease_id {
+            return Err(Error::BindingMismatch);
+        }
+        Ok(())
+    }
+
     /// Encodes one capability-bearing pull for the final onion layer.
     pub fn prepare(
         route_id: [u8; 16],
@@ -5017,6 +5215,269 @@ mod serde_bytes64 {
         value[..32].copy_from_slice(&low);
         value[32..].copy_from_slice(&high);
         Ok(value)
+    }
+}
+
+// [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Focused authored fixtures;
+// execution is intentionally deferred under the current worker policy.
+#[cfg(test)]
+mod pull_restart_tests {
+    use super::*;
+    use super::super::blind_vault_replica_workflow::{
+        open_pull_restart, seal_pull_restart, MAX_PULL_RESTART_BODY_BYTES,
+    };
+    use super::super::onion_reply::{
+        decode_onion_reply_request, encode_onion_sealed_response, seal_onion_reply,
+    };
+
+    const ROUTE: [u8; 16] = [3; 16];
+
+    fn identity(seed: u8) -> IdentityKeyPair {
+        IdentityKeyPair::from_bytes(&[seed; 32]).expect("fixture identity")
+    }
+
+    fn pull(cursor: usize) -> BlindVaultPullRequest {
+        BlindVaultPullRequest {
+            version: BLIND_VAULT_PROTOCOL_VERSION,
+            lease_id: [7; 32],
+            read_capability: [8; 32],
+            continuation_cursor: vec![9; cursor],
+            limit: 1,
+        }
+    }
+
+    fn prepared() -> (Vec<u8>, BlindVaultOnionPullSession) {
+        BlindVaultOnionPullSession::prepare(ROUTE, identity(2).public_key_bytes(), pull(128))
+            .expect("prepare")
+    }
+
+    fn sealed_response(request: &[u8], lease_id: [u8; 32]) -> Vec<u8> {
+        let terminal = identity(2);
+        let request = decode_onion_reply_request(request).expect("request");
+        let mut page = BlindVaultPullResponse::new(
+            lease_id, vec![], vec![], 1_800_000_000_000, terminal.public_key_bytes(),
+        );
+        page.sign(&terminal).expect("signed page");
+        let payload = encode_blind_vault_frame(&BlindVaultFrame::PullResponse(page)).expect("frame");
+        let response = seal_onion_reply(ROUTE, &request, &payload, &terminal).expect("seal response");
+        encode_onion_sealed_response(&response).expect("encode response")
+    }
+
+    #[test]
+    fn pull_restart_actual_shape_bound_and_signed_response_roundtrip() {
+        let source = identity(1);
+        let terminal = identity(2).public_key_bytes();
+        let (request, session) = prepared();
+        let raw_len = session.reply_session.encode_restart_state().expect("private state")
+            .as_bytes().len();
+        let sealed = session.seal_restart(&source, ROUTE, terminal, &request).expect("snapshot");
+        let body = open_pull_restart(&source, &sealed).expect("authenticated body");
+        assert_eq!(body.len(), PULL_RESTART_PREFIX_BYTES + raw_len);
+        assert_eq!(sealed.len(), body.len() + 4 + 2 + 24 + 16);
+        assert!(sealed.len() <= MAX_BLIND_VAULT_ONION_PULL_RESTART_BYTES);
+        let restored = BlindVaultOnionPullSession::restore_restart(
+            &source, &sealed, ROUTE, terminal, &request,
+        ).expect("restore exact request");
+        let response = restored.open(&sealed_response(&request, [7; 32])).expect("verified page");
+        assert_eq!(response.lease_id, [7; 32]);
+        // open consumes restored by value; a second call on it cannot compile.
+        // Restoring the same snapshot again IS possible and requires journal CAS.
+    }
+
+    #[test]
+    fn pull_restart_codec_parity_and_borrowed_bounds() {
+        for cursor in [0, 1, MAX_BLIND_VAULT_PULL_CURSOR_BYTES] {
+            let encoded = encode_blind_vault_frame(&BlindVaultFrame::PullRequest(pull(cursor)))
+                .expect("existing canonical codec");
+            assert_eq!(pull_restart_lease(&encoded).expect("borrowed projection"), [7; 32]);
+            assert_eq!(encoded.len(), FRAME_HEADER_BYTES + 2 + 32 + 32 + 8 + cursor + 2);
+            if cursor == MAX_BLIND_VAULT_PULL_CURSOR_BYTES {
+                assert_eq!(encoded.len(), MAX_PULL_RESTART_FRAME_BYTES);
+                let mut trailing = encoded.clone();
+                trailing.push(0);
+                assert!(pull_restart_lease(&trailing).is_err());
+            }
+            let mut huge_cursor = encoded.clone();
+            huge_cursor[73..81].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert_eq!(pull_restart_lease(&huge_cursor), Err(BlindVaultOnionPullRestartError::TooLarge));
+            for offset in [4, 6, 7, encoded.len() - 1] {
+                let mut malformed = encoded.clone();
+                malformed[offset] ^= 1;
+                assert!(pull_restart_lease(&malformed).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn pull_restart_rejects_identity_route_terminal_and_exact_request_changes() {
+        let source = identity(1);
+        let terminal = identity(2).public_key_bytes();
+        let (request, session) = prepared();
+        let sealed = session.seal_restart(&source, ROUTE, terminal, &request).expect("snapshot");
+        assert!(matches!(BlindVaultOnionPullSession::restore_restart(
+            &identity(4), &sealed, ROUTE, terminal, &request,
+        ), Err(BlindVaultOnionPullRestartError::AuthenticationFailed)));
+        for (route, target) in [([4; 16], terminal), (ROUTE, identity(4).public_key_bytes())] {
+            assert!(BlindVaultOnionPullSession::restore_restart(
+                &source, &sealed, route, target, &request,
+            ).is_err());
+            assert!(session.seal_restart(&source, route, target, &request).is_err());
+        }
+        // Existing source header: magic/version/mode/key/class/length; then
+        // Pull version/lease/capability/cursor/limit. Change every region.
+        for offset in [0, 4, 5, 6, 38, 42, 46 + 7, 46 + 9, 46 + 41, 46 + 81, request.len() - 1] {
+            let mut changed = request.clone();
+            changed[offset] ^= 1;
+            assert!(BlindVaultOnionPullSession::restore_restart(
+                &source, &sealed, ROUTE, terminal, &changed,
+            ).is_err());
+        }
+        let mut trailing = request.clone();
+        trailing.push(0);
+        assert!(session.seal_restart(&source, ROUTE, terminal, &trailing).is_err());
+        assert!(session.seal_restart(&source, ROUTE, terminal, &request[..10]).is_err());
+    }
+
+    #[test]
+    fn pull_restart_rejects_authenticated_wrong_body_and_container_tampering() {
+        let source = identity(1);
+        let terminal = identity(2).public_key_bytes();
+        let (request, session) = prepared();
+        let sealed = session.seal_restart(&source, ROUTE, terminal, &request).expect("snapshot");
+        let body = open_pull_restart(&source, &sealed).expect("body");
+        // Deliberately authenticated but semantically wrong local state.
+        for offset in [0, 4, 6, 7, 39, 71] {
+            let mut changed = Zeroizing::new(body.to_vec());
+            changed[offset] ^= 1;
+            let forged = seal_pull_restart(&source, &changed).expect("authenticated test body");
+            assert!(BlindVaultOnionPullSession::restore_restart(
+                &source, &forged, ROUTE, terminal, &request,
+            ).is_err());
+        }
+        let mut changed = Zeroizing::new(body.to_vec());
+        changed.push(0);
+        let forged = seal_pull_restart(&source, &changed).expect("trailing body");
+        assert!(BlindVaultOnionPullSession::restore_restart(
+            &source, &forged, ROUTE, terminal, &request,
+        ).is_err());
+        for offset in [0, 4, 6, sealed.len() - 1] {
+            let mut changed = sealed.clone();
+            changed[offset] ^= 1;
+            assert!(BlindVaultOnionPullSession::restore_restart(
+                &source, &changed, ROUTE, terminal, &request,
+            ).is_err());
+        }
+        for bad in [vec![], sealed[..sealed.len() - 1].to_vec(), vec![0; 513]] {
+            assert!(BlindVaultOnionPullSession::restore_restart(
+                &source, &bad, ROUTE, terminal, &request,
+            ).is_err());
+        }
+    }
+
+    #[test]
+    fn pull_restart_facade_enforces_actual_512_byte_container_boundary() {
+        let source = identity(1);
+        let body = Zeroizing::new(vec![0x55; MAX_PULL_RESTART_BODY_BYTES]);
+        let sealed = seal_pull_restart(&source, &body).expect("maximum body");
+        assert_eq!(sealed.len(), MAX_BLIND_VAULT_ONION_PULL_RESTART_BYTES);
+        assert_eq!(open_pull_restart(&source, &sealed).expect("open").as_slice(), body.as_slice());
+        let excess = Zeroizing::new(vec![0; MAX_PULL_RESTART_BODY_BYTES + 1]);
+        assert_eq!(seal_pull_restart(&source, &excess), Err(BlindVaultOnionPullRestartError::TooLarge));
+        assert!(open_pull_restart(&source, &vec![0; 513]).is_err());
+        let mut trailing = sealed;
+        trailing.push(0);
+        assert!(open_pull_restart(&source, &trailing).is_err());
+    }
+
+    #[test]
+    fn pull_restart_rejects_legacy_mode_wrong_class_and_non_pull_sessions() {
+        let source = identity(1);
+        let terminal = identity(2).public_key_bytes();
+        let payload = encode_blind_vault_frame(&BlindVaultFrame::PullRequest(pull(0))).expect("pull");
+        let (legacy, legacy_session) = OnionReplySession::prepare(
+            ROUTE, terminal, BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS, payload.clone(),
+        ).expect("legacy");
+        let (small, small_session) = OnionReplySession::prepare_source_sealed(
+            ROUTE, terminal, ONION_REPLY_RESPONSE_SIZE_CLASSES[0], payload,
+        ).expect("small class");
+        for (request, reply_session) in [(legacy, legacy_session), (small, small_session)] {
+            let session = BlindVaultOnionPullSession { lease_id: [7; 32], reply_session };
+            let encoded = encode_onion_reply_request(&request).expect("request");
+            assert!(session.seal_restart(&source, ROUTE, terminal, &encoded).is_err());
+        }
+        let mut invalid_pull = pull(0);
+        invalid_pull.limit = 2;
+        let payload = encode_blind_vault_frame(&BlindVaultFrame::PullRequest(invalid_pull)).expect("frame");
+        let (request, reply_session) = OnionReplySession::prepare_source_sealed(
+            ROUTE, terminal, BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS, payload,
+        ).expect("non-inline pull");
+        let session = BlindVaultOnionPullSession { lease_id: [7; 32], reply_session };
+        assert!(session.seal_restart(
+            &source, ROUTE, terminal, &encode_onion_reply_request(&request).expect("request"),
+        ).is_err());
+    }
+
+    #[test]
+    fn pull_restart_preserves_response_lease_verification() {
+        let source = identity(1);
+        let terminal = identity(2).public_key_bytes();
+        let (request, session) = prepared();
+        let sealed = session.seal_restart(&source, ROUTE, terminal, &request).expect("snapshot");
+        let restored = BlindVaultOnionPullSession::restore_restart(
+            &source, &sealed, ROUTE, terminal, &request,
+        ).expect("restore");
+        assert!(matches!(restored.open(&sealed_response(&request, [6; 32])),
+            Err(BlindVaultOnionPullError::LeaseMismatch)));
+    }
+
+    #[test]
+    fn pull_restart_preserves_terminal_operation_and_signature_checks() {
+        let source = identity(1);
+        let terminal = identity(2);
+        let (request, session) = prepared();
+        let sealed = session.seal_restart(
+            &source, ROUTE, terminal.public_key_bytes(), &request,
+        ).expect("snapshot");
+        let restore = || BlindVaultOnionPullSession::restore_restart(
+            &source, &sealed, ROUTE, terminal.public_key_bytes(), &request,
+        ).expect("restore fixture (production requires durable CAS)");
+        let decoded = decode_onion_reply_request(&request).expect("request");
+        for operation in [BlindVaultTerminalOperation::Put, BlindVaultTerminalOperation::Pull] {
+            let failure = BlindVaultFrame::TerminalFailure(BlindVaultTerminalFailure::new(
+                operation, BlindVaultTerminalFailureCode::Rejected,
+            ));
+            let payload = encode_blind_vault_frame(&failure).expect("failure frame");
+            let response = seal_onion_reply(ROUTE, &decoded, &payload, &terminal).expect("reply");
+            let bytes = encode_onion_sealed_response(&response).expect("response bytes");
+            let result = restore().open(&bytes);
+            if operation == BlindVaultTerminalOperation::Pull {
+                assert!(matches!(result, Err(BlindVaultOnionPullError::TerminalFailure(
+                    BlindVaultTerminalFailureCode::Rejected,
+                ))));
+            } else {
+                assert!(matches!(result, Err(BlindVaultOnionPullError::UnexpectedResponseFrame)));
+            }
+            // A non-request nested frame must never be sealable as a Pull session.
+            let (bad_request, reply_session) = OnionReplySession::prepare_source_sealed(
+                ROUTE, terminal.public_key_bytes(), BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS,
+                payload,
+            ).expect("other workload");
+            let other = BlindVaultOnionPullSession { lease_id: [7; 32], reply_session };
+            assert!(other.seal_restart(
+                &source, ROUTE, terminal.public_key_bytes(),
+                &encode_onion_reply_request(&bad_request).expect("canonical outer request"),
+            ).is_err());
+        }
+        let mut tampered = sealed_response(&request, [7; 32]);
+        let end = tampered.len() - 1;
+        tampered[end] ^= 1;
+        assert!(restore().open(&tampered).is_err());
+        let wrong_terminal_response = seal_onion_reply(
+            ROUTE, &decoded, &[0], &identity(4),
+        ).expect("other signer");
+        assert!(restore().open(
+            &encode_onion_sealed_response(&wrong_terminal_response).expect("wrong signer response"),
+        ).is_err());
     }
 }
 

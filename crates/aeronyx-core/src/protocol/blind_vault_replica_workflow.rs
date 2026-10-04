@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.73.0-SourceReservationSeal - Exported purpose-fixed local
+//! Last Modified: v1.74.0-PullRestartSeal - Crate-private purpose-fixed facade.
+//! [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] No generic crypto export.
+//! v1.73.0-SourceReservationSeal - Exported purpose-fixed local
 //! reservation sealing, not workflow readiness or dispatch authority.
 //! [SOURCE-RESERVATION-SEAL 2026-10-04 by Codex] Public opaque local seal/open
 //! boundary with fixed private-body and container limits; generic helpers stay private.
@@ -320,6 +322,12 @@ pub use sealed_local::{
     open_blind_vault_source_reservation, seal_blind_vault_source_reservation,
     BlindVaultSourceReservationSealError, MAX_BLIND_VAULT_SOURCE_RESERVATION_BODY_BYTES,
     MAX_BLIND_VAULT_SOURCE_RESERVATION_SEALED_BYTES,
+};
+// [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Only the typed Pull
+// session exposes ciphertext publicly; clear state never crosses the crate API.
+pub(crate) use sealed_local::{
+    open_pull_restart, seal_pull_restart, MAX_PULL_RESTART_BODY_BYTES,
+    MAX_PULL_RESTART_SEALED_BYTES,
 };
 
 use std::fmt;

@@ -31,7 +31,9 @@
 //! - Do not implement `Clone` for session or key ownership types.
 //! - Keep response opening delegated to the single parent verifier.
 //!
-//! Last Modified: v1.3.0-EncodedRequestBinding - Added a private-key-safe
+//! Last Modified: v1.4.0-PullRestartBinding - Private metadata comparison.
+//! [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] No public secret codec.
+//! v1.3.0-EncodedRequestBinding - Added a private-key-safe
 //! preflight that rejects session/request cursor mismatch before network I/O.
 //! v1.2.0-ExactRequestRebuild - Persisted proof mode and added
 //! commitment-checked request reconstruction after restart.
@@ -263,6 +265,63 @@ impl OnionReplySession {
             request.reply_public_key == self.reply_key.public_key_bytes()
                 && request_context_commitment(&request) == self.request_context_commitment
         })
+    }
+
+    // [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Parse the canonical
+    // source-sealed header without allocating. Only a bounded, fully framed
+    // payload is copied for the existing context hash, then immediately erased.
+    pub(crate) fn restart_request_payload<'a>(
+        &self,
+        encoded: &'a [u8],
+        maximum_payload: usize,
+    ) -> Result<&'a [u8], OnionReplyError> {
+        let maximum_payload = maximum_payload.min(super::MAX_ONION_REPLY_REQUEST_PAYLOAD_BYTES);
+        if encoded.len() > super::SOURCE_SEALED_REQUEST_HEADER_BYTES + maximum_payload {
+            return Err(OnionReplyError::FrameTooLarge);
+        }
+        let mut cursor = super::WireCursor::new(encoded);
+        if cursor.take_array::<4>()? != super::REQUEST_MAGIC
+            || cursor.take_u8()? != super::SOURCE_SEALED_REQUEST_VERSION
+            || cursor.take_u8()? != OnionReplyProofMode::SourceSealedTerminalProof as u8
+            || self.proof_mode != OnionReplyProofMode::SourceSealedTerminalProof
+            || cursor.take_array::<32>()? != self.reply_key.public_key_bytes()
+            || cursor.take_u32()? as usize != self.response_size_class
+        {
+            return Err(OnionReplyError::RequestMismatch);
+        }
+        let length = cursor.take_u32()? as usize;
+        let payload = &encoded[cursor.offset..];
+        if length == 0 || length > maximum_payload || length != payload.len() {
+            return Err(OnionReplyError::RequestMismatch);
+        }
+        let mut request = OnionReplyRequest {
+            version: super::SOURCE_SEALED_REQUEST_VERSION,
+            proof_mode: self.proof_mode,
+            reply_public_key: self.reply_key.public_key_bytes(),
+            response_size_class: self.response_size_class as u32,
+            payload: payload.to_vec(),
+        };
+        let matches = request_context_commitment(&request) == self.request_context_commitment;
+        request.payload.zeroize();
+        if !matches {
+            return Err(OnionReplyError::RequestMismatch);
+        }
+        Ok(payload)
+    }
+
+    // [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Callers compare trusted
+    // journal bindings without parsing AXOR offsets or exporting any key.
+    pub(crate) fn matches_restart_binding(
+        &self,
+        route_id: [u8; 16],
+        terminal_node_id: [u8; 32],
+        response_size_class: usize,
+        proof_mode: OnionReplyProofMode,
+    ) -> bool {
+        self.route_id == route_id
+            && self.expected_terminal_node_id == terminal_node_id
+            && self.response_size_class == response_size_class
+            && self.proof_mode == proof_mode
     }
 
     /// Encodes plaintext state solely for immediate identity-sealed journaling.

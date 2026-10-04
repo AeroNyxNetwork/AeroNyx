@@ -21,7 +21,9 @@
 //! - Callers own plaintext cleanup before sealing and after opening.
 //! - Do not add identity, work, node, lease, or sequence data to the header.
 //!
-//! Last Modified: v1.1.0-SourceReservationSeal - Narrow local persistence API.
+//! Last Modified: v1.2.0-PullRestartSeal - Private purpose-fixed AXBP facade.
+//! [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Reuses identity AEAD only.
+//! v1.1.0-SourceReservationSeal - Narrow local persistence API.
 //! [SOURCE-RESERVATION-SEAL 2026-10-04 by Codex] Fixed reservation domain
 //! and bounds; no workflow readiness, persistence receipt, or dispatch authority.
 //! v1.0.0-IdentitySealedLocal - Shared private container.
@@ -41,6 +43,61 @@ use crate::crypto::keys::IdentityKeyPair;
 
 const HEADER_BYTES: usize = 4 + 2 + 24;
 const TAG_BYTES: usize = 16;
+
+// [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Independent local-only
+// domain. Neither the facade nor its plaintext is public outside this crate.
+const PULL_RESTART_MAGIC: [u8; 4] = *b"AXBP";
+const PULL_RESTART_VERSION: u16 = 1;
+const PULL_RESTART_KEY_SALT: &[u8] = b"AeroNyx-BlindVault-OnionPull-Restart-Key-v1";
+const PULL_RESTART_KEY_INFO: &[u8] = b"AeroNyx-BlindVault-OnionPull-Restart-State-v1";
+pub(crate) const MAX_PULL_RESTART_SEALED_BYTES: usize = 512;
+pub(crate) const MAX_PULL_RESTART_BODY_BYTES: usize =
+    MAX_PULL_RESTART_SEALED_BYTES - HEADER_BYTES - TAG_BYTES;
+
+pub(crate) fn seal_pull_restart(
+    identity: &IdentityKeyPair,
+    body: &[u8],
+) -> Result<Vec<u8>, super::super::blind_vault::BlindVaultOnionPullRestartError> {
+    seal_identity_bound(
+        identity,
+        PULL_RESTART_MAGIC,
+        PULL_RESTART_VERSION,
+        PULL_RESTART_KEY_SALT,
+        PULL_RESTART_KEY_INFO,
+        body,
+        MAX_PULL_RESTART_SEALED_BYTES,
+    )
+    .map_err(pull_restart_error)
+}
+
+pub(crate) fn open_pull_restart(
+    identity: &IdentityKeyPair,
+    sealed: &[u8],
+) -> Result<zeroize::Zeroizing<Vec<u8>>, super::super::blind_vault::BlindVaultOnionPullRestartError> {
+    open_identity_bound(
+        identity,
+        sealed,
+        PULL_RESTART_MAGIC,
+        PULL_RESTART_VERSION,
+        PULL_RESTART_KEY_SALT,
+        PULL_RESTART_KEY_INFO,
+        MAX_PULL_RESTART_SEALED_BYTES,
+    )
+    .map(zeroize::Zeroizing::new)
+    .map_err(pull_restart_error)
+}
+
+fn pull_restart_error(
+    error: IdentitySealedLocalError,
+) -> super::super::blind_vault::BlindVaultOnionPullRestartError {
+    use super::super::blind_vault::BlindVaultOnionPullRestartError as Error;
+    match error {
+        IdentitySealedLocalError::TooLarge => Error::TooLarge,
+        IdentitySealedLocalError::Malformed => Error::Malformed,
+        IdentitySealedLocalError::UnsupportedVersion => Error::UnsupportedVersion,
+        IdentitySealedLocalError::AuthenticationFailed => Error::AuthenticationFailed,
+    }
+}
 
 // [SOURCE-RESERVATION-SEAL 2026-10-04 by Codex] Source-local AXSR v1 is
 // deliberately distinct from AXRJ journals, AXRS snapshots and AXBC bodies.
