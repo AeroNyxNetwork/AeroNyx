@@ -251,6 +251,16 @@ use crate::protocol::discovery_endpoint_attestation::{
 pub const MAX_SIGNED_NODE_DESCRIPTOR_BYTES: usize = 16 * 1024;
 const MAX_DESCRIPTOR_BYTES: u64 = 16 * 1024;
 
+// [PRIVATE-ONION-RECIPIENT-AUTH 2026-10-04 by Codex] This authorization is
+// source-local carriage, not a descriptor/discovery-union extension. Keeping
+// it bounded and independently versioned avoids changing old bincode layouts.
+pub const PRIVATE_ONION_RECIPIENT_AUTHORIZATION_VERSION_V1: u16 = 1;
+pub const MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_BYTES: usize = 1024;
+pub const MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_LIFETIME_SECS_V1: u64 = 24 * 60 * 60;
+const PRIVATE_ONION_RECIPIENT_AUTHORIZATION_DOMAIN_V1: &[u8] =
+    b"AeroNyx-PrivateOnionRecipientAuthorization-v1";
+const MAX_PRIVATE_ONION_RECIPIENT_PURPOSE_BYTES: usize = 64;
+
 // [ANONYMOUS-MAILBOX-WORK-POLICY 2026-09-07 by Codex] Keep the public work
 // policy inside the already signed SemVer metadata field, with a fixed codec
 // that upgraded clients can validate without changing descriptor schema v2.
@@ -1438,6 +1448,203 @@ impl DirectoryDescriptorCommitmentV1 {
     fn structurally_valid(&self) -> bool {
         self.node_id != [0u8; 32] && self.sequence > 0 && self.descriptor_hash != [0u8; 32]
     }
+}
+
+/// A recipient-signed, standalone authorization for one exact R -> private-P
+/// route role. It is deliberately not embedded in [`NodeDescriptor`] or
+/// [`NodeDiscoveryMessage`]: older bincode decoders must continue to parse the
+/// existing descriptor/discovery wire unchanged.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedPrivateOnionRecipientAuthorizationV1 {
+    version: u16,
+    relay_node_id: [u8; 32],
+    relay_descriptor: DirectoryDescriptorCommitmentV1,
+    recipient_node_id: [u8; 32],
+    recipient_descriptor: DirectoryDescriptorCommitmentV1,
+    purpose_hash: [u8; 32],
+    issued_at: u64,
+    expires_at: u64,
+    #[serde(with = "serde_bytes64")]
+    signature: [u8; 64],
+}
+
+impl std::fmt::Debug for SignedPrivateOnionRecipientAuthorizationV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SignedPrivateOnionRecipientAuthorizationV1")
+            .field("version", &self.version)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SignedPrivateOnionRecipientAuthorizationV1 {
+    /// Creates a P-signed authorization binding exact R/P descriptor versions.
+    pub fn new_signed(
+        relay: &SignedNodeDescriptor,
+        recipient: &SignedNodeDescriptor,
+        purpose: &str,
+        issued_at: u64,
+        expires_at: u64,
+        recipient_identity: &IdentityKeyPair,
+    ) -> Result<Self, CoreError> {
+        relay.verify_signature()?;
+        recipient.verify_signature()?;
+        if purpose.is_empty()
+            || purpose.len() > MAX_PRIVATE_ONION_RECIPIENT_PURPOSE_BYTES
+            || issued_at == 0
+            || expires_at <= issued_at
+            || expires_at - issued_at > MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_LIFETIME_SECS_V1
+            || recipient.descriptor.node_id != recipient_identity.public_key_bytes()
+            || !recipient
+                .descriptor
+                .advertises_protocol_feature(NodeProtocolFeature::AnonymousMailboxV1)
+        {
+            return Err(CoreError::malformed(
+                "private onion recipient authorization claims are invalid",
+            ));
+        }
+        let relay_descriptor = DirectoryDescriptorCommitmentV1::from_signed_descriptor(relay)?;
+        let recipient_descriptor = DirectoryDescriptorCommitmentV1::from_signed_descriptor(recipient)?;
+        if !relay_descriptor.structurally_valid()
+            || !recipient_descriptor.structurally_valid()
+            || issued_at < relay.descriptor.issued_at
+            || issued_at < recipient.descriptor.issued_at
+            || expires_at > relay.descriptor.expires_at
+            || expires_at > recipient.descriptor.expires_at
+        {
+            return Err(CoreError::malformed(
+                "private onion recipient authorization interval is invalid",
+            ));
+        }
+        let mut authorization = Self {
+            version: PRIVATE_ONION_RECIPIENT_AUTHORIZATION_VERSION_V1,
+            relay_node_id: relay.node_id(),
+            relay_descriptor,
+            recipient_node_id: recipient.node_id(),
+            recipient_descriptor,
+            purpose_hash: private_onion_recipient_purpose_hash(purpose),
+            issued_at,
+            expires_at,
+            signature: [0u8; 64],
+        };
+        authorization.signature = recipient_identity.sign(&authorization.signing_bytes());
+        Ok(authorization)
+    }
+
+    /// Verifies the P signature, exact descriptor pins, purpose, and TTL.
+    pub fn verify_at(
+        &self,
+        relay: &SignedNodeDescriptor,
+        recipient: &SignedNodeDescriptor,
+        purpose: &str,
+        now: u64,
+    ) -> Result<(), CoreError> {
+        if self.version != PRIVATE_ONION_RECIPIENT_AUTHORIZATION_VERSION_V1
+            || purpose.is_empty()
+            || purpose.len() > MAX_PRIVATE_ONION_RECIPIENT_PURPOSE_BYTES
+            || self.purpose_hash != private_onion_recipient_purpose_hash(purpose)
+            || self.issued_at == 0
+            || self.expires_at <= self.issued_at
+            || self.expires_at - self.issued_at
+                > MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_LIFETIME_SECS_V1
+            || now < self.issued_at
+            || now >= self.expires_at
+            || self.relay_node_id == [0u8; 32]
+            || self.recipient_node_id == [0u8; 32]
+        {
+            return Err(CoreError::malformed(
+                "private onion recipient authorization is invalid",
+            ));
+        }
+        relay.verify_at(now)?;
+        recipient.verify_at(now)?;
+        if relay.node_id() != self.relay_node_id
+            || recipient.node_id() != self.recipient_node_id
+            || !self.relay_descriptor.matches_signed_descriptor(relay)?
+            || !self.recipient_descriptor.matches_signed_descriptor(recipient)?
+            || self.expires_at > relay.descriptor.expires_at
+            || self.expires_at > recipient.descriptor.expires_at
+            || !recipient
+                .descriptor
+                .advertises_protocol_feature(NodeProtocolFeature::AnonymousMailboxV1)
+        {
+            return Err(CoreError::malformed(
+                "private onion recipient authorization descriptor mismatch",
+            ));
+        }
+        IdentityPublicKey::from_bytes(&self.recipient_node_id)?.verify(
+            &self.signing_bytes(),
+            &self.signature,
+        )
+    }
+
+    /// Returns the exact relay identity authorized by P.
+    #[must_use]
+    pub const fn relay_node_id(&self) -> [u8; 32] {
+        self.relay_node_id
+    }
+
+    /// Returns the exact private recipient identity.
+    #[must_use]
+    pub const fn recipient_node_id(&self) -> [u8; 32] {
+        self.recipient_node_id
+    }
+
+    /// Returns the authorization expiry.
+    #[must_use]
+    pub const fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+
+    /// Encodes this standalone authorization canonically for source-local use.
+    pub fn encode_canonical(&self) -> Result<Vec<u8>, CoreError> {
+        encode_bincode_bounded(self, MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_BYTES as u64)
+            .map_err(|_| CoreError::malformed("private onion recipient authorization encode"))
+    }
+
+    /// Decodes one bounded, trailing-byte-free authorization.
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, CoreError> {
+        let decoded: Self = decode_bincode_bounded(
+            bytes,
+            MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_BYTES as u64,
+            TrailingBytesPolicy::Reject,
+        )
+        .map_err(|_| CoreError::malformed("private onion recipient authorization decode"))?;
+        if decoded.encode_canonical()?.as_slice() != bytes {
+            return Err(CoreError::malformed(
+                "private onion recipient authorization non-canonical",
+            ));
+        }
+        Ok(decoded)
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(PRIVATE_ONION_RECIPIENT_AUTHORIZATION_DOMAIN_V1.len() + 2 + 32 * 2 + 8 * 2 + 32 + 16 * 2);
+        bytes.extend_from_slice(PRIVATE_ONION_RECIPIENT_AUTHORIZATION_DOMAIN_V1);
+        bytes.extend_from_slice(&self.version.to_le_bytes());
+        bytes.extend_from_slice(&self.relay_node_id);
+        bytes.extend_from_slice(&self.relay_descriptor.node_id);
+        bytes.extend_from_slice(&self.relay_descriptor.sequence.to_le_bytes());
+        bytes.extend_from_slice(&self.relay_descriptor.descriptor_hash);
+        bytes.extend_from_slice(&self.recipient_node_id);
+        bytes.extend_from_slice(&self.recipient_descriptor.node_id);
+        bytes.extend_from_slice(&self.recipient_descriptor.sequence.to_le_bytes());
+        bytes.extend_from_slice(&self.recipient_descriptor.descriptor_hash);
+        bytes.extend_from_slice(&self.purpose_hash);
+        bytes.extend_from_slice(&self.issued_at.to_le_bytes());
+        bytes.extend_from_slice(&self.expires_at.to_le_bytes());
+        bytes
+    }
+}
+
+fn private_onion_recipient_purpose_hash(purpose: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"AeroNyx-PrivateOnionRecipientPurpose-v1");
+    hasher.update((purpose.len() as u16).to_le_bytes());
+    hasher.update(purpose.as_bytes());
+    hasher.finalize().into()
 }
 
 /// Computes the stable digest committed by [`DirectoryDescriptorCommitmentV1`].
@@ -4765,6 +4972,69 @@ mod tests {
         assert!(descriptor.advertises_protocol_feature(feature));
         let signed = SignedNodeDescriptor::sign(descriptor, &identity).expect("sign descriptor");
         assert!(signed.verify_at(1_700_000_100).is_ok());
+    }
+
+    #[test]
+    fn private_recipient_authorization_is_standalone_exact_and_bounded() {
+        let relay = IdentityKeyPair::from_bytes(&[0x41; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[0x42; 32]).unwrap();
+        let relay_descriptor = SignedNodeDescriptor::sign(descriptor_for(&relay), &relay).unwrap();
+        let mut recipient_body = descriptor_for(&recipient);
+        recipient_body.public_endpoint = None;
+        recipient_body = recipient_body.with_protocol_features([NodeProtocolFeature::AnonymousMailboxV1]);
+        let recipient_descriptor = SignedNodeDescriptor::sign(recipient_body, &recipient).unwrap();
+        let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &relay_descriptor,
+            &recipient_descriptor,
+            "anonymous_mailbox_v1",
+            1_700_000_100,
+            1_700_001_000,
+            &recipient,
+        )
+        .unwrap();
+        authorization
+            .verify_at(
+                &relay_descriptor,
+                &recipient_descriptor,
+                "anonymous_mailbox_v1",
+                1_700_000_500,
+            )
+            .unwrap();
+        let encoded = authorization.encode_canonical().unwrap();
+        assert!(encoded.len() <= MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_BYTES);
+        let decoded = SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(&encoded).unwrap();
+        assert_eq!(decoded, authorization);
+        assert!(decoded
+            .verify_at(
+                &relay_descriptor,
+                &recipient_descriptor,
+                "message_relay",
+                1_700_000_500,
+            )
+            .is_err());
+        assert!(decoded
+            .verify_at(
+                &relay_descriptor,
+                &recipient_descriptor,
+                "anonymous_mailbox_v1",
+                1_700_001_000,
+            )
+            .is_err());
+        let mut trailing = authorization.encode_canonical().unwrap();
+        trailing.push(0);
+        assert!(SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(&trailing).is_err());
+        let mut tampered = encoded;
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(&tampered).is_ok());
+        assert!(SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(&tampered)
+            .unwrap()
+            .verify_at(
+                &relay_descriptor,
+                &recipient_descriptor,
+                "anonymous_mailbox_v1",
+                1_700_000_500,
+            )
+            .is_err());
     }
 
     fn work_policy_descriptor(identity: &IdentityKeyPair) -> NodeDescriptor {

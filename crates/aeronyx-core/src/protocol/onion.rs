@@ -118,7 +118,10 @@ use zeroize::Zeroize;
 use crate::crypto::keys::{E2eSession, EphemeralKeyPair, IdentityKeyPair, IdentityPublicKey};
 use crate::error::CoreError;
 use crate::protocol::chat::BlindRelayEnvelope;
-use crate::protocol::discovery::{NodeCapability, NodeProtocolFeature, SignedNodeDescriptor};
+use crate::protocol::discovery::{
+    NodeCapability, NodeProtocolFeature, SignedNodeDescriptor,
+    SignedPrivateOnionRecipientAuthorizationV1,
+};
 
 // [REVERSE-ONION-CONTRACT 2026-10-04 by Codex] Additive adjacent-hop contract.
 pub mod reverse_delivery;
@@ -512,6 +515,16 @@ pub enum OnionRoutePlanError {
         /// One-based hop position.
         hop_number: usize,
     },
+    /// A private terminal route is missing its exact P-signed R/P authorization.
+    #[error("private onion recipient authorization is missing or invalid")]
+    MissingPrivateRecipientAuthorization,
+    /// Private P must not advertise a public endpoint that could be confused
+    /// with an ordinary reachable terminal role.
+    #[error("private onion recipient has a public endpoint")]
+    PrivateRecipientHasPublicEndpoint,
+    /// The private recipient builder is intentionally restricted to AMST.
+    #[error("private onion recipient route requires anonymous mailbox purpose")]
+    PrivateRecipientPurposeRequired,
     /// The signing identity supplied at construction differs from the plan.
     #[error("onion route source identity does not match the verified plan")]
     SourceIdentityMismatch,
@@ -560,6 +573,9 @@ impl OnionRoutePlanError {
             Self::MissingProtocolFeature { .. } => "missing_protocol_feature",
             Self::MissingX25519Kem { .. } => "missing_x25519_kem",
             Self::MissingPublicEndpoint { .. } => "missing_public_endpoint",
+            Self::MissingPrivateRecipientAuthorization => "missing_private_recipient_authorization",
+            Self::PrivateRecipientHasPublicEndpoint => "private_recipient_public_endpoint",
+            Self::PrivateRecipientPurposeRequired => "private_recipient_purpose_required",
             Self::SourceIdentityMismatch => "source_identity_mismatch",
             Self::OutsideValidityWindow => "outside_validity_window",
             Self::EnvelopeConstruction { .. } => "envelope_construction_failed",
@@ -576,6 +592,9 @@ impl OnionRoutePlanError {
             | Self::MissingProtocolFeature { .. }
             | Self::MissingX25519Kem { .. }
             | Self::MissingPublicEndpoint { .. }
+            | Self::MissingPrivateRecipientAuthorization
+            | Self::PrivateRecipientHasPublicEndpoint
+            | Self::PrivateRecipientPurposeRequired
             | Self::OutsideValidityWindow => OnionRouteFailureDisposition::RefreshRoute,
             Self::TooManyHops { .. } | Self::DuplicateNode { .. } | Self::SourceIncluded { .. } => {
                 OnionRouteFailureDisposition::PolicyRejected
@@ -718,6 +737,117 @@ impl VerifiedOnionRoute {
             verified_at: now,
             valid_until,
             hops,
+        })
+    }
+
+    /// Verifies the explicit two-hop R -> private-P route role.
+    ///
+    /// This opt-in builder is separate from [`Self::from_signed_descriptors`]:
+    /// R remains publicly reachable and SSRF-validated by its transport, while
+    /// P must have no public endpoint and is admitted only by P's standalone
+    /// descriptor-bound authorization. The generic public route builder is
+    /// unchanged and never infers this role from a missing endpoint.
+    pub fn from_signed_private_recipient_descriptors(
+        source_node_id: [u8; 32],
+        relay: &SignedNodeDescriptor,
+        recipient: &SignedNodeDescriptor,
+        authorization: &SignedPrivateOnionRecipientAuthorizationV1,
+        purpose: OnionRoutePurpose,
+        now: u64,
+    ) -> Result<Self, OnionRoutePlanError> {
+        if purpose != OnionRoutePurpose::AnonymousMailboxV1 {
+            return Err(OnionRoutePlanError::PrivateRecipientPurposeRequired);
+        }
+        relay
+            .verify_at(now)
+            .map_err(|_| OnionRoutePlanError::DescriptorRejected { hop_number: 1 })?;
+        recipient
+            .verify_at(now)
+            .map_err(|_| OnionRoutePlanError::DescriptorRejected { hop_number: 2 })?;
+        if relay.node_id() == source_node_id {
+            return Err(OnionRoutePlanError::SourceIncluded { hop_number: 1 });
+        }
+        if recipient.node_id() == source_node_id {
+            return Err(OnionRoutePlanError::SourceIncluded { hop_number: 2 });
+        }
+        if relay.node_id() == recipient.node_id() {
+            return Err(OnionRoutePlanError::DuplicateNode { hop_number: 2 });
+        }
+        for capability in ONION_FORWARD_HOP_REQUIRED_CAPABILITIES {
+            if !relay.descriptor.capabilities.contains(&capability) {
+                return Err(OnionRoutePlanError::MissingCapability {
+                    hop_number: 1,
+                    capability,
+                });
+            }
+        }
+        if !recipient
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::ChatRelay)
+        {
+            return Err(OnionRoutePlanError::MissingCapability {
+                hop_number: 2,
+                capability: NodeCapability::ChatRelay,
+            });
+        }
+        for feature in purpose.required_terminal_protocol_features() {
+            if !recipient.descriptor.advertises_protocol_feature(*feature) {
+                return Err(OnionRoutePlanError::MissingProtocolFeature {
+                    hop_number: 2,
+                    feature: *feature,
+                });
+            }
+        }
+        for feature in purpose.required_path_protocol_features() {
+            if !relay.descriptor.advertises_protocol_feature(*feature) {
+                return Err(OnionRoutePlanError::MissingProtocolFeature {
+                    hop_number: 1,
+                    feature: *feature,
+                });
+            }
+        }
+        if relay
+            .descriptor
+            .public_endpoint
+            .as_deref()
+            .map_or(true, |endpoint| endpoint.trim().is_empty())
+        {
+            return Err(OnionRoutePlanError::MissingPublicEndpoint { hop_number: 1 });
+        }
+        if recipient.descriptor.public_endpoint.is_some() {
+            return Err(OnionRoutePlanError::PrivateRecipientHasPublicEndpoint);
+        }
+        authorization
+            .verify_at(relay, recipient, purpose.as_str(), now)
+            .map_err(|_| OnionRoutePlanError::MissingPrivateRecipientAuthorization)?;
+        let relay_kem = relay
+            .descriptor
+            .x25519_kem_public()
+            .ok_or(OnionRoutePlanError::MissingX25519Kem { hop_number: 1 })?;
+        let recipient_kem = recipient
+            .descriptor
+            .x25519_kem_public()
+            .ok_or(OnionRoutePlanError::MissingX25519Kem { hop_number: 2 })?;
+        Ok(Self {
+            source_node_id,
+            purpose,
+            verified_at: now,
+            valid_until: relay
+                .descriptor
+                .expires_at
+                .min(recipient.descriptor.expires_at)
+                .min(authorization.expires_at()),
+            hops: vec![
+                OnionHop {
+                    node_id: relay.node_id(),
+                    kem_pub: relay_kem,
+                },
+                OnionHop {
+                    node_id: recipient.node_id(),
+                    kem_pub: recipient_kem,
+                },
+            ],
         })
     }
 
@@ -1263,6 +1393,7 @@ mod tests {
     use crate::protocol::chat::{
         encode_blind_relay_envelope, validate_blind_relay_envelope_size, BlindRelayDeliveryReceipt,
     };
+    use crate::protocol::discovery::NodeDescriptor;
     use crate::protocol::memchain::{encode_memchain, MemChainMessage};
 
     #[test]
@@ -1421,6 +1552,102 @@ mod tests {
 
     fn x25519_secret(identity: &IdentityKeyPair) -> StaticSecret {
         identity.to_x25519().0
+    }
+
+    fn private_route_descriptor(
+        identity: &IdentityKeyPair,
+        endpoint: Option<&str>,
+        capabilities: Vec<NodeCapability>,
+        features: &[NodeProtocolFeature],
+    ) -> SignedNodeDescriptor {
+        let mut descriptor = NodeDescriptor::new(
+            identity.public_key_bytes(),
+            7,
+            1_700_000_000,
+            1_700_003_600,
+            "test",
+        )
+        .with_x25519_kem(identity.x25519_public_key_bytes());
+        descriptor.public_endpoint = endpoint.map(str::to_owned);
+        descriptor.capabilities = capabilities;
+        descriptor = descriptor.with_protocol_features(features.iter().copied());
+        SignedNodeDescriptor::sign(descriptor, identity).unwrap()
+    }
+
+    #[test]
+    fn private_recipient_route_requires_signed_role_and_keeps_p_endpointless() {
+        let source = IdentityKeyPair::from_bytes(&[0x61; 32]).unwrap();
+        let relay = IdentityKeyPair::from_bytes(&[0x62; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[0x63; 32]).unwrap();
+        let relay_descriptor = private_route_descriptor(
+            &relay,
+            Some("relay.example:443"),
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
+            &[
+                NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+                NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+            ],
+        );
+        let recipient_descriptor = private_route_descriptor(
+            &recipient,
+            None,
+            vec![NodeCapability::ChatRelay],
+            &ANONYMOUS_MAILBOX_FEATURES,
+        );
+        let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &relay_descriptor,
+            &recipient_descriptor,
+            OnionRoutePurpose::AnonymousMailboxV1.as_str(),
+            1_700_000_100,
+            1_700_001_000,
+            &recipient,
+        )
+        .unwrap();
+        let route = VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+            source.public_key_bytes(),
+            &relay_descriptor,
+            &recipient_descriptor,
+            &authorization,
+            OnionRoutePurpose::AnonymousMailboxV1,
+            1_700_000_500,
+        )
+        .unwrap();
+        assert_eq!(route.hop_count(), 2);
+        assert_eq!(route.entry_node_id(), relay.public_key_bytes());
+        assert_eq!(route.terminal_node_id(), recipient.public_key_bytes());
+        assert_eq!(route.valid_until(), 1_700_001_000);
+        assert!(route
+            .build_envelope(b"AMST", [7; 16], 1_700_000_500, &source)
+            .is_ok());
+
+        let public_recipient_descriptor = private_route_descriptor(
+            &recipient,
+            Some("recipient.example:443"),
+            vec![NodeCapability::ChatRelay],
+            &ANONYMOUS_MAILBOX_FEATURES,
+        );
+        let public_authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &relay_descriptor,
+            &public_recipient_descriptor,
+            OnionRoutePurpose::AnonymousMailboxV1.as_str(),
+            1_700_000_100,
+            1_700_001_000,
+            &recipient,
+        )
+        .unwrap();
+        assert_eq!(
+            VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                source.public_key_bytes(),
+                &relay_descriptor,
+                &public_recipient_descriptor,
+                &public_authorization,
+                OnionRoutePurpose::AnonymousMailboxV1,
+                1_700_000_500,
+            )
+            .unwrap_err()
+            .reason_bucket(),
+            "private_recipient_public_endpoint"
+        );
     }
 
     #[test]
