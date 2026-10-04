@@ -27,6 +27,11 @@
 //! boundary with bounded blocking, source evidence, and deterministic coarse
 //! replies.
 
+// [REVERSE-ONION-ROUTER-ADAPTER 2026-10-04 by Codex] Keep the HTTP surface
+// additive and default-unmounted: composition owns whether this router is
+// merged into a node-peer listener. The handlers below accept only bounded
+// canonical binary frames and never expose an admin or JSON control surface.
+
 use std::sync::Arc;
 
 use aeronyx_core::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
@@ -36,8 +41,14 @@ use aeronyx_core::protocol::onion::reverse_delivery::{
     ReverseOnionSourceQueryV1, MAX_REVERSE_ONION_FRAME_BYTES,
     MAX_REVERSE_ONION_SOURCE_EVIDENCE_BYTES, REVERSE_ONION_SOURCE_QUERY_BYTES,
 };
+use aeronyx_core::protocol::onion::reverse_delivery::MAX_REVERSE_ONION_CLAIM_BYTES;
 use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
+use axum::http::{header, HeaderMap};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::Router;
 use rand::{rngs::OsRng, RngCore};
 use tokio::sync::Semaphore;
 
@@ -205,6 +216,93 @@ impl ReverseOnionApi {
             Err(_) => ReverseOnionApiReply::empty(StatusCode::SERVICE_UNAVAILABLE),
         }
     }
+}
+
+/// Stable node-peer paths used by the recipient carrier and source runtime.
+/// This builder is intentionally not merged into any listener here; startup
+/// owns the explicit default-off composition decision.
+pub(crate) const REVERSE_ONION_CLAIM_PATH: &str = "/api/chat/peer/reverse-onion/claim";
+pub(crate) const REVERSE_ONION_RESULT_PATH: &str = "/api/chat/peer/reverse-onion/result";
+pub(crate) const REVERSE_ONION_SOURCE_QUERY_PATH: &str =
+    "/api/chat/peer/reverse-onion/source-query";
+const REVERSE_ONION_BINARY_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// Builds the opt-in adjacent-hop queue router. The returned router is
+/// unmounted by default so disabled nodes allocate no public handler state.
+/// Claim/Result use the frame cap; SourceQuery has its own exact 230-byte
+/// request cap and never inherits the larger evidence response bound.
+pub(crate) fn build_reverse_onion_router(api: Arc<ReverseOnionApi>) -> Router {
+    let claim_route = Router::new()
+        .route(REVERSE_ONION_CLAIM_PATH, post(handle_claim_http))
+        .layer(DefaultBodyLimit::max(MAX_REVERSE_ONION_CLAIM_BYTES));
+    let result_route = Router::new()
+        .route(REVERSE_ONION_RESULT_PATH, post(handle_result_http))
+        .layer(DefaultBodyLimit::max(MAX_REVERSE_ONION_FRAME_BYTES));
+    let source_routes = Router::new()
+        .route(REVERSE_ONION_SOURCE_QUERY_PATH, post(handle_source_query_http))
+        .layer(DefaultBodyLimit::max(REVERSE_ONION_SOURCE_QUERY_BYTES));
+    claim_route
+        .merge(result_route)
+        .merge(source_routes)
+        .with_state(api)
+}
+
+async fn handle_claim_http(
+    State(api): State<Arc<ReverseOnionApi>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !has_binary_content_type(&headers) {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    into_http_reply(api.handle_claim(body, trusted_receive_time()).await)
+}
+
+async fn handle_result_http(
+    State(api): State<Arc<ReverseOnionApi>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !has_binary_content_type(&headers) {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    into_http_reply(api.handle_result(body, trusted_receive_time()).await)
+}
+
+async fn handle_source_query_http(
+    State(api): State<Arc<ReverseOnionApi>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !has_binary_content_type(&headers) {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    into_http_reply(api.handle_source_query(body, trusted_receive_time()).await)
+}
+
+fn has_binary_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        == Some(REVERSE_ONION_BINARY_CONTENT_TYPE)
+}
+
+fn into_http_reply(reply: ReverseOnionApiReply) -> Response {
+    if reply.body.is_empty() {
+        return reply.status.into_response();
+    }
+    (
+        reply.status,
+        [(header::CONTENT_TYPE, REVERSE_ONION_BINARY_CONTENT_TYPE)],
+        reply.body,
+    )
+        .into_response()
+}
+
+fn trusted_receive_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn handle_source_query_blocking(
@@ -922,6 +1020,105 @@ mod tests {
             relay.public_key_bytes(),
             wrong.public_key_bytes(),
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn router_requires_binary_content_type_and_post_only() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let (_directory, _queue, api, _relay, _recipient, _source) = fixture();
+        let router = build_reverse_onion_router(Arc::new(api));
+        let wrong_content_type = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(REVERSE_ONION_CLAIM_PATH)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![0u8; 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_content_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let wrong_method = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(REVERSE_ONION_CLAIM_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn router_applies_exact_source_query_request_cap() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let (_directory, _queue, api, _relay, _recipient, _source) = fixture();
+        let router = build_reverse_onion_router(Arc::new(api));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(REVERSE_ONION_SOURCE_QUERY_PATH)
+                    .header(header::CONTENT_TYPE, REVERSE_ONION_BINARY_CONTENT_TYPE)
+                    .body(Body::from(vec![0u8; REVERSE_ONION_SOURCE_QUERY_BYTES + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn router_applies_exact_claim_request_cap() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let (_directory, _queue, api, _relay, _recipient, _source) = fixture();
+        let response = build_reverse_onion_router(Arc::new(api))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(REVERSE_ONION_CLAIM_PATH)
+                    .header(header::CONTENT_TYPE, REVERSE_ONION_BINARY_CONTENT_TYPE)
+                    .body(Body::from(vec![0u8; MAX_REVERSE_ONION_CLAIM_BYTES + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn router_builder_has_no_unrelated_default_route() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let (_directory, _queue, api, _relay, _recipient, _source) = fixture();
+        let response = build_reverse_onion_router(Arc::new(api))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/reverse-onion")
+                    .header(header::CONTENT_TYPE, REVERSE_ONION_BINARY_CONTENT_TYPE)
+                    .body(Body::from(vec![0u8; 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
 
