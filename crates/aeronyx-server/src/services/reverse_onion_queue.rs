@@ -1016,6 +1016,16 @@ impl SqliteReverseOnionQueue {
         let now = sqlite_integer(now)?;
         let mut connection = connection.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let clock_high_water: i64 = tx
+            .query_row(
+                &format!("SELECT clock_high_water FROM {META_TABLE} WHERE id = 1"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| ReverseOnionQueueError::Corrupt)?;
+        if clock_high_water < 0 || now < clock_high_water {
+            return Err(ReverseOnionQueueError::Rejected);
+        }
         validate_all_rows(&tx, &self.limits)?;
         validate_all_no_work_rows(&tx, &self.limits)?;
         let row = load_by_source_route(&tx, &source_node_id, &route_id, &request_commitment)?;
@@ -1447,7 +1457,7 @@ fn ensure_item_identity(row: &StoredRow, item: &ReverseOnionQueueItem) -> Result
 
 fn validate_row(row: &StoredRow) -> Result<(), ReverseOnionQueueError> {
     if let Some(source_node_id) = row.source_node_id.as_deref() {
-        if !valid_source_node_id(source_node_id) {
+        if !valid_source_node_slice(source_node_id) {
             return Err(ReverseOnionQueueError::Corrupt);
         }
     }
@@ -2136,6 +2146,12 @@ fn validate_now(now: u64) -> Result<(), ReverseOnionQueueError> { if now == 0 { 
 fn is_zero(bytes: &[u8]) -> bool { bytes.iter().all(|byte| *byte == 0) }
 fn valid_source_node_id(bytes: &[u8; COMMITMENT_BYTES]) -> bool {
     !is_zero(bytes) && IdentityPublicKey::from_bytes(bytes).is_ok()
+}
+fn valid_source_node_slice(bytes: &[u8]) -> bool {
+    let Ok(bytes) = <[u8; COMMITMENT_BYTES]>::try_from(bytes) else {
+        return false;
+    };
+    valid_source_node_id(&bytes)
 }
 
 #[cfg(test)]
