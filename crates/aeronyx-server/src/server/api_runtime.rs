@@ -1,8 +1,11 @@
 // [SERVER-API-RUNTIME-SPLIT 2026-09-25 by Codex] Keep API/router assembly,
 // required-listener binding/serving, and management task construction in one
 // server-local runtime child while preserving startup and shutdown ordering.
+// [BLIND-VAULT-PUBLIC-ADMISSION-PARITY 2026-10-04 by Codex] Public and
+// combined vault routes share explicit replica admission and validated policy.
 use super::*;
 use crate::api::chat_handlers::build_chat_pull_http_router;
+use crate::api::public_node_router::build_public_node_router_with_replica_admission;
 
 impl Server {
     // ============================================
@@ -247,6 +250,13 @@ impl Server {
         } else {
             None
         };
+        // [BLIND-VAULT-PUBLIC-ADMISSION-PARITY 2026-10-04 by Codex] Policy
+        // construction above fails startup on invalid bounds. Clone only the
+        // existing capability and copy that same policy, never open a second
+        // journal or allocate a per-listener admission budget.
+        let public_blind_vault_replica = blind_vault_replica_admission
+            .clone()
+            .zip(blind_vault_replica_policy);
         let public_anonymous_mailbox = anonymous_mailbox.clone();
         let local_anonymous_mailbox = anonymous_mailbox.clone();
         let vpn_anonymous_mailbox_source = anonymous_mailbox_source.clone();
@@ -278,7 +288,7 @@ impl Server {
             // a detached task that the process cannot observe.
             let mut listener_tasks = JoinSet::new();
             if let Some((public_addr, public_listener)) = public_api_listener {
-                let mut public_app = build_public_node_router(PublicNodeRouterDependencies {
+                let public_deps = PublicNodeRouterDependencies {
                     peer_store: Arc::clone(&peer_store),
                     discovery_api_policy: discovery_api_policy.clone(),
                     chat_relay: chat_relay.clone(),
@@ -310,7 +320,17 @@ impl Server {
                     endpoint_proof_ttl_secs: public_endpoint_proof_ttl_secs,
                     endpoint_evidence,
                     endpoint_attestation_inbox: endpoint_attestation_inbox.clone(),
-                });
+                };
+                // [BLIND-VAULT-PUBLIC-ADMISSION-PARITY 2026-10-04 by Codex]
+                // Legacy/default-off callers retain the original constructor;
+                // enabled listeners share the already-validated admission pair.
+                let mut public_app = match public_blind_vault_replica {
+                    Some(replica) => build_public_node_router_with_replica_admission(
+                        public_deps,
+                        Some(replica),
+                    ),
+                    None => build_public_node_router(public_deps),
+                };
                 if let Some(runtime) = public_promotion_runtime {
                     public_app = public_app.merge(build_endpoint_possession_responder(Arc::clone(
                         &node_identity,

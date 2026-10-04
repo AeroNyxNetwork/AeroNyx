@@ -6,6 +6,8 @@
 //! This module is the only composition boundary that may turn an ADET V2
 //! request into [`VerifiedEndpointProofPeerContext`]. It has no promotion
 //! authority and never consults the mutable peer store for candidate identity.
+//! [BLIND-VAULT-PUBLIC-ADMISSION-PARITY 2026-10-04 by Codex] Optional replica
+//! admission shares the combined listener's validated policy and runtime.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,7 +31,9 @@ use tokio::sync::mpsc;
 use tower::ServiceExt;
 
 use crate::api::blind_vault::{
-    build_blind_vault_router_with_admission_runtime, BlindVaultApiAdmissionRuntime,
+    build_blind_vault_router_with_admission_runtime,
+    build_blind_vault_router_with_replica_admission, BlindVaultApiAdmissionRuntime,
+    BlindVaultReplicaApiPolicyV1,
 };
 use crate::api::chat_peer::build_chat_peer_router_with_anonymous_mailbox;
 use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica_and_runtime;
@@ -44,6 +48,7 @@ use crate::api::discovery_endpoint_verification::{
     build_discovery_endpoint_verification_router_with_evidence, VerifiedEndpointProofPeerContext,
 };
 use crate::api::memchain_peer::build_memchain_peer_router_with_runtime;
+use crate::services::blind_vault_replica_coordinator::BlindVaultReplicaJobAdmission;
 use crate::services::chat_relay::ChatRelayService;
 use crate::services::chat_relay_mailbox::AnonymousMailboxCustodyRepository;
 use crate::services::memchain::MemoryStorage;
@@ -101,6 +106,20 @@ pub(crate) struct PublicNodeRouterDependencies {
 /// Endpoint proof transport is absent when its independent rollout gate is
 /// false, so no verifier service or replay state is allocated in that mode.
 pub(crate) fn build_public_node_router(deps: PublicNodeRouterDependencies) -> Router {
+    // [BLIND-VAULT-PUBLIC-ADMISSION-PARITY 2026-10-04 by Codex] Existing
+    // constructors remain default-off without changing dependency literals.
+    build_public_node_router_with_replica_admission(deps, None)
+}
+
+/// Adds explicit replica-job admission without changing legacy public routes.
+///
+/// [BLIND-VAULT-PUBLIC-ADMISSION-PARITY 2026-10-04 by Codex] Keep capability
+/// and validated policy paired. This boundary does not open storage, create a
+/// coordinator, authorize an owner, or advertise outbound replication readiness.
+pub(crate) fn build_public_node_router_with_replica_admission(
+    deps: PublicNodeRouterDependencies,
+    replica: Option<(Arc<dyn BlindVaultReplicaJobAdmission>, BlindVaultReplicaApiPolicyV1)>,
+) -> Router {
     let block_peer_store = Arc::clone(&deps.peer_store);
     let block_identity = Arc::clone(&deps.node_identity);
     let directory_peer_store = Arc::clone(&deps.peer_store);
@@ -164,11 +183,24 @@ pub(crate) fn build_public_node_router(deps: PublicNodeRouterDependencies) -> Ro
         ));
     }
     if let (true, Some(vault)) = (deps.blind_vault_public_api_enabled, deps.blind_vault) {
-        app = app.merge(build_blind_vault_router_with_admission_runtime(
-            vault,
-            deps.node_identity,
-            deps.blind_vault_admission,
-        ));
+        // [BLIND-VAULT-PUBLIC-ADMISSION-PARITY 2026-10-04 by Codex] The
+        // existing public vault gate controls both variants. Use the same API
+        // verifier and shared pressure budget as the combined listener.
+        let vault_router = match replica {
+            Some((admission, policy)) => build_blind_vault_router_with_replica_admission(
+                vault,
+                deps.node_identity,
+                deps.blind_vault_admission,
+                admission,
+                policy,
+            ),
+            None => build_blind_vault_router_with_admission_runtime(
+                vault,
+                deps.node_identity,
+                deps.blind_vault_admission,
+            ),
+        };
+        app = app.merge(vault_router);
     }
     if let Some(storage) = deps.commitment_storage {
         app = app.merge(build_memchain_peer_router_with_runtime(
