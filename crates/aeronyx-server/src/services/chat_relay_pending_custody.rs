@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_pending_custody.rs
 // ============================================
-// Version: 1.0.0-PendingCustodyDomain
+// Version: 1.1.0-PendingRetryRowIntegrity
 //
 // Creation Reason:
 //   [CHAT-PENDING-CUSTODY-DOMAIN 2026-08-25 by Codex] Extract durable offline
@@ -11,6 +11,8 @@
 // Main Functionality:
 //   [PENDING-CUSTODY-BOUNDED-RETRY 2026-10-04 by Codex] Resolve durable
 //   retry equality through a bounded scalar projection, not a stored BLOB copy.
+//   [PENDING-CUSTODY-RETRY-INTEGRITY 2026-10-04 by Codex] Exact retries also
+//   require canonical indexed metadata and a pending, positive-sequence row.
 //   - Defines the pending-message custody policy as a domain value.
 //   - Defines a replaceable repository trait for durable store and ACK writes.
 //   - Implements idempotence, quotas, monotonic sequence allocation, and ACKs.
@@ -34,6 +36,8 @@
 //   - Never log or expose message IDs, wallet keys, envelopes, or ciphertext.
 //
 // Last Modified:
+//   [PENDING-CUSTODY-RETRY-INTEGRITY 2026-10-04 by Codex] Reject false custody
+//   evidence from metadata drift without repairing or deleting stored rows.
 //   [PENDING-CUSTODY-BOUNDED-RETRY 2026-10-04 by Codex] Preserve exact retry
 //   before quota while rejecting malformed durable shapes without mutation.
 //   v1.0.0-PendingCustodyDomain - Initial custody repository composition
@@ -160,12 +164,29 @@ impl PendingMessageCustodyRepository for SqlitePendingMessageCustodyRepository {
         // durable envelope. Do not use a lowered operator size limit to reject
         // historical rows. SQLite's own pager/comparison memory is not covered
         // by this returned-projection bound.
+        // [PENDING-CUSTODY-RETRY-INTEGRITY 2026-10-04 by Codex] Equal bytes
+        // alone do not prove a usable custody row: Pull/ACK use indexed claims.
+        // Require the explicit successful conjunction below; SQL NULL must fall
+        // into Corrupt, not bypass a list of negative comparisons. Production
+        // init_schema completes the legacy positive-sequence migration before
+        // returning the service. This checks sequence shape, not its history.
+        // A different bounded envelope remains Conflict before metadata checks.
         let existing = tx
             .query_row(
                 "SELECT CASE
                     WHEN typeof(envelope) != 'blob' THEN 2
                     WHEN length(envelope) > ?2 THEN 2
-                    WHEN envelope = ?3 THEN 1
+                    WHEN envelope = ?3 THEN CASE
+                        WHEN typeof(sender) = 'blob' AND length(sender) = 32
+                         AND sender = ?4
+                         AND typeof(receiver) = 'blob' AND length(receiver) = 32
+                         AND receiver = ?5
+                         AND typeof(timestamp) = 'integer' AND timestamp = ?6
+                         AND typeof(status) = 'integer' AND status = 0
+                         AND typeof(queue_sequence) = 'integer' AND queue_sequence > 0
+                        THEN 1
+                        ELSE 2
+                    END
                     ELSE 0
                  END
                  FROM pending_messages WHERE message_id = ?1",
@@ -173,6 +194,9 @@ impl PendingMessageCustodyRepository for SqlitePendingMessageCustodyRepository {
                     write.message_id.as_slice(),
                     MAX_CHAT_ENVELOPE_BYTES,
                     write.envelope.as_slice(),
+                    write.sender.as_slice(),
+                    write.receiver.as_slice(),
+                    write.timestamp,
                 ],
                 |row| row.get::<_, i64>(0),
             )
@@ -191,7 +215,7 @@ impl PendingMessageCustodyRepository for SqlitePendingMessageCustodyRepository {
                 // Leave the original row intact for existing Pull/maintenance
                 // evidence. The transaction drops without any custody mutation.
                 return Err(ChatRelayError::CorruptStoredData {
-                    field: "pending_message_retry_envelope",
+                    field: "pending_message_retry_row",
                 });
             }
             None => {}
