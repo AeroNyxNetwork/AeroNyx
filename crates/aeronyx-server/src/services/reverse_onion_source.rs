@@ -1562,18 +1562,31 @@ mod tests {
             let sealed = journal.seal(&row)?;
             one(tx.execute("UPDATE source_jobs SET sealed=?1 WHERE route=?2", params![sealed, f.route().as_slice()]).map_err(unavailable)?)
         })).unwrap();
-        let snapshot = Connection::open(&f.path()).unwrap().query_row(
-            "SELECT phase,generation,reserved,retain_until,sealed FROM source_jobs WHERE route=?1",
-            params![f.route().as_slice()],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, Vec<u8>>(4)?)),
-        ).unwrap();
+        let (snapshot, before_clock) = journal.with_inner(|inner| {
+            let snapshot = inner.connection.query_row(
+                "SELECT phase,generation,reserved,retain_until,sealed FROM source_jobs WHERE route=?1",
+                params![f.route().as_slice()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, Vec<u8>>(4)?)),
+            ).map_err(unavailable)?;
+            let clock = inner.connection.query_row(
+                "SELECT clock FROM source_meta WHERE singleton=1", [], |row| row.get::<_, i64>(0),
+            ).map_err(unavailable)?;
+            Ok((snapshot, clock))
+        }).unwrap();
         assert_eq!(journal.arm(f.route(), NOW + 2).err(), Some(SourceJournalError::Rejected));
-        let after = Connection::open(&f.path()).unwrap().query_row(
-            "SELECT phase,generation,reserved,retain_until,sealed FROM source_jobs WHERE route=?1",
-            params![f.route().as_slice()],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, Vec<u8>>(4)?)),
-        ).unwrap();
+        let (after, after_clock) = journal.with_inner(|inner| {
+            let after = inner.connection.query_row(
+                "SELECT phase,generation,reserved,retain_until,sealed FROM source_jobs WHERE route=?1",
+                params![f.route().as_slice()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, Vec<u8>>(4)?)),
+            ).map_err(unavailable)?;
+            let clock = inner.connection.query_row(
+                "SELECT clock FROM source_meta WHERE singleton=1", [], |row| row.get::<_, i64>(0),
+            ).map_err(unavailable)?;
+            Ok((after, clock))
+        }).unwrap();
         assert_eq!(after, snapshot);
+        assert_eq!(after_clock, before_clock);
     }
 
     // [REVERSE-ONION-SOURCE-V1-MIGRATION-FIXTURE 2026-10-04 by Codex]
@@ -1636,53 +1649,12 @@ mod tests {
         let journal = f.open(NOW);
         f.prepare(&journal, NOW);
         journal.arm(f.route(), NOW + 1).unwrap();
-        let mut second_request = f.outbound.clone();
-        second_request.envelope = second_request.envelope.clone().sign_with(&f.source);
-        second_request.envelope.route_id = [12; 16];
-        second_request.envelope = second_request.envelope.clone().sign_with(&f.source);
-        let second_expected = ExpectedRetainedEnvelope {
-            relay: f.relay.public_key_bytes(),
-            recipient: f.recipient.public_key_bytes(),
-            route: [12; 16],
-            ttl: f.expected().ttl,
-            timestamp: f.expected().timestamp,
-            blob_hash: hash(&second_request.envelope.encrypted_blob),
-            signing_commitment: hash(&second_request.envelope.signing_data()),
-        };
-        let second_plan = SourcePreparedPull::from_runtime_admission(
-            &f.source,
-            second_request.clone(),
-            second_expected,
-            f.recipient.public_key_bytes(),
-            f.recipient_descriptor_commitment,
-            f.relay_descriptor_commitment,
-            f.recipient_descriptor_commitment,
-            blind_relay_authenticated_request_commitment(&second_request).unwrap(),
-            SourceRouteAuthority {
-                relay_descriptor: f.authority.relay_descriptor.clone(),
-                recipient_descriptor: f.authority.recipient_descriptor.clone(),
-                authorization: f.authority.authorization.clone(),
-                purpose: f.authority.purpose.clone(),
-            },
-            NOW + 600,
-            f.terminal.to_vec(),
-        ).unwrap();
-        let (_, second_session) = BlindVaultOnionPullSession::prepare(
-            [12; 16],
-            f.recipient.public_key_bytes(),
-            BlindVaultPullRequest {
-                version: BLIND_VAULT_PROTOCOL_VERSION,
-                lease_id: [7; 32],
-                read_capability: [8; 32],
-                continuation_cursor: vec![],
-                limit: 1,
-            },
-        ).unwrap();
-        journal.prepare(second_plan, second_session, NOW).unwrap();
-        journal.arm([12; 16], NOW + 1).unwrap();
+        let f2 = Fixture::new_with_route(12);
+        journal.prepare(f2.plan(), f2.session(), NOW + 1).unwrap();
+        journal.arm(f2.route(), NOW + 1).unwrap();
         let (sealed, phase, generation, reserved, retain_until) = journal.with_inner(|inner| {
             journal.transaction(inner, NOW + 1, |tx| {
-                let row = journal.load(tx, [12; 16])?.ok_or(SourceJournalError::Corrupt)?;
+                let row = journal.load(tx, f2.route())?.ok_or(SourceJournalError::Corrupt)?;
                 let clear = encode_v1_fixture(&row);
                 let sealed = seal_blind_vault_source_pull_journal(&journal.identity, &clear)
                     .map_err(|_| SourceJournalError::Corrupt)?;
@@ -1692,7 +1664,7 @@ mod tests {
         journal.with_inner(|inner| journal.transaction(inner, NOW + 1, |tx| {
             one(tx.execute(
                 "UPDATE source_jobs SET sealed=?1 WHERE route=?2 AND phase=?3 AND generation=?4 AND reserved=?5 AND retain_until=?6",
-                params![sealed, [12u8; 16].as_slice(), phase, generation as i64, reserved as i64, retain_until as i64],
+                params![sealed, f2.route().as_slice(), phase, generation as i64, reserved as i64, retain_until as i64],
             ).map_err(unavailable)?)
         })).unwrap();
         drop(journal);
@@ -1700,20 +1672,24 @@ mod tests {
             let mut statement = connection.prepare(
                 "SELECT route,phase,generation,reserved,retain_until,sealed FROM source_jobs ORDER BY route",
             ).unwrap();
-            statement.query_map([], |row| Ok((
+            let rows = statement.query_map([], |row| Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, Vec<u8>>(5)?,
-            ) )).unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap()
+            ) )).unwrap();
+            rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
         };
-        let before_connection = Connection::open(&f.path()).unwrap();
-        let before_rows = snapshot(&before_connection);
-        let before_clock: i64 = before_connection.query_row(
-            "SELECT clock FROM source_meta WHERE singleton=1", [], |row| row.get(0),
-        ).unwrap();
+        let (before_rows, before_clock) = {
+            let before_connection = Connection::open(&f.path()).unwrap();
+            let before_rows = snapshot(&before_connection);
+            let before_clock: i64 = before_connection.query_row(
+                "SELECT clock FROM source_meta WHERE singleton=1", [], |row| row.get(0),
+            ).unwrap();
+            (before_rows, before_clock)
+        };
         assert_eq!(ReverseOnionSourceJournal::open(&f.path(), f.source.clone(),
             SourceJournalLimits { max_entries: 8, max_bytes: RESERVED_PER_JOB * 8 }, NOW + 2).err(),
             Some(SourceJournalError::MigrationRequired));
