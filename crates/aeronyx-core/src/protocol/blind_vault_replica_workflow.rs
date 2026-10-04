@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.74.0-PullRestartSeal - Crate-private purpose-fixed facade.
+//! Last Modified: v1.75.0-SourcePullJournalSeal - Dedicated bounded public facade.
+//! [REVERSE-ONION-SOURCE-JOURNAL 2026-10-04 by Codex] No generic crypto export.
+//! v1.74.0-PullRestartSeal - Crate-private purpose-fixed facade.
 //! [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] No generic crypto export.
 //! v1.73.0-SourceReservationSeal - Exported purpose-fixed local
 //! reservation sealing, not workflow readiness or dispatch authority.
@@ -328,6 +330,13 @@ pub use sealed_local::{
 pub(crate) use sealed_local::{
     open_pull_restart, seal_pull_restart, MAX_PULL_RESTART_BODY_BYTES,
     MAX_PULL_RESTART_SEALED_BYTES,
+};
+// [REVERSE-ONION-SOURCE-JOURNAL 2026-10-04 by Codex] Server-local record
+// sealing only, never a dispatch permit or public network codec.
+pub use sealed_local::{
+    open_blind_vault_source_pull_journal, seal_blind_vault_source_pull_journal,
+    BlindVaultSourcePullJournalSealError, MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_BODY_BYTES,
+    MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_SEALED_BYTES,
 };
 
 use std::fmt;

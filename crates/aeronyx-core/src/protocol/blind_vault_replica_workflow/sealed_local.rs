@@ -21,7 +21,9 @@
 //! - Callers own plaintext cleanup before sealing and after opening.
 //! - Do not add identity, work, node, lease, or sequence data to the header.
 //!
-//! Last Modified: v1.2.0-PullRestartSeal - Private purpose-fixed AXBP facade.
+//! Last Modified: v1.3.0-SourcePullJournalSeal - Bounded public AXPJ facade.
+//! [REVERSE-ONION-SOURCE-JOURNAL 2026-10-04 by Codex] No reservation reuse.
+//! v1.2.0-PullRestartSeal - Private purpose-fixed AXBP facade.
 //! [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Reuses identity AEAD only.
 //! v1.1.0-SourceReservationSeal - Narrow local persistence API.
 //! [SOURCE-RESERVATION-SEAL 2026-10-04 by Codex] Fixed reservation domain
@@ -43,6 +45,116 @@ use crate::crypto::keys::IdentityKeyPair;
 
 const HEADER_BYTES: usize = 4 + 2 + 24;
 const TAG_BYTES: usize = 16;
+
+// [REVERSE-ONION-SOURCE-JOURNAL 2026-10-04 by Codex] One bounded local
+// record, not chunks and not a protocol frame. AXSR and AXBP stay unchanged.
+const SOURCE_PULL_JOURNAL_MAGIC: [u8; 4] = *b"AXPJ";
+const SOURCE_PULL_JOURNAL_VERSION: u16 = 1;
+const SOURCE_PULL_JOURNAL_KEY_SALT: &[u8] = b"AeroNyx-BlindVault-Source-Pull-Journal-Key-v1";
+const SOURCE_PULL_JOURNAL_KEY_INFO: &[u8] = b"AeroNyx-BlindVault-Source-Pull-Journal-State-v1";
+
+/// Fixed local clear record ceiling. Callers must also enforce per-field bounds.
+pub const MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_BODY_BYTES: usize = 1024 * 1024;
+/// Fixed local container ceiling, including authenticated header and AEAD tag.
+pub const MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_SEALED_BYTES: usize =
+    MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_BODY_BYTES + HEADER_BYTES + TAG_BYTES;
+
+/// Coarse errors with no record, key, identity or path material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum BlindVaultSourcePullJournalSealError {
+    #[error("source pull journal exceeds local size limit")]
+    TooLarge,
+    #[error("malformed source pull journal")]
+    Malformed,
+    #[error("unsupported source pull journal version")]
+    UnsupportedVersion,
+    #[error("source pull journal authentication failed")]
+    AuthenticationFailed,
+}
+
+/// Identity-seals a complete bounded source Pull journal record.
+///
+/// [REVERSE-ONION-SOURCE-JOURNAL 2026-10-04 by Codex] Fixed purpose, no
+/// caller-controlled crypto domains. The caller owns canonical fields, quota
+/// reservations, plaintext zeroization, durable CAS and rollback protection.
+/// Successful sealing grants neither dispatch nor response-opening authority.
+pub fn seal_blind_vault_source_pull_journal(
+    identity: &IdentityKeyPair,
+    body: &[u8],
+) -> Result<Vec<u8>, BlindVaultSourcePullJournalSealError> {
+    seal_identity_bound(
+        identity, SOURCE_PULL_JOURNAL_MAGIC, SOURCE_PULL_JOURNAL_VERSION,
+        SOURCE_PULL_JOURNAL_KEY_SALT, SOURCE_PULL_JOURNAL_KEY_INFO, body,
+        MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_SEALED_BYTES,
+    ).map_err(source_pull_journal_error)
+}
+
+/// Authenticates a bounded record and returns zeroizing private plaintext.
+/// The caller must validate every semantic binding before using any field.
+pub fn open_blind_vault_source_pull_journal(
+    identity: &IdentityKeyPair,
+    sealed: &[u8],
+) -> Result<zeroize::Zeroizing<Vec<u8>>, BlindVaultSourcePullJournalSealError> {
+    open_identity_bound(
+        identity, sealed, SOURCE_PULL_JOURNAL_MAGIC, SOURCE_PULL_JOURNAL_VERSION,
+        SOURCE_PULL_JOURNAL_KEY_SALT, SOURCE_PULL_JOURNAL_KEY_INFO,
+        MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_SEALED_BYTES,
+    ).map(zeroize::Zeroizing::new).map_err(source_pull_journal_error)
+}
+
+fn source_pull_journal_error(error: IdentitySealedLocalError) -> BlindVaultSourcePullJournalSealError {
+    use BlindVaultSourcePullJournalSealError as Error;
+    match error {
+        IdentitySealedLocalError::TooLarge => Error::TooLarge,
+        IdentitySealedLocalError::Malformed => Error::Malformed,
+        IdentitySealedLocalError::UnsupportedVersion => Error::UnsupportedVersion,
+        IdentitySealedLocalError::AuthenticationFailed => Error::AuthenticationFailed,
+    }
+}
+
+// [REVERSE-ONION-SOURCE-JOURNAL 2026-10-04 by Codex] Authored, not executed.
+#[cfg(test)]
+mod source_pull_journal_tests {
+    use super::*;
+
+    #[test]
+    fn source_pull_journal_actual_size_bound_and_roundtrip() {
+        let identity = IdentityKeyPair::from_bytes(&[61; 32]).expect("fixture");
+        let clear = zeroize::Zeroizing::new(vec![0x5a; MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_BODY_BYTES]);
+        let sealed = seal_blind_vault_source_pull_journal(&identity, &clear).expect("seal maximum");
+        assert_eq!(sealed.len(), MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_SEALED_BYTES);
+        let opened = open_blind_vault_source_pull_journal(&identity, &sealed).expect("open maximum");
+        assert!(opened.as_slice() == clear.as_slice());
+        let too_large = zeroize::Zeroizing::new(vec![0; MAX_BLIND_VAULT_SOURCE_PULL_JOURNAL_BODY_BYTES + 1]);
+        assert_eq!(seal_blind_vault_source_pull_journal(&identity, &too_large),
+            Err(BlindVaultSourcePullJournalSealError::TooLarge));
+        let mut trailing = sealed;
+        trailing.push(0);
+        assert!(matches!(open_blind_vault_source_pull_journal(&identity, &trailing),
+            Err(BlindVaultSourcePullJournalSealError::TooLarge)));
+    }
+
+    #[test]
+    fn source_pull_journal_rejects_other_identity_purpose_version_and_tamper() {
+        let identity = IdentityKeyPair::from_bytes(&[61; 32]).expect("fixture");
+        let other = IdentityKeyPair::from_bytes(&[62; 32]).expect("other fixture");
+        let sealed = seal_blind_vault_source_pull_journal(&identity, b"private record").expect("seal");
+        assert!(open_blind_vault_source_pull_journal(&other, &sealed).is_err());
+        for offset in [0, 4, 6, sealed.len() - 1] {
+            let mut changed = sealed.clone();
+            changed[offset] ^= 1;
+            assert!(open_blind_vault_source_pull_journal(&identity, &changed).is_err());
+        }
+        let reservation = seal_blind_vault_source_reservation(&identity, b"private record").expect("reservation");
+        assert!(open_blind_vault_source_pull_journal(&identity, &reservation).is_err());
+        assert!(open_blind_vault_source_reservation(&identity, &sealed).is_err());
+        assert!(open_pull_restart(&identity, &sealed).is_err());
+        assert!(open_blind_vault_source_pull_journal(&identity, &sealed[..10]).is_err());
+        let mut trailing = sealed;
+        trailing.push(0);
+        assert!(open_blind_vault_source_pull_journal(&identity, &trailing).is_err());
+    }
+}
 
 // [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Independent local-only
 // domain. Neither the facade nor its plaintext is public outside this crate.
