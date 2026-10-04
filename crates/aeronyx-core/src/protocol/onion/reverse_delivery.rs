@@ -28,7 +28,10 @@ const REVERSE_ONION_SIGN_DOMAIN: &[u8] = b"AeroNyx-Reverse-Onion-Sign-v1\0";
 const REVERSE_ONION_COMMIT_DOMAIN: &[u8] = b"AeroNyx-Reverse-Onion-Frame-v1\0";
 const REVERSE_ONION_HEADER_BYTES: usize = 170;
 const REVERSE_ONION_SIGNATURE_BYTES: usize = 64;
-const REVERSE_ONION_ENVELOPE_BYTES: usize = 256 * 1024;
+// [REVERSE-ONION-BOUND-EXPORT 2026-10-04 by Codex] Export the existing
+// envelope bound as the single named source of truth for queue envelopes;
+// this is an additive API name only and does not alter the V1 wire.
+pub const MAX_REVERSE_ONION_ENVELOPE_BYTES: usize = 256 * 1024;
 
 /// Strict claim lifetime; clocks are supplied by callers, never read here.
 pub const REVERSE_ONION_CLAIM_LIFETIME_SECS: u64 = 30;
@@ -41,6 +44,10 @@ pub const REVERSE_ONION_RESULT_RETENTION_SECS: u64 = 300;
 pub const MAX_REVERSE_ONION_FRAME_BYTES: usize = REVERSE_ONION_HEADER_BYTES
     + REVERSE_ONION_SIGNATURE_BYTES
     + MAX_ONION_SEALED_RESPONSE_BYTES;
+/// Exact fixed Claim frame bound, derived from the existing canonical header
+/// and signature sizes. Lease/Result use `MAX_REVERSE_ONION_FRAME_BYTES`.
+pub const MAX_REVERSE_ONION_CLAIM_BYTES: usize =
+    REVERSE_ONION_HEADER_BYTES + REVERSE_ONION_SIGNATURE_BYTES;
 
 /// Frozen additive frame codes. A result is NOT an execution acknowledgement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -452,7 +459,7 @@ impl ReverseOnionFrameV1 {
     fn payload_limit(kind: ReverseOnionKindV1) -> usize {
         match kind {
             ReverseOnionKindV1::Claim => 0,
-            ReverseOnionKindV1::Lease => REVERSE_ONION_ENVELOPE_BYTES,
+            ReverseOnionKindV1::Lease => MAX_REVERSE_ONION_ENVELOPE_BYTES,
             ReverseOnionKindV1::Result => MAX_ONION_SEALED_RESPONSE_BYTES,
         }
     }

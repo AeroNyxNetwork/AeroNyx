@@ -41,6 +41,10 @@
 //! Last Modified: v1.1.0-DurableClock - Trusted local time high-water and
 //! explicit owned metadata migration.
 
+use aeronyx_core::protocol::onion::reverse_delivery::{
+    MAX_REVERSE_ONION_CLAIM_BYTES, MAX_REVERSE_ONION_ENVELOPE_BYTES,
+    MAX_REVERSE_ONION_FRAME_BYTES,
+};
 use parking_lot::Mutex;
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -61,13 +65,15 @@ const RESULT: i64 = 3;
 const TOMBSTONE: i64 = 4;
 const ID_BYTES: usize = 16;
 const COMMITMENT_BYTES: usize = 32;
-const MAX_CLAIM_BYTES: usize = 8 * 1024;
-// [REVERSE-ONION-QUEUE-BOUNDS 2026-10-04 by Codex] Keep the adapter bound
-// above the current core frame envelope until the core constant is imported
-// by the runtime wiring; never truncate a signed frame at this boundary.
-const MAX_LEASE_BYTES: usize = 512 * 1024;
-const MAX_RESULT_BYTES: usize = 512 * 1024;
-pub(crate) const MAX_REVERSE_ONION_QUEUE_ITEM_BYTES: usize = 512 * 1024;
+// [REVERSE-ONION-QUEUE-CORE-BOUNDS 2026-10-04 by Codex] Queue limits consume
+// the core's canonical frame/envelope bounds. Claim remains its exact fixed
+// frame size; Lease/Result remain full frame bounds; aggregate reservation
+// continues to distinguish per-item bytes from the envelope carrier bound.
+const MAX_CLAIM_BYTES: usize = MAX_REVERSE_ONION_CLAIM_BYTES;
+const MAX_LEASE_BYTES: usize = MAX_REVERSE_ONION_FRAME_BYTES;
+const MAX_RESULT_BYTES: usize = MAX_REVERSE_ONION_FRAME_BYTES;
+pub(crate) const MAX_REVERSE_ONION_QUEUE_ITEM_BYTES: usize =
+    MAX_REVERSE_ONION_ENVELOPE_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum ReverseOnionQueueError {
