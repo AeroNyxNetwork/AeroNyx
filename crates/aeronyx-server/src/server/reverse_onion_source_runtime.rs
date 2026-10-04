@@ -14,7 +14,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aeronyx_core::crypto::keys::IdentityKeyPair;
 use aeronyx_core::protocol::blind_vault::BlindVaultOnionPullSession;
@@ -23,7 +23,6 @@ use aeronyx_core::protocol::discovery::{
     SignedPrivateOnionRecipientAuthorizationV1,
 };
 use aeronyx_core::protocol::onion::OnionRoutePurpose;
-use aeronyx_core::protocol::onion_reply::decode_onion_sealed_response;
 use aeronyx_core::protocol::onion::reverse_delivery::{
     ReverseOnionSourceEvidenceV1, ReverseOnionSourceQueryV1, SourceEvidencePartV1,
     SourceEvidenceStateV1, VerifiedSourceEvidenceChain, REVERSE_ONION_SOURCE_QUERY_LIFETIME_SECS,
@@ -31,7 +30,7 @@ use aeronyx_core::protocol::onion::reverse_delivery::{
 };
 use async_trait::async_trait;
 use axum::body::Bytes;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use rand::RngCore;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::api::{
@@ -127,22 +126,37 @@ impl SourcePinnedRelayPolicy {
         authorization: SignedPrivateOnionRecipientAuthorizationV1,
         now: u64,
     ) -> Result<Self, SourceRuntimeError> {
+        let policy = Self::validate_shape(source, relay, recipient, authorization)?;
+        policy.validate_at(now)?;
+        Ok(policy)
+    }
+
+    /// Constructs the same pinned authority for a durable grace/restart read.
+    /// The journal has already authenticated the retained authorization at its
+    /// historical envelope timestamp; this constructor only repeats signature,
+    /// role, feature, endpoint, and identity checks without requiring the
+    /// authorization to remain within its original wall-clock window.
+    pub(crate) fn new_for_recovery(
+        source: [u8; 32],
+        relay: SignedNodeDescriptor,
+        recipient: SignedNodeDescriptor,
+        authorization: SignedPrivateOnionRecipientAuthorizationV1,
+    ) -> Result<Self, SourceRuntimeError> {
+        Self::validate_shape(source, relay, recipient, authorization)
+    }
+
+    fn validate_shape(
+        source: [u8; 32],
+        relay: SignedNodeDescriptor,
+        recipient: SignedNodeDescriptor,
+        authorization: SignedPrivateOnionRecipientAuthorizationV1,
+    ) -> Result<Self, SourceRuntimeError> {
         if source == [0; 32]
             || relay.node_id() == [0; 32]
             || recipient.node_id() == [0; 32]
             || source == relay.node_id()
             || source == recipient.node_id()
             || relay.node_id() == recipient.node_id()
-            || authorization
-                .verify_at(
-                    &relay,
-                    &recipient,
-                    OnionRoutePurpose::BlindVaultPull.as_str(),
-                    now,
-                )
-                .is_err()
-            || relay.verify_at(now).is_err()
-            || recipient.verify_at(now).is_err()
             || !relay
                 .descriptor
                 .capabilities
@@ -150,7 +164,7 @@ impl SourcePinnedRelayPolicy {
             || !relay
                 .descriptor
                 .capabilities
-                .contains(&NodeCapability::BlindVaultReplica)
+                .contains(&NodeCapability::OnionMiddle)
             || !recipient
                 .descriptor
                 .capabilities
@@ -159,8 +173,9 @@ impl SourcePinnedRelayPolicy {
                 .descriptor
                 .capabilities
                 .contains(&NodeCapability::BlindVaultReplica)
-            || !has_required_features(&relay)
-            || !has_required_features(&recipient)
+            || !has_required_path_features(&relay)
+            || !has_required_terminal_features(&recipient)
+            || recipient.descriptor.public_endpoint.is_some()
         {
             return Err(SourceRuntimeError::Rejected);
         }
@@ -172,6 +187,14 @@ impl SourcePinnedRelayPolicy {
         if !peer_endpoint_is_public_ip(endpoint) {
             return Err(SourceRuntimeError::Rejected);
         }
+        authorization
+            .verify_at(
+                &relay,
+                &recipient,
+                OnionRoutePurpose::BlindVaultPull.as_str(),
+                authorization.issued_at(),
+            )
+            .map_err(|_| SourceRuntimeError::Rejected)?;
         Ok(Self {
             source,
             relay,
@@ -195,6 +218,28 @@ impl SourcePinnedRelayPolicy {
                 now,
             )
             .map_err(|_| SourceRuntimeError::Rejected)?;
+        let endpoint = self
+            .relay
+            .descriptor
+            .public_endpoint
+            .as_deref()
+            .ok_or(SourceRuntimeError::Rejected)?;
+        if !peer_endpoint_is_public_ip(endpoint) {
+            return Err(SourceRuntimeError::Rejected);
+        }
+        Ok(())
+    }
+
+    fn validate_relay_at(&self, now: u64) -> Result<(), SourceRuntimeError> {
+        self.relay
+            .verify_at(now)
+            .map_err(|_| SourceRuntimeError::Rejected)?;
+        if !self.relay.descriptor.capabilities.contains(&NodeCapability::ChatRelay)
+            || !self.relay.descriptor.capabilities.contains(&NodeCapability::OnionMiddle)
+            || !has_required_path_features(&self.relay)
+        {
+            return Err(SourceRuntimeError::Rejected);
+        }
         let endpoint = self
             .relay
             .descriptor
@@ -250,12 +295,15 @@ impl SourcePinnedRelayPolicy {
     }
 }
 
-fn has_required_features(descriptor: &SignedNodeDescriptor) -> bool {
-    let terminal = OnionRoutePurpose::BlindVaultPull.required_terminal_protocol_features();
+fn has_required_path_features(descriptor: &SignedNodeDescriptor) -> bool {
     let path = OnionRoutePurpose::BlindVaultPull.required_path_protocol_features();
-    terminal
+    path.iter().all(|feature| descriptor.descriptor.advertises_protocol_feature(*feature))
+}
+
+fn has_required_terminal_features(descriptor: &SignedNodeDescriptor) -> bool {
+    OnionRoutePurpose::BlindVaultPull
+        .required_terminal_protocol_features()
         .iter()
-        .chain(path.iter())
         .all(|feature| descriptor.descriptor.advertises_protocol_feature(*feature))
 }
 
@@ -342,6 +390,7 @@ pub(crate) struct ReverseOnionSourceRuntime {
     policy: Arc<SourcePinnedRelayPolicy>,
     transport: Arc<dyn SourceTransport>,
     permits: Arc<Semaphore>,
+    max_in_flight: u32,
     timeout: Duration,
     stopped: Arc<AtomicBool>,
 }
@@ -354,7 +403,12 @@ impl ReverseOnionSourceRuntime {
         transport: Arc<dyn SourceTransport>,
         config: SourceRuntimeConfig,
     ) -> Result<Self, SourceRuntimeError> {
-        if identity.public_key_bytes() != policy.source {
+        if identity.public_key_bytes() != policy.source
+            || config.max_in_flight == 0
+            || config.max_in_flight > MAX_SOURCE_IN_FLIGHT
+            || config.timeout.is_zero()
+            || config.timeout > MAX_SOURCE_TIMEOUT
+        {
             return Err(SourceRuntimeError::Rejected);
         }
         Ok(Self {
@@ -363,6 +417,7 @@ impl ReverseOnionSourceRuntime {
             policy,
             transport,
             permits: Arc::new(Semaphore::new(config.max_in_flight)),
+            max_in_flight: config.max_in_flight as u32,
             timeout: config.timeout,
             stopped: Arc::new(AtomicBool::new(false)),
         })
@@ -370,6 +425,64 @@ impl ReverseOnionSourceRuntime {
 
     pub(crate) fn request_stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops admission and waits until every accepted dispatch, including any
+    /// cancellation-surviving blocking child holding a permit clone, has
+    /// released its permit. Composition must call this before closing the
+    /// journal or removing the authenticated route.
+    pub(crate) async fn shutdown_and_drain(&self) {
+        self.request_stop();
+        let _drain = self
+            .permits
+            .clone()
+            .acquire_many_owned(self.max_in_flight)
+            .await;
+    }
+
+    /// Evidence-only restart/grace recovery. It never prepares a session,
+    /// mutates a Prepared row, or emits another blind-relay POST. The durable
+    /// row remains the authority for the historical P authorization; only the
+    /// current exact relay descriptor is required before evidence queries.
+    pub(crate) async fn resume(
+        &self,
+        route: [u8; 16],
+        now: u64,
+    ) -> Result<BlindVaultPullResult, SourceRuntimeError> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(SourceRuntimeError::Stopped);
+        }
+        let permit = Arc::new(self
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| SourceRuntimeError::Busy)?);
+        let observed_at = observed_now(now);
+        let metadata = self.metadata(route, observed_at, Arc::clone(&permit)).await?;
+        if metadata.source() != self.identity.public_key_bytes()
+            || metadata.relay() != self.policy.relay_id()
+            || metadata.recipient() != self.policy.recipient_id()
+            || metadata.target() != self.policy.recipient_id()
+            || metadata.recipient_descriptor_commitment() != self.policy.descriptor_commitment()?
+            || metadata.relay_descriptor_commitment() != self.policy.relay_descriptor_commitment()?
+        {
+            return Err(SourceRuntimeError::Unavailable);
+        }
+        if observed_at >= metadata.retain_until() {
+            return Err(SourceRuntimeError::Expired);
+        }
+        self.policy.validate_relay_at(observed_at)?;
+        match metadata.phase() {
+            SourcePhase::ResultReady => self.open_result(route, observed_at, Arc::clone(&permit)).await,
+            SourcePhase::Verified => self.read_verified(route, observed_at, Arc::clone(&permit)).await,
+            SourcePhase::Armed | SourcePhase::DispatchAmbiguous => {
+                self.collect_and_open(route, observed_at, Arc::clone(&permit)).await
+            }
+            SourcePhase::Prepared => Err(SourceRuntimeError::Ambiguous),
+            SourcePhase::Rejected | SourcePhase::Opening | SourcePhase::OpenAmbiguous => {
+                Err(SourceRuntimeError::Ambiguous)
+            }
+        }
     }
 
     /// Arms once, sends the exact durable JSON body once, then recovers the
@@ -403,9 +516,9 @@ impl ReverseOnionSourceRuntime {
             admitted_deadline,
             terminal_request,
             now,
-            permit,
+            Arc::clone(&permit),
         ).await?;
-        let (request, route, deadline, url, exact_bytes) = match admission {
+        let (request, route, _deadline, url, exact_bytes) = match admission {
             SourceAdmission::Send(admission) => (
                 admission.request,
                 admission.route,
@@ -414,13 +527,19 @@ impl ReverseOnionSourceRuntime {
                 admission.exact_bytes,
             ),
             SourceAdmission::Recover { route } => {
-                return self.collect_and_open(route, now).await;
+                return self.collect_and_open(route, now, Arc::clone(&permit)).await;
             }
-            SourceAdmission::Complete { route } => return self.read_verified(route, now).await,
+            SourceAdmission::Complete { route } => {
+                return self.read_verified(route, now, Arc::clone(&permit)).await;
+            }
         };
         if exact_bytes.len() > MAX_SOURCE_DISPATCH_BYTES {
-            self.mark_ambiguous(route, now).await;
+            self.mark_ambiguous(route, observed_now(now), Arc::clone(&permit)).await;
             return Err(SourceRuntimeError::Rejected);
+        }
+        if self.stopped.load(Ordering::Acquire) {
+            self.mark_ambiguous(route, observed_now(now), Arc::clone(&permit)).await;
+            return Err(SourceRuntimeError::Stopped);
         }
         let response = match tokio::time::timeout(
             self.timeout,
@@ -433,15 +552,18 @@ impl ReverseOnionSourceRuntime {
         };
         match response {
             SourceTransportOutcome::Ambiguous => {
-                self.mark_ambiguous(route, now).await;
+                self.mark_ambiguous(route, observed_now(now), Arc::clone(&permit)).await;
                 Err(SourceRuntimeError::Ambiguous)
             }
             SourceTransportOutcome::Response { status, body } => {
+                let observed_at = observed_now(now);
                 let request_for_verify = request;
                 let relay = self.policy.relay_id();
+                let blocking_permit = Arc::clone(&permit);
                 let response = match tokio::task::spawn_blocking(move || {
+                    let _permit = blocking_permit;
                     let response = decode_peer_response(status, &body)?;
-                    verify_success_response(&request_for_verify, &response, relay)?;
+                    verify_success_response(&request_for_verify, &response, relay, observed_at)?;
                     Ok::<_, SourceRuntimeError>(response)
                 })
                 .await
@@ -449,12 +571,12 @@ impl ReverseOnionSourceRuntime {
                 {
                     Ok(response) => response,
                     Err(error) => {
-                        self.mark_ambiguous(route, now).await;
+                        self.mark_ambiguous(route, observed_at, Arc::clone(&permit)).await;
                         return Err(error);
                     }
                 };
                 let _ = response;
-                self.collect_and_open(route, now).await
+                self.collect_and_open(route, observed_at, Arc::clone(&permit)).await
             }
         }
     }
@@ -532,29 +654,47 @@ impl ReverseOnionSourceRuntime {
         Ok(result)
     }
 
-    async fn mark_ambiguous(&self, route: [u8; 16], now: u64) {
+    async fn mark_ambiguous(
+        &self,
+        route: [u8; 16],
+        now: u64,
+        permit: Arc<OwnedSemaphorePermit>,
+    ) {
         let journal = Arc::clone(&self.journal);
-        let _ = tokio::task::spawn_blocking(move || journal.mark_dispatch_ambiguous(route, now)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            journal.mark_dispatch_ambiguous(route, now)
+        })
+        .await;
     }
 
     async fn collect_and_open(
         &self,
         route: [u8; 16],
-        now: u64,
+        fallback_now: u64,
+        permit: Arc<OwnedSemaphorePermit>,
     ) -> Result<BlindVaultPullResult, SourceRuntimeError> {
-        let metadata = self.metadata(route, now).await?;
+        let now = observed_now(fallback_now);
+        let metadata = self.metadata(route, now, Arc::clone(&permit)).await?;
         let deadline = metadata.deadline();
         if !matches!(metadata.phase(), SourcePhase::Armed | SourcePhase::DispatchAmbiguous) {
             return match metadata.phase() {
-                SourcePhase::Verified => self.read_verified(route, now).await,
-                SourcePhase::ResultReady => self.open_result(route, now).await,
+                SourcePhase::Verified => self.read_verified(route, now, Arc::clone(&permit)).await,
+                SourcePhase::ResultReady => self.open_result(route, now, Arc::clone(&permit)).await,
                 SourcePhase::Rejected => Err(SourceRuntimeError::Rejected),
                 _ => Err(SourceRuntimeError::Ambiguous),
             };
         }
         let mut parts = Vec::with_capacity(3);
         for part in [SourceEvidencePartV1::Claim, SourceEvidencePartV1::Lease, SourceEvidencePartV1::Result] {
-            let query = self.sign_query(route, metadata.request_commitment(), part, now).await?;
+            if self.stopped.load(Ordering::Acquire) {
+                self.mark_ambiguous(route, observed_now(now), Arc::clone(&permit)).await;
+                return Err(SourceRuntimeError::Stopped);
+            }
+            let query_now = observed_now(now);
+            let query = self
+                .sign_query(route, metadata.request_commitment(), part, query_now, Arc::clone(&permit))
+                .await?;
             let body = query.encode();
             let url = self.policy.relay_url(SOURCE_QUERY_PATH)?;
             let response = match tokio::time::timeout(
@@ -566,22 +706,25 @@ impl ReverseOnionSourceRuntime {
                 Ok(response) => response,
                 Err(_) => SourceTransportOutcome::Ambiguous,
             };
+            let observed_at = observed_now(query_now);
             let bytes = match response {
                 SourceTransportOutcome::Response { status: 200, body } => body,
                 SourceTransportOutcome::Response { .. } | SourceTransportOutcome::Ambiguous => {
-                    self.mark_ambiguous(route, now).await;
+                    self.mark_ambiguous(route, observed_at, Arc::clone(&permit)).await;
                     return Err(SourceRuntimeError::Ambiguous);
                 }
             };
             if bytes.len() > MAX_REVERSE_ONION_SOURCE_EVIDENCE_BYTES {
-                self.mark_ambiguous(route, now).await;
+                self.mark_ambiguous(route, observed_at, Arc::clone(&permit)).await;
                 return Err(SourceRuntimeError::Ambiguous);
             }
+            let blocking_permit = Arc::clone(&permit);
             let verified = tokio::task::spawn_blocking(move || {
+                let _permit = blocking_permit;
                 let evidence = ReverseOnionSourceEvidenceV1::decode(&bytes)
                     .map_err(|_| SourceRuntimeError::Ambiguous)?;
                 let evidence_state = evidence
-                    .verify_for_query(&query, now)
+                    .verify_for_query(&query, observed_at)
                     .map_err(|_| SourceRuntimeError::Ambiguous)?;
                 if evidence_state.state() != SourceEvidenceStateV1::Available {
                     return Err(SourceRuntimeError::Ambiguous);
@@ -593,32 +736,37 @@ impl ReverseOnionSourceRuntime {
             let (query, evidence) = match verified {
                 Ok(pair) => pair,
                 Err(_) => {
-                    self.mark_ambiguous(route, now).await;
+                    self.mark_ambiguous(route, observed_at, Arc::clone(&permit)).await;
                     return Err(SourceRuntimeError::Ambiguous);
                 }
             };
             if evidence.encode().len() > MAX_REVERSE_ONION_SOURCE_EVIDENCE_BYTES {
-                self.mark_ambiguous(route, now).await;
+                self.mark_ambiguous(route, observed_at, Arc::clone(&permit)).await;
                 return Err(SourceRuntimeError::Ambiguous);
             }
             parts.push((query, evidence));
         }
+        let chain_now = observed_now(now);
+        let blocking_permit = Arc::clone(&permit);
         let chain = tokio::task::spawn_blocking(move || {
+            let _permit = blocking_permit;
             let verified = [
-                parts[0].1.verify_for_query(&parts[0].0, now).map_err(|_| SourceRuntimeError::Ambiguous)?,
-                parts[1].1.verify_for_query(&parts[1].0, now).map_err(|_| SourceRuntimeError::Ambiguous)?,
-                parts[2].1.verify_for_query(&parts[2].0, now).map_err(|_| SourceRuntimeError::Ambiguous)?,
+                parts[0].1.verify_for_query(&parts[0].0, chain_now).map_err(|_| SourceRuntimeError::Ambiguous)?,
+                parts[1].1.verify_for_query(&parts[1].0, chain_now).map_err(|_| SourceRuntimeError::Ambiguous)?,
+                parts[2].1.verify_for_query(&parts[2].0, chain_now).map_err(|_| SourceRuntimeError::Ambiguous)?,
             ];
-            VerifiedSourceEvidenceChain::verify([&verified[0], &verified[1], &verified[2]], deadline, now)
+            VerifiedSourceEvidenceChain::verify([&verified[0], &verified[1], &verified[2]], deadline, chain_now)
                 .map_err(|_| SourceRuntimeError::Ambiguous)
         })
         .await
         .map_err(|_| SourceRuntimeError::Unavailable)??;
         let journal = Arc::clone(&self.journal);
+        let blocking_permit = Arc::clone(&permit);
         let opened = tokio::task::spawn_blocking(move || {
-            journal.record_result(route, chain.claim(), chain.lease(), chain.result(), now)
+            let _permit = blocking_permit;
+            journal.record_result(route, chain.claim(), chain.lease(), chain.result(), chain_now)
                 .map_err(SourceRuntimeError::from)?;
-            journal.open_result(route, now).map_err(SourceRuntimeError::from)
+            journal.open_result(route, chain_now).map_err(SourceRuntimeError::from)
         })
         .await
         .map_err(|_| SourceRuntimeError::Unavailable)??;
@@ -631,10 +779,12 @@ impl ReverseOnionSourceRuntime {
         request_commitment: [u8; 32],
         part: SourceEvidencePartV1,
         now: u64,
+        permit: Arc<OwnedSemaphorePermit>,
     ) -> Result<ReverseOnionSourceQueryV1, SourceRuntimeError> {
         let identity = Arc::clone(&self.identity);
         let relay = self.policy.relay_id();
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let mut nonce = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut nonce);
             if nonce == [0; 32] {
@@ -657,9 +807,15 @@ impl ReverseOnionSourceRuntime {
         .map_err(|_| SourceRuntimeError::Unavailable)?
     }
 
-    async fn metadata(&self, route: [u8; 16], now: u64) -> Result<SourceRecoveryMetadata, SourceRuntimeError> {
+    async fn metadata(
+        &self,
+        route: [u8; 16],
+        now: u64,
+        permit: Arc<OwnedSemaphorePermit>,
+    ) -> Result<SourceRecoveryMetadata, SourceRuntimeError> {
         let journal = Arc::clone(&self.journal);
         let page = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let mut after = None;
             for _ in 0..16 {
                 let page = journal.recover_metadata(after, 64, now).map_err(SourceRuntimeError::from)?;
@@ -678,18 +834,36 @@ impl ReverseOnionSourceRuntime {
         Ok(page)
     }
 
-    async fn read_verified(&self, route: [u8; 16], now: u64) -> Result<BlindVaultPullResult, SourceRuntimeError> {
+    async fn read_verified(
+        &self,
+        route: [u8; 16],
+        now: u64,
+        permit: Arc<OwnedSemaphorePermit>,
+    ) -> Result<BlindVaultPullResult, SourceRuntimeError> {
         let journal = Arc::clone(&self.journal);
-        let response = tokio::task::spawn_blocking(move || journal.read_verified(route, now))
+        let observed_at = observed_now(now);
+        let response = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            journal.read_verified(route, observed_at)
+        })
             .await
             .map_err(|_| SourceRuntimeError::Unavailable)?
             .map_err(SourceRuntimeError::from)?;
         Ok(BlindVaultPullResult { response })
     }
 
-    async fn open_result(&self, route: [u8; 16], now: u64) -> Result<BlindVaultPullResult, SourceRuntimeError> {
+    async fn open_result(
+        &self,
+        route: [u8; 16],
+        now: u64,
+        permit: Arc<OwnedSemaphorePermit>,
+    ) -> Result<BlindVaultPullResult, SourceRuntimeError> {
         let journal = Arc::clone(&self.journal);
-        let response = tokio::task::spawn_blocking(move || journal.open_result(route, now))
+        let observed_at = observed_now(now);
+        let response = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            journal.open_result(route, observed_at)
+        })
             .await
             .map_err(|_| SourceRuntimeError::Unavailable)?
             .map_err(SourceRuntimeError::from)?;
@@ -709,6 +883,13 @@ struct PreparedDispatch {
     route: [u8; 16],
     deadline: u64,
     url: reqwest::Url,
+}
+
+fn observed_now(fallback: u64) -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(fallback)
 }
 
 /// The successful source-side result is intentionally typed; callers cannot
@@ -735,38 +916,36 @@ fn verify_success_response(
     request: &PeerBlindRelayRequest,
     response: &PeerBlindRelayResponse,
     relay: [u8; 32],
+    observed_at: u64,
 ) -> Result<(), SourceRuntimeError> {
-    if !response.accepted || !response.terminal || response.forwarded || response.delivery_receipt.is_some() {
+    if !response.accepted
+        || response.terminal
+        || !response.forwarded
+        || response.reason.is_some()
+        || response.delivery_receipt.is_some()
+        || response.failure_receipt.is_some()
+        || response.opaque_terminal_response_b64.is_some()
+    {
         return Err(SourceRuntimeError::Ambiguous);
     }
-    if response.opaque_terminal_response_b64.is_none() {
-        return Err(SourceRuntimeError::Ambiguous);
-    }
-    let opaque = response
-        .opaque_terminal_response_b64
-        .as_deref()
-        .ok_or(SourceRuntimeError::Ambiguous)?;
-    if opaque.len() > aeronyx_core::protocol::MAX_ONION_SEALED_RESPONSE_BASE64_BYTES {
-        return Err(SourceRuntimeError::Ambiguous);
-    }
-    let opaque = BASE64.decode(opaque).map_err(|_| SourceRuntimeError::Ambiguous)?;
-    if opaque.is_empty() || opaque.len() > aeronyx_core::protocol::MAX_ONION_SEALED_RESPONSE_BYTES {
-        return Err(SourceRuntimeError::Ambiguous);
-    }
-    decode_onion_sealed_response(&opaque).map_err(|_| SourceRuntimeError::Ambiguous)?;
     let receipt = response
         .success_receipt
         .as_ref()
         .ok_or(SourceRuntimeError::Ambiguous)?;
+    if receipt.accepted_at > observed_at.saturating_add(30)
+        || observed_at.saturating_sub(receipt.accepted_at) > 120
+    {
+        return Err(SourceRuntimeError::Ambiguous);
+    }
     receipt
         .verify_expected(
             &request.envelope,
-            true,
             false,
+            true,
             response.ttl_remaining,
             response.reason.as_deref(),
             None,
-            Some(&opaque),
+            None,
             &relay,
         )
         .map_err(|_| SourceRuntimeError::Ambiguous)
@@ -810,6 +989,61 @@ mod tests {
             failure_receipt: None,
             opaque_terminal_response_b64: None,
         };
-        assert_eq!(verify_success_response(&request, &response, [2; 32]), Err(SourceRuntimeError::Ambiguous));
+        assert_eq!(verify_success_response(&request, &response, [2; 32], 1_700_000_000), Err(SourceRuntimeError::Ambiguous));
+    }
+
+    #[test]
+    fn forwarded_custody_receipt_is_fresh_and_terminal_payload_is_not_opened_here() {
+        // [REVERSE-ONION-SOURCE-ACK-GATE 2026-10-04 by Codex] The source
+        // accepts only the immediate relay's forwarded custody ACK; AXRE
+        // evidence remains the sole terminal-response opening authority.
+        let relay = IdentityKeyPair::generate();
+        let envelope = aeronyx_core::protocol::chat::BlindRelayEnvelope {
+            route_id: [1; 16],
+            next_hop: relay.public_key_bytes(),
+            ttl: 2,
+            timestamp: 1_700_000_000,
+            encrypted_blob: vec![7; 4],
+            signature: [0; 64],
+        };
+        let request = PeerBlindRelayRequest {
+            envelope: envelope.clone(),
+            previous_hop_node_id: [3; 32],
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        let receipt = aeronyx_core::protocol::chat::BlindRelaySuccessReceipt::forwarded(
+            &envelope,
+            1,
+            None,
+            None,
+            None,
+            1_700_000_001,
+            &relay,
+        );
+        let response = PeerBlindRelayResponse {
+            accepted: true,
+            terminal: false,
+            forwarded: true,
+            ttl_remaining: 1,
+            reason: None,
+            delivery_receipt: None,
+            success_receipt: Some(receipt),
+            failure_receipt: None,
+            opaque_terminal_response_b64: None,
+        };
+        assert!(verify_success_response(
+            &request,
+            &response,
+            relay.public_key_bytes(),
+            1_700_000_002,
+        )
+        .is_ok());
+        let mut stale = response;
+        stale.success_receipt.as_mut().unwrap().accepted_at = 1_700_000_002 - 121;
+        assert_eq!(
+            verify_success_response(&request, &stale, relay.public_key_bytes(), 1_700_000_002),
+            Err(SourceRuntimeError::Ambiguous)
+        );
     }
 }
