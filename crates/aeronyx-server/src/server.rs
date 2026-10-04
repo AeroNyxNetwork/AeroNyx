@@ -1019,7 +1019,9 @@ use rusqlite::OptionalExtension;
 
 use crate::api::auth::ensure_jwt_secret;
 use crate::api::blind_vault::{
-    build_blind_vault_router_with_admission_runtime, BlindVaultApiAdmissionRuntime,
+    build_blind_vault_router_with_admission_runtime,
+    build_blind_vault_router_with_replica_admission, BlindVaultApiAdmissionRuntime,
+    BlindVaultReplicaApiPolicyV1,
 };
 use crate::api::chat_anonymous_mailbox_source::build_chat_anonymous_mailbox_source_router;
 use crate::api::chat_handlers::build_chat_router;
@@ -1149,6 +1151,11 @@ use crate::services::{
     SessionTermination, SqliteDiscoveryEndpointAttestationInbox,
     SqliteDiscoveryEndpointEvidenceStore,
 };
+use crate::services::blind_vault_replica_coordinator::{
+    BlindVaultReplicaCoordinator, BlindVaultReplicaJobAdmission,
+};
+#[cfg(unix)]
+use crate::services::blind_vault_replica_coordinator::FileBlindVaultReplicaJobStore;
 // v1.0.0-Membership
 use crate::services::deny_list::DenyList;
 use crate::services::session::StatsSnapshot;
@@ -1973,6 +1980,40 @@ impl Server {
             info!("[BLIND_VAULT] Disabled");
             None
         };
+        // [BLIND-VAULT-REPLICA-ADMISSION 2026-10-04 by Codex] The explicit
+        // replica-job route owns a private durable admission generation. Keep
+        // construction behind the existing default-off rollout gate so
+        // disabled nodes perform no filesystem operation and corrupt/locked
+        // generations fail startup before any listener is exposed.
+        let blind_vault_replica_admission: Option<Arc<dyn BlindVaultReplicaJobAdmission>> =
+            if self.config.blind_vault.replica_advertisement_configured() {
+                #[cfg(unix)]
+                {
+                    let vault = blind_vault.clone().ok_or_else(|| {
+                        ServerError::startup_failed("Blind Vault replica admission unavailable")
+                    })?;
+                    let directory = self.config.blind_vault.replica_job_directory();
+                    let store = tokio::task::spawn_blocking(move || {
+                        FileBlindVaultReplicaJobStore::open(&directory)
+                    })
+                    .await
+                    .map_err(|_| {
+                        ServerError::startup_failed("Blind Vault replica admission unavailable")
+                    })?
+                    .map_err(|_| {
+                        ServerError::startup_failed("Blind Vault replica admission unavailable")
+                    })?;
+                    Some(Arc::new(BlindVaultReplicaCoordinator::new(vault, store)))
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(ServerError::startup_failed(
+                        "Blind Vault replica admission unavailable",
+                    ));
+                }
+            } else {
+                None
+            };
         let chat_relay_runtime_ready = chat_relay.is_some();
         let anonymous_mailbox_runtime_ready = anonymous_mailbox.is_some();
         // [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Admission
@@ -2521,7 +2562,7 @@ impl Server {
             let (commitment_tip_tx, commitment_tip_rx) = mpsc::channel(1);
 
             let api_task = self
-                .start_combined_api(
+                .start_combined_api_with_replica_admission(
                     self.config.memchain.api_listen_addr,
                     Some(Arc::clone(&mpi_state)),
                     Arc::clone(&ip_pool),
@@ -2536,6 +2577,7 @@ impl Server {
                     Arc::clone(&directory_replica_sync_runtime),
                     chat_relay.clone(),
                     blind_vault.clone(),
+                    blind_vault_replica_admission.clone(),
                     anonymous_mailbox.clone(),
                     anonymous_mailbox_source.clone(),
                     Arc::clone(&udp),
@@ -2764,7 +2806,7 @@ impl Server {
 
         if !node_api_started {
             let api_task = self
-                .start_combined_api(
+                .start_combined_api_with_replica_admission(
                     self.config.memchain.api_listen_addr,
                     None,
                     Arc::clone(&ip_pool),
@@ -2779,6 +2821,7 @@ impl Server {
                     Arc::clone(&directory_replica_sync_runtime),
                     chat_relay.clone(),
                     blind_vault.clone(),
+                    blind_vault_replica_admission.clone(),
                     anonymous_mailbox.clone(),
                     anonymous_mailbox_source.clone(),
                     Arc::clone(&udp),

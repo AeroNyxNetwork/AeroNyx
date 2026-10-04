@@ -9,6 +9,9 @@ impl Server {
     // Combined API Server
     // ============================================
 
+    // [BLIND-VAULT-REPLICA-ADMISSION 2026-10-04 by Codex] Keep the legacy
+    // entry point additive so embedded/test callers remain default-off while
+    // the server startup path can pass the durable admission capability.
     /// Binds every required API socket before returning a runtime task.
     ///
     /// [STARTUP-READINESS 2026-07-29 by Codex] The previous implementation
@@ -16,6 +19,9 @@ impl Server {
     /// logged an error while `Server::run()` still announced successful
     /// startup. Pre-binding makes listener availability part of the startup
     /// transaction and gives `Type=notify` a truthful readiness barrier.
+    /// Compatibility wrapper for callers that do not enable replica-job
+    /// admission. The additive replica-aware entry point below keeps all
+    /// existing test and embedded-server call sites unchanged.
     pub(super) async fn start_combined_api(
         &self,
         listen_addr: std::net::SocketAddr,
@@ -32,6 +38,60 @@ impl Server {
         directory_replica_sync_runtime: Arc<DirectoryReplicaSyncRuntime>,
         chat_relay: Option<Arc<ChatRelayService>>,
         blind_vault: Option<Arc<BlindVaultService>>,
+        anonymous_mailbox: Option<Arc<SqliteAnonymousMailboxStore>>,
+        anonymous_mailbox_source: Option<Arc<AnonymousMailboxSourceCoordinator>>,
+        udp: Arc<UdpTransport>,
+        peer_http_clients: &PeerHttpClients,
+        commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
+        anonymous_mailbox_cleanup_runtime_supervised: bool,
+        anonymous_mailbox_readiness: AnonymousMailboxReadinessProjection,
+        critical_failure_tx: mpsc::Sender<CriticalRuntimeFailure>,
+    ) -> Result<JoinHandle<()>> {
+        self.start_combined_api_with_replica_admission(
+            listen_addr,
+            mpi_state,
+            ip_pool,
+            sessions,
+            node_policy,
+            voucher_verifier,
+            encrypted_message_counter,
+            packet_handler,
+            peer_store,
+            directory_chain_store,
+            directory_replica_store,
+            directory_replica_sync_runtime,
+            chat_relay,
+            blind_vault,
+            None,
+            anonymous_mailbox,
+            anonymous_mailbox_source,
+            udp,
+            peer_http_clients,
+            commitment_sync_tip_notifier,
+            anonymous_mailbox_cleanup_runtime_supervised,
+            anonymous_mailbox_readiness,
+            critical_failure_tx,
+        )
+        .await
+    }
+
+    pub(super) async fn start_combined_api_with_replica_admission(
+        &self,
+        listen_addr: std::net::SocketAddr,
+        mpi_state: Option<Arc<MpiState>>,
+        ip_pool: Arc<IpPoolService>,
+        sessions: Arc<SessionManager>,
+        node_policy: Arc<NodePolicyRuntime>,
+        voucher_verifier: Arc<VoucherVerifier>,
+        encrypted_message_counter: Arc<AtomicU64>,
+        packet_handler: Arc<PacketHandler>,
+        peer_store: Arc<PeerStore>,
+        directory_chain_store: Option<Arc<DirectoryChainStore>>,
+        directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
+        directory_replica_sync_runtime: Arc<DirectoryReplicaSyncRuntime>,
+        chat_relay: Option<Arc<ChatRelayService>>,
+        blind_vault: Option<Arc<BlindVaultService>>,
+        blind_vault_replica_admission: Option<Arc<dyn BlindVaultReplicaJobAdmission>>,
         anonymous_mailbox: Option<Arc<SqliteAnonymousMailboxStore>>,
         anonymous_mailbox_source: Option<Arc<AnonymousMailboxSourceCoordinator>>,
         udp: Arc<UdpTransport>,
@@ -172,6 +232,21 @@ impl Server {
         let blind_vault_public_api_enabled = self.config.blind_vault.public_api_enabled;
         let public_blind_vault = blind_vault.clone();
         let local_blind_vault = blind_vault.clone();
+        let local_blind_vault_replica_admission = blind_vault_replica_admission.clone();
+        let blind_vault_replica_policy = if local_blind_vault_replica_admission.is_some() {
+            Some(
+                BlindVaultReplicaApiPolicyV1::new(
+                    self.config.blind_vault.max_lease_ttl_ms(),
+                    self.config.blind_vault.max_object_ttl_ms(),
+                    self.config.blind_vault.mutation_clock_skew_ms(),
+                )
+                .ok_or_else(|| {
+                    ServerError::startup_failed("Blind Vault replica policy unavailable")
+                })?,
+            )
+        } else {
+            None
+        };
         let public_anonymous_mailbox = anonymous_mailbox.clone();
         let local_anonymous_mailbox = anonymous_mailbox.clone();
         let vpn_anonymous_mailbox_source = anonymous_mailbox_source.clone();
@@ -305,8 +380,22 @@ impl Server {
                 .as_ref()
                 .map(|relay| build_chat_router(Arc::clone(relay)))
                 .unwrap_or_else(axum::Router::new);
-            let blind_vault_router = match (blind_vault_public_api_enabled, local_blind_vault) {
-                (true, Some(vault)) => build_blind_vault_router_with_admission_runtime(
+            let blind_vault_router = match (
+                blind_vault_public_api_enabled,
+                local_blind_vault,
+                local_blind_vault_replica_admission,
+                blind_vault_replica_policy,
+            ) {
+                (true, Some(vault), Some(replica_admission), Some(replica_policy)) => {
+                    build_blind_vault_router_with_replica_admission(
+                        vault,
+                        Arc::clone(&node_identity),
+                        Arc::clone(&blind_vault_admission),
+                        replica_admission,
+                        replica_policy,
+                    )
+                }
+                (true, Some(vault), None, _) => build_blind_vault_router_with_admission_runtime(
                     vault,
                     Arc::clone(&node_identity),
                     Arc::clone(&blind_vault_admission),

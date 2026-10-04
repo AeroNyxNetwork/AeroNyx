@@ -55,6 +55,7 @@
 //! ============================================
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use aeronyx_core::crypto::keys::IdentityPublicKey;
 use aeronyx_core::protocol::blind_vault::{
@@ -498,6 +499,18 @@ impl BlindVaultConfig {
         // validation so malformed or missing issuer policy can never appear in
         // a signed descriptor constructed by a test or embedded server.
         self.advertise_replica && self.enabled && self.public_api_enabled && self.validate().is_ok()
+    }
+
+    /// Returns the private directory used for the explicit replica-job
+    /// admission generation. It is derived from the dedicated Blind Vault
+    /// database path so it cannot reuse MemChain or Chat Relay storage.
+    // [BLIND-VAULT-REPLICA-ADMISSION 2026-10-04 by Codex] Keep the admission
+    // journal path deterministic without adding another operator-facing path
+    // field; disabled/default-off mode never evaluates this helper.
+    pub(crate) fn replica_job_directory(&self) -> PathBuf {
+        let mut path = PathBuf::from(&self.db_path);
+        path.set_extension("replica-job");
+        path
     }
 }
 

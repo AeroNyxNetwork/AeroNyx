@@ -3,6 +3,11 @@
 // Bodies are unchanged. Private items are pub(super) so the parent flow can call them.
 use super::*;
 
+// [BLIND-VAULT-REPLICA-ADMISSION 2026-10-04 by Codex] Admission readiness
+// only proves that durable jobs can be accepted locally. Until a supervised
+// outbound dispatcher is wired, do not advertise end-to-end replication.
+const BLIND_VAULT_REPLICA_DISPATCHER_READY: bool = false;
+
 impl Server {
     pub(super) fn build_self_discovery_descriptor(&self, now: u64) -> Result<SignedNodeDescriptor> {
         Self::build_self_discovery_descriptor_for(&self.config, &self.identity, now)
@@ -223,6 +228,7 @@ impl Server {
             && chat_relay_runtime_ready
             && blind_vault_runtime_ready
             && advertises_peer_api
+            && BLIND_VAULT_REPLICA_DISPATCHER_READY
         {
             capabilities.push(NodeCapability::BlindVaultReplica);
         }
