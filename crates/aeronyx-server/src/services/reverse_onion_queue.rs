@@ -3147,18 +3147,41 @@ mod tests {
     #[test]
     fn owned_unknown_object_is_rejected_without_mutation() {
         let (queue, connection) = initialized_queue(4, 60, 120);
+        // [REVERSE-ONION-INVENTORY-FIXTURE 2026-10-04 by Codex] Snapshot
+        // the deliberately over-cap fixture without invoking the production
+        // inventory gate that initialize is expected to reject below.
+        let snapshot = || {
+            let connection = connection.lock();
+            let mut statement = connection
+                .prepare("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name")
+                .unwrap();
+            let objects = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            objects
+        };
         {
             let connection = connection.lock();
             connection
                 .execute("CREATE TABLE foreign_extra (opaque BLOB)", [])
                 .unwrap();
         }
-        let before = application_objects(&connection.lock()).unwrap();
+        let before = snapshot();
         assert_eq!(
             queue.initialize(&connection),
             Err(ReverseOnionQueueError::Corrupt)
         );
-        assert_eq!(application_objects(&connection.lock()).unwrap(), before);
+        assert_eq!(snapshot(), before);
     }
 
     #[test]
