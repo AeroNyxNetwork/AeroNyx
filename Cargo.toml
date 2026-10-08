@@ -49,6 +49,7 @@ members = [
     "crates/aeronyx-transport",
     "crates/aeronyx-server",
     "crates/aeronyx-common",
+    "crates/aeronyx-mailbox-wire",
 ]
 
 [workspace.package]
