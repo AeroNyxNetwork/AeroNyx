@@ -59,6 +59,8 @@ pub mod management;
 pub mod miner;
 pub mod server;
 pub mod services;
+// [TEE-DSTACK 2026-10-09 by Claude] dstack identity derivation and quotes.
+pub mod tee;
 pub mod voucher_verifier;
 
 // Re-export primary types

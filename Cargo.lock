@@ -105,6 +105,9 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-util",
  "jsonwebtoken",
  "ndarray",
  "nix",
@@ -1426,6 +1429,7 @@ dependencies = [
  "pin-utils",
  "smallvec",
  "tokio",
+ "want",
 ]
 
 [[package]]

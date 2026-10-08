@@ -287,20 +287,48 @@ impl Default for TunConfig {
 // ServerKeyConfig
 // ============================================
 
+/// Where the node's Ed25519 identity comes from.
+///
+/// [TEE-DSTACK 2026-10-09 by Claude] `Dstack` derives the identity from the
+/// app-bound KMS key inside a dstack CVM; nothing is read from or written to
+/// `key_file`. A node that cannot reach the agent refuses to start rather
+/// than falling back to a generated key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerKeySource {
+    /// Base64 key file at `key_file` (created by `register`).
+    #[default]
+    File,
+    /// dstack guest agent `GetKey` at `dstack_socket`.
+    Dstack,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerKeyConfig {
     #[serde(default = "default_key_file")]
     pub key_file: String,
+    /// Identity source; `file` keeps the historical behaviour.
+    #[serde(default)]
+    pub source: ServerKeySource,
+    /// dstack guest agent socket, used when `source = "dstack"`.
+    #[serde(default = "default_dstack_socket")]
+    pub dstack_socket: String,
 }
 
 fn default_key_file() -> String {
     "/etc/aeronyx/server_key.json".into()
 }
 
+fn default_dstack_socket() -> String {
+    crate::tee::DEFAULT_DSTACK_SOCKET.into()
+}
+
 impl Default for ServerKeyConfig {
     fn default() -> Self {
         Self {
             key_file: default_key_file(),
+            source: ServerKeySource::default(),
+            dstack_socket: default_dstack_socket(),
         }
     }
 }

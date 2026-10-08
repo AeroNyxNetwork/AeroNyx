@@ -175,6 +175,11 @@ tracing-subscriber = { workspace = true }
 
 # Utilities
 bytes = { workspace = true }
+# [TEE-DSTACK 2026-10-09 by Claude] HTTP/1 client over the dstack guest
+# agent's Unix socket. Same versions axum already pulls in.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 arc-swap = { workspace = true }

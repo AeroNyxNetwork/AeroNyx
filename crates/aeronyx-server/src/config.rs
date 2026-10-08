@@ -184,7 +184,7 @@ pub(crate) struct PinnedRouteDomainAssignment {
 pub use crate::config_blind_vault::BlindVaultConfig;
 pub use crate::config_chat_relay::ChatRelayConfig;
 pub use crate::config_infra::{
-    LimitsConfig, LoggingConfig, NetworkConfig, ServerKeyConfig, TunConfig, VpnConfig,
+    LimitsConfig, LoggingConfig, NetworkConfig, ServerKeyConfig, ServerKeySource, TunConfig, VpnConfig,
     VpnTransportConfig,
 };
 pub use crate::config_memchain::{MemChainConfig, MemChainMode, VectorQuantizationMode};

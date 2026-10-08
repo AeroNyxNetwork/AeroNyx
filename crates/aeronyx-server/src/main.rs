@@ -150,6 +150,8 @@ use aeronyx_server::services::{
     DirectoryReplicaStore, DirectoryReplicaTip, PeerStore, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
     CHAT_RELAY_RESTORE_PLAN_VALIDITY_SECS,
 };
+use aeronyx_server::config::ServerKeySource;
+use aeronyx_server::tee::DstackClient;
 use aeronyx_server::{ManagementClient, Server, ServerConfig};
 
 mod mailbox_probe;
@@ -1204,7 +1206,10 @@ async fn cmd_register(
         }
     }
 
-    let identity = if key_path.exists() {
+    let identity = if config.server_key.source == ServerKeySource::Dstack {
+        info!("Deriving node key from dstack KMS...");
+        load_node_identity(&config).await?
+    } else if key_path.exists() {
         info!("Loading existing node key...");
         load_key(&key_path).await?
     } else {
@@ -1335,8 +1340,8 @@ async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
         }
     };
 
-    let identity = if key_path.exists() {
-        load_key(&key_path).await?
+    let identity = if config.server_key.source == ServerKeySource::Dstack || key_path.exists() {
+        load_node_identity(&config).await?
     } else {
         println!();
         println!("❌ Server key not found!");
@@ -1392,9 +1397,9 @@ async fn cmd_status(config_path: PathBuf) -> anyhow::Result<()> {
 
     println!();
 
-    // Check key file
-    if key_path.exists() {
-        match load_key(&key_path).await {
+    // Check node identity
+    if config.server_key.source == ServerKeySource::Dstack || key_path.exists() {
+        match load_node_identity(&config).await {
             Ok(identity) => {
                 println!("Server Key:    ✅ Valid");
                 println!(
@@ -3229,8 +3234,7 @@ async fn load_relay_custody_identity(
     config: &ServerConfig,
     operation: &str,
 ) -> anyhow::Result<IdentityKeyPair> {
-    let identity_path = PathBuf::from(&config.server_key.key_file);
-    load_key(&identity_path)
+    load_node_identity(config)
         .await
         .map_err(|_| anyhow::anyhow!("relay custody {operation} requires the node identity key"))
 }
@@ -3335,15 +3339,11 @@ async fn cmd_memchain_verify_aof(
 /// Shows node public key (hidden command for troubleshooting).
 async fn cmd_pubkey(config_path: PathBuf, format: String) -> anyhow::Result<()> {
     let config = load_or_default_config(&config_path).await;
-    let key_path = PathBuf::from(&config.server_key.key_file);
-
-    if !key_path.exists() {
+    let Ok(identity) = load_node_identity(&config).await else {
         println!("❌ Node key not found. Register first:");
         println!("   aeronyx-server register --code <YOUR_CODE>");
         std::process::exit(1);
-    }
-
-    let identity = load_key(&key_path).await?;
+    };
 
     match format.as_str() {
         "base64" => println!("{}", identity.public_key()),
@@ -4194,13 +4194,7 @@ async fn open_directory_replica_store(
         .directory_chain_path
         .as_deref()
         .context("discovery.directory_chain_path is not configured")?;
-    let key_path = PathBuf::from(&config.server_key.key_file);
-    anyhow::ensure!(
-        key_path.exists(),
-        "node identity key not found: {}",
-        key_path.display()
-    );
-    let identity = load_key(&key_path).await?;
+    let identity = load_node_identity(&config).await?;
     let now = unix_timestamp()?;
     let (store, audit) =
         DirectoryReplicaStore::open(database_path, identity.public_key_bytes(), now)?;
@@ -4252,6 +4246,31 @@ async fn load_or_default_config(path: &PathBuf) -> ServerConfig {
         ServerConfig::load(path).await.unwrap_or_default()
     } else {
         ServerConfig::default()
+    }
+}
+
+/// Loads the node identity from its configured source.
+///
+/// [TEE-DSTACK 2026-10-09 by Claude] The single identity entry point for
+/// every command, so a dstack node never silently reads or creates a key file.
+async fn load_node_identity(config: &ServerConfig) -> anyhow::Result<IdentityKeyPair> {
+    match config.server_key.source {
+        ServerKeySource::File => {
+            let key_path = PathBuf::from(&config.server_key.key_file);
+            anyhow::ensure!(
+                key_path.exists(),
+                "node identity key not found: {}",
+                key_path.display()
+            );
+            load_key(&key_path).await
+        }
+        ServerKeySource::Dstack => {
+            let seed = DstackClient::new(&config.server_key.dstack_socket)
+                .derive_identity_seed()
+                .await
+                .context("derive node identity from dstack KMS")?;
+            Ok(IdentityKeyPair::from_bytes(&seed)?)
+        }
     }
 }
 
