@@ -489,7 +489,14 @@ async fn discovered_chat_relay_peer_receives_encrypted_envelope_fanout() {
         .expect("mock peer should remain in route candidate status");
     assert_eq!(row.route_health, "healthy");
     assert_eq!(row.route_consecutive_failures, 0);
-    assert_eq!(row.last_route_success_at, Some(now));
+    // [FLAKY-SECOND-ROLLOVER 2026-10-09 by Claude] Success is recorded at the
+    // real completion time, which can fall in the second after `now` was
+    // taken; 1 of 20 Linux runs failed on exactly that boundary.
+    let recorded = row.last_route_success_at.expect("route success timestamp");
+    assert!(
+        (now..=unix_now_secs()).contains(&recorded),
+        "route success recorded outside the request window"
+    );
     mock_peer.abort();
 }
 
