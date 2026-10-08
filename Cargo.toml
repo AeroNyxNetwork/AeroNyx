@@ -32,6 +32,9 @@
 # - Use workspace inheritance for common dependencies
 # - All crates should use the same async runtime (tokio)
 #
+# [RELICENSE 2026-10-08 by Claude] Workspace license MIT OR Apache-2.0 -> AGPL-3.0-only
+# (owner decision), and `repository` pointed at the real public repo; LICENSE and
+# README.md added. The app is a separate closed-source work and is not in this repo.
 # Last Modified: v0.2.1-PinnedToolchain - Clarified MSRV versus the exact
 # production release compiler declared by rust-toolchain.toml.
 # Last Modified: v0.2.0-BlindIssuer - Added an isolated blind-signing process.
@@ -55,8 +58,8 @@ edition = "2021"
 # contract. Production release reproducibility is separately pinned to one
 # exact compiler in rust-toolchain.toml.
 rust-version = "1.75"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/aeronyx/aeronyx-server"
+license = "AGPL-3.0-only"
+repository = "https://github.com/AeroNyxNetwork/AeroNyx"
 authors = ["AeroNyx Contributors"]
 keywords = ["privacy", "network", "encryption", "tunnel"]
 categories = ["network-programming", "cryptography"]
