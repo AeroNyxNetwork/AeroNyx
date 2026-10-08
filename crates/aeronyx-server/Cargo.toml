@@ -203,6 +203,8 @@ blind-rsa-signatures = "0.17.2"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+# [MAILBOX-WIRE 2026-10-09 by Claude] node <-> wire crate interop tests.
+aeronyx-mailbox-wire = { path = "../aeronyx-mailbox-wire" }
 tempfile = "3.12"
 tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
