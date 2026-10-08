@@ -1007,7 +1007,8 @@ use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
 use aeronyx_core::protocol::{
     DataPacket, MessageType, NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor,
     NodeDiscoveryMessage, NodePolicy, NodeProtocolFeature, OnionRouteFailureDisposition,
-    OnionRoutePlanError, OnionRoutePurpose, SignedNodeDescriptor, VerifiedOnionRoute,
+    OnionRoutePlanError, OnionRoutePurpose, SignedNodeDescriptor,
+    SignedPrivateOnionRecipientAuthorizationV1, VerifiedOnionRoute,
     PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2,
 };
 use aeronyx_transport::traits::{Transport, TunConfig};
@@ -1034,14 +1035,17 @@ use crate::api::chat_handlers::build_chat_router;
 #[cfg(test)]
 use crate::api::chat_peer::blind_relay_delivery_receipt_is_valid;
 use crate::api::chat_peer::{
-    build_chat_peer_router_with_anonymous_mailbox, prepare_peer_blind_relay_http_request_with,
+    build_chat_peer_router_with_private_recipient_admission_and_runtime,
+    prepare_peer_blind_relay_http_request_with,
     prepare_peer_chat_relay_request_v1, prepare_peer_chat_relay_request_v2,
     prepare_peer_chat_relay_request_v3, verify_blind_relay_delivery_receipt,
     verify_peer_chat_relay_receipt, BlindRelayDeliveryReceiptVerificationFailure,
     BlindRelayRequestPreparationError, DirectRelayReceiptVerificationFailure,
     PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayResponse, PeerChatRelayResponseV2,
-    PreparedAuthenticatedPeerChatRelayHttpRequest,
+    PeerRelaySharedRuntime, PreparedAuthenticatedPeerChatRelayHttpRequest,
+    PrivateBlindRelayAdmission,
 };
+use crate::api::reverse_onion::ReverseOnionApi;
 use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica_and_runtime;
 use crate::api::directory_replica_status::{
     build_directory_replica_status_router_with_witness_carrier, DirectoryReplicaStatusScope,
@@ -1098,6 +1102,7 @@ use crate::api::{
 use crate::config::{
     DiscoveryConfig, MemChainConfig, MemChainMode, ServerConfig, VectorQuantizationMode,
 };
+use crate::config_reverse_onion::ReverseOnionConfig;
 use crate::error::{Result, RuntimeTaskJoinFailureKind, ServerError};
 use crate::handlers::packet::DecryptedPayload;
 use crate::handlers::PacketHandler;
@@ -1149,6 +1154,8 @@ use crate::services::peer_store::{
     THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
     VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
 };
+use crate::services::reverse_onion_queue::ReverseOnionQueueLimits;
+use crate::services::reverse_onion_queue_db::{ReverseOnionQueueDb, ReverseOnionQueueDbConfig};
 use crate::services::{
     start_dns_proxy, BlindVaultService, DirectoryChainAppendReport, DirectoryChainStore,
     DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore, DirectoryReplicaSyncRuntime,
@@ -1223,6 +1230,7 @@ mod background_tasks;
 mod api_runtime;
 // [REVERSE-ONION-CARRIER 2026-10-04 by Codex] Bounded carrier; startup remains opt-in.
 mod reverse_onion_runtime;
+pub(crate) mod reverse_onion_source_runtime;
 // [SERVER-SESSION-RUNTIME-SPLIT 2026-09-25 by Codex] Keep VPN service
 // initialization and transport shutdown in one focused child; data-plane
 // handshake/session task bodies remain in data_plane_runtime.
@@ -1238,7 +1246,7 @@ use self::runtime_supervision::{
     custody_witness_runtime_failure, data_plane_receive_failure_action,
     required_runtime_supervisor_channel_closed, retry_required_data_plane_receive,
     take_pre_ready_runtime_failure, CriticalRuntimeFailure, DataPlaneReceiveFailureAction,
-    RequiredApiListenerExit, RuntimeTaskRegistry, RuntimeTaskShutdownOutcome,
+    RequiredApiListenerExit, RuntimeTaskShutdownOutcome,
     RuntimeTaskShutdownReport,
 };
 
@@ -1687,12 +1695,37 @@ pub struct Server {
     // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Never placed in the
     // generic abortable task registry. Disabled mode has no lifecycle object.
     reverse_recipient: Option<Arc<reverse_onion_runtime::RecipientServerLifecycle>>,
+    // [SOURCE-OWNED-SERVER 2026-10-05 by Codex] Internal callers retain this
+    // handle, not a second journal or an untracked transport task.
+    reverse_source: Option<Arc<reverse_onion_source_runtime::ReverseOnionSourceLifecycle>>,
+    reverse_run_started: Arc<AtomicBool>,
+    // [PHALA-ORDERED-RUN-STOP 2026-10-08 by Codex] Separate requested
+    // reverse shutdown from global dependency shutdown after ordered drain.
+    reverse_run_stop: runtime_supervision::ReverseRunStop,
     config: ServerConfig,
     identity: IdentityKeyPair,
     config_path: Option<PathBuf>,
     shutdown: Arc<AtomicBool>,
     shutdown_tx: broadcast::Sender<()>,
     custody_witness_runtime: Arc<CustodyWitnessRuntimeTelemetry>,
+}
+
+// [REVERSE-RUN-CANCELLATION 2026-10-05 by Codex] Dropping the public waiter
+// requests shutdown; the detached supervisor retains and drains dependencies.
+struct ReverseRunCancellation {
+    stop: runtime_supervision::ReverseRunStop,
+    recipient: Option<Arc<reverse_onion_runtime::RecipientServerLifecycle>>,
+    source: Option<Arc<reverse_onion_source_runtime::ReverseOnionSourceLifecycle>>,
+}
+
+impl Drop for ReverseRunCancellation {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.source { owner.request_stop(); }
+        if let Some(owner) = &self.recipient { owner.request_stop(); }
+        // [PHALA-ORDERED-RUN-STOP 2026-10-08 by Codex] The retained
+        // supervisor closes queue intake and drains before global broadcast.
+        self.stop.request_stop();
+    }
 }
 
 // [CHAT-DISPATCH-STORAGE-DECOUPLING 2026-09-02 by Codex] Keep optional
@@ -1752,7 +1785,12 @@ impl MemChainStorageRequirement {
             | MemChainMessage::WalletPresence { .. } => Self::IndependentRuntime,
             MemChainMessage::BroadcastRecord(_)
             | MemChainMessage::SyncRecordRequest { .. }
-            | MemChainMessage::SyncRecordResponse { .. } => Self::RecordStore,
+            | MemChainMessage::SyncRecordResponse { .. }
+            // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Keep sealed replica
+            // ingress on the durable record-store gate, not the Fact/AOF gate.
+            | MemChainMessage::BroadcastSealedMemoryV2ReplicaV1(_)
+            | MemChainMessage::SyncSealedMemoryV2RequestV1 { .. }
+            | MemChainMessage::SyncSealedMemoryV2ResponseV1 { .. } => Self::RecordStore,
             // Preserve the historical storage gate for every non-chat variant.
             // New wire variants therefore fail closed until they are explicitly
             // assigned to an independently configured runtime.
@@ -1849,6 +1887,302 @@ async fn open_endpoint_attestation_inbox(
     Ok(Some(Arc::new(inbox)))
 }
 
+// [REVERSE-ONION-SIGNED-STARTUP 2026-10-04 by Codex] The queue is promoted
+// only from one complete, current signed R/P authority bundle. Legacy
+// recipient-id-only configuration remains readable but never becomes a
+// routing or custody capability. The queue database and both node-peer
+// handlers share the same Arc so admission and durable state cannot diverge.
+struct ReverseOnionQueueRuntime {
+    api: Arc<ReverseOnionApi>,
+    private_admission: Option<Arc<PrivateBlindRelayAdmission>>,
+}
+
+// [PHALA-QUEUE-LIFECYCLE-OWNER 2026-10-07 by Codex] This owner survives
+// listener assembly and closes all retained router clones on every exit path.
+// Normal shutdown awaits the shared permit drain; Drop is the cancellation
+// fallback and deliberately cannot claim that blocking DB work has finished.
+impl ReverseOnionQueueRuntime {
+    fn request_stop(&self) {
+        self.api.request_stop();
+        if let Some(admission) = &self.private_admission {
+            admission.request_stop();
+        }
+    }
+
+    async fn shutdown_and_drain(&self) {
+        self.request_stop();
+        // Live composition verifies the same queue, semaphore and stop bit;
+        // retain both explicit drain contracts, ordered to avoid competing
+        // acquire-many waits on that shared semaphore.
+        self.api.shutdown_and_drain().await;
+        if let Some(admission) = &self.private_admission {
+            admission.shutdown_and_drain().await;
+        }
+    }
+}
+
+impl Drop for ReverseOnionQueueRuntime {
+    fn drop(&mut self) {
+        self.request_stop();
+    }
+}
+
+// [PHALA-QUEUE-CAPACITY-OPEN 2026-10-08 by Codex] Both startup modes fence
+// the blocking open's own clock, not merely the older async caller timestamp.
+// Failure drops the unopened runtime; no API or fresh admission is published.
+fn open_reverse_onion_queue_storage(
+    config: ReverseOnionQueueDbConfig,
+    existing_only: bool,
+    not_before: u64,
+) -> std::result::Result<ReverseOnionQueueDb,
+    crate::services::reverse_onion_queue_db::ReverseOnionQueueDbError> {
+    use crate::services::reverse_onion_queue_db::ReverseOnionQueueDbError;
+    let opened_at = unix_now_secs();
+    if not_before == 0 || opened_at == 0 || opened_at < not_before {
+        return Err(ReverseOnionQueueDbError::ClockUnavailable);
+    }
+    let queue = if existing_only {
+        ReverseOnionQueueDb::open_existing(config, opened_at)?
+    } else {
+        ReverseOnionQueueDb::open(config, opened_at)?
+    };
+    let ready_at = unix_now_secs();
+    if ready_at == 0 || ready_at < opened_at {
+        return Err(ReverseOnionQueueDbError::ClockUnavailable);
+    }
+    Ok(queue)
+}
+
+// [REVERSE-RECOVERY-BOOT 2026-10-05 by Codex] This owner exposes only
+// historical Claim/Result/evidence handling. It cannot enqueue ciphertext or
+// authorize new execution, and does not need yesterday's ephemeral KEM key.
+async fn open_reverse_onion_recovery_runtime(
+    config: &ReverseOnionConfig,
+    identity: &IdentityKeyPair,
+) -> Result<ReverseOnionQueueRuntime> {
+    config.validate()?;
+    let q = &config.queue;
+    if !q.enabled || !q.recovery_only || q.recipient_node_ids.len() != 1 {
+        return Err(ServerError::startup_failed("reverse recovery configuration rejected"));
+    }
+    let mut recipient = [0u8; 32];
+    hex::decode_to_slice(&q.recipient_node_ids[0], &mut recipient)
+        .map_err(|_| ServerError::startup_failed("reverse recovery recipient rejected"))?;
+    if recipient == identity.public_key_bytes() {
+        return Err(ServerError::startup_failed("reverse recovery recipient overlaps relay"));
+    }
+    // [REVERSE-ONION-ROUTE-CAP 2026-10-06 by Codex] Recovery enforces the
+    // same signed-route freshness ceiling without enabling fresh admission.
+    let limits = ReverseOnionQueueLimits::new(
+        u64::from(q.max_items), q.max_bytes, u64::from(q.max_items_per_recipient),
+        q.lease_max_secs, q.recovery_retention_secs,
+    ).and_then(|limits| limits.with_route_max_secs(q.route_max_secs))
+        .map_err(|_| ServerError::startup_failed("reverse recovery limits rejected"))?;
+    let physical_bytes = q.max_bytes.checked_mul(2)
+        .and_then(|bytes| bytes.checked_add((u64::from(q.max_items) + 256).checked_mul(4096)?))
+        .ok_or_else(|| ServerError::startup_failed("reverse recovery limits overflow"))?;
+    let db_config = ReverseOnionQueueDbConfig::new(q.db_path.clone().into(), physical_bytes, limits)
+        .map_err(|_| ServerError::startup_failed("reverse recovery storage rejected"))?;
+    let not_before = unix_now_secs();
+    let queue = tokio::task::spawn_blocking(move || {
+        open_reverse_onion_queue_storage(db_config, true, not_before)
+    }).await.map_err(|_| ServerError::startup_failed("reverse recovery opener failed"))?
+        .map_err(|_| ServerError::startup_failed("reverse recovery storage unavailable"))?;
+    let api = ReverseOnionApi::new(
+        Arc::new(queue), Arc::new(identity.clone()), recipient, q.max_in_flight,
+    ).map_err(|_| ServerError::startup_failed("reverse recovery API rejected"))?
+        .recovery_only();
+    Ok(ReverseOnionQueueRuntime { api: Arc::new(api), private_admission: None })
+}
+
+// [REVERSE-ONION-ROTATING-ROLE-GATE 2026-10-05 by Codex] Check the stable
+// route role on one current R/P snapshot without requiring an expiring token.
+pub(crate) fn reverse_onion_current_pull_roles_valid(
+    relay: &SignedNodeDescriptor,
+    recipient: &SignedNodeDescriptor,
+) -> bool {
+    use aeronyx_core::protocol::onion::ONION_FORWARD_HOP_REQUIRED_CAPABILITIES;
+
+    // [REVERSE-ONION-PINNED-HOST 2026-10-05 by Codex] The caller still
+    // requires an exact configured relay identity and pins DNS before I/O.
+    relay.descriptor.public_endpoint.as_deref()
+        .is_some_and(crate::api::reverse_onion_endpoint_supported)
+        && recipient.descriptor.public_endpoint.is_none()
+        // [PHALA-PRIVATE-DISCOVERY-ISOLATION 2026-10-06 by Codex] Require
+        // the descriptor's signed privacy policy, not endpoint omission alone.
+        && !recipient.descriptor.policy.public_discovery
+        && ONION_FORWARD_HOP_REQUIRED_CAPABILITIES
+            .iter()
+            .all(|capability| relay.descriptor.capabilities.contains(capability))
+        // [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex] P is a private
+        // read-only terminal. Its signed purpose-specific feature is the role
+        // proof; requiring generic ChatRelay would falsely require a public
+        // peer API surface that this recipient intentionally does not expose.
+        && OnionRoutePurpose::BlindVaultPull
+            .specialized_terminal_capability()
+            // [PHALA-PULL-ROLE-REPAIR 2026-10-08 by Codex] No public
+            // replica role is required; signed private terminal features are.
+            .is_none_or(|capability| recipient.descriptor.capabilities.contains(&capability))
+        && OnionRoutePurpose::BlindVaultPull
+            .required_terminal_protocol_features()
+            .iter()
+            .all(|feature| recipient.descriptor.advertises_protocol_feature(*feature))
+        && OnionRoutePurpose::BlindVaultPull
+            .required_path_protocol_features()
+            .iter()
+            .all(|feature| relay.descriptor.advertises_protocol_feature(*feature))
+        && relay.descriptor.x25519_kem_public().is_some()
+        && recipient.descriptor.x25519_kem_public().is_some()
+}
+
+async fn open_reverse_onion_queue_runtime(
+    config: &ReverseOnionConfig,
+    identity: &IdentityKeyPair,
+    peer_store: Arc<PeerStore>,
+    public_endpoint: Option<&str>,
+) -> Result<Option<ReverseOnionQueueRuntime>> {
+    let queue_config = &config.queue;
+    if !queue_config.enabled {
+        return Ok(None);
+    }
+    // [PHALA-QUEUE-IDENTITY-PINS 2026-10-08 by Codex] Embedded startup
+    // also validates resource limits before installing pins or opening SQL.
+    config.validate()?;
+    // [PHALA-REVERSE-QUEUE-ORIGIN-GATE 2026-10-06 by Codex] Keep startup
+    // fail-closed for embedders that bypass ServerConfig::validate.
+    if !public_endpoint.is_some_and(|endpoint| {
+        crate::api::reverse_onion_endpoint_supported(endpoint.trim())
+    }) {
+        return Err(ServerError::startup_failed(
+            "reverse onion queue requires a public HTTPS discovery endpoint",
+        ));
+    }
+    if queue_config.recovery_only {
+        return open_reverse_onion_recovery_runtime(config, identity).await.map(Some);
+    }
+    let pins = queue_config.live_identity_pins(identity.public_key_bytes())
+        .map_err(|_| ServerError::startup_failed("reverse onion identity policy rejected"))?;
+    let recipient_node_id = pins.recipient();
+    let now = unix_now_secs();
+    if now == 0 {
+        return Err(ServerError::startup_failed("reverse onion startup clock unavailable"));
+    }
+    // [PHALA-REVERSE-AUTHORITY-BOOTSTRAP 2026-10-06 by Codex] A supplied
+    // signed bundle is optional historical cache seed only. Live admission
+    // always resolves the current descriptor/grant epoch from PeerStore.
+    let seed = if queue_config.signed_private_admission_configured() {
+        let (relay, recipient, authorization) = queue_config
+            .signed_private_authority_material()
+            .map_err(|_| ServerError::startup_failed("reverse onion authority seed rejected"))?;
+        if relay.node_id() != identity.public_key_bytes()
+            || recipient.node_id() != recipient_node_id
+        {
+            return Err(ServerError::startup_failed("reverse onion identity seed mismatch"));
+        }
+        let current = startup_network::reverse_onion_recipient_seed_is_current(
+            identity.public_key_bytes(), &relay, &recipient, &authorization, now,
+        )?;
+        Some((recipient, current))
+    } else {
+        None
+    };
+    peer_store
+        .pin_private_onion_queue_identities(&pins)
+        .map_err(|_| ServerError::startup_failed("reverse onion identity policy capacity rejected"))?;
+    let source_ids = pins.into_sources();
+    if let Some((recipient, seed_is_current)) = seed {
+        if seed_is_current {
+            let _ = peer_store.seed_private_onion_route_descriptor(
+                &identity.public_key_bytes(), &recipient_node_id, recipient, now,
+                "reverse_onion_identity_seed",
+            );
+        }
+    }
+    // Queue/API startup precedes discovery gossip. Fresh work remains closed
+    // until the per-request authority snapshot sees current signed R/P/grant.
+    // [REVERSE-ONION-ROUTE-CAP 2026-10-06 by Codex] Route and execution
+    // horizons are now independently bounded from the signed configuration.
+    let limits = ReverseOnionQueueLimits::new(
+        u64::from(queue_config.max_items),
+        queue_config.max_bytes,
+        u64::from(queue_config.max_items_per_recipient),
+        queue_config.lease_max_secs,
+        queue_config.recovery_retention_secs,
+    )
+    .and_then(|limits| limits.with_route_max_secs(queue_config.route_max_secs))
+    .map_err(|_| ServerError::startup_failed("reverse onion queue limits rejected"))?;
+    let physical_bytes = queue_config
+        .max_bytes
+        .checked_mul(2)
+        .and_then(|value| {
+            value.checked_add(
+                (u64::from(queue_config.max_items) + 256).checked_mul(4096)?,
+            )
+        })
+        .ok_or_else(|| ServerError::startup_failed("reverse onion queue bounds overflow"))?;
+    let db_config = ReverseOnionQueueDbConfig::new(
+        queue_config.db_path.clone().into(),
+        physical_bytes,
+        limits,
+    )
+    .map_err(|_| ServerError::startup_failed("reverse onion queue configuration rejected"))?;
+    // [REVERSE-ONION-DISCOVERY-BOOTSTRAP 2026-10-05 by Codex] Open durable
+    // state independently of transient route freshness. No fresh work can be
+    // admitted until the request-time authority snapshot succeeds.
+    let queue = tokio::task::spawn_blocking(move || {
+        open_reverse_onion_queue_storage(db_config, false, now)
+    })
+        .await
+        .map_err(|_| ServerError::startup_failed("reverse onion queue startup task failed"))?
+        .map_err(|_| ServerError::startup_failed("reverse onion queue unavailable"))?;
+    let queue = Arc::new(queue);
+    // [REVERSE-ONION-DISCOVERY-BOOTSTRAP 2026-10-05 by Codex] Recheck clock
+    // monotonicity after the blocking open. Live route authority is deliberately
+    // not snapshotted into this process-lifetime capability.
+    let post_open_now = unix_now_secs();
+    if post_open_now == 0 || post_open_now < now {
+        return Err(ServerError::startup_failed(
+            "reverse onion startup clock moved backwards",
+        ));
+    }
+    let private_admission = Arc::new(
+        PrivateBlindRelayAdmission::new_pinned_identity_only(
+            identity.public_key_bytes(),
+            recipient_node_id,
+            OnionRoutePurpose::BlindVaultPull,
+            source_ids,
+            Arc::clone(&queue),
+            queue_config.max_in_flight,
+            // [REVERSE-ONION-ROUTE-CAP-WIRING 2026-10-06 by Codex] Route
+            // authorization lifetime and recipient execution lease are
+            // independent configured bounds; don't silently shorten route
+            // validity to the lease duration.
+            queue_config.route_max_secs,
+        )
+        .map_err(|_| ServerError::startup_failed("reverse onion private admission rejected"))?,
+    );
+    let api = Arc::new(
+        ReverseOnionApi::new(
+            queue,
+            Arc::new(identity.clone()),
+            private_admission.recipient_node_id(),
+            queue_config.max_in_flight,
+        )
+        // [REVERSE-ONION-LIVE-CLAIM-AUTH 2026-10-05 by Codex] Fresh Lease
+        // issuance shares both current descriptor/token authority and the
+        // queue DB semaphore with blind-relay admission. Historical exact
+        // Lease replay remains available through the same durable API.
+        .and_then(|api| api.with_live_private_admission(
+            Arc::clone(&private_admission), Arc::clone(&peer_store),
+        ))
+        .map_err(|_| ServerError::startup_failed("reverse onion API admission rejected"))?,
+    );
+    Ok(Some(ReverseOnionQueueRuntime {
+        api,
+        private_admission: Some(private_admission),
+    }))
+}
+
 // [ARCH-SPLIT 2026-10-02] Child modules keep the same call paths.
 mod bootstrap_import;
 mod discovery_advertisement;
@@ -1873,9 +2207,18 @@ impl Server {
             config.discovery.custody_audit_witness_auto_renewal_enabled,
             config.discovery.custody_audit_witness_max_age_secs,
         ));
+        // [REVERSE-SOURCE-API-ADMISSION 2026-10-05 by Codex] Use the same
+        // validated source limit for pre-body admission and runtime work.
+        let reverse_source_request_limit = config.reverse_onion.source.max_in_flight;
         Self {
             reverse_recipient: config.reverse_onion.recipient.enabled
                 .then(|| Arc::new(reverse_onion_runtime::RecipientServerLifecycle::new())),
+            reverse_source: config.reverse_onion.source.enabled
+                .then(|| Arc::new(reverse_onion_source_runtime::ReverseOnionSourceLifecycle::with_request_limit(
+                    reverse_source_request_limit,
+                ))),
+            reverse_run_started: Arc::new(AtomicBool::new(false)),
+            reverse_run_stop: runtime_supervision::ReverseRunStop::default(),
             config,
             identity,
             config_path,
@@ -1886,33 +2229,127 @@ impl Server {
     }
 
     pub async fn run(&self) -> Result<()> {
-        if self.config.reverse_onion.queue.enabled || self.config.reverse_onion.recipient.enabled {
+        let reverse_enabled = self.config.reverse_onion.queue.enabled
+            || self.config.reverse_onion.recipient.enabled || self.config.reverse_onion.source.enabled;
+        if reverse_enabled {
             self.config.validate()?;
+            // [PHALA-ORDERED-RUN-STOP 2026-10-08 by Codex] An operator
+            // stop before first poll has no runtime/storage owner to start.
+            if self.reverse_run_stop.is_requested() { return Ok(()); }
         }
         if self.config.reverse_onion.recipient.enabled
             && self.config.reverse_onion.recipient.relay_node_id.eq_ignore_ascii_case(&hex::encode(self.identity.public_key_bytes()))
         { return Err(ServerError::startup_failed("Recipient relay identity must differ from local identity")); }
+        // [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex] Install
+        // synchronously before startup is spawned or storage/network can yield.
+        // A setup failure has no accepted reverse work or registered tasks yet.
+        let signals = runtime_supervision::ProcessShutdownSignals::install()
+            .map_err(|failure| ServerError::runtime_failed(failure.task, failure.reason))?;
         // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] A cancelled public
         // startup waiter requests stop, never drops the owned startup stack.
         // That stack retains registry/dependencies through explicit worker drain.
-        let Some(lifecycle) = self.reverse_recipient.as_ref() else {
-            return self.run_owned().await;
-        };
-        if lifecycle.active.swap(true, Ordering::SeqCst) {
-            return Err(ServerError::startup_failed("Recipient lifecycle already started"));
+        if !reverse_enabled {
+            return self.run_owned(signals).await;
+        }
+        if self.reverse_run_started.swap(true, Ordering::SeqCst) {
+            return Err(ServerError::startup_failed("Reverse lifecycle already started"));
+        }
+        if let Some(lifecycle) = &self.reverse_recipient {
+            lifecycle.active.store(true, Ordering::SeqCst);
         }
         let owner = Self { config: self.config.clone(), identity: self.identity.clone(),
             config_path: self.config_path.clone(), shutdown: Arc::clone(&self.shutdown),
             shutdown_tx: self.shutdown_tx.clone(), custody_witness_runtime: Arc::clone(&self.custody_witness_runtime),
-            reverse_recipient: Some(Arc::clone(lifecycle)) };
-        let cancellation = reverse_onion_runtime::RecipientRunCancellation(Arc::clone(lifecycle));
-        let outcome = tokio::spawn(async move { owner.run_owned().await }).await
-            .map_err(|_| ServerError::startup_failed("Recipient-owned server task failed"));
+            reverse_recipient: self.reverse_recipient.clone(),
+            reverse_source: self.reverse_source.clone(),
+            reverse_run_started: Arc::clone(&self.reverse_run_started),
+            reverse_run_stop: self.reverse_run_stop.clone() };
+        let cancellation = ReverseRunCancellation {
+            stop: self.reverse_run_stop.clone(),
+            recipient: self.reverse_recipient.clone(), source: self.reverse_source.clone(),
+        };
+        let outcome = tokio::spawn(async move {
+            let result = owner.run_owned(signals).await;
+            // [PHALA-SHUTDOWN-FAULT-RECONCILIATION 2026-10-07 by Codex]
+            // Early startup errors also close every reverse gate before any
+            // await. Collect both drains even if the first owner reports failure.
+            if let Some(recipient) = &owner.reverse_recipient { recipient.request_stop(); }
+            if let Some(source) = &owner.reverse_source { source.request_stop(); }
+            let recipient_drain = if let Some(recipient) = &owner.reverse_recipient {
+                recipient.drain().await
+                    .map_err(|_| ServerError::startup_failed("Recipient drain failed"))
+            } else { Ok(()) };
+            let source_drain = if let Some(source) = &owner.reverse_source {
+                source.shutdown_and_drain().await
+                    .map_err(|_| ServerError::startup_failed("Source drain failed"))
+            } else { Ok(()) };
+            // All drains have already been attempted. Preserve the original
+            // startup/runtime failure rather than replace it with drain detail.
+            result?;
+            if let Some(failure) = runtime_supervision::reconcile_reverse_onion_runtime_failure(
+                None, owner.reverse_source.as_deref(), owner.reverse_recipient.as_deref(),
+            ) {
+                return Err(ServerError::runtime_failed(failure.task, failure.reason));
+            }
+            recipient_drain?;
+            source_drain?;
+            Ok(())
+        }).await.map_err(|_| ServerError::startup_failed("Reverse-owned server task failed"));
         drop(cancellation);
         outcome?
     }
 
-    async fn run_owned(&self) -> Result<()> {
+    pub(crate) fn reverse_onion_source(&self)
+        -> Option<Arc<reverse_onion_source_runtime::ReverseOnionSourceLifecycle>>
+    {
+        self.reverse_source.clone()
+    }
+
+    async fn run_owned(&self, mut signals: runtime_supervision::ProcessShutdownSignals) -> Result<()> {
+        // [PHALA-RETAINED-UNWIND-DRAIN 2026-10-07 by Codex] An outer
+        // owner retains registered dependencies even if startup/runtime unwinds.
+        // Disabled reverse roles preserve the prior abort-on-return policy.
+        let mut dependencies = runtime_supervision::ReverseRuntimeDependencies::default();
+        let reverse_enabled = self.config.reverse_onion.queue.enabled
+            || self.config.reverse_onion.recipient.enabled || self.config.reverse_onion.source.enabled;
+        let result = if reverse_enabled {
+            runtime_supervision::catch_reverse_runtime_unwind(
+                self.run_with_dependencies(&mut dependencies, &mut signals),
+            ).await
+        } else {
+            self.run_with_dependencies(&mut dependencies, &mut signals).await
+        };
+        if reverse_enabled && result.is_err() {
+            let drain = dependencies.drain_reverse_owners(
+                self.reverse_source.as_deref(), self.reverse_recipient.as_deref(),
+            ).await;
+            // Keep generic dependencies running through reverse drain. Only
+            // now publish global stop and hand handles to bounded shutdown.
+            self.publish_dependency_shutdown();
+            for report in Self::shutdown_runtime_tasks(dependencies.tasks.take_for_shutdown()).await {
+                if report.outcome != RuntimeTaskShutdownOutcome::Completed {
+                    warn!(task = report.name, outcome = ?report.outcome,
+                        "[RUNTIME] Task shutdown after reverse owner failure");
+                }
+            }
+            if drain.is_err() {
+                warn!("[RUNTIME] Reverse owner drain reported failure after server failure");
+            }
+        }
+        result
+    }
+
+    // [PHALA-RETAINED-UNWIND-DRAIN 2026-10-07 by Codex] The borrowed
+    // registry/queue cannot drop with this future; accepted operations own the
+    // remaining service Arcs. No generic abort precedes outer reverse drain.
+    async fn run_with_dependencies(
+        &self,
+        dependencies: &mut runtime_supervision::ReverseRuntimeDependencies,
+        signals: &mut runtime_supervision::ProcessShutdownSignals,
+    ) -> Result<()> {
+        let runtime_supervision::ReverseRuntimeDependencies {
+            tasks, queue: reverse_onion_queue_runtime,
+        } = dependencies;
         info!("Starting AeroNyx server v{}", env!("CARGO_PKG_VERSION"));
         // [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex] Static config parsing
         // cannot compare trust pins with the public key derived from the
@@ -1930,10 +2367,10 @@ impl Server {
         // only the first critical runtime failure. The receiver stays in the
         // main task so required listener loss can terminate the process.
         let (critical_failure_tx, mut critical_failure_rx) = mpsc::channel(1);
-        // [STARTUP-TASK-REGISTRY 2026-07-30 by Codex] Create ownership before
-        // the first process task can be spawned. Every later `?` then aborts
-        // work already started by this startup transaction.
-        let mut tasks = RuntimeTaskRegistry::default();
+        // [PHALA-RETAINED-UNWIND-DRAIN 2026-10-07 by Codex] run_owned
+        // established registry ownership before any process task can spawn.
+        // Reverse-enabled failures drain accepted work before task shutdown;
+        // disabled roles retain registry Drop's transactional startup abort.
 
         let peer_http_clients = PeerHttpClients::build(&self.config)?;
         info!(
@@ -1951,10 +2388,12 @@ impl Server {
         // and the old secret is unrecoverable. The grace window is tied to the
         // descriptor TTL so a previous key outlives any descriptor still in
         // circulation. See services::onion_keys.
-        crate::services::onion_keys::init_shared(
+        // [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] Do not advertise
+        // or accept private work after a failed key-policy initialization.
+        crate::services::onion_keys::try_init_shared(
             unix_now_secs(),
             self.config.discovery.descriptor_ttl_secs,
-        );
+        ).map_err(|_| ServerError::startup_failed("onion key initialization rejected"))?;
 
         let (ip_pool, sessions, routing) = self.init_services()?;
 
@@ -1965,6 +2404,16 @@ impl Server {
             info!("[MEMCHAIN] Disabled (mode=off)");
             (None, None, None, None)
         };
+        // [PHALA-SOURCE-MPI-COMPOSITION 2026-10-08 by Codex] The later
+        // MPI constructor requires this complete storage tuple. Refuse a
+        // partial composition before source open/migration or peer publication;
+        // the API root independently checks the actual constructed MPI state.
+        let source_mpi_mode = (storage.is_some() && vector_index.is_some()
+            && mempool.is_some() && aof_writer.is_some()).then_some(
+                if self.config.memchain.is_saas() { Mode::Saas } else { Mode::Local },
+            );
+        api_runtime::validate_reverse_source_api_composition(self.reverse_source.is_some(),
+            self.config.vpn_enabled(), source_mpi_mode)?;
         // [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Complete the
         // provider transaction before self descriptors, peer cache, gossip,
         // or AgentRelay capability can leave this process.
@@ -2062,15 +2511,40 @@ impl Server {
         let blind_vault_runtime_ready =
             Self::observe_blind_vault_admission_readiness(blind_vault.clone(), unix_now_secs())
                 .await;
+        // [PRIVATE-ONION-PULL-READINESS 2026-10-05 by Codex] Read-only
+        // terminal readiness is independent of public mutation admission.
+        // [REVERSE-ONION-LIVE-RECIPIENT-AUTHORITY 2026-10-05 by Codex] One
+        // policy helper keeps startup advertisement and grant renewal aligned.
+        let private_pull_runtime_ready = if self.config.reverse_onion.recipient.permits_new_claims() {
+            Self::observe_blind_vault_terminal_readiness(blind_vault.clone()).await
+        } else {
+            false
+        };
 
         let peer_store = self
             .init_peer_store_with_storage_runtime(
                 chat_relay_runtime_ready,
                 blind_vault_runtime_ready,
+                private_pull_runtime_ready,
                 anonymous_mailbox_runtime_ready,
                 peer_http_clients.control.as_ref(),
             )
             .await?;
+        *reverse_onion_queue_runtime = open_reverse_onion_queue_runtime(
+            &self.config.reverse_onion,
+            &self.identity,
+            Arc::clone(&peer_store),
+            self.config.effective_public_endpoint(),
+        )
+        .await?;
+        if let Some(source) = &self.reverse_source {
+            let runtime = reverse_onion_source_runtime::open_configured_source(
+                &self.config.reverse_onion.source, Arc::new(self.identity.clone()),
+                Arc::clone(&peer_store),
+            ).await.map_err(|_| ServerError::startup_failed("Source journal startup failed"))?;
+            source.install(runtime)
+                .map_err(|_| ServerError::startup_failed("Source installation rejected"))?;
+        }
         if self
             .config
             .memchain
@@ -2196,15 +2670,26 @@ impl Server {
             tasks.push(("discovery-gossip", task));
         }
 
-        let udp = Arc::new(
-            UdpTransport::bind_addr(self.config.listen_addr())
+        // [PHALA-NO-VPN-PROFILE 2026-10-06 by Codex] Keep peer HTTP services
+        // independent from the optional UDP/TUN client data plane.
+        let vpn_enabled = self.config.vpn_enabled();
+        let udp = Arc::new(if vpn_enabled {
+            let transport = UdpTransport::bind_addr(self.config.listen_addr())
                 .await
-                .map_err(|e| ServerError::startup_failed(format!("UDP bind: {}", e)))?,
-        );
-        info!("UDP transport listening on {}", self.config.listen_addr());
+                .map_err(|e| ServerError::startup_failed(format!("UDP bind: {}", e)))?;
+            info!("UDP transport listening on {}", self.config.listen_addr());
+            transport
+        } else {
+            info!("VPN data plane disabled; UDP/TUN listeners will not start");
+            UdpTransport::disabled()
+        });
 
         #[cfg(target_os = "linux")]
-        let tun = self.init_tun().await?;
+        let tun = if vpn_enabled {
+            Some(self.init_tun().await?)
+        } else {
+            None
+        };
 
         let server_pubkey_hex = hex::encode(self.identity.public_key_bytes());
 
@@ -2213,7 +2698,7 @@ impl Server {
         // and never records queried domains, DNS contents, destinations, or
         // client IPs. Operators may disable it when systemd-resolved or another
         // hardened host resolver intentionally owns gateway_ip:53.
-        if self.config.dns_proxy_enabled() {
+        if vpn_enabled && self.config.dns_proxy_enabled() {
             // [DNS-STARTUP-READINESS 2026-07-30 by Codex] Bind before
             // systemd READY so the node cannot advertise a usable privacy
             // data plane while its configured DNS listener is unavailable.
@@ -2233,11 +2718,13 @@ impl Server {
                     critical_failure_tx.clone(),
                 ),
             ));
-        } else {
+        } else if vpn_enabled {
             info!(
                 gateway_ip = %self.config.gateway_ip(),
                 "[DNS] Built-in VPN DNS proxy disabled by vpn.dns_proxy_enabled=false; expecting external gateway DNS listener"
             );
+        } else {
+            info!("VPN data plane disabled; DNS proxy will not start");
         }
 
         // v1.0.0-Membership: TrafficTracker must be created before
@@ -2307,53 +2794,55 @@ impl Server {
             ));
         }
 
-        let udp_task = self.spawn_udp_task(
-            Arc::clone(&udp),
-            #[cfg(target_os = "linux")]
-            Arc::clone(&tun),
-            Arc::clone(&handshake_service),
-            Arc::clone(&packet_handler),
-            Arc::clone(&voucher_verifier),
-            Arc::clone(&sessions),
-            session_event_sender.clone(),
-            mempool.clone(),
-            aof_writer.clone(),
-            storage.clone(),
-            vector_index.clone(),
-            self.config.memchain.clone(),
-            server_pubkey_hex.clone(),
-            chat_relay.clone(),
-            Arc::clone(&routing),
-            Arc::clone(&peer_store),
-            Arc::clone(&peer_http_clients.control),
-            Arc::clone(&traffic_tracker),
-        );
-        tasks.push((
-            "udp",
-            Self::supervise_required_runtime_task(
-                "udp",
-                udp_task,
-                Arc::clone(&self.shutdown),
-                critical_failure_tx.clone(),
-            ),
-        ));
-
-        #[cfg(target_os = "linux")]
-        {
-            let tun_task = self.spawn_tun_task(
-                Arc::clone(&tun),
+        if vpn_enabled {
+            let udp_task = self.spawn_udp_task(
                 Arc::clone(&udp),
+                #[cfg(target_os = "linux")]
+                Arc::clone(tun.as_ref().expect("VPN-enabled Linux runtime has TUN")),
+                Arc::clone(&handshake_service),
                 Arc::clone(&packet_handler),
+                Arc::clone(&voucher_verifier),
+                Arc::clone(&sessions),
+                session_event_sender.clone(),
+                mempool.clone(),
+                aof_writer.clone(),
+                storage.clone(),
+                vector_index.clone(),
+                self.config.memchain.clone(),
+                server_pubkey_hex.clone(),
+                chat_relay.clone(),
+                Arc::clone(&routing),
+                Arc::clone(&peer_store),
+                Arc::clone(&peer_http_clients.control),
+                Arc::clone(&traffic_tracker),
             );
             tasks.push((
-                "tun",
+                "udp",
                 Self::supervise_required_runtime_task(
-                    "tun",
-                    tun_task,
+                    "udp",
+                    udp_task,
                     Arc::clone(&self.shutdown),
                     critical_failure_tx.clone(),
                 ),
             ));
+
+            #[cfg(target_os = "linux")]
+            {
+                let tun_task = self.spawn_tun_task(
+                    Arc::clone(tun.as_ref().expect("VPN-enabled Linux runtime has TUN")),
+                    Arc::clone(&udp),
+                    Arc::clone(&packet_handler),
+                );
+                tasks.push((
+                    "tun",
+                    Self::supervise_required_runtime_task(
+                        "tun",
+                        tun_task,
+                        Arc::clone(&self.shutdown),
+                        critical_failure_tx.clone(),
+                    ),
+                ));
+            }
         }
 
         let cleanup_task = self.spawn_cleanup_task(
@@ -2374,13 +2863,15 @@ impl Server {
         );
         tasks.push(("traffic-snapshot", snapshot_task));
 
-        let keepalive_task = self.spawn_keepalive_probe_task(
-            Arc::clone(&sessions),
-            Arc::clone(&udp),
-            Arc::clone(&packet_handler),
-            self.config.gateway_ip(),
-        );
-        tasks.push(("vpn-keepalive", keepalive_task));
+        if vpn_enabled {
+            let keepalive_task = self.spawn_keepalive_probe_task(
+                Arc::clone(&sessions),
+                Arc::clone(&udp),
+                Arc::clone(&packet_handler),
+                self.config.gateway_ip(),
+            );
+            tasks.push(("vpn-keepalive", keepalive_task));
+        }
 
         if let Some(ref relay) = chat_relay {
             let relay_cleanup_task = self.spawn_chat_relay_cleanup_task(Arc::clone(relay));
@@ -2621,6 +3112,13 @@ impl Server {
                     chat_relay.clone(),
                     blind_vault.clone(),
                     blind_vault_replica_admission.clone(),
+                    reverse_onion_queue_runtime
+                        .as_ref()
+                        .map(|runtime| Arc::clone(&runtime.api)),
+                    reverse_onion_queue_runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.private_admission.clone()),
+                    self.reverse_source.clone(),
                     anonymous_mailbox.clone(),
                     anonymous_mailbox_source.clone(),
                     Arc::clone(&udp),
@@ -2675,33 +3173,43 @@ impl Server {
                 tasks.push(("memchain-coordinator-lease", lease_task));
             }
 
-            if let Some(ref router) = llm_router {
-                let worker = TaskWorker::new(
-                    Arc::clone(st),
-                    Arc::clone(router),
-                    self.config.memchain.supernode.worker.clone(),
-                );
-                let worker_shutdown = self.shutdown_tx.subscribe();
-                // [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Once the
-                // operator enables SuperNode, its worker is required runtime.
-                // Unexpected return or panic must revoke process readiness.
-                let worker_task = tokio::spawn(async move {
-                    worker.run(worker_shutdown).await;
-                });
-                tasks.push((
-                    "supernode-worker",
-                    Self::supervise_required_runtime_task(
+            // [MEMCHAIN-PHALA-E2EE-BOUNDARY 2026-10-06 by Codex] Startup rejects
+            // server-side model routing until a client-to-TEE E2EE transport is
+            // available; retain this mode gate as defense in depth.
+            if is_saas {
+                if let Some(ref router) = llm_router {
+                    let worker = TaskWorker::new(
+                        Arc::clone(st),
+                        Arc::clone(router),
+                        self.config.memchain.supernode.worker.clone(),
+                    )
+                    .with_full_entity_extraction_allowed(
+                        self.config.memchain.supernode.privacy.is_full_allowed(
+                            crate::config_supernode::CognitiveTaskType::EntityExtraction,
+                        ),
+                    );
+                    let worker_shutdown = self.shutdown_tx.subscribe();
+                    // [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Once the
+                    // operator enables SuperNode, its worker is required runtime.
+                    // Unexpected return or panic must revoke process readiness.
+                    let worker_task = tokio::spawn(async move {
+                        worker.run(worker_shutdown).await;
+                    });
+                    tasks.push((
                         "supernode-worker",
-                        worker_task,
-                        Arc::clone(&self.shutdown),
-                        critical_failure_tx.clone(),
-                    ),
-                ));
-                info!(
-                    poll_interval = self.config.memchain.supernode.worker.poll_interval_secs,
-                    max_concurrent = self.config.memchain.supernode.worker.max_concurrent,
-                    "[SUPERNODE] TaskWorker spawned"
-                );
+                        Self::supervise_required_runtime_task(
+                            "supernode-worker",
+                            worker_task,
+                            Arc::clone(&self.shutdown),
+                            critical_failure_tx.clone(),
+                        ),
+                    ));
+                    info!(
+                        poll_interval = self.config.memchain.supernode.worker.poll_interval_secs,
+                        max_concurrent = self.config.memchain.supernode.worker.max_concurrent,
+                        "[SUPERNODE] TaskWorker spawned"
+                    );
+                }
             }
 
             if is_saas {
@@ -2747,7 +3255,9 @@ impl Server {
                     if let (Some(ref sp), Some(ref sys_db)) =
                         (&mpi_state.storage_pool, &mpi_state.system_db)
                     {
-                        let scheduler = crate::miner::MinerScheduler::new(
+                        // [MEMCHAIN-PHALA-EXTRACTION 2026-10-05 by Codex] Only
+                        // the validated SaaS privacy policy can opt this queue in.
+                        let scheduler = crate::miner::MinerScheduler::new_with_full_entity_extraction_allowed(
                             Arc::clone(sp),
                             Arc::clone(sys_db),
                             self.config
@@ -2766,6 +3276,9 @@ impl Server {
                             llm_router.clone(),
                             embed_engine.clone(),
                             ner_engine.clone(),
+                            self.config.memchain.supernode.privacy.is_full_allowed(
+                                crate::config_supernode::CognitiveTaskType::EntityExtraction,
+                            ),
                         )
                         .await?;
                         let mut sched_rx = self.shutdown_tx.subscribe();
@@ -2820,7 +3333,12 @@ impl Server {
                         miner.with_llm_router(Arc::clone(lr))
                     } else {
                         miner
-                    };
+                    }
+                    .with_full_entity_extraction_allowed(
+                        self.config.memchain.supernode.privacy.is_full_allowed(
+                            crate::config_supernode::CognitiveTaskType::EntityExtraction,
+                        ),
+                    );
 
                     // Reconcile a bounded backlog before announcing startup.
                     // This packs only verified opaque commitments; it never
@@ -2865,6 +3383,13 @@ impl Server {
                     chat_relay.clone(),
                     blind_vault.clone(),
                     blind_vault_replica_admission.clone(),
+                    reverse_onion_queue_runtime
+                        .as_ref()
+                        .map(|runtime| Arc::clone(&runtime.api)),
+                    reverse_onion_queue_runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.private_admission.clone()),
+                    self.reverse_source.clone(),
                     anonymous_mailbox.clone(),
                     anonymous_mailbox_source.clone(),
                     Arc::clone(&udp),
@@ -2899,30 +3424,112 @@ impl Server {
             if let Some(failure) = take_pre_ready_runtime_failure(&mut critical_failure_rx) {
                 Some(failure)
             } else {
-                if self.reverse_recipient.as_ref().is_some_and(|owner| owner.is_cancelled()) {
-                    return Ok(None);
-                }
-                if let Some(owner) = self.reverse_recipient.as_ref() {
-                    owner.verify_ready().await.map_err(|_| ServerError::startup_failed("Recipient readiness unavailable"))?;
+                let recipient_wait_failed = if let Some(owner) = self.reverse_recipient.as_ref() {
+                    // [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex]
+                    // Readiness is read-only and may be cancelled; its worker
+                    // remains owned through the ordered drain below.
+                    tokio::select! {
+                        ready = owner.verify_ready() => ready.is_err(),
+                        // [PHALA-ORDERED-RUN-STOP 2026-10-08 by Codex]
+                        // Both stop carriers wake a pending readiness barrier;
+                        // neither publishes global dependency shutdown here.
+                        _ = async {
+                            tokio::select! {
+                                _ = signals.wait() => {},
+                                _ = self.reverse_run_stop.cancelled() => {},
+                            }
+                        } => {
+                            owner.request_stop();
+                            if let Some(source) = self.reverse_source.as_ref() { source.request_stop(); }
+                            if let Some(queue) = reverse_onion_queue_runtime.as_ref() { queue.request_stop(); }
+                            false
+                        },
+                    }
+                } else { false };
+                // [PHALA-READY-PUBLICATION 2026-10-07 by Codex] Every
+                // asynchronous readiness barrier precedes this fresh final
+                // snapshot. No yield between the decision and READY; stopped
+                // owners drain normally and known faults retain their bucket.
+                // [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex]
+                // Consume buffered startup stop before publishing READY.
+                let decision = runtime_supervision::pre_ready_runtime_decision(
+                    &mut critical_failure_rx,
+                    &self.shutdown,
+                    self.reverse_source.as_deref(),
+                    self.reverse_recipient.as_deref(),
+                    recipient_wait_failed,
+                );
+                match self.reverse_run_stop.before_ready(signals.before_ready(decision)) {
+                    runtime_supervision::PreReadyRuntimeDecision::Ready => {}
+                    runtime_supervision::PreReadyRuntimeDecision::Stopped => return Ok(None),
+                    runtime_supervision::PreReadyRuntimeDecision::Failed(failure) => return Ok(Some(failure)),
                 }
                 systemd_notifier.ready("AeroNyx privacy node is ready")?;
                 info!("Server started successfully");
                 if let Some(owner) = self.reverse_recipient.as_ref() {
-                    tokio::select! {
-                        failure = self.wait_for_shutdown(&mut critical_failure_rx) => failure,
+                    let failure = tokio::select! {
+                        failure = self.wait_for_shutdown(&mut critical_failure_rx, signals) => failure,
+                        failure = runtime_supervision::wait_for_reverse_onion_source_failure(
+                            self.reverse_source.as_deref(),
+                        ) => Some(failure),
                         _ = owner.cancelled() => None,
+                        // [PHALA-RECIPIENT-PREFLIGHT-FAULT 2026-10-07 by Codex]
+                        // Stop other intake when local failure is known; do
+                        // not wait for accepted terminal work to finish drain.
+                        unexpected = owner.wait_for_unexpected_worker_failure_or_exit() => {
+                            unexpected.then(runtime_supervision::reverse_onion_recipient_worker_exited)
+                        },
+                    };
+                    failure
+                } else {
+                    tokio::select! {
+                        failure = self.wait_for_shutdown(&mut critical_failure_rx, signals) => failure,
+                        failure = runtime_supervision::wait_for_reverse_onion_source_failure(
+                            self.reverse_source.as_deref(),
+                        ) => Some(failure),
                     }
-                } else { self.wait_for_shutdown(&mut critical_failure_rx).await }
+                }
             };
-        Ok(runtime_failure)
+        // [PHALA-SHUTDOWN-FAULT-RECONCILIATION 2026-10-07 by Codex]
+        // This covers both source-only and combined-role select branches.
+        Ok(runtime_supervision::reconcile_reverse_onion_runtime_failure(
+            runtime_failure, self.reverse_source.as_deref(), self.reverse_recipient.as_deref(),
+        ))
         }.await;
         // Stop only reverse intake first. Keep peer router dependencies and the
         // generic task registry alive until worker + adapter + DB drain finishes.
+        // [REVERSE-OWNER-DRAIN 2026-10-05 by Codex] Close every admission
+        // gate before awaiting any owner, and collect failures only after all
+        // owners have drained their cancellation-surviving work.
+        if let Some(owner) = &self.reverse_recipient { owner.request_stop(); }
+        if let Some(source) = &self.reverse_source { source.request_stop(); }
+        if let Some(queue) = reverse_onion_queue_runtime.as_ref() {
+            queue.request_stop();
+        }
         let reverse_drain = if let Some(owner) = self.reverse_recipient.as_ref() {
             owner.drain().await.map_err(|_| ServerError::startup_failed("Recipient drain failed"))
         } else { Ok(()) };
-        let runtime_failure = api_runtime_result?;
-        reverse_drain?;
+        let source_drain = if let Some(source) = &self.reverse_source {
+            source.shutdown_and_drain().await
+                .map_err(|_| ServerError::startup_failed("Source drain failed"))
+        } else { Ok(()) };
+        // [REVERSE-QUEUE-DRAIN 2026-10-05 by Codex] Both admission paths stop
+        // before either drain; cancelled HTTP futures still hold worker permits.
+        if let Some(queue) = reverse_onion_queue_runtime.as_ref() {
+            queue.shutdown_and_drain().await;
+        }
+        // [PHALA-SHUTDOWN-FAULT-RECONCILIATION 2026-10-07 by Codex]
+        // A completion writer may publish its fault after select returned.
+        // Snapshot only after all reverse owners/queue permits have drained.
+        let runtime_failure = runtime_supervision::reconcile_reverse_onion_runtime_failure(
+            api_runtime_result?, self.reverse_source.as_deref(), self.reverse_recipient.as_deref(),
+        );
+        // Keep an already selected critical fault and finish generic shutdown.
+        // Drain-only errors still fail closed when no owner published a fault.
+        if runtime_failure.is_none() {
+            reverse_drain?;
+            source_drain?;
+        }
         if let Some(failure) = runtime_failure.as_ref() {
             error!(
                 task = failure.task,
@@ -2940,8 +3547,7 @@ impl Server {
         }
         info!("Shutting down server...");
 
-        self.shutdown.store(true, Ordering::SeqCst);
-        let _ = self.shutdown_tx.send(());
+        self.publish_dependency_shutdown();
 
         // [TASK-SHUTDOWN 2026-07-29 by Codex] Every task received the same
         // broadcast already, so join them concurrently. This bounds total
@@ -2983,10 +3589,12 @@ impl Server {
         Self::shutdown_udp_transport(udp.as_ref()).await;
 
         if let (Some(ref st), Some(ref mp), Some(ref aw)) = (&storage, &mempool, &aof_writer) {
+            let sqlite_count = st.count().await;
+            let aof_count = aw.lock().await.write_count();
             info!(
-                sqlite = st.count().await,
+                sqlite = sqlite_count,
                 mempool = mp.count(),
-                aof = aw.lock().await.write_count(),
+                aof = aof_count,
                 "Shutdown complete (MemChain stats)"
             );
         } else {
@@ -3021,6 +3629,105 @@ impl std::fmt::Debug for Server {
 
 #[cfg(test)]
 mod tests {
+    // [PHALA-RETAINED-UNWIND-DRAIN 2026-10-07 by Codex] Authored, not
+    // run: retain the production queue across an inner unwind, close both
+    // intake clones, and wait for an accepted permit before dropping its owner.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_unwind_retains_queue_until_accepted_work_drains() {
+        use std::sync::{Arc, atomic::Ordering};
+        use super::runtime_supervision::{catch_reverse_runtime_unwind, ReverseRuntimeDependencies};
+        let directory = tempfile::Builder::new().prefix("phala-queue-unwind-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+        let relay = aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[0x74; 32]).unwrap();
+        let recipient = aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[0x75; 32]).unwrap();
+        let source = aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[0x76; 32]).unwrap();
+        let mut config = crate::config_reverse_onion::ReverseOnionConfig::default();
+        config.queue.enabled = true;
+        config.queue.db_path = directory.path().join("queue.sqlite").display().to_string();
+        config.queue.recipient_node_ids = vec![hex::encode(recipient.public_key_bytes())];
+        config.queue.source_node_ids = vec![hex::encode(source.public_key_bytes())];
+        config.queue.max_in_flight = 1;
+        let mut dependencies = ReverseRuntimeDependencies::default();
+        dependencies.queue = super::open_reverse_onion_queue_runtime(
+            &config, &relay, Arc::new(crate::services::peer_store::PeerStore::new()),
+            Some("https://relay.example.net"),
+        ).await.unwrap();
+        let queue = dependencies.queue.as_ref().unwrap();
+        let api = queue.api.clone();
+        let admission = queue.private_admission.as_ref().unwrap().clone();
+        let accepted_work = admission.try_queue_permit().unwrap();
+        let failed = catch_reverse_runtime_unwind(async {
+            tokio::task::yield_now().await;
+            panic!("synthetic queue owner unwind payload");
+        }).await.unwrap_err();
+        assert!(matches!(failed, crate::error::ServerError::RuntimeFailed { task, reason }
+            if task == "reverse-owned-server" && reason == "required reverse server owner unwound"));
+        assert!(!admission.queue_stop_signal().load(Ordering::Acquire));
+        let mut drain = Box::pin(dependencies.drain_reverse_owners(None, None));
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        assert!(admission.queue_stop_signal().load(Ordering::Acquire));
+        assert!(admission.try_queue_permit().is_err());
+        let response = api.handle_source_query(axum::body::Bytes::from(vec![0;
+            aeronyx_core::protocol::onion::reverse_delivery::REVERSE_ONION_SOURCE_QUERY_BYTES]),
+            1_800_000_000).await;
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        drop(drain);
+        drop(accepted_work);
+        dependencies.drain_reverse_owners(None, None).await.unwrap();
+        dependencies.drain_reverse_owners(None, None).await.unwrap();
+        drop(dependencies);
+        assert!(admission.try_queue_permit().is_err());
+    }
+
+    // [PHALA-QUEUE-LIFECYCLE-OWNER 2026-10-07 by Codex] Authored, not run.
+    // Cancellation closes retained router capabilities but never pretends that
+    // accepted, cancellation-surviving DB work has already drained.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_queue_runtime_closes_retained_router_owners() {
+        let directory = tempfile::Builder::new()
+            .prefix("phala-queue-owner-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+        let relay = aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap();
+        let recipient = aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[0x72; 32]).unwrap();
+        let source = aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[0x73; 32]).unwrap();
+        let mut config = crate::config_reverse_onion::ReverseOnionConfig::default();
+        config.queue.enabled = true;
+        config.queue.db_path = directory.path().join("queue.sqlite").to_string_lossy().into_owned();
+        config.queue.recipient_node_ids = vec![hex::encode(recipient.public_key_bytes())];
+        config.queue.source_node_ids = vec![hex::encode(source.public_key_bytes())];
+        config.queue.max_in_flight = 1;
+        let runtime = super::open_reverse_onion_queue_runtime(
+            &config, &relay,
+            std::sync::Arc::new(crate::services::peer_store::PeerStore::new()),
+            Some("https://relay.example.net"),
+        ).await.unwrap().unwrap();
+        let api = std::sync::Arc::clone(&runtime.api);
+        let admission = runtime.private_admission.as_ref().unwrap().clone();
+        let accepted_work = admission.try_queue_permit().unwrap();
+        drop(runtime);
+
+        assert!(admission.queue_stop_signal().load(std::sync::atomic::Ordering::Acquire));
+        assert!(admission.try_queue_permit().is_err());
+        let response = api.handle_source_query(
+            axum::body::Bytes::from(vec![0;
+                aeronyx_core::protocol::onion::reverse_delivery::REVERSE_ONION_SOURCE_QUERY_BYTES]),
+            1_800_000_000,
+        ).await;
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        let drain = api.shutdown_and_drain();
+        tokio::pin!(drain);
+        tokio::select! {
+            biased;
+            _ = &mut drain => panic!("runtime drop discarded an accepted DB-work permit"),
+            _ = std::future::ready(()) => {}
+        }
+        drop(accepted_work);
+        drain.await;
+        assert!(admission.try_queue_permit().is_err());
+    }
+
     // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Authored, unexecuted.
     #[tokio::test]
     async fn incomplete_reverse_queue_is_rejected_without_starting_server() {
@@ -3054,6 +3761,7 @@ mod tests {
     };
 
     use super::{
+        reverse_onion_current_pull_roles_valid,
         await_commitment_tip_announcement_or_newer,
         commitment_coordinator_lease_degraded_retry_delay,
         commitment_coordinator_lease_production_valid_for, commitment_follower_success_retry_delay,
@@ -3063,6 +3771,7 @@ mod tests {
         custody_witness_runtime_failure, data_plane_receive_failure_action,
         discovery_heartbeat_status_value, memchain_index_rejection_reason,
         open_endpoint_attestation_inbox, open_endpoint_evidence_store,
+        startup_network::reverse_onion_recipient_seed_is_current,
         peer_store_heartbeat_status_value, prefix_to_netmask,
         required_runtime_supervisor_channel_closed, retry_required_data_plane_receive,
         take_pre_ready_runtime_failure, unix_now_secs, CommitmentCoordinatorLeaseRound,
@@ -3078,7 +3787,7 @@ mod tests {
         PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryAnchorState,
         PeerStoreVerifiedClientDeliveryCacheEvidence,
         PeerStoreVerifiedClientDeliveryExternalWitnessDecision, RequiredApiListenerExit,
-        RuntimeTaskRegistry, RuntimeTaskShutdownOutcome, RuntimeTaskShutdownReport, Server,
+        RuntimeTaskShutdownOutcome, RuntimeTaskShutdownReport, Server,
         SystemdNotifier, BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
         BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
         COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS, DATA_PLANE_RECV_FAILURE_LIMIT,
@@ -3093,6 +3802,9 @@ mod tests {
         VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
     };
+    // [PHALA-RETAINED-UNWIND-DRAIN 2026-10-07 by Codex] Registry-only
+    // contract fixtures do not require a production parent-module import.
+    use super::runtime_supervision::RuntimeTaskRegistry;
     use crate::api::chat_peer::{
         build_chat_peer_router, PeerBlindRelayRequest, PeerBlindRelayResponse,
         PeerChatRelayReceiptV2, PeerChatRelayRequest, PeerChatRelayRequestV2,
@@ -3187,6 +3899,8 @@ mod tests {
     mod peer_cache;
     mod remaining;
     mod runtime_supervision;
+    // [REVERSE-ONION-WORKER-SUPERVISION 2026-10-05 by Codex]
+    mod reverse_onion_worker_supervision;
     mod session_vpn;
     mod startup_runtime;
     mod verified_submit;
@@ -4321,6 +5035,14 @@ mod tests {
         DiscoveryGossipExecution {
             client,
             peer_store,
+            local_identity: None,
+            // [PHALA-PRIVATE-EGRESS-ORIGIN 2026-10-07 by Codex] Existing
+            // public gossip fixtures retain their ordinary egress policy.
+            private_recipient: None,
+            private_authorization_target: None,
+            // [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex]
+            private_authorization_source_targets: &[],
+            private_authorization_recipient: None,
             directory_announcements,
             peer_identity_hints: None,
             now,

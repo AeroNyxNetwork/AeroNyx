@@ -102,6 +102,10 @@ impl Default for NetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VpnConfig {
+    /// [PHALA-NO-VPN-PROFILE 2026-10-06 by Codex] Defaults true for backwards compatibility.
+    /// Whether this node runs the UDP/TUN VPN data plane.
+    #[serde(default = "default_vpn_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_ip_range")]
     pub virtual_ip_range: String,
     #[serde(default = "default_gateway_ip")]
@@ -115,6 +119,9 @@ pub struct VpnConfig {
 fn default_ip_range() -> String {
     "100.64.0.0/22".into()
 }
+fn default_vpn_enabled() -> bool {
+    true
+}
 fn default_gateway_ip() -> Ipv4Addr {
     Ipv4Addr::new(100, 64, 0, 1)
 }
@@ -124,13 +131,17 @@ fn default_dns_proxy_enabled() -> bool {
 
 impl VpnConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        // [PHALA-NO-VPN-PROFILE 2026-10-06 by Codex] Keep the shared IP-range
+        // schema valid, but do not require an active UDP carrier in relay mode.
         if !self.virtual_ip_range.contains('/') {
             return Err(ServerError::config_invalid(
                 "vpn.virtual_ip_range",
                 "must be CIDR",
             ));
         }
-        self.transports.validate()?;
+        if self.enabled {
+            self.transports.validate()?;
+        }
         Ok(())
     }
 
@@ -162,6 +173,7 @@ impl VpnConfig {
 impl Default for VpnConfig {
     fn default() -> Self {
         Self {
+            enabled: default_vpn_enabled(),
             virtual_ip_range: default_ip_range(),
             gateway_ip: default_gateway_ip(),
             dns_proxy_enabled: default_dns_proxy_enabled(),
@@ -409,7 +421,9 @@ mod tests {
 
     #[test]
     fn test_vpn_default_valid() {
-        assert!(VpnConfig::default().validate().is_ok());
+        let config = VpnConfig::default();
+        assert!(config.enabled);
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -419,6 +433,17 @@ mod tests {
             ..Default::default()
         };
         assert!(vc.validate().is_err());
+    }
+
+    // [PHALA-NO-VPN-PROFILE 2026-10-06 by Codex]
+    #[test]
+    fn test_vpn_disabled_does_not_validate_unused_tunnel_settings() {
+        let config = VpnConfig {
+            enabled: false,
+            virtual_ip_range: "unused".into(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

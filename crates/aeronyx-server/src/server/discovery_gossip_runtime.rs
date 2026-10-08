@@ -7,6 +7,54 @@
 // the parent module; no route, receipt, quarantine, or backpressure contract
 // changes are introduced by this extraction.
 use super::*;
+// [PHALA-NODE-COMPILE-REPAIR 2026-10-08 by Codex] Keep the same
+// cfg-gated loopback policy as the outbound transport owner.
+use super::chat_outbound_runtime::is_test_loopback_peer_endpoint;
+use crate::services::discovery_peer_sampling::sample_public_gossip_peers_with_policy;
+
+// [PHALA-APPRAISAL-TASK-OWNERSHIP 2026-10-07 by Codex] The gossip
+// future owns one child even when startup unwinds or its registry aborts it.
+// Blocking QVL/publication work may outlive async cancellation; the shared
+// stop bit fences publication without releasing QVL's retained permit early.
+pub(super) struct PhalaAppraisalTaskOwner {
+    task: Option<JoinHandle<()>>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl PhalaAppraisalTaskOwner {
+    pub(super) fn new() -> Self {
+        Self { task: None, stopped: Arc::new(AtomicBool::new(false)) }
+    }
+
+    pub(super) fn can_start(&self) -> bool {
+        !self.stopped.load(Ordering::Acquire)
+            && self.task.as_ref().is_none_or(|task| task.is_finished())
+    }
+
+    pub(super) fn stop_signal(&self) -> Arc<AtomicBool> { Arc::clone(&self.stopped) }
+
+    pub(super) fn start(&mut self, work: impl std::future::Future<Output = ()> + Send + 'static) -> bool {
+        if !self.can_start() { return false; }
+        self.task = Some(tokio::spawn(work));
+        true
+    }
+
+    fn request_stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        if let Some(task) = &self.task { task.abort(); }
+    }
+
+    pub(super) async fn stop_and_join(&mut self) {
+        self.request_stop();
+        // Keep the handle owned if this join itself is cancelled.
+        if let Some(task) = self.task.as_mut() { let _ = task.await; }
+        self.task = None;
+    }
+}
+
+impl Drop for PhalaAppraisalTaskOwner {
+    fn drop(&mut self) { self.request_stop(); }
+}
 
 /// Minimal additive fields read from a peer's public discovery summary.
 ///
@@ -49,6 +97,39 @@ pub(super) enum DirectoryProofGossipResult {
     RateLimited,
     ProtocolRejected,
     TransportFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiscoveryGossipTargetPolicy {
+    round_peer_limit: usize,
+    include_operator_seeds: bool,
+    include_cached_peers: bool,
+}
+
+impl DiscoveryGossipTargetPolicy {
+    fn for_config(config: &ServerConfig, backpressure_active: bool) -> Self {
+        // [PHALA-PRIVATE-RECIPIENT-RELAY-ONLY 2026-10-06 by Codex] A private
+        // worker may refresh only its operator-pinned relay; neither configured
+        // seeds nor cached public peers are outbound authority for this role.
+        if config.reverse_onion.recipient.enabled {
+            return Self {
+                round_peer_limit: 1,
+                include_operator_seeds: false,
+                include_cached_peers: false,
+            };
+        }
+
+        let seed_limit = config.discovery.seed_endpoints.len().max(1);
+        Self {
+            round_peer_limit: if backpressure_active {
+                usize::from(config.discovery.gossip_peer_limit).min(seed_limit)
+            } else {
+                usize::from(config.discovery.gossip_peer_limit)
+            },
+            include_operator_seeds: true,
+            include_cached_peers: !backpressure_active || config.discovery.seed_endpoints.is_empty(),
+        }
+    }
 }
 
 impl DirectoryProofGossipResult {
@@ -238,6 +319,18 @@ impl std::fmt::Display for DiscoveryGossipFailure {
 #[derive(Debug, Default)]
 pub(super) struct DiscoveryPeerIdentityHints {
     pub(super) by_url: HashMap<String, Option<[u8; 32]>>,
+    // Keep the route's transport pin separate from gossip identity hints:
+    // identity ambiguity must not silently select the generic DNS client.
+    private_transport_by_url: HashMap<String, Option<[u8; 32]>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// [PHALA-NODE-COMPILE-REPAIR 2026-10-08 by Codex] Internal scope also
+// admits the existing server-level policy regression fixtures.
+pub(super) enum GossipTransportPin {
+    Generic,
+    Pinned([u8; 32]),
+    Reject,
 }
 
 impl DiscoveryPeerIdentityHints {
@@ -257,6 +350,39 @@ impl DiscoveryPeerIdentityHints {
     pub(super) fn unique_node_id(&self, url: &str) -> Option<[u8; 32]> {
         self.by_url.get(url).copied().flatten()
     }
+
+    // [REVERSE-ONION-GOSSIP-FAIL-CLOSED 2026-10-06 by Codex]
+    pub(super) fn observe_private_transport_target(
+        &mut self,
+        url: String,
+        node_id: [u8; 32],
+    ) {
+        match self.private_transport_by_url.entry(url) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(node_id));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref() != Some(&node_id) {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+
+    pub(super) fn transport_pin_for(
+        &self,
+        url: &str,
+        verified_node_id: Option<[u8; 32]>,
+    ) -> GossipTransportPin {
+        match self.private_transport_by_url.get(url) {
+            None => GossipTransportPin::Generic,
+            Some(None) => GossipTransportPin::Reject,
+            Some(Some(expected)) if verified_node_id.is_some_and(|node| node != *expected) => {
+                GossipTransportPin::Reject
+            }
+            Some(Some(expected)) => GossipTransportPin::Pinned(*expected),
+        }
+    }
 }
 
 /// Immutable dependencies and policy for one outbound gossip round.
@@ -268,6 +394,18 @@ impl DiscoveryPeerIdentityHints {
 pub(super) struct DiscoveryGossipExecution<'a> {
     pub(super) client: &'a reqwest::Client,
     pub(super) peer_store: &'a PeerStore,
+    pub(super) local_identity: Option<&'a IdentityKeyPair>,
+    /// [PHALA-PRIVATE-EGRESS-ORIGIN 2026-10-07 by Codex] Applies to all
+    /// private-recipient gossip, including recovery-only descriptor refresh.
+    pub(super) private_recipient: Option<&'a crate::config_reverse_onion::ReverseOnionRecipientConfig>,
+    /// The one R identity for which a local P may issue its grant.
+    pub(super) private_authorization_target: Option<[u8; 32]>,
+    /// [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex] Exact,
+    /// bounded operator-pinned source identities selected for this round.
+    pub(super) private_authorization_source_targets: &'a [[u8; 32]],
+    /// P identity named by the local queue's operator pin; signatures and
+    /// current descriptors still come from authenticated gossip.
+    pub(super) private_authorization_recipient: Option<[u8; 32]>,
     pub(super) directory_announcements: &'a [DirectoryReplicaGossipAnnouncement],
     /// Verified `PeerStore` identity hints keyed by canonical gossip URL.
     ///
@@ -385,6 +523,28 @@ impl DiscoveryGossipRoundAccumulator {
 }
 
 impl Server {
+    // [PHALA-APPRAISAL-EGRESS-PIN 2026-10-07 by Codex] Derive outbound
+    // appraisal scope from enabled roles, including recovery-only startup.
+    // Invalid private configuration disables appraisal, never public fallback.
+    pub(super) fn phala_peer_appraisal_egress_for_config(
+        config: &ServerConfig,
+    ) -> Option<crate::services::peer_store::PhalaPeerAppraisalEgress> {
+        use crate::services::peer_store::PhalaPeerAppraisalEgress;
+        if config.reverse_onion.recipient.enabled {
+            let mut relay = [0u8; 32];
+            let pin = &config.reverse_onion.recipient.relay_node_id;
+            if pin.len() != 64 || hex::decode_to_slice(pin, &mut relay).is_err() { return None; }
+            return PhalaPeerAppraisalEgress::fixed_relay(
+                relay, &config.reverse_onion.recipient.relay_endpoint, true,
+            );
+        }
+        if config.reverse_onion.source.enabled {
+            let (relay, _, endpoint) = config.reverse_onion.source.identity_pins().ok()?;
+            return PhalaPeerAppraisalEgress::fixed_relay(relay, &endpoint, false);
+        }
+        Some(PhalaPeerAppraisalEgress::discovery())
+    }
+
     pub(super) fn spawn_discovery_gossip_task(
         &self,
         peer_store: Arc<PeerStore>,
@@ -403,12 +563,26 @@ impl Server {
         let self_node_id = identity.public_key_bytes();
         let shutdown = Arc::clone(&self.shutdown);
         let mut rx = self.shutdown_tx.subscribe();
+        let phala_appraisal_egress = Self::phala_peer_appraisal_egress_for_config(&config);
 
         Some(tokio::spawn(async move {
             let mut run_immediately = true;
             let mut last_blind_relay_probe_at = 0u64;
             let mut last_two_hop_blind_relay_probe_at = 0u64;
             let mut last_three_hop_blind_relay_probe_at = 0u64;
+            // [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex] Keep
+            // source delivery bounded by the existing concurrency policy and
+            // an eight-target cap; ordinary peer selection remains independent.
+            let mut private_authorization_source_cursor = 0usize;
+            // [PHALA-AUTHORITY-DESCRIPTOR-EPOCH 2026-10-08 by Codex]
+            // The owner retains public bytes only, after PeerStore accepted
+            // them. A new task/process starts fresh; no persisted KEM secret
+            // or cached self descriptor can restore this local generation.
+            let mut private_authority_descriptor_epoch = None;
+            // [PHALA-PEER-ATTESTATION-SCHEDULER 2026-10-06 by Codex] Appraise
+            // at most one advertised Phala peer per discovery round.
+            let mut phala_peer_attestation_cursor = 0usize;
+            let mut phala_peer_appraisals = PhalaAppraisalTaskOwner::new();
             'gossip: loop {
                 if run_immediately {
                     run_immediately = false;
@@ -441,33 +615,168 @@ impl Server {
                 }
 
                 let now = unix_now_secs();
+                if config.discovery.phala_attested_peers_required
+                    && phala_peer_appraisals.can_start()
+                {
+                    // [PHALA-PINNED-RELAY-APPRAISAL 2026-10-07 by Codex]
+                    // A fixed recovery relay need not publish public discovery.
+                    // Only PeerStore can mint that private appraisal scope;
+                    // ordinary peers and Stage-A promotion keep their own gate.
+                    if let Some(target) = phala_appraisal_egress.as_ref().and_then(|egress| {
+                        peer_store.next_phala_peer_appraisal_target(
+                            now, config.discovery.max_peers, phala_peer_attestation_cursor, egress,
+                        )
+                    }) {
+                        let descriptor = target.descriptor().clone();
+                        phala_peer_attestation_cursor =
+                            phala_peer_attestation_cursor.wrapping_add(1);
+                        let appraisal_store = Arc::clone(&peer_store);
+                        let trusted_app_ids = config.discovery.phala_trusted_app_ids.clone();
+                        let trusted_compose_hashes =
+                            config.discovery.phala_trusted_compose_hashes.clone();
+                        // [PHALA-APPRAISAL-TASK-OWNERSHIP 2026-10-07 by Codex]
+                        let appraisal_stopped = phala_peer_appraisals.stop_signal();
+                        let appraisal_shutdown = Arc::clone(&shutdown);
+                        phala_peer_appraisals.start(async move {
+                            if appraisal_stopped.load(Ordering::Acquire)
+                                || appraisal_shutdown.load(Ordering::Acquire) { return; }
+                            // [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex]
+                            // The verifier owns the common timeout/permits. Cache
+                            // its challenge age, never restamp network evidence.
+                            if let Ok(appraisal) = crate::api::discovery::verify_phala_peer_appraisal_target(
+                                &target, &trusted_app_ids, &trusted_compose_hashes,
+                            ).await {
+                                // Route authority may be draining a DB writer;
+                                // do not synchronously wait on the async worker.
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    appraisal_store.record_verified_phala_peer_attestation_if(
+                                        &descriptor, &appraisal, || {
+                                            !appraisal_stopped.load(Ordering::SeqCst)
+                                                && !appraisal_shutdown.load(Ordering::SeqCst)
+                                        },
+                                    )
+                                }).await;
+                            }
+                        });
+                    }
+                }
                 // Rotate the onion key on the discovery cadence (no-op until the
                 // rotation period elapses). Forward secrecy — see onion_keys.
-                crate::services::onion_keys::tick_rotation(now);
+                // [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] No new
+                // authority is signed for a failed/rollback key observation.
+                if crate::services::onion_keys::try_tick_rotation(now).is_err() {
+                    peer_store.record_gossip_round(
+                        now, 0, 0, 0, Some("onion_key_epoch_rejected".to_string()),
+                    );
+                    continue;
+                }
                 // [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex]
                 // Refresh physical/logical admission readiness every gossip
                 // round. A stale `BlindVaultReplica` claim could otherwise
                 // route fresh replicas to a node that is already fail-closed.
                 let blind_vault_runtime_ready =
                     Self::observe_blind_vault_admission_readiness(blind_vault.clone(), now).await;
-                let Ok(self_descriptor) = Self::build_self_discovery_descriptor_for_runtime_state(
+                // [PRIVATE-ONION-PULL-READINESS 2026-10-05 by Codex] Renew
+                // the operation feature only while the read-only terminal is
+                // actually reachable; public admission policy is independent.
+                // [REVERSE-ONION-LIVE-RECIPIENT-AUTHORITY 2026-10-05 by Codex]
+                let private_pull_runtime_ready = if config.reverse_onion.recipient.permits_new_claims() {
+                    Self::observe_blind_vault_terminal_readiness(blind_vault.clone()).await
+                } else {
+                    false
+                };
+                // [REVERSE-ONION-AUTHORITY-RENEWAL 2026-10-05 by Codex] The
+                // current R descriptor/KEM is refreshed normally. P's signed
+                // authority is checked per new enqueue against this PeerStore.
+                // [PHALA-SELF-DESCRIPTOR-SEQUENCE 2026-10-08 by Codex]
+                // Choose the counter before signing nested runtime policies.
+                let self_sequence = match Self::private_authority_self_descriptor_sequence(
+                    &config, &identity, private_authority_descriptor_epoch.as_ref(), &peer_store, now,
+                ) {
+                    Ok(sequence) => sequence,
+                    Err(_) => {
+                        peer_store.record_gossip_round(
+                            now, 0, 0, 0, Some("self_descriptor_sequence_rejected".to_string()),
+                        );
+                        continue;
+                    }
+                };
+                let self_descriptor = match Self::pinned_private_experiment_self_descriptor_for(
                     &config,
                     &identity,
                     now,
                     chat_relay_runtime_ready,
                     blind_vault_runtime_ready,
                     anonymous_mailbox_runtime_ready,
-                ) else {
-                    warn!("[DISCOVERY] Skipping outbound gossip; self descriptor build failed");
-                    peer_store.record_gossip_round(
+                ) {
+                    Ok(Some(descriptor)) => descriptor,
+                    Ok(None) => match Self::build_self_discovery_descriptor_for_runtime_state_with_private_pull_and_sequence(
+                        &config,
+                        &identity,
                         now,
-                        0,
-                        0,
-                        0,
-                        Some("self_descriptor_build_failed".to_string()),
-                    );
-                    continue;
+                        chat_relay_runtime_ready,
+                        blind_vault_runtime_ready,
+                        anonymous_mailbox_runtime_ready,
+                        private_pull_runtime_ready,
+                        self_sequence,
+                    ) {
+                        Ok(descriptor) => descriptor,
+                        Err(_) => {
+                            warn!("[DISCOVERY] Skipping outbound gossip; self descriptor build failed");
+                            peer_store.record_gossip_round(
+                                now,
+                                0,
+                                0,
+                                0,
+                                Some("self_descriptor_build_failed".to_string()),
+                            );
+                            continue;
+                        }
+                    },
+                    Err(_) => {
+                        // [REVERSE-ONION-GOSSIP-FALLBACK 2026-10-04 by Codex]
+                        // A stale private experiment must stop only its
+                        // private advertisement/admission. Keep ordinary
+                        // discovery exchange, directory proofs, and route
+                        // probes alive with the normal runtime descriptor.
+                        warn!("[DISCOVERY] Private reverse-onion authority unavailable; falling back to ordinary descriptor");
+                        match Self::build_self_discovery_descriptor_for_runtime_state_with_private_pull_and_sequence(
+                            &config,
+                            &identity,
+                            now,
+                            chat_relay_runtime_ready,
+                            blind_vault_runtime_ready,
+                            anonymous_mailbox_runtime_ready,
+                            private_pull_runtime_ready,
+                            self_sequence,
+                        ) {
+                            Ok(descriptor) => descriptor,
+                            Err(_) => {
+                                warn!("[DISCOVERY] Skipping outbound gossip; self descriptor build failed");
+                                peer_store.record_gossip_round(
+                                    now,
+                                    0,
+                                    0,
+                                    0,
+                                    Some("self_descriptor_build_failed".to_string()),
+                                );
+                                continue;
+                            }
+                        }
+                    }
                 };
+                // [PHALA-AUTHORITY-DESCRIPTOR-EPOCH 2026-10-08 by Codex]
+                // Build current readiness/KEM first, then retain an unchanged
+                // signed epoch without extending its original expiry.
+                // [PHALA-SELF-DESCRIPTOR-SEQUENCE 2026-10-08 by Codex]
+                // An independently imported newer local descriptor must not
+                // cause the owner to re-publish its older readiness surface.
+                let cached_self = peer_store.get_signature_verified_cached(&self_node_id);
+                let retained_owner = private_authority_descriptor_epoch.as_ref().filter(|owner|
+                    cached_self.as_ref().map_or(true, |cached| cached == *owner));
+                let self_descriptor = Self::select_private_authority_descriptor_epoch(
+                    &config, self_descriptor, retained_owner, now,
+                );
                 // [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex]
                 // Keep local route selection aligned with the descriptor sent
                 // to peers. Otherwise this process could retain its startup
@@ -489,20 +798,17 @@ impl Server {
                     continue;
                 }
 
+                private_authority_descriptor_epoch = Some(self_descriptor.clone());
+
                 let consecutive_failures = peer_store.consecutive_gossip_failures();
                 let backpressure_active = Self::discovery_gossip_backpressure_active(
                     &config.discovery,
                     consecutive_failures,
                 );
-                let peer_limit = usize::from(config.discovery.gossip_peer_limit);
-                let seed_limit = config.discovery.seed_endpoints.len().max(1);
-                let round_peer_limit = if backpressure_active {
-                    peer_limit.min(seed_limit)
-                } else {
-                    peer_limit
-                };
-                let include_cached_peers =
-                    !backpressure_active || config.discovery.seed_endpoints.is_empty();
+                let target_policy =
+                    DiscoveryGossipTargetPolicy::for_config(&config, backpressure_active);
+                let round_peer_limit = target_policy.round_peer_limit;
+                let include_cached_peers = target_policy.include_cached_peers;
                 let self_gossip_url = config
                     .discovery
                     .public_endpoint
@@ -513,18 +819,123 @@ impl Server {
                 let mut gossip_urls = Vec::new();
                 let mut gossip_peer_identity_hints = DiscoveryPeerIdentityHints::default();
 
-                for endpoint in &config.discovery.seed_endpoints {
-                    let Some(url) = Self::discovery_gossip_url(endpoint) else {
-                        continue;
+                if target_policy.include_operator_seeds {
+                    for endpoint in &config.discovery.seed_endpoints {
+                        let Some(url) = Self::discovery_gossip_url(endpoint) else {
+                            continue;
+                        };
+                        if self_gossip_url.as_deref() == Some(url.as_str()) {
+                            continue;
+                        }
+                        if seen_urls.insert(url.clone()) {
+                            gossip_urls.push(url);
+                        }
+                        if gossip_urls.len() >= round_peer_limit {
+                            break;
+                        }
+                    }
+                }
+
+                // [REVERSE-ONION-AUTHORITY-GOSSIP 2026-10-05 by Codex]
+                // The private recipient's pinned relay endpoint bootstraps the
+                // first signed descriptor exchange; later rounds use the exact
+                // verified descriptor identity hint above.
+                // [PHALA-RECIPIENT-DESCRIPTOR-RECOVERY 2026-10-06 by Codex]
+                // Both live and recovery-only workers need this pinned
+                // transport to refresh the relay descriptor. Grant issuance
+                // remains separately gated by permits_new_claims below.
+                if config.reverse_onion.recipient.enabled {
+                    if let Some(url) = Self::reverse_onion_private_gossip_url(
+                        &config.reverse_onion.recipient.relay_endpoint,
+                    ) {
+                        let mut relay_id = [0u8; 32];
+                        let relay_hint = hex::decode_to_slice(
+                            &config.reverse_onion.recipient.relay_node_id, &mut relay_id,
+                        ).is_ok();
+                        if relay_hint {
+                            gossip_peer_identity_hints.observe_private_transport_target(
+                                url.clone(), relay_id,
+                            );
+                            gossip_peer_identity_hints.observe_verified(url.clone(), relay_id);
+                        }
+                        if self_gossip_url.as_deref() != Some(url.as_str())
+                            && seen_urls.insert(url.clone())
+                        {
+                            gossip_urls.push(url);
+                        }
+                    }
+                }
+
+                // [REVERSE-ONION-AUTHORITY-GOSSIP 2026-10-05 by Codex]
+                // A source always refreshes through its configured relay
+                // identity, even when an expired descriptor is not yet a
+                // routeable PeerStore candidate.
+                if config.reverse_onion.source.enabled {
+                    if let Ok((relay_id, _, endpoint)) =
+                        config.reverse_onion.source.identity_pins()
+                    {
+                        if let Some(url) = Self::reverse_onion_private_gossip_url(&endpoint) {
+                            if self_gossip_url.as_deref() != Some(url.as_str()) {
+                                gossip_peer_identity_hints.observe_private_transport_target(
+                                    url.clone(), relay_id,
+                                );
+                                gossip_peer_identity_hints.observe_verified(url.clone(), relay_id);
+                                if seen_urls.insert(url.clone()) {
+                                    gossip_urls.push(url);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // [PHALA-PRIVATE-EGRESS-ORIGIN 2026-10-07 by Codex] The
+                // configured relay target above also serves recovery. Never
+                // append a signed descriptor's rotated endpoint: identity/key
+                // renewal is not operator permission to disclose P elsewhere.
+
+                // [REVERSE-ONION-AUTHORITY-GOSSIP 2026-10-05 by Codex]
+                // [PHALA-REVERSE-AUTHORITY-BOOTSTRAP 2026-10-06 by Codex]
+                // The relay forwards P's current signed grant only to a
+                // configured source. Descriptor/grant delivery is a gossip
+                // bootstrap; the queue still enforces the same current signed
+                // R/P/grant snapshot at every durable effect boundary.
+                // [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex]
+                // Keep the selected bounded pin batch immutable for the round.
+                let (private_authorization_recipient, private_authorization_source_targets) =
+                    if config.reverse_onion.queue.enabled
+                        && !config.reverse_onion.queue.recovery_only
+                    {
+                        // [PHALA-QUEUE-IDENTITY-PINS 2026-10-08 by Codex]
+                        // Never forward a grant using a partially parsed or
+                        // role-overlapping operator allowlist.
+                        match config.reverse_onion.queue.live_identity_pins(identity.public_key_bytes()) {
+                            Ok(pins) => {
+                                let selected = Self::private_authorization_source_batch(
+                                    pins.sources(), &mut private_authorization_source_cursor,
+                                    usize::from(config.discovery.gossip_concurrency_limit),
+                                );
+                                (Some(pins.recipient()), selected)
+                            }
+                            Err(_) => (None, Vec::new()),
+                        }
+                    } else {
+                        (None, Vec::new())
                     };
-                    if self_gossip_url.as_deref() == Some(url.as_str()) {
-                        continue;
-                    }
-                    if seen_urls.insert(url.clone()) {
-                        gossip_urls.push(url);
-                    }
-                    if gossip_urls.len() >= round_peer_limit {
-                        break;
+                for source_id in private_authorization_source_targets.iter().copied() {
+                    if let Some(source) = peer_store.get_valid(&source_id, now) {
+                        if let Some(endpoint) = source.descriptor.public_endpoint.as_deref() {
+                            if let Some(url) = Self::reverse_onion_private_gossip_url(endpoint) {
+                                if self_gossip_url.as_deref() != Some(url.as_str()) {
+                                    gossip_peer_identity_hints.observe_private_transport_target(
+                                        url.clone(), source_id,
+                                    );
+                                    gossip_peer_identity_hints.observe_verified(url.clone(), source_id);
+                                    if seen_urls.insert(url.clone()) {
+                                        gossip_urls.push(url);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -539,7 +950,14 @@ impl Server {
                     // colliding descriptor cannot hide just beyond fan-out.
                     for (peer_node_id, endpoint) in peer_store.valid_public_endpoint_identities(now)
                     {
-                        let Some(url) = Self::discovered_peer_gossip_url(&endpoint) else {
+                        let Some(descriptor) = peer_store.get_valid(&peer_node_id, now) else {
+                            continue;
+                        };
+                        let Some(url) = Self::attested_discovered_peer_gossip_url(
+                            &peer_store,
+                            &descriptor,
+                            now,
+                        ) else {
                             continue;
                         };
                         if self_gossip_url.as_deref() == Some(url.as_str()) {
@@ -652,6 +1070,18 @@ impl Server {
                 let execution = DiscoveryGossipExecution {
                     client: gossip_http_client.as_ref(),
                     peer_store: &peer_store,
+                    local_identity: Some(&identity),
+                    private_recipient: config.reverse_onion.recipient.enabled
+                        .then_some(&config.reverse_onion.recipient),
+                    // [REVERSE-ONION-LIVE-RECIPIENT-AUTHORITY 2026-10-05 by Codex]
+                    private_authorization_target: if config.reverse_onion.recipient.permits_new_claims() {
+                        let mut target = [0u8; 32];
+                        hex::decode_to_slice(&config.reverse_onion.recipient.relay_node_id, &mut target)
+                            .ok().map(|()| target)
+                    } else { None },
+                    // [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex]
+                    private_authorization_source_targets: &private_authorization_source_targets,
+                    private_authorization_recipient,
                     directory_announcements: &directory_gossip_announcements,
                     peer_identity_hints: Some(&gossip_peer_identity_hints),
                     now,
@@ -716,7 +1146,10 @@ impl Server {
                 if shutdown.load(Ordering::Acquire) {
                     break 'gossip;
                 }
-                if chat_relay_runtime_ready && gossip_round.succeeded > 0 {
+                if chat_relay_runtime_ready
+                    && !config.reverse_onion.recipient.enabled
+                    && gossip_round.succeeded > 0
+                {
                     let probe_now = unix_now_secs();
                     let probe_cooldown_secs = Self::blind_relay_probe_cooldown_secs_for_status(
                         &config.discovery,
@@ -812,6 +1245,7 @@ impl Server {
                     }
                 }
             }
+            phala_peer_appraisals.stop_and_join().await;
         }))
     }
 
@@ -1089,14 +1523,79 @@ impl Server {
         let peer_node_id = execution
             .peer_identity_hints
             .and_then(|hints| hints.unique_node_id(url));
-        let directory_proof = if execution.directory_announcements.is_empty() {
+        let transport_pin = execution.peer_identity_hints
+            .map(|hints| hints.transport_pin_for(url, peer_node_id))
+            .unwrap_or(GossipTransportPin::Generic);
+        // [PHALA-PRIVATE-EGRESS-ORIGIN 2026-10-07 by Codex] Fence the actual
+        // request boundary too, before DNS, proofs, or private announcement.
+        // This is independent of live grant issuance, so recovery cannot
+        // accidentally fall back to generic gossip transport.
+        let private_egress_rejected = execution.private_recipient.is_some_and(|recipient| {
+            !Self::private_recipient_gossip_target_allowed(recipient, peer_node_id, url)
+        });
+        if transport_pin == GossipTransportPin::Reject || private_egress_rejected {
+            return DiscoveryPeerGossipReport {
+                directory_proof: DirectoryProofGossipOutcome::negotiation_failed(
+                    DirectoryProofGossipResult::TransportFailed,
+                ),
+                legacy_error: Some(DiscoveryGossipFailure::peer_timeout()),
+            };
+        }
+        // [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex] Only
+        // selected pinned sources get the private transport path this round.
+        let private_target = peer_node_id.is_some_and(|peer_id| {
+            execution.private_authorization_target == Some(peer_id)
+                || execution.private_authorization_source_targets.contains(&peer_id)
+        });
+        // [PHALA-DNS-SEED-PIN 2026-10-07 by Codex] Operator seeds have no
+        // descriptor identity hint, but HTTPS DNS must still resolve to a
+        // wholly public answer set before the generic gossip client connects.
+        let dns_target_requires_pin = reqwest::Url::parse(url)
+            .is_ok_and(|parsed| crate::api::peer_http_target_requires_dns_pin(&parsed));
+        let pinned_target = if matches!(transport_pin, GossipTransportPin::Pinned(_))
+            || private_target
+            || dns_target_requires_pin
+        {
+            let parsed = reqwest::Url::parse(url).ok();
+            match parsed {
+                Some(url) => match crate::api::resolve_pinned_peer_http_target(
+                    url, execution.peer_timeout,
+                ).await {
+                    Ok(target) => Some(target),
+                    Err(_) => return DiscoveryPeerGossipReport {
+                        directory_proof: DirectoryProofGossipOutcome::negotiation_failed(
+                            DirectoryProofGossipResult::TransportFailed,
+                        ),
+                        legacy_error: Some(DiscoveryGossipFailure::peer_timeout()),
+                    },
+                },
+                None => return DiscoveryPeerGossipReport {
+                    directory_proof: DirectoryProofGossipOutcome::negotiation_failed(
+                        DirectoryProofGossipResult::TransportFailed,
+                    ),
+                    legacy_error: Some(DiscoveryGossipFailure::peer_timeout()),
+                },
+            }
+        } else {
+            None
+        };
+        let client = pinned_target.as_ref()
+            .map(|target| &target.client)
+            .unwrap_or(execution.client);
+        let peer_url = pinned_target.as_ref()
+            .map(|target| target.url.as_str())
+            .unwrap_or(url);
+        let remaining_proof_budget = proof_budget.saturating_sub(started_at.elapsed());
+        let directory_proof = if execution.directory_announcements.is_empty()
+            || remaining_proof_budget.is_zero()
+        {
             DirectoryProofGossipOutcome::default()
         } else {
             tokio::time::timeout(
-                proof_budget,
+                remaining_proof_budget,
                 Self::gossip_directory_proofs_with_peer(
-                    execution.client,
-                    url,
+                    client,
+                    peer_url,
                     execution.directory_announcements,
                     peer_node_id,
                 ),
@@ -1112,9 +1611,9 @@ impl Server {
         let legacy_error = tokio::time::timeout(
             legacy_budget,
             Self::gossip_legacy_with_peer(
-                execution.client,
+                client,
                 execution.peer_store,
-                url,
+                peer_url,
                 self_descriptor,
                 execution.now,
                 execution.snapshot_limit,
@@ -1125,6 +1624,129 @@ impl Server {
             |_| Some(DiscoveryGossipFailure::peer_timeout()),
             |result| result.err(),
         );
+
+        // [REVERSE-ONION-AUTHORITY-GOSSIP 2026-10-05 by Codex] P issues the
+        // fresh grant to its configured R; R later forwards the exact signed
+        // grant only to selected source identities in its configured allowlist.
+        // Both directions require the target's signed support feature and a
+        // successful legacy descriptor exchange first.
+        if legacy_error.is_none() {
+            // [PHALA-AUTHORITY-GOSSIP-FENCE 2026-10-07 by Codex] Legacy
+            // exchange/DNS may consume the round's timestamp. Renewal starts
+            // from a new wall-clock sample; rollback never mints a fresh grant.
+            let authority_now = unix_now_secs();
+            if authority_now == 0 || authority_now < execution.now {
+                return DiscoveryPeerGossipReport { directory_proof, legacy_error };
+            }
+            if let (Some(local_identity), Some(peer_id)) =
+                (execution.local_identity, peer_node_id)
+            {
+                let peer = execution.peer_store.get_valid(&peer_id, authority_now);
+                let supports_grant_gossip = peer.as_ref().is_some_and(|descriptor| {
+                    descriptor.descriptor.advertises_protocol_feature(
+                        NodeProtocolFeature::PrivateOnionAuthorizationGossipV1,
+                    )
+                });
+                if supports_grant_gossip {
+                    // [PRIVATE-ONION-AUTHORITY-PURPOSES 2026-10-05 by Codex]
+                    // Keep each workload grant independent end-to-end; never
+                    // replace a Pull grant with admission authority in cache.
+                    let purposes = [
+                        OnionRoutePurpose::BlindVaultPull.as_str(),
+                        OnionRoutePurpose::BlindVaultLeaseAdmission.as_str(),
+                    ];
+                    let issued: Vec<_> = if execution.private_authorization_target == Some(peer_id) {
+                        // [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex]
+                        // Reuse an ACK-confirmed current grant verbatim rather
+                        // than revoking it with a fresh signature each heartbeat.
+                        purposes.into_iter().filter_map(|purpose| {
+                            Self::private_recipient_authorization_for_gossip(
+                                execution.peer_store, local_identity, peer_id,
+                                purpose, authority_now, unix_now_secs,
+                            ).filter(|(_, relay, _, _)| {
+                                relay.descriptor.public_endpoint.as_deref()
+                                    .and_then(Self::reverse_onion_private_gossip_url)
+                                    .as_deref() == Some(peer_url)
+                            })
+                        }).collect()
+                    } else if execution.private_authorization_source_targets.contains(&peer_id) {
+                        // [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex]
+                        // Batch membership selects transport, not authority.
+                        let selected_source_is_current = execution.peer_store
+                            .get_valid(&peer_id, authority_now)
+                            .and_then(|source| source.descriptor.public_endpoint)
+                            .and_then(|endpoint| Self::reverse_onion_private_gossip_url(&endpoint))
+                            .as_deref() == Some(peer_url);
+                        execution.private_authorization_recipient
+                            .filter(|_| selected_source_is_current)
+                            .map(|recipient_id| {
+                                // [REVERSE-ONION-AUTHORITY-SNAPSHOT-GOSSIP 2026-10-05 by Codex]
+                                // Fetch R, P and the cached P grant under one PeerStore
+                                // authority epoch. Never combine independently read
+                                // generations into a bundle that the receiver rejects.
+                                purposes.into_iter().filter_map(|purpose| {
+                                    execution.peer_store
+                                        .current_private_onion_authority_snapshot_for_purpose(
+                                            &local_identity.public_key_bytes(),
+                                            &recipient_id,
+                                            purpose,
+                                            authority_now,
+                                        )
+                                        .map(|(relay, recipient, authorization)| {
+                                            // [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex]
+                                            // Retain the fresh lookup's lower clock bound.
+                                            (authorization, relay, recipient, authority_now)
+                                        })
+                                }).collect()
+                            }).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    // [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex]
+                    // Cached grant age never replaces this attempt's clock floor.
+                    for (authorization, relay_descriptor, recipient_descriptor, selected_at) in issued {
+                        let message = NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 {
+                            authorization: authorization.clone(),
+                            relay_descriptor,
+                            recipient_descriptor,
+                        };
+                        // [PHALA-AUTHORITY-GOSSIP-FENCE 2026-10-07 by Codex]
+                        // Finish request construction before the final exact
+                        // target/R/P/grant check. Never reselect after a wait.
+                        let Some(selected_peer) = peer.as_ref() else { break; };
+                        let Ok(request) = client.post(peer_url).json(&message).build() else { break; };
+                        let Some(sent_at) = Self::private_authorization_gossip_admitted_at(
+                            execution.peer_store, local_identity.public_key_bytes(), selected_peer,
+                            &message, peer_url, selected_at, unix_now_secs,
+                        ) else { break; };
+                        let remaining = execution.peer_timeout.saturating_sub(started_at.elapsed());
+                        if !remaining.is_zero() {
+                            if let Ok(Ok(response)) = tokio::time::timeout(
+                                remaining,
+                                client.execute(request),
+                            ).await {
+                                if response.status().is_success()
+                                    && authorization.recipient_node_id()
+                                        == local_identity.public_key_bytes()
+                                {
+                                    // [PHALA-AUTHORITY-GOSSIP-FENCE 2026-10-07 by Codex]
+                                    // ACK does not freeze route validity. The
+                                    // cache writer rechecks current R/P under
+                                    // its own epoch using this new timestamp.
+                                    let _ = execution.peer_store
+                                        .try_remember_issued_private_onion_authorization_at(
+                                            authorization,
+                                            local_identity.public_key_bytes(),
+                                            sent_at,
+                                            unix_now_secs,
+                                        );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         DiscoveryPeerGossipReport {
             directory_proof,
@@ -1146,8 +1768,8 @@ impl Server {
         let concurrency_limit = concurrency_limit.max(1).min(gossip_urls.len().max(1));
         let mut reports = futures::stream::iter(gossip_urls.into_iter().enumerate())
             .map(|(index, url)| {
-                let self_descriptor = self_descriptor.clone();
-                async move {
+                    let self_descriptor = self_descriptor.clone();
+                    async move {
                     let report = Self::gossip_with_peer(execution, &url, self_descriptor).await;
                     (index, report)
                 }
@@ -1349,7 +1971,24 @@ impl Server {
             );
             return;
         };
-        let Some(url) = Self::blind_relay_probe_url(endpoint) else {
+        // [PHALA-PROMOTION-DNS-CONTROL-PROBE 2026-10-07 by Codex] Only
+        // signed promotion control probes may enter the appraised DNS lane;
+        // legacy warmup/probe URL policy remains public-IP-only.
+        let dns_promotion_probe = require_signed_terminal_receipt
+            && !peer_endpoint_is_public_ip(endpoint)
+            && !is_test_loopback_peer_endpoint(endpoint);
+        let probe_url = if dns_promotion_probe {
+            Self::promotion_blind_relay_probe_url(peer_store, &candidate, now)
+        } else {
+            Self::blind_relay_probe_url(endpoint)
+        };
+        let Some(mut url) = probe_url else {
+            // [PHALA-PROMOTION-DNS-CONTROL-PROBE 2026-10-08 by Codex]
+            // Local quote expiry/lock contention is not a peer failure.
+            if dns_promotion_probe {
+                peer_store.record_blind_relay_probe_result(now, false, "promotion_unavailable");
+                return;
+            }
             peer_store.record_blind_relay_probe_result(now, false, "invalid_endpoint");
             let _ = peer_store.record_route_forward_failure_for_descriptor(
                 &candidate,
@@ -1358,6 +1997,17 @@ impl Server {
             );
             return;
         };
+        let mut probe_client = client.clone();
+        if dns_promotion_probe {
+            let Some((pinned_client, pinned_url)) = Self::resolve_onion_middle_blind_relay_target(
+                endpoint, client,
+            ).await else {
+                peer_store.record_blind_relay_probe_result(now, false, "dns_target_unavailable");
+                return;
+            };
+            probe_client = pinned_client;
+            url = pinned_url;
+        }
 
         let promotion_route_id = if require_signed_terminal_receipt {
             let mut route_id = [0u8; 16];
@@ -1411,14 +2061,25 @@ impl Server {
         };
         let (request, probe_envelope) = request;
 
-        match client
-            .post(url)
+        // [PHALA-PROMOTION-DNS-CONTROL-PROBE 2026-10-07 by Codex] DNS
+        // and request preparation can wait. Recheck the exact gate/quote at
+        // POST entry, without falling back to the unpinned generic client.
+        if dns_promotion_probe
+            && Self::promotion_blind_relay_probe_url(peer_store, &candidate, unix_now_secs())
+                .as_deref() != Some(url.as_str())
+        {
+            peer_store.record_blind_relay_probe_result(now, false, "stale_promotion");
+            return;
+        }
+
+        match probe_client
+            .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(request.body())
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => {
+            Ok(response) if response.status().is_success() && response.url().as_str() == url => {
                 match decode_bounded_json_response::<PeerBlindRelayResponse>(
                     response,
                     PEER_ACK_RESPONSE_MAX_BYTES,
@@ -1440,8 +2101,11 @@ impl Server {
                             // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex]
                             // Generic route-health writes never open a promoted
                             // candidate. Only this verified control transition can.
-                            let recorded = peer_store
-                                .record_permissionless_promotion_probe_verified(&candidate, now);
+                            // [PHALA-PROMOTION-DNS-CONTROL-PROBE 2026-10-07 by Codex]
+                            // Receipt observation cannot reuse pre-DNS wall time.
+                            let recorded = peer_store.record_permissionless_promotion_probe_verified(
+                                &candidate, unix_now_secs(),
+                            );
                             peer_store.record_blind_relay_probe_result(
                                 now,
                                 recorded,
@@ -2760,13 +3424,151 @@ impl Server {
             .map(|url| url.to_string())
     }
 
+    // [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex] Source pins
+    // retain configured order and rotate even when a selected peer is offline.
+    // No unbounded fanout or extra independent concurrency pool is introduced.
+    pub(super) fn private_authorization_source_batch(
+        sources: &[[u8; 32]], cursor: &mut usize, concurrency_limit: usize,
+    ) -> Vec<[u8; 32]> {
+        if sources.is_empty() || sources.len() > 64 || concurrency_limit == 0 {
+            return Vec::new();
+        }
+        let start = *cursor % sources.len();
+        let count = concurrency_limit.min(8).min(sources.len());
+        let selected = (0..count).map(|offset| sources[(start + offset) % sources.len()]).collect();
+        *cursor = (start + count) % sources.len();
+        selected
+    }
+
+    // [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex] Select only
+    // within one nonblocking R/P/grant epoch and a post-lock clock sample.
+    // Reuse needs a still-valid exact cached grant; missing/expired/rotated
+    // authority signs a new candidate, remembered only after a successful ACK.
+    // Carry this observation even for an old grant: its issued_at is not the
+    // clock floor of the current outbound attempt.
+    pub(super) fn private_recipient_authorization_for_gossip(
+        peers: &PeerStore,
+        identity: &IdentityKeyPair,
+        relay_id: [u8; 32],
+        purpose: &str,
+        floor: u64,
+        clock: impl FnOnce() -> u64,
+    ) -> Option<(SignedPrivateOnionRecipientAuthorizationV1, SignedNodeDescriptor, SignedNodeDescriptor, u64)> {
+        if !matches!(purpose, "blind_vault_pull" | "blind_vault_lease_admission") {
+            return None;
+        }
+        let _epoch = peers.try_private_onion_authority_read_guard()?;
+        let now = clock();
+        let recipient_id = identity.public_key_bytes();
+        if now == 0 || now < floor
+            || !peers.has_private_onion_route_identity_pin(&relay_id, &recipient_id)
+        {
+            return None;
+        }
+        let (relay, recipient) = peers.get_valid_pair(&relay_id, &recipient_id, now)?;
+        if recipient.descriptor.public_endpoint.is_some() || recipient.descriptor.policy.public_discovery {
+            return None;
+        }
+        if let Some((relay, recipient, authorization)) = peers
+            .current_private_onion_authority_snapshot_for_purpose_under_guard(
+                &relay_id, &recipient_id, purpose, now,
+            )
+        {
+            return Some((authorization, relay, recipient, now));
+        }
+        let expires_at = now
+            .saturating_add(aeronyx_core::protocol::discovery::MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_LIFETIME_SECS_V1)
+            .min(relay.descriptor.expires_at)
+            .min(recipient.descriptor.expires_at);
+        let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &relay, &recipient, purpose, now, expires_at, identity,
+        ).ok()?;
+        Some((authorization, relay, recipient, now))
+    }
+
+    // [PHALA-AUTHORITY-GOSSIP-FENCE 2026-10-07 by Codex] The real POST
+    // entry and regression sources share this exact bundle/target gate. It
+    // never selects a replacement or holds a lock across a network await.
+    pub(super) fn private_authorization_gossip_admitted_at(
+        peers: &PeerStore,
+        local: [u8; 32],
+        target: &SignedNodeDescriptor,
+        message: &NodeDiscoveryMessage,
+        url: &str,
+        floor: u64,
+        clock: impl FnOnce() -> u64,
+    ) -> Option<u64> {
+        let _authority_epoch = peers.try_private_onion_authority_read_guard()?;
+        let now = clock();
+        if now == 0 || now < floor { return None; }
+        let endpoint = target.descriptor.public_endpoint.as_deref()?;
+        if Self::reverse_onion_private_gossip_url(endpoint).as_deref() != Some(url) {
+            return None;
+        }
+        let NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 {
+            authorization, relay_descriptor, recipient_descriptor,
+        } = message else { return None; };
+        peers.private_onion_gossip_bundle_is_current_under_guard(
+            local, target, authorization, relay_descriptor, recipient_descriptor, now,
+        ).then_some(now)
+    }
+
+    // [REVERSE-ONION-PINNED-HOST 2026-10-05 by Codex] Only operator-pinned
+    // reverse-onion authority routes may select a DNS hostname. Generic seed
+    // and sampled descriptor selection retain their existing policies.
+    pub(super) fn reverse_onion_private_gossip_url(endpoint: &str) -> Option<String> {
+        crate::api::reverse_onion_endpoint_supported(endpoint)
+            .then(|| Self::discovery_gossip_url(endpoint))?
+    }
+
+    // [PHALA-PRIVATE-EGRESS-ORIGIN 2026-10-07 by Codex] A public signature
+    // authenticates the descriptor identity, not a new outbound disclosure
+    // destination. Require both the configured R identity and fixed origin.
+    fn private_recipient_gossip_target_allowed(
+        recipient: &crate::config_reverse_onion::ReverseOnionRecipientConfig,
+        peer_node_id: Option<[u8; 32]>,
+        url: &str,
+    ) -> bool {
+        let mut relay = [0u8; 32];
+        recipient.relay_node_id.len() == 64
+            && hex::decode_to_slice(&recipient.relay_node_id, &mut relay).is_ok()
+            && relay != [0; 32]
+            && peer_node_id == Some(relay)
+            && crate::api::reverse_onion_same_origin(&recipient.relay_endpoint, url)
+    }
+
     /// Derives a gossip target from a permissionless signed descriptor.
     ///
-    /// Configured bootstrap seeds remain operator-trusted and may use DNS or
-    /// private addressing. PeerStore descriptors are untrusted network input
-    /// and therefore require a public IP literal before any outbound request.
+    /// Configured bootstrap seeds retain their legacy operator-trusted policy.
+    /// PeerStore descriptors sampled as permissionless gossip remain untrusted
+    /// and therefore require a public IP literal before outbound requests.
     pub(super) fn discovered_peer_gossip_url(endpoint: &str) -> Option<String> {
         peer_endpoint_is_public_ip(endpoint).then(|| Self::discovery_gossip_url(endpoint))?
+    }
+
+    // [PHALA-ATTESTED-DNS-GOSSIP 2026-10-06 by Codex] DNS discovery is
+    // available only for an exact signed Phala descriptor with fresh local
+    // appraisal. The caller's gossip transport then uses the existing pinned
+    // DNS resolver and TLS hostname verification.
+    fn attested_discovered_peer_gossip_url(
+        peer_store: &PeerStore,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+    ) -> Option<String> {
+        let endpoint = descriptor.descriptor.public_endpoint.as_deref()?;
+        if peer_endpoint_is_public_ip(endpoint) {
+            return Self::discovered_peer_gossip_url(endpoint);
+        }
+        if !peer_store.phala_attested_peer_routes_required()
+            || !descriptor
+                .descriptor
+                .advertises_protocol_feature(NodeProtocolFeature::PhalaNodeAttestationV1)
+            || !peer_store.phala_peer_route_is_eligible(descriptor, now)
+            || !crate::api::reverse_onion_endpoint_supported(endpoint)
+        {
+            return None;
+        }
+        Self::discovery_gossip_url(endpoint)
     }
 
     /// Adds only current, signed public peers after operator seeds have taken
@@ -2786,21 +3588,27 @@ impl Server {
         // sees only the live verified PeerStore, never Stage-A candidates.
         // Filter seed/self URLs before ranking so duplicates do not consume
         // the bounded non-seed budget.
-        let sampled = sample_public_gossip_peers(
+        let sampled = sample_public_gossip_peers_with_policy(
             peer_store,
             selection.now,
             selection.round_nonce,
             remaining,
             &[*selection.self_node_id],
             |endpoint| {
-                let url = Self::discovered_peer_gossip_url(endpoint)?;
-                (selection.self_gossip_url != Some(url.as_str()) && !seen_urls.contains(&url))
-                    .then_some(url)
+                let safe = peer_endpoint_is_public_ip(endpoint)
+                    || crate::api::reverse_onion_endpoint_supported(endpoint);
+                safe.then(|| Self::discovery_gossip_url(endpoint))?
+            },
+            |descriptor| {
+                Self::attested_discovered_peer_gossip_url(peer_store, descriptor, selection.now)
+                    .is_some()
             },
         );
         for peer in sampled {
             let url = peer.canonical_endpoint;
-            if seen_urls.insert(url.clone()) {
+            if selection.self_gossip_url != Some(url.as_str())
+                && seen_urls.insert(url.clone())
+            {
                 gossip_urls.push(url);
             }
         }
@@ -2810,6 +3618,109 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_reverse_onion_private_routes_may_select_dns_gossip_targets() {
+        assert!(Server::reverse_onion_private_gossip_url("https://relay.example.net:443").is_some());
+        assert!(Server::reverse_onion_private_gossip_url("https://8.8.8.8:8422").is_some());
+        assert!(Server::reverse_onion_private_gossip_url("http://8.8.8.8:8422").is_none());
+        assert!(Server::discovered_peer_gossip_url("https://relay.example.net:443").is_none());
+        assert!(Server::discovered_peer_gossip_url("https://8.8.8.8:443").is_some());
+        // [REVERSE-ONION-HTTPS-ONLY 2026-10-05 by Codex] Generic discovered
+        // IP routes keep their existing HTTP compatibility; only the private
+        // operator-pinned reverse-onion path is HTTPS-only.
+        assert!(Server::discovered_peer_gossip_url("http://8.8.8.8:8422").is_some());
+        assert!(Server::reverse_onion_private_gossip_url("http://relay.example.net:8422").is_none());
+    }
+
+    // [PHALA-ATTESTED-DNS-GOSSIP 2026-10-06 by Codex]
+    #[test]
+    fn general_dns_gossip_requires_fresh_phala_appraisal_and_strict_policy() {
+        let now = unix_now_secs();
+        let identity = IdentityKeyPair::generate();
+        let mut body = NodeDescriptor::new(
+            identity.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now + 600,
+            "1.0.0",
+        )
+        .with_protocol_features([NodeProtocolFeature::PhalaNodeAttestationV1]);
+        body.public_endpoint = Some("https://phala-node.example.net:443".into());
+        body.capabilities = vec![NodeCapability::ChatRelay];
+        body.policy.public_discovery = true;
+        let descriptor = SignedNodeDescriptor::sign(body, &identity).unwrap();
+        let store = PeerStore::new();
+        store.configure_phala_attested_peer_routes(true, 300);
+        store.upsert_verified(descriptor.clone(), now).unwrap();
+
+        assert!(Server::attested_discovered_peer_gossip_url(&store, &descriptor, now).is_none());
+        assert!(store.record_phala_peer_attestation(&descriptor, now));
+        assert_eq!(
+            Server::attested_discovered_peer_gossip_url(&store, &descriptor, now).as_deref(),
+            Some("https://phala-node.example.net/api/discovery/gossip")
+        );
+        assert!(Server::attested_discovered_peer_gossip_url(&store, &descriptor, now + 301).is_none());
+    }
+
+    // [PHALA-PRIVATE-RECIPIENT-EGRESS 2026-10-06 by Codex] Authored, unexecuted.
+    #[test]
+    fn private_recipient_gossip_target_policy_is_pinned_relay_only() {
+        let mut config = ServerConfig::default();
+        config.discovery.seed_endpoints = vec!["https://seed.example.net".into()];
+        config.reverse_onion.recipient.enabled = true;
+
+        let policy = DiscoveryGossipTargetPolicy::for_config(&config, false);
+        assert_eq!(policy.round_peer_limit, 1);
+        assert!(!policy.include_operator_seeds);
+        assert!(!policy.include_cached_peers);
+
+        config.reverse_onion.recipient.enabled = false;
+        let public_policy = DiscoveryGossipTargetPolicy::for_config(&config, false);
+        assert!(public_policy.include_operator_seeds);
+        assert!(public_policy.include_cached_peers);
+    }
+
+    // [PHALA-PRIVATE-EGRESS-ORIGIN 2026-10-07 by Codex] Authored, not run.
+    // Includes negative controls for same-identity endpoint rotation and
+    // same-origin identity substitution in both live and recovery modes.
+    #[test]
+    fn private_recipient_gossip_requires_configured_identity_and_origin() {
+        let relay = [0x31; 32];
+        let mut recipient = crate::config_reverse_onion::ReverseOnionRecipientConfig::default();
+        recipient.enabled = true;
+        recipient.relay_node_id = hex::encode(relay);
+        recipient.relay_endpoint = "https://relay.example.net".into();
+        let same_origin = "https://RELAY.example.net:443/api/discovery/gossip";
+        for recovery_only in [false, true] {
+            recipient.recovery_only = recovery_only;
+            assert!(Server::private_recipient_gossip_target_allowed(
+                &recipient, Some(relay), same_origin,
+            ));
+            for endpoint in ["https://other.example.net/api/discovery/gossip",
+                "https://relay.example.net:8443/api/discovery/gossip",
+                "http://relay.example.net/api/discovery/gossip",
+                "https://relay.internal/api/discovery/gossip"] {
+                assert!(!Server::private_recipient_gossip_target_allowed(
+                    &recipient, Some(relay), endpoint,
+                ));
+            }
+            for identity in [None, Some([0x32; 32])] {
+                assert!(!Server::private_recipient_gossip_target_allowed(
+                    &recipient, identity, same_origin,
+                ));
+            }
+        }
+        recipient.relay_endpoint = "http://relay.example.net".into();
+        assert!(!Server::private_recipient_gossip_target_allowed(
+            &recipient, Some(relay), "http://relay.example.net/api/discovery/gossip",
+        ));
+        recipient.relay_endpoint = "https://relay.example.net".into();
+        recipient.relay_node_id = hex::encode([0; 32]);
+        assert!(!Server::private_recipient_gossip_target_allowed(
+            &recipient, Some([0; 32]), same_origin,
+        ));
+    }
 
     #[test]
     fn directory_proof_gossip_result_classifies_privacy_safe_status_buckets() {

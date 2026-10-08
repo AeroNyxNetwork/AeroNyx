@@ -78,11 +78,48 @@ impl PeerStore {
         gates.contains_key(node_id) || gates.len() < MAX_PERMISSIONLESS_PROMOTION_GATES
     }
 
+    // [PHALA-PROMOTION-NETWORK-ADMISSION 2026-10-07 by Codex] Preflight
+    // exact Stage-A work before spending transport/QVL capacity. This is not a
+    // reservation or route authority; final promotion still rechecks its gates.
+    pub(crate) fn permissionless_candidate_probe_is_admitted(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+    ) -> bool {
+        if now == 0 || !Self::permissionless_descriptor_shape_is_valid(descriptor, now) {
+            return false;
+        }
+        let Some(commitment) = Self::untrusted_candidate_commitment(descriptor) else {
+            return false;
+        };
+        let node_id = descriptor.node_id();
+        if !self.prepare_permissionless_promotion_capacity_for(&node_id, now) {
+            return false;
+        }
+        // Match Stage-A insertion's peers -> candidates -> gates order. A
+        // stronger live import may have arrived without removing old Stage-A.
+        let peers = self.peers.read();
+        if peers.get(&node_id).is_some_and(|current| {
+            current.sequence() > descriptor.sequence()
+                || (current.sequence() == descriptor.sequence() && current != descriptor)
+        }) {
+            return false;
+        }
+        let candidates = self.untrusted_discovery_candidates.read();
+        let gates = self.permissionless_promotions.read();
+        candidates.candidates.get(&node_id).is_some_and(|candidate| {
+            candidate.descriptor == *descriptor && candidate.commitment == commitment
+        }) && (gates.contains_key(&node_id) || gates.len() < MAX_PERMISSIONLESS_PROMOTION_GATES)
+    }
+
     pub(super) fn prune_expired_permissionless_promotions(&self, now: u64) -> usize {
         // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Never drop
         // a deny gate while its exact live descriptor remains in the peer
         // map: that would turn expiry into route authority on clock rollback.
         // Lock peers before gates, matching read-side lock order.
+        // [REVERSE-ONION-AUTHORITY-FENCE 2026-10-05 by Codex] Expiry can
+        // remove a live descriptor; order it against in-flight Lease issue.
+        let _authority_update = self.private_onion_authority_gate.write();
         let mut peers = self.peers.write();
         let mut gates = self.permissionless_promotions.write();
         let expired = gates
@@ -118,6 +155,19 @@ impl PeerStore {
         material: &VerifiedPromotionMaterial,
         now: u64,
     ) -> Result<bool, PeerStoreError> {
+        self.promote_permissionless_candidate_if(material, now, || true)
+    }
+
+    // [PHALA-PROMOTION-CANCEL-OWNERSHIP 2026-10-08 by Codex] Owner
+    // admission can only veto verified material. A cancelled cell may finish
+    // an admitted descriptor write, but cannot activate its closed deny gate.
+    pub(crate) fn promote_permissionless_candidate_if(
+        &self,
+        material: &VerifiedPromotionMaterial,
+        now: u64,
+        mut owner_running: impl FnMut() -> bool,
+    ) -> Result<bool, PeerStoreError> {
+        if !owner_running() { return Err(PeerStoreError::VerificationFailed); }
         let descriptor = material.descriptor();
         let node_id = descriptor.node_id();
         let pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(descriptor)
@@ -141,6 +191,7 @@ impl PeerStore {
             return Err(PeerStoreError::VerificationFailed);
         }
         let mut gates = self.permissionless_promotions.write();
+        if !owner_running() { return Err(PeerStoreError::VerificationFailed); }
         if !gates.contains_key(&node_id) && gates.len() >= MAX_PERMISSIONLESS_PROMOTION_GATES {
             return Err(PeerStoreError::CapacityExceeded {
                 max_peers: MAX_PERMISSIONLESS_PROMOTION_GATES,
@@ -161,6 +212,7 @@ impl PeerStore {
             },
         );
         drop(gates);
+        if !owner_running() { return Err(PeerStoreError::VerificationFailed); }
         let changed = match self.upsert_verified_from_source(
             descriptor.clone(),
             now,
@@ -189,11 +241,17 @@ impl PeerStore {
         // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Generic
         // route success is not promotion authority. Keep the candidate read
         // lock through activation so rotation cannot reopen the old gate.
-        if let Some(gate) = self.permissionless_promotions.write().get_mut(&node_id) {
-            if gate.descriptor_hash == pin.descriptor_hash {
-                gate.active = true;
-            }
+        // [PHALA-PROMOTION-CANCEL-OWNERSHIP 2026-10-08 by Codex] Sample
+        // after the final gate lock wait. A concurrent same-descriptor round
+        // cannot lend this round its generation or bypass its owner's veto.
+        let mut gates = self.permissionless_promotions.write();
+        if !owner_running() { return Err(PeerStoreError::VerificationFailed); }
+        let Some(gate) = gates.get_mut(&node_id) else { return Err(PeerStoreError::VerificationFailed); };
+        if gate.descriptor_hash != pin.descriptor_hash || gate.generation != generation {
+            return Err(PeerStoreError::VerificationFailed);
         }
+        gate.active = true;
+        drop(gates);
         drop(candidates);
         Ok(changed)
     }
@@ -206,6 +264,20 @@ impl PeerStore {
         descriptor: &SignedNodeDescriptor,
         now: u64,
     ) -> bool {
+        // [PHALA-PROMOTION-DNS-CONTROL-PROBE 2026-10-07 by Codex] DNS
+        // probes must retain the same descriptor/appraisal epoch through the
+        // route-gate write. A valid receipt alone cannot revive expired quotes.
+        let dns_probe = descriptor.descriptor.public_endpoint.as_deref().is_some_and(|endpoint| {
+            aeronyx_core::protocol::discovery_endpoint_proof::
+                canonical_public_https_dns_endpoint_commitment_v1(endpoint).is_ok()
+        });
+        let _authority_snapshot = if dns_probe {
+            let Some(guard) = self.private_onion_authority_gate.try_read() else { return false; };
+            Some(guard)
+        } else { None };
+        if dns_probe && !self.phala_promotion_control_probe_under_authority_guard(descriptor, now) {
+            return false;
+        }
         let node_id = descriptor.node_id();
         let Ok(pin) = DirectoryDescriptorCommitmentV1::from_signed_descriptor(descriptor) else {
             return false;
@@ -230,8 +302,67 @@ impl PeerStore {
         if !gate.active || gate.valid_until < now || gate.descriptor_hash != pin.descriptor_hash {
             return false;
         }
+        if dns_probe && !self.phala_promotion_control_appraisal_is_fresh(descriptor, now) {
+            return false;
+        }
         gate.verified_control_probe = true;
         true
+    }
+
+    // [PHALA-PROMOTION-DNS-CONTROL-PROBE 2026-10-07 by Codex] This
+    // narrow pre-route capability breaks the readiness bootstrap cycle: the
+    // exact promoted descriptor may be probed before verified_control_probe,
+    // but Stage-A input, an ordinary DNS peer or a pin alone is never enough.
+    pub(crate) fn phala_promotion_control_probe_is_admitted(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+    ) -> bool {
+        let Some(_authority_snapshot) = self.private_onion_authority_gate.try_read() else {
+            return false;
+        };
+        self.phala_promotion_control_probe_under_authority_guard(descriptor, now)
+    }
+
+    fn phala_promotion_control_probe_under_authority_guard(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+    ) -> bool {
+        if now == 0 || !self.phala_attested_peer_routes_required()
+            || !Self::permissionless_descriptor_shape_is_valid(descriptor, now)
+            || !descriptor.descriptor.capabilities.contains(&aeronyx_core::protocol::discovery::NodeCapability::ChatRelay)
+            || !descriptor.descriptor.public_endpoint.as_deref().is_some_and(|endpoint| {
+                aeronyx_core::protocol::discovery_endpoint_proof::
+                    canonical_public_https_dns_endpoint_commitment_v1(endpoint).is_ok()
+            })
+        {
+            return false;
+        }
+        let Ok(pin) = DirectoryDescriptorCommitmentV1::from_signed_descriptor(descriptor) else {
+            return false;
+        };
+        let Some(peers) = self.peers.try_read() else { return false; };
+        if peers.get(&descriptor.node_id()) != Some(descriptor) { return false; }
+        let Some(gates) = self.permissionless_promotions.try_read() else { return false; };
+        gates.get(&descriptor.node_id()).is_some_and(|gate| {
+            gate.active && gate.valid_until >= now && gate.descriptor_hash == pin.descriptor_hash
+        }) && self.phala_promotion_control_appraisal_is_fresh(descriptor, now)
+    }
+
+    fn phala_promotion_control_appraisal_is_fresh(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+    ) -> bool {
+        use aeronyx_core::protocol::{discovery::signed_descriptor_commitment_hash, NodeProtocolFeature};
+        let Ok(commitment) = signed_descriptor_commitment_hash(descriptor) else { return false; };
+        let Some(cache) = self.phala_peer_attestations.try_read() else { return false; };
+        descriptor.descriptor.advertises_protocol_feature(NodeProtocolFeature::PhalaNodeAttestationV1)
+            && cache.get(&descriptor.node_id()).is_some_and(|entry| {
+                entry.commitment == commitment
+                    && entry.is_fresh_at(descriptor, now, self.phala_peer_attestation_max_age_secs())
+            })
     }
 
     pub(super) fn permissionless_gate_allows(
@@ -284,6 +415,155 @@ mod tests {
         descriptor.public_endpoint = Some(endpoint.to_string());
         descriptor.capabilities = vec![NodeCapability::PrivacyRelay, NodeCapability::ChatRelay];
         SignedNodeDescriptor::sign(descriptor, kp).unwrap()
+    }
+
+    // [PHALA-PROMOTION-CANCEL-OWNERSHIP 2026-10-08 by Codex] Authored
+    // only: both gate admissions run under the actual write lock. Cancellation
+    // after a descriptor write leaves its deny gate closed, not a ready route.
+    #[test]
+    fn promotion_owner_veto_fences_gate_install_activation_and_generation() {
+        let now = 1_780_000_000;
+        let key = IdentityKeyPair::from_bytes(&[0x56; 32]).unwrap();
+        let descriptor = permissionless_descriptor_for(&key, 7, now, "https://8.8.8.8:8422");
+        let material = VerifiedPromotionMaterial::test_only_from_descriptor(descriptor.clone(), now, now + 90).unwrap();
+        let store = PeerStore::new();
+        assert_eq!(store.admit_permissionless_descriptor(descriptor.clone(), now), PermissionlessNodeAdmissionOutcome::Admitted);
+        assert!(store.promote_permissionless_candidate_if(&material, now, || false).is_err());
+        assert!(store.permissionless_promotions.read().is_empty());
+        assert!(store.peers.read().is_empty());
+        let mut samples = 0;
+        assert!(store.promote_permissionless_candidate_if(&material, now, || {
+            samples += 1;
+            if samples == 2 || samples == 4 {
+                assert!(store.permissionless_promotions.try_write().is_none(), "sample after gate lock acquisition");
+            }
+            samples < 4
+        }).is_err());
+        assert_eq!(samples, 4);
+        assert_eq!(store.peers.read().get(&descriptor.node_id()), Some(&descriptor));
+        assert!(!store.permissionless_promotions.read().get(&descriptor.node_id()).unwrap().active);
+        assert!(store.get_valid(&descriptor.node_id(), now).is_none());
+        let mut samples = 0;
+        assert!(store.promote_permissionless_candidate_if(&material, now, || {
+            samples += 1;
+            if samples == 3 {
+                store.permissionless_promotions.write().get_mut(&descriptor.node_id()).unwrap().generation += 1;
+            }
+            true
+        }).is_err(), "an otherwise live owner cannot activate another generation");
+        assert!(!store.permissionless_promotions.read().get(&descriptor.node_id()).unwrap().active);
+        assert!(store.promote_permissionless_candidate_if(&material, now, || true).is_ok(), "positive admission calibration");
+        assert!(store.permissionless_promotions.read().get(&descriptor.node_id()).unwrap().active);
+        assert!(!store.permissionless_promotions.read().get(&descriptor.node_id()).unwrap().verified_control_probe);
+        assert!(store.get_valid(&descriptor.node_id(), now).is_none());
+    }
+
+    // [PHALA-PROMOTION-CANCEL-OWNERSHIP 2026-10-08 by Codex] Authored
+    // only: first owner sampling precedes a known held gate; stop before unlock
+    // must be observed by the post-lock admission, with no descriptor insertion.
+    #[test]
+    fn promotion_stopped_while_waiting_for_gate_cannot_publish() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let now = 1_780_000_000;
+        let key = IdentityKeyPair::from_bytes(&[0x57; 32]).unwrap();
+        let descriptor = permissionless_descriptor_for(&key, 7, now, "https://8.8.8.8:8422");
+        let material = VerifiedPromotionMaterial::test_only_from_descriptor(descriptor.clone(), now, now + 90).unwrap();
+        let store = Arc::new(PeerStore::new());
+        assert_eq!(store.admit_permissionless_descriptor(descriptor, now), PermissionlessNodeAdmissionOutcome::Admitted);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_store = Arc::clone(&store);
+        let worker_stopped = Arc::clone(&stopped);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let held = store.permissionless_promotions.write();
+        let worker = std::thread::spawn(move || {
+            let mut ready = Some(ready_tx);
+            worker_store.promote_permissionless_candidate_if(&material, now, || {
+                let running = !worker_stopped.load(Ordering::SeqCst);
+                if let Some(ready) = ready.take() { ready.send(()).unwrap(); }
+                running
+            })
+        });
+        ready_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        stopped.store(true, Ordering::SeqCst);
+        drop(held);
+        assert!(worker.join().unwrap().is_err());
+        assert!(store.permissionless_promotions.read().is_empty());
+        assert!(store.peers.read().is_empty());
+    }
+
+    // [PHALA-PROMOTION-DNS-CONTROL-PROBE 2026-10-07 by Codex] Authored
+    // only: this pre-route capability requires both independently established
+    // promotion and exact fresh quote evidence, including on receipt commit.
+    #[test]
+    fn phala_dns_control_probe_requires_exact_promotion_and_fresh_appraisal() {
+        use aeronyx_core::protocol::NodeProtocolFeature;
+        let now = 1_780_000_000;
+        let identity = IdentityKeyPair::from_bytes(&[0x54; 32]).unwrap();
+        // [PHALA-EXECUTED-PROFILE-FIXTURES 2026-10-08 by Codex] Use a
+        // public-shape synthetic origin; this test performs no DNS or sockets.
+        let descriptor = permissionless_descriptor_for(&identity, 7, now, "https://relay.aeronyx.network");
+        let descriptor = SignedNodeDescriptor::sign(descriptor.descriptor.with_protocol_features(
+            [NodeProtocolFeature::PhalaNodeAttestationV1],
+        ), &identity).unwrap();
+        let store = PeerStore::new();
+        store.configure_phala_attested_peer_routes(true, 60);
+        assert_eq!(store.admit_permissionless_descriptor(descriptor.clone(), now),
+            PermissionlessNodeAdmissionOutcome::Admitted);
+        assert!(!store.phala_promotion_control_probe_is_admitted(&descriptor, now));
+        let material = VerifiedPromotionMaterial::test_only_from_descriptor(descriptor.clone(), now, now + 300).unwrap();
+        store.promote_permissionless_candidate(&material, now).unwrap();
+        assert!(!store.phala_promotion_control_probe_is_admitted(&descriptor, now));
+        assert!(!store.record_permissionless_promotion_probe_verified(&descriptor, now));
+        assert!(!store.permissionless_promotions.read().get(&descriptor.node_id()).unwrap().verified_control_probe);
+        assert!(store.record_phala_peer_attestation(&descriptor, now));
+        assert!(store.phala_promotion_control_probe_is_admitted(&descriptor, now));
+        assert!(store.get_valid(&descriptor.node_id(), now).is_none(),
+            "the capability must exist before the control readiness bit opens");
+        {
+            let _writer = store.private_onion_authority_gate.write();
+            assert!(!store.phala_promotion_control_probe_is_admitted(&descriptor, now));
+            assert!(!store.record_permissionless_promotion_probe_verified(&descriptor, now));
+        }
+        {
+            let _writer = store.phala_peer_attestations.write();
+            assert!(!store.phala_promotion_control_probe_is_admitted(&descriptor, now));
+        }
+        {
+            let mut gates = store.permissionless_promotions.write();
+            gates.get_mut(&descriptor.node_id()).unwrap().active = false;
+        }
+        assert!(!store.phala_promotion_control_probe_is_admitted(&descriptor, now));
+        store.permissionless_promotions.write().get_mut(&descriptor.node_id()).unwrap().active = true;
+        store.permissionless_promotions.write().get_mut(&descriptor.node_id()).unwrap().valid_until = now - 1;
+        assert!(!store.phala_promotion_control_probe_is_admitted(&descriptor, now));
+        store.permissionless_promotions.write().get_mut(&descriptor.node_id()).unwrap().valid_until = now + 300;
+        let restarted = PeerStore::new();
+        restarted.configure_phala_attested_peer_routes(true, 60);
+        restarted.upsert_verified(descriptor.clone(), now).unwrap();
+        assert!(restarted.record_phala_peer_attestation(&descriptor, now));
+        assert!(!restarted.phala_promotion_control_probe_is_admitted(&descriptor, now),
+            "descriptor and quote alone do not restore the promotion gate");
+        assert!(store.record_permissionless_promotion_probe_verified(&descriptor, now + 1));
+        assert!(store.get_valid(&descriptor.node_id(), now + 1).is_some());
+        assert!(!store.phala_promotion_control_probe_is_admitted(&descriptor, now + 61));
+        assert!(!store.record_permissionless_promotion_probe_verified(&descriptor, now + 61),
+            "late valid receipt cannot revive expired appraisal");
+        // [PHALA-EXECUTED-PROFILE-FIXTURES 2026-10-08 by Codex] A signed
+        // descriptor remains bootstrap evidence, not fresh route authority.
+        assert!(store.get_valid(&descriptor.node_id(), now + 61).is_some());
+        assert!(!store.phala_peer_route_is_eligible(&descriptor, now + 61));
+        let mut rotated = descriptor.descriptor.clone();
+        rotated.sequence += 1;
+        rotated.public_endpoint = Some("https://rotated.aeronyx.network".into());
+        let rotated = SignedNodeDescriptor::sign(rotated, &identity).unwrap();
+        store.upsert_verified(rotated.clone(), now + 61).unwrap();
+        assert!(store.record_phala_peer_attestation(&rotated, now + 61));
+        assert!(!store.phala_promotion_control_probe_is_admitted(&descriptor, now + 61));
+        assert!(!store.phala_promotion_control_probe_is_admitted(&rotated, now + 61),
+            "new quote cannot reuse the old promotion commitment");
+        store.configure_phala_attested_peer_routes(false, 60);
+        assert!(!store.phala_promotion_control_probe_is_admitted(&rotated, now + 61));
     }
 
     #[test]

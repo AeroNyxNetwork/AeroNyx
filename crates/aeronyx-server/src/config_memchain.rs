@@ -231,38 +231,26 @@ pub struct MemChainConfig {
     pub rawlog_batch_threshold: usize,
 
     // ── Embedding Engine (v2.1.0) ──────────────────────────────────────
-    /// Enable local embedding inference for MemChain semantic recall.
-    ///
-    /// Protocol-only nodes may set this to `false` to keep encrypted storage,
-    /// public discovery, and ChatRelay available without requiring a local ONNX
-    /// model bundle. The default remains `true` for backward compatibility.
+    /// Legacy compatibility field. Local model inference is disabled; MemChain
+    /// cognition and embeddings must use the configured Phala ACI provider.
+    /// This value is accepted from old config files but no longer enables ONNX.
     #[serde(default = "default_embed_enabled")]
     pub embed_enabled: bool,
 
-    /// Path to the local embedding model directory.
-    /// Must contain `model.onnx` and `tokenizer.json` for MiniLM-L6-v2.
+    /// Legacy model path retained for config compatibility; node startup ignores it.
     #[serde(default = "default_embed_model_path")]
     pub embed_model_path: String,
 
-    /// Expected embedding dimension from the local model (384 for MiniLM-L6-v2).
+    /// Legacy embedding dimension retained for config compatibility.
     #[serde(default = "default_embed_dim")]
     pub embed_dim: usize,
 
-    /// Maximum token sequence length for embedding inference.
+    /// Legacy token limit retained for config compatibility.
     #[serde(default = "default_embed_max_tokens")]
     pub embed_max_tokens: usize,
 
-    /// Output embedding dimension after Matryoshka truncation (v2.5.0).
-    ///
-    /// For MiniLM-L6-v2: native dimension is 384, this value must be ≤ 384.
-    /// For EmbeddingGemma-300M: native dimension is 768, truncated via
-    ///   Matryoshka Representation Learning. Supported: 768, 512, 384, 256, 128.
-    ///
-    /// Default: 384 (compatible with both models, no downstream changes needed).
-    /// Pass 0 to EmbedEngine::load() to use this default.
-    ///
-    /// ⚠️ Changing this value requires rebuilding ALL existing embeddings.
-    ///    Miner Step 0.5 handles this automatically on next startup.
+    /// Legacy output dimension retained for config compatibility; no local
+    /// inference or automatic rebuild is performed by ordinary nodes.
     #[serde(default = "default_embed_output_dim")]
     pub embed_output_dim: usize,
 
@@ -402,18 +390,17 @@ pub struct MemChainConfig {
     pub max_remote_owners: usize,
 
     // ── NER Engine (v2.4.0-GraphCognition) ───────────────────────────
-    /// Enable the local GLiNER NER engine for entity extraction.
-    ///
-    /// When false (default), the entire cognitive graph pipeline is disabled.
+    /// [MEMCHAIN-PHALA-ONLY 2026-10-06 by Codex] Legacy compatibility flag.
+    /// It no longer authorizes local NER inference; extraction uses the client's
+    /// direct Phala ACI route or remains unavailable to local/P2P nodes.
     #[serde(default)]
     pub ner_enabled: bool,
 
-    /// Path to the GLiNER ONNX model directory.
+    /// Legacy model path retained for config compatibility; node startup ignores it.
     #[serde(default = "default_ner_model_path")]
     pub ner_model_path: String,
 
-    /// Path to the GLiNER tokenizer file.
-    /// If empty, defaults to `{ner_model_path}/tokenizer.json`.
+    /// Legacy tokenizer path retained for old TOML; ordinary nodes do not load it.
     #[serde(default)]
     pub ner_tokenizer_path: String,
 
@@ -423,8 +410,8 @@ pub struct MemChainConfig {
     pub ner_confidence_threshold: f32,
 
     // ── Knowledge Graph (v2.4.0-GraphCognition) ───────────────────────
-    /// Enable knowledge graph traversal in recall queries.
-    /// Requires ner_enabled = true to populate the graph.
+    /// Enable deterministic knowledge-graph storage and traversal. This flag
+    /// does not enable local extraction or model inference.
     #[serde(default)]
     pub graph_enabled: bool,
 
@@ -458,19 +445,20 @@ pub struct MemChainConfig {
     pub entropy_window_overlap: usize,
 
     // ── Miner Cognitive Steps (v2.4.0-GraphCognition) ─────────────────
-    /// Enable Miner Step 7: Entity/relation extraction. Requires ner_enabled.
+    /// Legacy miner switch for entity/relation extraction. No local model is
+    /// run when enabled; Phala tasks still require explicit routing and consent.
     #[serde(default)]
     pub miner_entity_extraction: bool,
 
-    /// Enable Miner Step 8: Community detection. Requires miner_entity_extraction.
+    /// Enable deterministic community detection over existing graph records.
     #[serde(default)]
     pub miner_community_detection: bool,
 
-    /// Enable Miner Step 10: Session summary generation.
+    /// Enable session summaries only through the configured Phala ACI task route.
     #[serde(default)]
     pub miner_session_summary: bool,
 
-    /// Enable Miner Step 10: Code artifact extraction.
+    /// Enable code artifact extraction only through the configured Phala ACI task route.
     #[serde(default)]
     pub miner_artifact_extraction: bool,
 
@@ -495,7 +483,7 @@ pub struct MemChainConfig {
     pub vector_saturation_threshold: usize,
 
     // ── Reranker (v2.4.0+Reranker) ────────────────────────────────────
-    /// Enable cross-encoder reranking for recall Step 3.5.
+    /// Legacy compatibility flag. Node startup does not load a local reranker.
     #[serde(default)]
     pub reranker_enabled: bool,
 
@@ -513,17 +501,31 @@ pub struct MemChainConfig {
     /// When supernode.enabled = false (default), system behaves identically
     /// to v2.4.0. See config_supernode.rs for full documentation.
     ///
+    /// [MEMCHAIN-PHALA-MEASUREMENT-POLICY 2026-10-05 by Codex] Enabled
+    /// deployments must pin reviewed Phala compose measurements explicitly.
+    /// [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex] Each measured
+    /// compose must also map to operator-reviewed repository or image provenance.
+    /// [MEMCHAIN-PHALA-ACI-PINNED-CONTRACT 2026-10-06 by Codex] ACI/1
+    /// responses require `X-ACI-Version`, `X-ACI-Identity`,
+    /// `X-ACI-Keyset-Digest`, and `X-Receipt-Id`; identity and keyset hints
+    /// are checked against the nonce-bound report, and the receipt hint is
+    /// checked against the signed receipt before a task result is staged.
+    /// [MEMCHAIN-PHALA-ACI-IDENTITY-HEADER 2026-10-06 by Codex]
+    ///
     /// ## Configuration Example
     /// ```toml
     /// [memchain.supernode]
     /// enabled = true
+    /// accepted_compose_hashes = ["sha256:<reviewed-64-lowercase-hex-measurement>"]
+    /// accepted_source_provenance = [{ compose_hash = "sha256:<same-measurement>", repo_url = "https://github.com/org/repo", repo_commit = "<reviewed-40-or-64-lowercase-hex-commit>" }]
+    /// accepted_kms_root_public_keys = ["0x<reviewed-compressed-secp256k1-key>"]
     ///
     /// [[memchain.supernode.providers]]
-    /// name = "deepseek"
-    /// type = "openai_compatible"
-    /// api_base = "https://api.deepseek.com/v1"
-    /// api_key = "$DEEPSEEK_API_KEY"
-    /// model = "deepseek-reasoner"
+    /// # [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex]
+    /// name = "phala"
+    /// type = "phala_aci"
+    /// api_key = "$PHALA_API_KEY"
+    /// model = "confidential-model"
     /// ```
     #[serde(default)]
     pub supernode: SuperNodeConfig,
@@ -599,7 +601,7 @@ fn default_rawlog_batch_threshold() -> usize {
     100
 }
 fn default_embed_enabled() -> bool {
-    true
+    false
 }
 fn default_embed_model_path() -> String {
     "models/minilm-l6-v2".into()
@@ -726,7 +728,45 @@ fn default_jwt_ttl() -> u64 {
 // ── validate() ────────────────────────────────────────────────────────────
 
 impl MemChainConfig {
+    // [MEMCHAIN-PHALA-CONFIG-GATE 2026-10-06 by Codex]
+    // These legacy switches used to enable in-process model execution. They
+    // remain parseable for diagnosis/migration, but must not silently appear
+    // active while ordinary nodes are limited to deterministic local work and
+    // attested Phala inference.
+    fn local_model_inference_configured(&self) -> Option<&'static str> {
+        [
+            (self.embed_enabled, "memchain.embed_enabled"),
+            (self.ner_enabled, "memchain.ner_enabled"),
+            (self.reranker_enabled, "memchain.reranker_enabled"),
+            (
+                self.miner_entity_extraction,
+                "memchain.miner_entity_extraction",
+            ),
+            (self.miner_session_summary, "memchain.miner_session_summary"),
+            (
+                self.miner_artifact_extraction,
+                "memchain.miner_artifact_extraction",
+            ),
+        ]
+        .into_iter()
+        .find_map(|(enabled, field)| enabled.then_some(field))
+        .or_else(|| {
+            (!self.miner_llm_endpoint.trim().is_empty())
+                .then_some("memchain.miner_llm_endpoint")
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
+        if let Some(field) = self.local_model_inference_configured() {
+            return Err(ServerError::config_invalid(
+                field,
+                "legacy inference switch is unsupported; local inference is disabled and no Phala task route is wired for this setting",
+            ));
+        }
+        // [PHALA-CHAT-RELAY-INDEPENDENT-CONFIG 2026-10-06 by Codex]
+        // ChatRelay is initialized independently of the MemChain runtime, so
+        // `mode = off` must not skip its enabled-store or nested-role checks.
+        self.chat_relay.validate()?;
         if self.mode == MemChainMode::Off {
             // [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] SuperNode
             // workers require MemoryStorage for their durable task queue.
@@ -1070,33 +1110,6 @@ impl MemChainConfig {
             debug!("[MEMCHAIN_BLOCK] Pinned coordinator follower sync enabled");
         }
 
-        // ── v2.4.0: NER Engine ────────────────────────────────────────
-        if self.ner_enabled {
-            if self.ner_confidence_threshold <= 0.0 || self.ner_confidence_threshold >= 1.0 {
-                return Err(ServerError::config_invalid(
-                    "memchain.ner_confidence_threshold",
-                    format!(
-                        "must be in (0.0, 1.0), got {}",
-                        self.ner_confidence_threshold
-                    ),
-                ));
-            }
-            if self.ner_model_path.is_empty() {
-                return Err(ServerError::config_invalid(
-                    "memchain.ner_model_path",
-                    "cannot be empty when ner_enabled = true",
-                ));
-            }
-            // [M1-STABILITY-LOGGING 2026-06-30] `validate()` can run on
-            // runtime policy / heartbeat paths, not only at process startup.
-            // Keep the success case at debug so an enabled NER config does not
-            // look like repeated model initialization in production journals.
-            debug!(
-                "[MEMCHAIN] NER engine enabled (model: {}, threshold: {})",
-                self.ner_model_path, self.ner_confidence_threshold
-            );
-        }
-
         // ── v2.4.0: Knowledge Graph ───────────────────────────────────
         if self.graph_enabled {
             if self.graph_max_depth == 0 || self.graph_max_depth > 3 {
@@ -1116,12 +1129,6 @@ impl MemChainConfig {
                     "memchain.graph_min_edge_weight",
                     format!("must be in [0.0, 1.0], got {}", self.graph_min_edge_weight),
                 ));
-            }
-            if !self.ner_enabled {
-                tracing::warn!(
-                    "[MEMCHAIN] graph_enabled=true but ner_enabled=false. \
-                     Graph traversal will have no data until NER is enabled."
-                );
             }
         }
 
@@ -1153,19 +1160,7 @@ impl MemChainConfig {
             }
         }
 
-        // ── v2.4.0: Miner cognitive step warnings ────────────────────
-        if self.miner_entity_extraction && !self.ner_enabled {
-            tracing::warn!(
-                "[MEMCHAIN] miner_entity_extraction=true but ner_enabled=false. \
-                 Entity extraction will be skipped until NER is enabled."
-            );
-        }
-        if self.miner_community_detection && !self.miner_entity_extraction {
-            tracing::warn!(
-                "[MEMCHAIN] miner_community_detection=true but miner_entity_extraction=false. \
-                 Community detection requires entities to cluster."
-            );
-        }
+        // ── v2.4.0: Miner cognitive steps ────────────────────────────
 
         // ── v2.4.0: Vector optimization ───────────────────────────────
         if self.vector_early_termination && self.vector_saturation_threshold == 0 {
@@ -1175,8 +1170,10 @@ impl MemChainConfig {
             ));
         }
 
-        // ── v2.5.0: SuperNode — delegates to SuperNodeConfig::validate()
-        self.supernode.validate()?;
+        // [MEMCHAIN-PHALA-NODE-BOUNDARY 2026-10-05 by Codex] Server-side
+        // cognition payloads are permitted only in SaaS mode; P2P/local nodes
+        // remain blind and rely on the client-to-Phala path.
+        self.supernode.validate_for_mode(self.is_saas())?;
 
         // ── v1.0.0-MultiTenant: SaaS ──────────────────────────────────
         if self.mode == MemChainMode::Saas {
@@ -1207,8 +1204,7 @@ impl MemChainConfig {
             }
         }
 
-        // ── v1.1.0-ChatRelay: delegates to ChatRelayConfig::validate()
-        self.chat_relay.validate()?;
+        // ── v1.1.0-ChatRelay: validated above before the MemChain mode gate.
 
         Ok(())
     }
@@ -1508,13 +1504,12 @@ impl MemChainConfig {
         }
     }
 
-    /// v2.4.0: Check whether the cognitive graph pipeline is fully enabled.
-    ///
-    /// Requires both NER and graph to be enabled. If NER is disabled,
-    /// the graph has no data to traverse.
+    /// Whether deterministic graph storage and traversal are enabled.
+    /// Entity extraction is a separate Phala-only operation; existing graph
+    /// records remain queryable when local NER inference is disabled.
     #[must_use]
     pub fn is_cognitive_graph_enabled(&self) -> bool {
-        self.ner_enabled && self.graph_enabled
+        self.graph_enabled
     }
 
     /// v2.4.0: Check whether any Miner cognitive steps are enabled.
@@ -1666,7 +1661,11 @@ mod tests {
         assert_eq!(mc.cold_start_threshold, 10);
         assert_eq!(mc.cold_start_until, 200);
         assert_eq!(mc.rawlog_batch_threshold, 100);
-        assert!(mc.embed_enabled);
+        assert!(!mc.embed_enabled);
+        // [MEMCHAIN-PHALA-ONLY 2026-10-06 by Codex] Defaults never activate
+        // local NER/reranker inference on ordinary Rust nodes.
+        assert!(!mc.ner_enabled);
+        assert!(!mc.reranker_enabled);
         assert_eq!(mc.embed_model_path, "models/minilm-l6-v2");
         assert_eq!(mc.embed_dim, 384);
         assert_eq!(mc.embed_max_tokens, 128);
@@ -1723,6 +1722,8 @@ mod tests {
         assert!(!mc.is_saas());
         assert!(!mc.chat_relay.enabled);
         assert!(!mc.is_chat_relay_enabled());
+        // [PHALA-CONFIG-EXECUTED-REGRESSION 2026-10-08 by Codex] Graph
+        // traversal follows graph_enabled; it is not an implicit NER fallback.
         assert!(!mc.is_cognitive_graph_enabled());
         assert!(!mc.has_cognitive_miner_steps());
         assert!(!mc.is_supernode_enabled());
@@ -1732,6 +1733,8 @@ mod tests {
 
     #[test]
     fn test_memchain_off_skips_inactive_feature_validation() {
+        // [MEMCHAIN-PHALA-CONFIG-GATE 2026-10-06 by Codex] Inference switches
+        // are tested separately because they fail before the mode=off return.
         // [SUPERNODE-STARTUP-INTEGRITY 2026-08-15 by Codex] Keep this fixture
         // focused on inactive fields. An explicitly enabled SuperNode is not
         // inactive and requires a MemChain runtime even when mode is `off`.
@@ -1742,8 +1745,6 @@ mod tests {
             embed_dim: 0,
             embed_max_tokens: 0,
             db_path: String::new(),
-            ner_enabled: true,
-            ner_confidence_threshold: 2.0,
             graph_max_depth: 99,
             entropy_filter_threshold: -1.0,
             supernode: SuperNodeConfig::default(),
@@ -1754,7 +1755,7 @@ mod tests {
                 ..Default::default()
             }),
             chat_relay: ChatRelayConfig {
-                enabled: true,
+                enabled: false,
                 offline_ttl_secs: 0,
                 db_path: String::new(),
                 ..Default::default()
@@ -1762,6 +1763,49 @@ mod tests {
             ..Default::default()
         };
         assert!(mc.validate().is_ok());
+    }
+
+    // [PHALA-CHAT-RELAY-INDEPENDENT-CONFIG 2026-10-06 by Codex]
+    #[test]
+    fn memchain_off_still_validates_an_independently_enabled_chat_relay() {
+        let invalid = MemChainConfig {
+            mode: MemChainMode::Off,
+            chat_relay: ChatRelayConfig {
+                enabled: true,
+                offline_ttl_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(invalid.validate().is_err());
+
+        let valid = MemChainConfig {
+            mode: MemChainMode::Off,
+            chat_relay: ChatRelayConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(valid.validate().is_ok());
+    }
+
+    // [PHALA-CHAT-RELAY-INDEPENDENT-CONFIG 2026-10-06 by Codex]
+    #[test]
+    fn memchain_off_still_rejects_enabled_chat_relay_subroles_without_parent() {
+        let invalid = MemChainConfig {
+            mode: MemChainMode::Off,
+            chat_relay: ChatRelayConfig {
+                enabled: false,
+                anonymous_mailbox: crate::config_chat_relay::AnonymousMailboxStoreConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
@@ -2452,39 +2496,18 @@ mod tests {
         assert!(disabled.validate_runtime_identity(&[0x64; 32]).is_ok());
     }
 
-    // ── NER ───────────────────────────────────────────────────────────────
+    // ── Legacy local NER setting ──────────────────────────────────────────
 
     #[test]
-    fn test_ner_enabled_valid() {
+    fn test_ner_model_flag_is_rejected_in_every_memchain_mode() {
         let mc = MemChainConfig {
+            mode: MemChainMode::Off,
             ner_enabled: true,
-            ner_model_path: "models/gliner".into(),
-            ner_confidence_threshold: 0.4,
             ..Default::default()
         };
-        assert!(mc.validate().is_ok());
-    }
-
-    #[test]
-    fn test_ner_confidence_boundary() {
-        for bad in [0.0f32, 1.0, -0.1, 1.1] {
-            let mc = MemChainConfig {
-                ner_enabled: true,
-                ner_confidence_threshold: bad,
-                ..Default::default()
-            };
-            assert!(mc.validate().is_err(), "expected err for threshold={bad}");
-        }
-    }
-
-    #[test]
-    fn test_ner_empty_model_path_rejected() {
-        let mc = MemChainConfig {
-            ner_enabled: true,
-            ner_model_path: String::new(),
-            ..Default::default()
-        };
-        assert!(mc.validate().is_err());
+        let error = mc.validate().unwrap_err().to_string();
+        assert!(error.contains("memchain.ner_enabled"));
+        assert!(error.contains("legacy inference switch is unsupported"));
     }
 
     // ── Graph ─────────────────────────────────────────────────────────────
@@ -2492,7 +2515,6 @@ mod tests {
     #[test]
     fn test_graph_enabled_valid() {
         let mc = MemChainConfig {
-            ner_enabled: true,
             graph_enabled: true,
             graph_max_depth: 2,
             graph_max_nodes_per_hop: 20,
@@ -2500,7 +2522,70 @@ mod tests {
             ..Default::default()
         };
         assert!(mc.validate().is_ok());
+        // [MEMCHAIN-PHALA-CONFIG-GATE 2026-10-06 by Codex] Existing graph
+        // records remain queryable without local NER inference.
         assert!(mc.is_cognitive_graph_enabled());
+    }
+
+    // [MEMCHAIN-PHALA-CONFIG-GATE 2026-10-06 by Codex] Keep deterministic
+    // graph work available while rejecting every legacy local model entry.
+    #[test]
+    fn test_legacy_local_model_switches_fail_closed() {
+        let cases = [
+            (
+                "memchain.embed_enabled",
+                MemChainConfig {
+                    embed_enabled: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "memchain.ner_enabled",
+                MemChainConfig {
+                    ner_enabled: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "memchain.reranker_enabled",
+                MemChainConfig {
+                    reranker_enabled: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "memchain.miner_entity_extraction",
+                MemChainConfig {
+                    miner_entity_extraction: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "memchain.miner_session_summary",
+                MemChainConfig {
+                    miner_session_summary: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "memchain.miner_artifact_extraction",
+                MemChainConfig {
+                    miner_artifact_extraction: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "memchain.miner_llm_endpoint",
+                MemChainConfig {
+                    miner_llm_endpoint: "https://model.example".into(),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (field, config) in cases {
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(field), "wrong config error for {field}: {error}");
+        }
     }
 
     #[test]
@@ -2576,6 +2661,7 @@ mod tests {
     #[test]
     fn test_supernode_validate_delegation_no_providers() {
         let mc = MemChainConfig {
+            mode: MemChainMode::Saas,
             supernode: SuperNodeConfig {
                 enabled: true,
                 providers: Vec::new(),
@@ -2586,17 +2672,28 @@ mod tests {
         assert!(mc.validate().is_err());
     }
 
+    // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex]
     #[test]
     fn test_supernode_valid_provider() {
         let mc = MemChainConfig {
+            mode: MemChainMode::Saas,
             supernode: SuperNodeConfig {
                 enabled: true,
+                accepted_compose_hashes: vec![format!("sha256:{}", "a".repeat(64))],
+                // [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex]
+                accepted_source_provenance: vec![config_supernode::AcceptedAciSourceProvenance {
+                    compose_hash: format!("sha256:{}", "a".repeat(64)),
+                    repo_url: Some("https://example.invalid/phala-gateway".into()),
+                    repo_commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                    image_digest: None,
+                }],
+                accepted_kms_root_public_keys: vec![format!("0x02{}", "a".repeat(64))],
                 providers: vec![config_supernode::ProviderConfig {
-                    name: "ollama".into(),
-                    provider_type: config_supernode::ProviderType::OpenaiCompatible,
-                    api_base: "http://localhost:11434/v1".into(),
-                    api_key: None,
-                    model: "llama3".into(),
+                    name: "phala".into(),
+                    provider_type: config_supernode::ProviderType::PhalaAci,
+                    api_base: String::new(),
+                    api_key: Some("$PHALA_API_KEY".into()),
+                    model: "confidential-model".into(),
                     max_tokens: None,
                     temperature: None,
                 }],
@@ -2607,6 +2704,25 @@ mod tests {
         assert!(mc.validate().is_ok());
     }
 
+    // [MEMCHAIN-PHALA-NODE-BOUNDARY 2026-10-05 by Codex]
+    #[test]
+    fn test_supernode_rejects_plaintext_queue_in_p2p_mode() {
+        let mc = MemChainConfig {
+            mode: MemChainMode::P2p,
+            supernode: SuperNodeConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error = mc
+            .validate()
+            .err()
+            .expect("ordinary P2P nodes must not own plaintext cognition queues");
+        assert!(error.to_string().contains("server-side cognition tasks"));
+    }
+
+    // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex]
     #[test]
     fn test_supernode_rejects_disabled_memchain_runtime() {
         let mc = MemChainConfig {
@@ -2614,11 +2730,11 @@ mod tests {
             supernode: SuperNodeConfig {
                 enabled: true,
                 providers: vec![config_supernode::ProviderConfig {
-                    name: "ollama".into(),
-                    provider_type: config_supernode::ProviderType::OpenaiCompatible,
-                    api_base: "http://localhost:11434/v1".into(),
-                    api_key: None,
-                    model: "llama3".into(),
+                    name: "phala".into(),
+                    provider_type: config_supernode::ProviderType::PhalaAci,
+                    api_base: String::new(),
+                    api_key: Some("$PHALA_API_KEY".into()),
+                    model: "confidential-model".into(),
                     max_tokens: None,
                     temperature: None,
                 }],
@@ -2747,23 +2863,11 @@ mod tests {
     #[test]
     fn test_is_cognitive_graph_enabled() {
         assert!(MemChainConfig {
-            ner_enabled: true,
             graph_enabled: true,
             ..Default::default()
         }
         .is_cognitive_graph_enabled());
-        assert!(!MemChainConfig {
-            ner_enabled: true,
-            graph_enabled: false,
-            ..Default::default()
-        }
-        .is_cognitive_graph_enabled());
-        assert!(!MemChainConfig {
-            ner_enabled: false,
-            graph_enabled: true,
-            ..Default::default()
-        }
-        .is_cognitive_graph_enabled());
+        assert!(!MemChainConfig::default().is_cognitive_graph_enabled());
     }
 
     #[test]

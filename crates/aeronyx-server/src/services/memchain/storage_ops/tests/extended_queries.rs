@@ -29,6 +29,39 @@ async fn test_get_embedding_model() {
     );
 }
 
+// [MEMCHAIN-PHALA-EMBEDDING-OWNER-SCOPE 2026-10-06 by Codex]
+#[tokio::test]
+async fn test_embedding_backfill_query_is_owner_scoped() {
+    let storage = MemoryStorage::open(":memory:", None).unwrap();
+    let owner_a = [0xA1; 32];
+    let owner_b = [0xB2; 32];
+    let mut record_a = make_rec_owner(100, owner_a, MemoryLayer::Episode);
+    let mut record_b = make_rec_owner(200, owner_b, MemoryLayer::Episode);
+    let oversized = MemoryRecord::new(
+        owner_a,
+        50,
+        MemoryLayer::Episode,
+        vec!["test".into()],
+        "ai".into(),
+        vec![b'x'; 16 * 1024 + 1],
+        Vec::new(),
+    );
+    record_a.embedding.clear();
+    record_b.embedding.clear();
+    let id_a = record_a.record_id;
+    let id_b = record_b.record_id;
+    assert!(storage.insert(&record_a, "old-model").await);
+    assert!(storage.insert(&record_b, "old-model").await);
+    assert!(storage.insert(&oversized, "old-model").await);
+
+    let pending = storage
+        .get_records_needing_embedding(&owner_a, "new-model", 32)
+        .await;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].record_id, id_a);
+    assert_ne!(pending[0].record_id, id_b);
+}
+
 #[tokio::test]
 async fn test_get_overview() {
     let s = MemoryStorage::open(":memory:", None).unwrap();

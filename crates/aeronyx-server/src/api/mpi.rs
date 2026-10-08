@@ -133,6 +133,54 @@ use super::supernode_handlers;
 
 pub(crate) const AUTH_TIMESTAMP_TOLERANCE_SECS: u64 = 300;
 
+// [PHALA-LEGACY-MEMORY-INGRESS 2026-10-08 by Codex] Local/Bearer and
+// SaaS/JWT select owners, not a TEE or permission to process plaintext.
+// Source-owned ACI transport must never enable these legacy node handlers.
+pub(crate) const fn node_accepts_plaintext_memory_processing() -> bool { false }
+
+// [PHALA-DISABLED-BODY-BOUNDARY 2026-10-08 by Codex] Share the early
+// rejection with direct mounts without changing the legacy mutation errors.
+pub(crate) fn plaintext_memory_unavailable_response(path: &str) -> axum::response::Response {
+    let error = match path {
+        "/api/mpi/remember" => "plaintext memory writes are disabled; use owner-signed sealed storage",
+        "/api/mpi/embed" => "node-side embeddings are disabled; use Phala ACI",
+        path if path.starts_with("/api/mpi/record/") =>
+            "plaintext record updates are disabled on ordinary nodes",
+        _ => "plaintext memory processing is disabled; use client-local search and owner-signed sealed storage",
+    };
+    let mut response = (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": error
+        })),
+    ).into_response();
+    response.headers_mut().insert(axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-store"));
+    response
+}
+
+fn is_legacy_plaintext_memory_request(method: &axum::http::Method, path: &str, query: Option<&str>) -> bool {
+    // [PHALA-DISABLED-BODY-BOUNDARY 2026-10-08 by Codex] The retained
+    // mutation routes are already disabled, but remote authentication would
+    // otherwise buffer/hash their body before reaching the inert handler.
+    // A record GET (including provenance) must keep its sealed-read contract.
+    if method == axum::http::Method::PATCH && path.strip_prefix("/api/mpi/record/")
+        .map(|id| !id.is_empty() && !id.contains('/')).unwrap_or(false)
+    {
+        return true;
+    }
+    match path {
+        "/api/mpi/log" | "/api/mpi/search" | "/api/mpi/remember" | "/api/mpi/embed" => true,
+        // Keep opaque session/language pagination without filename search.
+        // Vec preserves duplicates: q=&q=secret cannot hide its second term.
+        "/api/mpi/artifacts/search" => serde_urlencoded::from_str::<Vec<(String, String)>>(
+            query.unwrap_or(""),
+        ).map(|fields| fields.iter().any(|(key, value)| key == "q" && !value.is_empty()))
+            .unwrap_or(true),
+        _ => false,
+    }
+}
+
 // [CHAT-HTTP-RELIABLE-PULL 2026-10-03 by Codex] The unified remote-auth
 // middleware hashes request bodies before the handler's route layer runs.
 // Keep the two reliable chat requests at their canonical 4 KiB ceiling here,
@@ -145,6 +193,10 @@ const CHAT_HTTP_REQUEST_MAX_BYTES: usize = 4 * 1024;
 fn unified_request_body_limit(path: &str) -> usize {
     if matches!(path, CHAT_PULL_HTTP_PATH | CHAT_ACK_HTTP_PATH) {
         CHAT_HTTP_REQUEST_MAX_BYTES
+    // [PHALA-SOURCE-HTTP-BOUNDARY 2026-10-07 by Codex] Remote auth reads
+    // the body before route admission; retain the source's same 16 KiB cap.
+    } else if path == super::reverse_onion_source::SOURCE_PULL_PATH {
+        aeronyx_core::protocol::onion::reverse_delivery::MAX_REVERSE_ONION_SOURCE_PULL_REQUEST_BYTES
     } else if path == "/api/mpi/remember_sealed_v2" {
         MEMORY_SEALED_V2_HTTP_BODY_BYTES
     } else {
@@ -296,14 +348,14 @@ impl MpiState {
         mvf_baseline: RwLock<Option<BaselineSnapshot>>,
         owner_key: [u8; 32],
         api_secret: Option<String>,
-        embed_engine: Option<Arc<EmbedEngine>>,
+        _embed_engine: Option<Arc<EmbedEngine>>,
         allow_remote_storage: bool,
         blind_storage_enabled: bool,
         max_remote_owners: usize,
-        ner_engine: Option<Arc<NerEngine>>,
+        _ner_engine: Option<Arc<NerEngine>>,
         graph_enabled: bool,
         entropy_filter_enabled: bool,
-        reranker_engine: Option<Arc<RerankerEngine>>,
+        _reranker_engine: Option<Arc<RerankerEngine>>,
         rawlog_key: Option<[u8; 32]>,
         llm_router: Option<Arc<LlmRouter>>,
     ) -> Self {
@@ -321,14 +373,16 @@ impl MpiState {
             mvf_baseline,
             owner_key,
             api_secret,
-            embed_engine,
+            // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Retain constructor
+            // parameters for source compatibility without enabling local models.
+            embed_engine: None,
             allow_remote_storage,
             blind_storage_enabled,
             max_remote_owners,
-            ner_engine,
+            ner_engine: None,
             graph_enabled,
             entropy_filter_enabled,
-            reranker_engine,
+            reranker_engine: None,
             rawlog_key,
             llm_router,
             // SaaS fields — None in Local mode
@@ -503,6 +557,9 @@ mod session_embedding_cache_tests {
             CHAT_HTTP_REQUEST_MAX_BYTES
         );
         assert_eq!(unified_request_body_limit("/api/mpi/remember"), 1024 * 1024);
+        // [PHALA-SOURCE-HTTP-BOUNDARY 2026-10-07 by Codex] Authored, not run.
+        assert_eq!(unified_request_body_limit(crate::api::reverse_onion_source::SOURCE_PULL_PATH),
+            aeronyx_core::protocol::onion::reverse_delivery::MAX_REVERSE_ONION_SOURCE_PULL_REQUEST_BYTES);
     }
 
     #[test]
@@ -513,6 +570,10 @@ mod session_embedding_cache_tests {
             ANONYMOUS_MAILBOX_SOURCE_SUBMIT_PATH
         ));
         assert!(!is_privacy_sensitive_mpi_path("/api/mpi/remember"));
+        // [PHALA-SOURCE-HTTP-BOUNDARY 2026-10-07 by Codex] Exact path only;
+        // unrelated MPI storage retains its existing resource provisioning.
+        assert!(is_privacy_sensitive_mpi_path(crate::api::reverse_onion_source::SOURCE_PULL_PATH));
+        assert!(!is_privacy_sensitive_mpi_path("/api/chat/reverse-onion/source/pull/extra"));
     }
 
     #[test]
@@ -618,6 +679,8 @@ mod session_embedding_cache_tests {
 #[cfg(test)]
 mod reliable_chat_http_route_tests {
     use super::*;
+    // [PHALA-NODE-COMPILE-REPAIR 2026-10-08 by Codex] Body-poll assertions.
+    use std::sync::atomic::Ordering;
     use axum::{body::Body, http::Request, routing::post, Router};
     use bincode::Options;
     use sha2::{Digest, Sha256};
@@ -798,6 +861,374 @@ mod reliable_chat_http_route_tests {
         assert_eq!(absent.status(), StatusCode::NOT_FOUND);
     }
 
+    // [PHALA-LEGACY-MEMORY-INGRESS 2026-10-08 by Codex] Authored, not run.
+    // Exercise the production middleware, not only the classification helper.
+    #[test]
+    fn legacy_plaintext_classification_handles_encoded_and_duplicate_terms() {
+        for query in ["q=private", "%71=private", "q=&q=private", "q=+", "q=%00"] {
+            assert!(is_legacy_plaintext_memory_request(&axum::http::Method::GET,
+                "/api/mpi/artifacts/search", Some(query)));
+        }
+        for query in [None, Some(""), Some("q="), Some("limit=5&session_id=opaque")] {
+            assert!(!is_legacy_plaintext_memory_request(&axum::http::Method::GET,
+                "/api/mpi/artifacts/search", query));
+        }
+        for path in ["/api/mpi/recall", "/api/mpi/remember_sealed_v2", "/api/mpi/forget",
+            super::super::reverse_onion_source::SOURCE_PULL_PATH] {
+            assert!(!is_legacy_plaintext_memory_request(&axum::http::Method::POST,
+                path, Some("q=private")));
+        }
+    }
+
+    // [PHALA-DISABLED-BODY-BOUNDARY 2026-10-08 by Codex] Authored, not run.
+    // Exact method/segment boundaries keep record retrieval and provenance.
+    #[test]
+    fn disabled_mutation_classification_preserves_sealed_record_reads() {
+        use axum::http::Method;
+        for path in ["/api/mpi/remember", "/api/mpi/embed"] {
+            assert!(is_legacy_plaintext_memory_request(&Method::POST, path, None));
+        }
+        assert!(is_legacy_plaintext_memory_request(&Method::PATCH, "/api/mpi/record/opaque", None));
+        for (method, path) in [
+            (Method::GET, "/api/mpi/record/opaque"),
+            (Method::GET, "/api/mpi/record/opaque/provenance"),
+            (Method::PATCH, "/api/mpi/record/opaque/provenance"),
+            (Method::PATCH, "/api/mpi/records/overview"),
+            (Method::PATCH, "/api/mpi/record/"),
+            (Method::POST, "/api/mpi/remember_sealed"),
+            (Method::POST, "/api/mpi/remember_sealed_v2"),
+        ] {
+            assert!(!is_legacy_plaintext_memory_request(&method, path, None));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_memory_rejection_precedes_auth_body_reads_in_both_modes() {
+        let (local, key) = local_state(true);
+        let storage = Arc::clone(local.storage.as_ref().unwrap());
+        for state in [local, saas_state("synthetic-jwt-secret")] {
+            let app = build_mpi_router(state);
+            for (method, path) in [
+                ("POST", "/api/mpi/log"),
+                ("GET", "/api/mpi/search?q=private-query"),
+                ("GET", "/api/mpi/artifacts/search?%71=private-filename"),
+                ("GET", "/api/mpi/artifacts/search?q=&q=private-filename"),
+                // [PHALA-DISABLED-BODY-BOUNDARY 2026-10-08 by Codex]
+                ("POST", "/api/mpi/remember"),
+                ("POST", "/api/mpi/embed"),
+                ("PATCH", "/api/mpi/record/opaque"),
+            ] {
+                let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let body_polls = Arc::clone(&polls);
+                let body = Body::from_stream(futures::stream::poll_fn(move |_| {
+                    body_polls.fetch_add(1, Ordering::SeqCst);
+                    std::task::Poll::<Option<Result<axum::body::Bytes, std::io::Error>>>::Pending
+                }));
+                let response = tokio::time::timeout(std::time::Duration::from_secs(1),
+                    app.clone().oneshot(Request::builder().method(method).uri(path)
+                        .header("x-memchain-publickey", hex::encode(key.public_key_bytes()))
+                        .header("x-memchain-timestamp", now_secs().to_string())
+                        .header("x-memchain-signature", hex::encode([0u8; 64]))
+                        .body(body).unwrap()))
+                    .await.expect("migration response must not wait for a body").unwrap();
+                assert_eq!(response.status(), StatusCode::GONE);
+                assert_eq!(polls.load(Ordering::SeqCst), 0);
+                assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL], "private, no-store");
+                let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+                assert!(!String::from_utf8_lossy(&bytes).contains("private-query"));
+                assert!(!String::from_utf8_lossy(&bytes).contains("private-filename"));
+                let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                match path {
+                    "/api/mpi/remember" => assert_eq!(error["error"],
+                        "plaintext memory writes are disabled; use owner-signed sealed storage"),
+                    "/api/mpi/embed" => assert_eq!(error["error"],
+                        "node-side embeddings are disabled; use Phala ACI"),
+                    "/api/mpi/record/opaque" => assert_eq!(error["error"],
+                        "plaintext record updates are disabled on ordinary nodes"),
+                    _ => {},
+                }
+            }
+        }
+        assert!(storage.get_unprocessed_rawlogs(10).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_memory_gate_preserves_authenticated_sealed_and_metadata_paths() {
+        let (state, _) = local_state(true);
+        let app = build_mpi_router(state);
+        for path in [
+            "/api/mpi/artifacts/search?q=&limit=5",
+            "/api/mpi/artifacts/search?session_id=opaque-id&language=rust",
+        ] {
+            let response = app.clone().oneshot(Request::builder().uri(path)
+                .header("authorization", "Bearer test-secret")
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = app.clone().oneshot(Request::builder().method("POST")
+            .uri("/api/mpi/recall").header("authorization", "Bearer test-secret")
+            .body(Body::from(r#"{"query_terms":[]}"#)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.oneshot(Request::builder().uri("/api/mpi/status")
+            .header("authorization", "Bearer test-secret")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status["plaintext_log_enabled"], false);
+        assert_eq!(status["plaintext_search_enabled"], false);
+        assert_eq!(status["sealed_memory_versions"], serde_json::json!([1, 2]));
+    }
+
+    // [REVERSE-ONION-SOURCE-MPI-AUTH 2026-10-06 by Codex] Authored, not run.
+    // The source handler is intentionally composition-only; this pins its
+    // deployment boundary to authenticated VPN/MPI composition.
+    #[tokio::test]
+    async fn reverse_onion_source_pull_is_mpi_authenticated_and_not_node_peer() {
+        const SOURCE_PULL_PATH: &str = "/api/chat/reverse-onion/source/pull";
+        let (state, _) = local_state(true);
+        let lifecycle = Arc::new(
+            crate::server::reverse_onion_source_runtime::ReverseOnionSourceLifecycle::new(),
+        );
+        let source = crate::api::reverse_onion_source::build_reverse_onion_source_router(
+            lifecycle,
+        );
+        let vpn_app = build_mpi_router_with_source(Arc::clone(&state), source);
+
+        let unauthenticated = vpn_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(SOURCE_PULL_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("unauthenticated source response");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        // [PHALA-SOURCE-HTTP-BOUNDARY 2026-10-07 by Codex] Auth failure
+        // precedes the source router, so MPI must supply its cache policy.
+        assert_eq!(unauthenticated.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store, no-cache, must-revalidate, private");
+
+        let node_app = build_mpi_router(state);
+        let absent = node_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(SOURCE_PULL_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("node source response");
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+    }
+
+    // [PHALA-SOURCE-HTTP-BOUNDARY 2026-10-07 by Codex] Authored, not run:
+    // a real valid JWT cannot provision SaaS storage, consume a source permit,
+    // or read its body. Generic authenticated chat composition stays available.
+    #[tokio::test]
+    async fn reverse_onion_source_rejects_valid_saas_jwt_without_affecting_chat() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::api::reverse_onion_source::SOURCE_PULL_PATH;
+        use crate::server::reverse_onion_source_runtime::ReverseOnionSourceLifecycle;
+        let secret = "test-jwt-secret-that-is-at-least-32-bytes-long";
+        let owner = IdentityKeyPair::generate();
+        let at = now_secs();
+        let token = crate::api::auth::issue_jwt(&hex::encode(owner.public_key_bytes()),
+            at, at + 3600, secret).unwrap();
+        // Pools are deliberately absent: touching SaaS owner resources would
+        // return 500 instead of the source-specific coarse 401 below.
+        let state = saas_state(secret);
+        let lifecycle = Arc::new(ReverseOnionSourceLifecycle::with_request_limit(1));
+        let admission = lifecycle.request_admission();
+        // [PHALA-SOURCE-PREAUTH-DRAIN 2026-10-07 by Codex] Exercise the
+        // production constructor; SaaS auth still rejects without a body slot.
+        let source = Router::new().route(CHAT_PULL_HTTP_PATH, post(|| async { StatusCode::NO_CONTENT }));
+        let app = build_mpi_router_with_reverse_onion_source(state, source, lifecycle.clone());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let reader_polls = polls.clone();
+        let body = Body::from_stream(futures::stream::poll_fn(move |_| {
+            reader_polls.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::<Option<Result<axum::body::Bytes, std::io::Error>>>::Pending
+        }));
+        let response = app.clone().oneshot(Request::builder().method("POST").uri(SOURCE_PULL_PATH)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(body).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store, no-cache, must-revalidate, private");
+        let bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::json!({ "success": false, "error": "source_pull_unauthorized" }));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert!(admission.try_acquire().is_some());
+        let response = app.oneshot(Request::builder().method("POST").uri(CHAT_PULL_HTTP_PATH)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        lifecycle.shutdown_and_drain().await.unwrap();
+    }
+
+    // [PHALA-SOURCE-HTTP-BOUNDARY 2026-10-07 by Codex] Authored, not run:
+    // exercise the actual remote-auth body reader, not just the limit helper.
+    #[tokio::test(start_paused = true)]
+    async fn reverse_onion_source_remote_auth_bounds_body_before_source_admission() {
+        use crate::api::reverse_onion_source::SOURCE_PULL_PATH;
+        use crate::server::reverse_onion_source_runtime::ReverseOnionSourceLifecycle;
+        let (state, identity) = local_state(true);
+        let lifecycle = Arc::new(ReverseOnionSourceLifecycle::with_request_limit(1));
+        let admission = lifecycle.request_admission();
+        // [PHALA-SOURCE-PREAUTH-DRAIN 2026-10-07 by Codex] The same
+        // single slot covers remote auth and is reused by JSON admission.
+        let app = build_mpi_router_with_reverse_onion_source(state, Router::new(), lifecycle.clone());
+        let timestamp = now_secs().to_string();
+        let builder = |signature: [u8; 64]| Request::builder().method("POST").uri(SOURCE_PULL_PATH)
+            .header("content-type", "application/json")
+            .header("x-memchain-publickey", hex::encode(identity.public_key_bytes()))
+            .header("x-memchain-timestamp", &timestamp)
+            .header("x-memchain-signature", hex::encode(signature));
+        let oversized = vec![0; aeronyx_core::protocol::onion::reverse_delivery::MAX_REVERSE_ONION_SOURCE_PULL_REQUEST_BYTES + 1];
+        let response = app.clone().oneshot(builder([0; 64]).body(Body::from(oversized)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store, no-cache, must-revalidate, private");
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({ "error": "failed to read request body" }));
+        assert!(admission.try_acquire().is_some());
+        let body = Body::from_stream(futures::stream::pending::<Result<axum::body::Bytes, std::io::Error>>());
+        let mut response = Box::pin(app.clone().oneshot(builder([0; 64]).body(body).unwrap()));
+        assert!(futures::poll!(response.as_mut()).is_pending());
+        assert!(admission.try_acquire().is_none(), "remote auth must retain the shared HTTP slot");
+        tokio::time::advance(crate::api::REVERSE_ONION_REQUEST_BODY_TIMEOUT).await;
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store, no-cache, must-revalidate, private");
+        assert!(admission.try_acquire().is_some());
+        // A correctly authenticated bounded request must reach JSON extraction,
+        // not be rejected by the new private-owner gate. Missing fields give 422.
+        let body = b"{}";
+        let mut digest = Sha256::new();
+        digest.update(timestamp.as_bytes());
+        digest.update(b"POST");
+        digest.update(SOURCE_PULL_PATH.as_bytes());
+        digest.update(Sha256::digest(body));
+        let signature = identity.sign(&digest.finalize());
+        let response = app.clone().oneshot(builder(signature).body(Body::from(body.as_slice())).unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let response = app.oneshot(Request::builder().method("POST").uri(SOURCE_PULL_PATH)
+            .header("content-type", "application/json").header("authorization", "Bearer test-secret")
+            .body(Body::from(body.as_slice())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        lifecycle.shutdown_and_drain().await.unwrap();
+    }
+
+    // [PHALA-SOURCE-PREAUTH-DRAIN 2026-10-07 by Codex] Authored, not run:
+    // capacity/stop precede remote body reads; caller cancellation frees its
+    // slot, but cancelling drain cannot discard a different live HTTP owner.
+    #[tokio::test(start_paused = true)]
+    async fn reverse_onion_source_preauth_capacity_cancellation_and_drain_are_shared() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::api::reverse_onion_source::SOURCE_PULL_PATH;
+        use crate::server::reverse_onion_source_runtime::ReverseOnionSourceLifecycle;
+        for method in ["POST", "GET"] {
+            let (state, identity) = local_state(true);
+            let lifecycle = Arc::new(ReverseOnionSourceLifecycle::with_request_limit(1));
+            // [PHALA-SOURCE-FIXTURE-REPAIR 2026-10-08 by Codex] This
+            // admission-only fixture intentionally has no installed runtime;
+            // that missing-owner fault must remain unchanged by normal stop.
+            let failure_before_stop = lifecycle.has_failed();
+            let admission = lifecycle.request_admission();
+            let chat = Router::new().route(CHAT_PULL_HTTP_PATH, post(|| async { StatusCode::NO_CONTENT }));
+            let app = build_mpi_router_with_reverse_onion_source(state, chat, lifecycle.clone());
+            let remote = || Request::builder().method(method).uri(SOURCE_PULL_PATH)
+                .header("content-type", "application/json")
+                .header("x-memchain-publickey", hex::encode(identity.public_key_bytes()))
+                .header("x-memchain-timestamp", now_secs().to_string())
+                .header("x-memchain-signature", hex::encode([0; 64]))
+                .body(Body::from_stream(futures::stream::pending::<Result<axum::body::Bytes, std::io::Error>>()))
+                .unwrap();
+            let mut first = Box::pin(app.clone().oneshot(remote()));
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            assert!(admission.try_acquire().is_none());
+            let polls = Arc::new(AtomicUsize::new(0));
+            for stopped in [false, true] {
+                if stopped {
+                    drop(first);
+                    assert!(admission.try_acquire().is_some());
+                    first = Box::pin(app.clone().oneshot(remote()));
+                    assert!(futures::poll!(first.as_mut()).is_pending());
+                    lifecycle.request_stop();
+                    let mut drain = Box::pin(lifecycle.shutdown_and_drain());
+                    assert!(futures::poll!(drain.as_mut()).is_pending());
+                    drop(drain);
+                }
+                let reader_polls = polls.clone();
+                let body = Body::from_stream(futures::stream::poll_fn(move |_| {
+                    reader_polls.fetch_add(1, Ordering::SeqCst);
+                    std::task::Poll::<Option<Result<axum::body::Bytes, std::io::Error>>>::Pending
+                }));
+                let response = app.clone().oneshot(Request::builder().method("POST").uri(SOURCE_PULL_PATH)
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-secret").body(body).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+                assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL],
+                    "no-store, no-cache, must-revalidate, private");
+                assert_eq!(polls.load(Ordering::SeqCst), 0);
+                let unrelated = app.clone().oneshot(Request::builder().method("POST").uri(CHAT_PULL_HTTP_PATH)
+                    .header("authorization", "Bearer test-secret").body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(unrelated.status(), StatusCode::NO_CONTENT);
+            }
+            let mut drain = Box::pin(lifecycle.shutdown_and_drain());
+            assert!(futures::poll!(drain.as_mut()).is_pending());
+            tokio::time::advance(crate::api::REVERSE_ONION_REQUEST_BODY_TIMEOUT).await;
+            assert_eq!(first.await.unwrap().status(), StatusCode::REQUEST_TIMEOUT);
+            drain.await.unwrap();
+            assert!(admission.is_stopped());
+            assert_eq!(lifecycle.has_failed(), failure_before_stop,
+                "normal intake stop must not change the existing owner fault");
+        }
+    }
+
+    // [PHALA-SOURCE-RESPONSE-DRAIN 2026-10-07 by Codex] Authored, not
+    // run: isolate outer resource composition with real MPI authentication and
+    // a synthetic successful body. The connected fixture covers the actual Pull.
+    #[tokio::test(start_paused = true)]
+    async fn source_response_capacity_survives_auth_handoff_but_not_delivery_expiry() {
+        use crate::api::reverse_onion_source::{SOURCE_PULL_PATH, with_mpi_source_admission};
+        use crate::server::reverse_onion_source_runtime::{ReverseOnionSourceLifecycle, SOURCE_RESPONSE_TIMEOUT};
+        let (state, _) = local_state(true);
+        let lifecycle = Arc::new(ReverseOnionSourceLifecycle::with_request_limit(1));
+        let admission = lifecycle.request_admission();
+        let routes = Router::new()
+            .route(SOURCE_PULL_PATH, post(|| async { Body::from(vec![71; 128 * 1024]) }))
+            .route(CHAT_PULL_HTTP_PATH, post(|| async { StatusCode::NO_CONTENT }));
+        let app = with_mpi_source_admission(build_mpi_router_with_source(state, routes), admission.clone());
+        let request = |path: &'static str| Request::builder().method("POST").uri(path)
+            .header("authorization", "Bearer test-secret").body(Body::empty()).unwrap();
+        let slow = app.clone().oneshot(request(SOURCE_PULL_PATH)).await.unwrap();
+        assert_eq!(slow.status(), StatusCode::OK);
+        assert_eq!(slow.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store, no-cache, must-revalidate, private");
+        assert!(admission.try_acquire().is_none());
+        assert_eq!(app.clone().oneshot(request(SOURCE_PULL_PATH)).await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(app.clone().oneshot(request(CHAT_PULL_HTTP_PATH)).await.unwrap().status(), StatusCode::NO_CONTENT);
+        tokio::time::advance(SOURCE_RESPONSE_TIMEOUT).await;
+        let recovered = app.oneshot(request(SOURCE_PULL_PATH)).await.unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK, "new intake must expire the unpolled predecessor");
+        assert!(axum::body::to_bytes(slow.into_body(), 256 * 1024).await.is_err());
+        assert!(admission.try_acquire().is_none(), "expired predecessor cannot release the successor slot");
+        drop(recovered);
+        assert!(admission.try_acquire().is_some());
+        lifecycle.shutdown_and_drain().await.unwrap();
+    }
+
     #[tokio::test]
     async fn reliable_chat_http_saas_jwt_owner_mismatch_is_rejected() {
         let secret = "test-jwt-secret-that-is-at-least-32-bytes-long";
@@ -974,15 +1405,33 @@ async fn unified_auth_middleware(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> impl IntoResponse {
-    match state.mode {
+    // [PHALA-LEGACY-MEMORY-INGRESS 2026-10-08 by Codex] Reject before
+    // remote body hashing or SaaS owner/pool allocation. This fixed public
+    // migration response authenticates nobody and reveals no owner state.
+    if !node_accepts_plaintext_memory_processing()
+        && is_legacy_plaintext_memory_request(req.method(), req.uri().path(), req.uri().query())
+    {
+        return plaintext_memory_unavailable_response(req.uri().path());
+    }
+    // [PHALA-SOURCE-HTTP-BOUNDARY 2026-10-07 by Codex] Authentication
+    // failures occur outside source route layers but need the same no-store
+    // policy. Only this exact source route changes response decoration.
+    let private_source = req.uri().path() == super::reverse_onion_source::SOURCE_PULL_PATH;
+    let response = match state.mode {
         Mode::Local => {
             // Check for remote Ed25519 auth first (X-MemChain-Signature header).
             if req.headers().contains_key("x-memchain-signature") {
-                return handle_remote_auth(state, req, next).await;
+                handle_remote_auth(state, req, next).await
+            } else {
+                handle_local_auth(state, req, next).await
             }
-            handle_local_auth(state, req, next).await
         }
         Mode::Saas => handle_saas_jwt_auth(state, req, next).await,
+    };
+    if private_source {
+        super::reverse_onion_source::private_source_response(response)
+    } else {
+        response
     }
 }
 
@@ -1300,7 +1749,18 @@ async fn handle_remote_auth(
     // [MEMORY-SEALED-V2 2026-10-02 by Codex] Bound the dedicated V2 body
     // before auth hashing/materialization; legacy V1 keeps its historical cap.
     let body_limit = unified_request_body_limit(parts.uri.path());
-    let body_bytes = match axum::body::to_bytes(body, body_limit).await {
+    // [PHALA-SOURCE-HTTP-BOUNDARY 2026-10-07 by Codex] This pre-effect
+    // remote-auth read happens before source permits/body admission. Give it
+    // the same bounded read deadline; never timeout accepted downstream work.
+    let read = axum::body::to_bytes(body, body_limit);
+    let read = if parts.uri.path() == super::reverse_onion_source::SOURCE_PULL_PATH {
+        match tokio::time::timeout(super::REVERSE_ONION_REQUEST_BODY_TIMEOUT, read).await {
+            Ok(read) => read,
+            Err(_) => return (StatusCode::REQUEST_TIMEOUT,
+                Json(serde_json::json!({ "error": "request body timed out" }))).into_response(),
+        }
+    } else { read.await };
+    let body_bytes = match read {
         Ok(b) => b,
         Err(_) => {
             return (
@@ -1493,6 +1953,9 @@ fn is_anonymous_mailbox_source_path(path: &str) -> bool {
 fn is_privacy_sensitive_mpi_path(path: &str) -> bool {
     is_anonymous_mailbox_source_path(path)
         || matches!(path, CHAT_PULL_HTTP_PATH | CHAT_ACK_HTTP_PATH)
+        // [PHALA-SOURCE-HTTP-BOUNDARY 2026-10-07 by Codex] Rejection and
+        // recovery must not allocate owner storage or expose request identities.
+        || path == super::reverse_onion_source::SOURCE_PULL_PATH
 }
 
 // ── Helper: extract Bearer token from Authorization header ───────────
@@ -1595,6 +2058,26 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
 /// authenticated owner before processing opaque source work.
 pub(crate) fn build_mpi_router_with_source(state: Arc<MpiState>, source_routes: Router) -> Router {
     build_mpi_router_inner(state, Some(source_routes))
+}
+
+// [PHALA-SOURCE-PREAUTH-DRAIN 2026-10-07 by Codex] Keep source state and
+// its pre-auth capacity owner together in the production VPN composition.
+// Generic chat/anonymous-source composition retains its historical contract.
+pub(crate) fn build_mpi_router_with_reverse_onion_source(
+    state: Arc<MpiState>, source_routes: Router,
+    source: Arc<crate::server::reverse_onion_source_runtime::ReverseOnionSourceLifecycle>,
+) -> Router {
+    let local = state.mode == Mode::Local;
+    let admission = source.request_admission();
+    let routes = source_routes.merge(super::reverse_onion_source::build_reverse_onion_source_router(source));
+    let router = build_mpi_router_inner(state, Some(routes));
+    if local {
+        super::reverse_onion_source::with_mpi_source_admission(router, admission)
+    } else {
+        // SaaS JWT auth never reads the body; its owner is rejected by the
+        // private source gate without allocating a source permit or storage.
+        router
+    }
 }
 
 fn build_mpi_router_inner(state: Arc<MpiState>, source_routes: Option<Router>) -> Router {

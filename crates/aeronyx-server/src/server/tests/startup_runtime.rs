@@ -2,6 +2,154 @@
 // Behavior is unchanged. Names resolve through `use super::*;`.
 use super::*;
 
+// [PHALA-ROLE-ENDPOINT-OVERRIDE 2026-10-07 by Codex] Shared by loader and
+// descriptor regressions. Deliberately retain both legacy origins and peers
+// in the mounted config so empty overrides cannot pass by testing defaults.
+pub(super) fn phala_role_override_fixture() -> ServerConfig {
+    let mut config: ServerConfig = toml::from_str(include_str!(
+        "../../../../../deploy/node/server.phala.peer.example.toml",
+    )).unwrap();
+    config.discovery.public_endpoint = Some("https://old.aeronyx.network".into());
+    config.network.public_endpoint = Some("https://fallback.aeronyx.network".into());
+    config.discovery.seed_endpoints = vec!["https://seed.aeronyx.network".into()];
+    config
+}
+
+// [PHALA-ROLE-ENDPOINT-OVERRIDE 2026-10-07 by Codex] Apply the same private
+// role literals as Compose, without changing the test runner's environment.
+pub(super) fn phala_private_role_environment(recovery_only: bool) -> Vec<(&'static str, String)> {
+    let relay_id = hex::encode(
+        IdentityKeyPair::from_bytes(&[48; 32]).unwrap().public_key_bytes(),
+    );
+    vec![
+        ("AERONYX_DISCOVERY_PUBLIC_ENDPOINT", String::new()),
+        ("AERONYX_DISCOVERY_PUBLIC_API_LISTEN_ADDR", String::new()),
+        ("AERONYX_DISCOVERY_PUBLIC_DISCOVERY", "false".into()),
+        ("AERONYX_DISCOVERY_SEED_ENDPOINTS", String::new()),
+        ("AERONYX_DISCOVERY_PHALA_ATTESTATION_SOCKET_PATH", String::new()),
+        ("AERONYX_REVERSE_ONION_RECIPIENT_ENABLED", "true".into()),
+        ("AERONYX_REVERSE_ONION_RELAY_NODE_ID", relay_id),
+        ("AERONYX_REVERSE_ONION_RELAY_ENDPOINT", "https://relay.aeronyx.network".into()),
+        ("AERONYX_REVERSE_ONION_RECOVERY_ONLY", recovery_only.to_string()),
+        ("AERONYX_PHALA_ONION_RELAY_ENABLED", "false".into()),
+        ("AERONYX_PHALA_REVERSE_ONION_QUEUE_ENABLED", "false".into()),
+        ("AERONYX_PHALA_REVERSE_ONION_QUEUE_RECOVERY_ONLY", "false".into()),
+    ]
+}
+
+// [PHALA-ROLE-ENDPOINT-OVERRIDE 2026-10-07 by Codex] Execute only when the
+// deferred test suite is authorized. The exact child test reads a fixture via
+// ServerConfig::load; the success marker prevents a zero-matched-test false pass.
+pub(super) fn run_phala_config_environment_case(
+    full_test_name: &str,
+    config: &ServerConfig,
+    case: &str,
+    overrides: &[(&str, String)],
+) {
+    let directory = tempfile::Builder::new()
+        .prefix("phala-config-environment-")
+        .tempdir_in("/Volumes/disk/aeronyx-codex-tmp")
+        .unwrap();
+    let path = directory.path().join("server.toml");
+    std::fs::write(&path, toml::to_string(config).unwrap()).unwrap();
+    let (_, test_name) = full_test_name.split_once("::").expect("crate-prefixed module path");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact").arg(test_name).arg("--nocapture").arg("--test-threads=1")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+        .env("AERONYX_PHALA_CONFIG_TEST_CASE", case)
+        .env("AERONYX_PHALA_CONFIG_TEST_PATH", &path)
+        .envs(overrides.iter().map(|(name, value)| (*name, value)))
+        .output()
+        .expect("isolated config test child should start");
+    assert!(output.status.success(), "{case}: {}\n{}",
+        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("PHALA_CONFIG_CASE_OK:{case}")),
+        "child did not complete the selected assertions: {test_name} {case}");
+}
+
+// [PHALA-ROLE-ENDPOINT-OVERRIDE 2026-10-07 by Codex] Authored, unexecuted:
+// cover the actual async loader with separate process environments, not just
+// helper calls that could miss ordering or optional-env handling regressions.
+#[tokio::test]
+async fn phala_load_resolves_role_overrides_before_final_validation() {
+    if let Ok(case) = std::env::var("AERONYX_PHALA_CONFIG_TEST_CASE") {
+        let path = std::env::var("AERONYX_PHALA_CONFIG_TEST_PATH").unwrap();
+        let loaded = tokio::time::timeout(Duration::from_secs(30), ServerConfig::load(&path))
+            .await.expect("local configuration load should complete");
+        match case.as_str() {
+            "missing" => {
+                let config = loaded.unwrap();
+                assert_eq!(config.discovery.public_endpoint.as_deref(), Some("https://old.aeronyx.network"));
+                assert_eq!(config.network.public_endpoint.as_deref(), Some("https://fallback.aeronyx.network"));
+                assert_eq!(config.discovery.seed_endpoints, vec!["https://seed.aeronyx.network"]);
+                assert!(config.discovery.phala_attestation_socket_path.is_some());
+                assert!(!config.reverse_onion.recipient.enabled);
+                assert_eq!(Server::discovery_startup_self_check(&config).0, "ready");
+            }
+            "private-live" | "private-recovery" => {
+                let config = loaded.unwrap();
+                assert!(config.discovery.public_endpoint.is_none());
+                assert!(config.network.public_endpoint.is_none());
+                assert!(config.effective_public_endpoint().is_none());
+                assert!(config.discovery.public_api_listen_addr.is_none());
+                assert!(config.discovery.phala_attestation_socket_path.is_none());
+                assert!(config.discovery.seed_endpoints.is_empty());
+                assert!(!config.discovery.public_discovery);
+                assert!(config.reverse_onion.recipient.enabled);
+                assert_eq!(config.reverse_onion.recipient.recovery_only, case == "private-recovery");
+                assert_eq!(config.reverse_onion.recipient.relay_endpoint, "https://relay.aeronyx.network");
+                assert!(config.memchain.chat_relay.enabled);
+                assert!(config.blind_vault.enabled);
+                let (status, detail) = Server::discovery_startup_self_check(&config);
+                assert_eq!(status, "ready");
+                assert!(detail.contains("pinned_relay_only"));
+            }
+            "public-listener" => {
+                let config = loaded.unwrap();
+                assert_eq!(config.discovery.public_api_listen_addr, Some("0.0.0.0:8422".parse().unwrap()));
+                assert_eq!(config.effective_public_endpoint(), Some("https://new.aeronyx.network"));
+                assert!(config.discovery.phala_attestation_socket_path.is_some());
+                assert!(!config.reverse_onion.recipient.enabled);
+            }
+            "private-quote-conflict" => assert!(matches!(loaded,
+                Err(ServerError::ConfigInvalid { field, .. }) if field == "discovery.phala_attestation_socket_path")),
+            "missing-listener" | "disabled-discovery" | "whitespace-origin" => assert!(matches!(loaded,
+                Err(ServerError::ConfigInvalid { field, .. }) if field == "AERONYX_DISCOVERY_PUBLIC_ENDPOINT")),
+            _ => panic!("unknown Phala config case"),
+        }
+        println!("PHALA_CONFIG_CASE_OK:{case}");
+        return;
+    }
+
+    let test_name = concat!(module_path!(), "::phala_load_resolves_role_overrides_before_final_validation");
+    let base = phala_role_override_fixture();
+    run_phala_config_environment_case(test_name, &base, "missing", &[]);
+    for recovery_only in [false, true] {
+        run_phala_config_environment_case(test_name, &base,
+            if recovery_only { "private-recovery" } else { "private-live" },
+            &phala_private_role_environment(recovery_only));
+    }
+    let mut no_listener = base.clone();
+    no_listener.discovery.public_api_listen_addr = None;
+    let origin = ("AERONYX_DISCOVERY_PUBLIC_ENDPOINT", "https://new.aeronyx.network".into());
+    run_phala_config_environment_case(test_name, &no_listener, "public-listener", &[
+        origin.clone(), ("AERONYX_DISCOVERY_PUBLIC_API_LISTEN_ADDR", "0.0.0.0:8422".into()),
+    ]);
+    run_phala_config_environment_case(test_name, &no_listener, "missing-listener", &[origin.clone()]);
+    let mut disabled = base.clone();
+    disabled.discovery.enabled = false;
+    run_phala_config_environment_case(test_name, &disabled, "disabled-discovery", &[origin]);
+    for endpoint in [" ", " https://new.aeronyx.network", "https://new.aeronyx.network "] {
+        run_phala_config_environment_case(test_name, &base, "whitespace-origin", &[
+            ("AERONYX_DISCOVERY_PUBLIC_ENDPOINT", endpoint.into()),
+        ]);
+    }
+    let mut quote_conflict = phala_private_role_environment(false);
+    quote_conflict.retain(|(name, _)| *name != "AERONYX_DISCOVERY_PHALA_ATTESTATION_SOCKET_PATH");
+    run_phala_config_environment_case(test_name, &base, "private-quote-conflict", &quote_conflict);
+}
+
 #[tokio::test]
 async fn storage_disabled_dispatch_gate_preserves_chat_and_rejects_storage_only_variants() {
     // [CHAT-DISPATCH-STORAGE-DECOUPLING 2026-09-02 by Codex] Classification
@@ -52,6 +200,29 @@ async fn storage_disabled_dispatch_gate_preserves_chat_and_rejects_storage_only_
         owner: [0x47; 32],
         after_timestamp: now,
     };
+    // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Appended sealed-V2 P2P
+    // variants require the record-store gate, never the legacy AOF gate.
+    let sealed_replica = aeronyx_core::protocol::memchain::SealedMemoryV2ReplicaV1 {
+        record_id: [0x4a; 32],
+        owner: sender.public_key_bytes(),
+        created_at: now,
+        envelope: vec![0; aeronyx_core::ledger::record::MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES],
+        signature: [0; 64],
+    };
+    let sealed_messages = [
+        MemChainMessage::BroadcastSealedMemoryV2ReplicaV1(sealed_replica),
+        MemChainMessage::SyncSealedMemoryV2RequestV1 {
+            owner: sender.public_key_bytes(),
+            after_record_id: None,
+            limit: 8,
+        },
+        MemChainMessage::SyncSealedMemoryV2ResponseV1 {
+            owner: sender.public_key_bytes(),
+            after_record_id: None,
+            records: vec![],
+            next_cursor: None,
+        },
+    ];
     let legacy_block_message = MemChainMessage::BlockAnnounce(aeronyx_core::ledger::BlockHeader {
         height: 1,
         timestamp: now,
@@ -130,6 +301,13 @@ async fn storage_disabled_dispatch_gate_preserves_chat_and_rejects_storage_only_
     assert!(record_requirement
         .authorize(Some(&mempool), Some(&aof_writer), &record_storage,)
         .is_ok());
+    for message in &sealed_messages {
+        let requirement = MemChainStorageRequirement::for_message(message);
+        assert_eq!(requirement, MemChainStorageRequirement::RecordStore);
+        assert!(requirement
+            .authorize(Some(&mempool), Some(&aof_writer), &record_storage)
+            .is_ok());
+    }
     for message in [&legacy_block_message, &record_block_message] {
         let requirement = MemChainStorageRequirement::for_message(message);
         assert_eq!(requirement, MemChainStorageRequirement::FactAof);
@@ -141,10 +319,10 @@ async fn storage_disabled_dispatch_gate_preserves_chat_and_rejects_storage_only_
 }
 
 #[test]
-fn configured_supernode_initialization_is_atomic_and_privacy_safe() {
-    // [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Disabled remains
-    // backward compatible, while every explicitly configured provider is
-    // required. Startup errors expose only the typed aggregate reason.
+fn configured_supernode_requires_client_to_tee_e2ee_transport() {
+    // [MEMCHAIN-PHALA-E2EE-BOUNDARY 2026-10-06 by Codex] Disabled remains
+    // backward compatible; enabled server-side inference is refused until
+    // request and response fields are encrypted to the source client.
     let disabled = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
     assert!(disabled.init_llm_router().unwrap().is_none());
 
@@ -157,19 +335,21 @@ fn configured_supernode_initialization_is_atomic_and_privacy_safe() {
         disabled_memchain_server
             .init_llm_router()
             .err()
-            .expect("SuperNode requires an active MemChain runtime")
+            .expect("SuperNode model IO requires source-bound E2EE")
             .to_string(),
-        "Server failed to start: SuperNode initialization failed (memchain_runtime_required)"
+        "Server failed to start: SuperNode initialization failed (client_to_tee_e2ee_transport_unavailable)"
     );
 
     let missing_environment = "AERONYX_TEST_SUPERNODE_SECRET_MUST_NOT_EXIST_20260814";
     let mut missing_secret_config = ServerConfig::default();
     missing_secret_config.memchain.supernode.enabled = true;
+    missing_secret_config.memchain.supernode.accepted_compose_hashes =
+        vec![format!("sha256:{}", "a".repeat(64))];
     missing_secret_config.memchain.supernode.providers =
         vec![crate::config_supernode::ProviderConfig {
             name: "private-provider-name".into(),
-            provider_type: crate::config_supernode::ProviderType::OpenaiCompatible,
-            api_base: "https://private-provider.example.com/v1".into(),
+            provider_type: crate::config_supernode::ProviderType::PhalaAci,
+            api_base: String::new(),
             api_key: Some(format!("${missing_environment}")),
             model: "test-model".into(),
             max_tokens: None,
@@ -182,17 +362,19 @@ fn configured_supernode_initialization_is_atomic_and_privacy_safe() {
         .err()
         .expect("missing configured secret must reject startup");
     let rendered = error.to_string();
-    assert!(rendered.contains("SuperNode initialization failed (provider_secret_unavailable)"));
+    assert!(rendered.contains("SuperNode initialization failed (client_to_tee_e2ee_transport_unavailable)"));
     assert!(!rendered.contains(missing_environment));
     assert!(!rendered.contains("private-provider-name"));
     assert!(!rendered.contains("private-provider.example.com"));
 
     let mut malformed_base_config = ServerConfig::default();
     malformed_base_config.memchain.supernode.enabled = true;
+    malformed_base_config.memchain.supernode.accepted_compose_hashes =
+        vec![format!("sha256:{}", "a".repeat(64))];
     malformed_base_config.memchain.supernode.providers =
         vec![crate::config_supernode::ProviderConfig {
             name: "local".into(),
-            provider_type: crate::config_supernode::ProviderType::OpenaiCompatible,
+            provider_type: crate::config_supernode::ProviderType::PhalaAci,
             api_base: "http://localhost:11434/v1?private=1".into(),
             api_key: None,
             model: "test-model".into(),
@@ -207,29 +389,33 @@ fn configured_supernode_initialization_is_atomic_and_privacy_safe() {
         .expect("ambiguous provider URL must reject startup");
     assert_eq!(
         malformed_error.to_string(),
-        "Server failed to start: SuperNode initialization failed (invalid_api_base)"
+        "Server failed to start: SuperNode initialization failed (client_to_tee_e2ee_transport_unavailable)"
     );
 
-    let mut keyless_local_config = ServerConfig::default();
-    keyless_local_config.memchain.supernode.enabled = true;
-    keyless_local_config.memchain.supernode.providers =
+    // [MEMCHAIN-PHALA-E2EE-BOUNDARY 2026-10-06 by Codex] Even a correctly
+    // configured ACI verifier does not provide client-bound payload secrecy.
+    let mut phala_config = ServerConfig::default();
+    phala_config.memchain.supernode.enabled = true;
+    phala_config.memchain.supernode.accepted_compose_hashes =
+        vec![format!("sha256:{}", "a".repeat(64))];
+    phala_config.memchain.supernode.providers =
         vec![crate::config_supernode::ProviderConfig {
-            name: "local".into(),
-            provider_type: crate::config_supernode::ProviderType::OpenaiCompatible,
-            api_base: "http://localhost:11434/v1".into(),
-            api_key: None,
+            name: "phala".into(),
+            provider_type: crate::config_supernode::ProviderType::PhalaAci,
+            api_base: String::new(),
+            api_key: Some("test-only-secret".into()),
             model: "test-model".into(),
             max_tokens: None,
             temperature: None,
         }];
-    let keyless_local_server = Server::new(keyless_local_config, IdentityKeyPair::generate(), None);
+    let phala_server = Server::new(phala_config, IdentityKeyPair::generate(), None);
     assert_eq!(
-        keyless_local_server
+        phala_server
             .init_llm_router()
-            .unwrap()
-            .unwrap()
-            .provider_count(),
-        1
+            .err()
+            .expect("server-side Phala inference without source E2EE must reject startup")
+            .to_string(),
+        "Server failed to start: SuperNode initialization failed (client_to_tee_e2ee_transport_unavailable)"
     );
 }
 

@@ -13,11 +13,10 @@
 //! - [`vector`]: Partitioned vector index for cosine similarity search
 //! - [`mvf`]: Multi-Variate Feature scoring (10-dim, v2.4.0)
 //! - [`graph`]: Co-occurrence graph + BFS + community detection (v2.4.0)
-//! - [`embed`]: Local embedding inference (ort + tokenizers)
-//! - [`ner`]: Local GLiNER NER inference (v2.4.0)
+//! - [`embed`], [`ner`], and [`reranker`]: legacy API shells; model loading is
+//!   fail-closed because MemChain inference is Phala ACI-only.
 //! - [`query_analyzer`]: Query analysis — entity detection + classification (v2.4.0)
 //! - [`quantize`]: Scalar Quantization float32→uint8 (v2.4.0)
-//! - [`reranker`]: Cross-encoder reranking ms-marco-MiniLM-L-6-v2 (v2.4.0+Reranker)
 //! - [`llm_provider`]: LlmProvider trait + shared types (v2.5.0+SuperNode)
 //! - [`llm_openai`]: OpenAI-compatible provider (v2.5.0+SuperNode)
 //! - [`llm_anthropic`]: Anthropic Messages API provider (v2.5.0+SuperNode)
@@ -40,7 +39,7 @@
 //! - All storage_*.rs files use `impl MemoryStorage` extension pattern.
 //!   Rust allows multiple impl blocks across files within the same crate.
 //! - When adding a new storage submodule: declare `pub mod` here AND add re-exports.
-//! - Re-export order: storage types → engines → SuperNode → multi-tenant → legacy.
+//! - Re-export order: storage types → compatibility types → SuperNode → multi-tenant → legacy.
 //! - CognitiveTaskType is defined in config_supernode.rs and re-exported through
 //!   llm_provider.rs. Do NOT define it here or in storage_supernode.rs.
 //! - PrivacyLevel is defined in config_supernode.rs and re-exported through prompts.rs.
@@ -138,7 +137,7 @@ pub mod graph;
 pub mod mvf;
 pub mod vector;
 
-// ── Local inference engines ──
+// ── Legacy model API compatibility (inference entry points fail closed) ──
 pub mod embed;
 // v2.4.0: GLiNER NER engine
 pub mod ner;
@@ -151,6 +150,16 @@ pub mod reranker;
 
 // ── v2.5.0+SuperNode: LLM provider infrastructure ──
 pub mod llm_anthropic;
+// [MEMCHAIN-PHALA-SECP256K1-RECEIPT 2026-10-06 by Codex] Keep ACI receipt
+// signature parsing and algorithm dispatch out of the provider response path.
+// [MEMCHAIN-PHALA-ACI-PINNED-CONTRACT 2026-10-06 by Codex]
+mod aci_receipt_signature;
+// [PHALA-UNIQUE-EVIDENCE-JSON 2026-10-07 by Codex] Discovery and ACI
+// share the same input guard; keep signature implementation details private.
+pub(crate) use aci_receipt_signature::validate_phala_json;
+// [PHALA-INTEL-LEXICAL-PROFILE 2026-10-08 by Codex] Keep the narrow
+// Intel signed-subtree profile separate from general evidence/receipt JSON.
+pub(crate) use aci_receipt_signature::validate_phala_intel_signed_json;
 pub mod llm_openai;
 pub mod llm_provider;
 pub mod llm_router;

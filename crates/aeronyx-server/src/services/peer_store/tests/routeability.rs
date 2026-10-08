@@ -1684,6 +1684,41 @@ fn permissionless_admission_rejects_unsafe_or_ambiguous_descriptor_shapes() {
     assert_eq!(store.len(), 0);
 }
 
+// [PHALA-ATTESTED-DNS-ADMISSION 2026-10-06 by Codex]
+#[test]
+fn permissionless_dns_endpoint_requires_signed_phala_attestation_feature() {
+    let now = 1_780_000_000;
+    let identity = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let mut body = NodeDescriptor::new(
+        identity.public_key_bytes(),
+        1,
+        now - 1,
+        now + 600,
+        "1.0.0",
+    )
+    .with_protocol_features([NodeProtocolFeature::PhalaNodeAttestationV1]);
+    body.public_endpoint = Some("https://phala-node.example.net:443".into());
+    body.capabilities = vec![NodeCapability::ChatRelay];
+    body.policy.public_discovery = true;
+    let descriptor = SignedNodeDescriptor::sign(body, &identity).unwrap();
+    assert_eq!(
+        store.admit_permissionless_descriptor(descriptor, now),
+        PermissionlessNodeAdmissionOutcome::Admitted
+    );
+
+    let without_feature = permissionless_descriptor_for(
+        &identity,
+        2,
+        now,
+        "https://another-node.example.net:443",
+    );
+    assert_eq!(
+        store.admit_permissionless_descriptor(without_feature, now),
+        PermissionlessNodeAdmissionOutcome::Rejected
+    );
+}
+
 #[test]
 fn permissionless_admission_capacity_is_hard_and_independent_from_live_peers() {
     let now = 1_780_000_000;

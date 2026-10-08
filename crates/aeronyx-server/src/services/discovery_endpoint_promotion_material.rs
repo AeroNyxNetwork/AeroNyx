@@ -11,8 +11,7 @@
 use aeronyx_core::protocol::discovery::{
     DirectoryDescriptorCommitmentV1, NodeCapability, NodeProtocolFeature, SignedNodeDescriptor,
 };
-use aeronyx_core::protocol::discovery_endpoint_attestation::canonical_attested_public_endpoint_socket_v1;
-use aeronyx_core::protocol::discovery_endpoint_proof::canonical_public_endpoint_commitment;
+use aeronyx_core::protocol::discovery_endpoint_attestation::canonical_attested_public_endpoint_commitment_v1;
 
 use super::discovery_endpoint_attestation_inbox::{
     DiscoveryEndpointAttestationInboxError, SqliteDiscoveryEndpointAttestationInbox,
@@ -183,13 +182,11 @@ impl<'a> DiscoveryEndpointPromotionMaterialResolver<'a> {
         let Some(endpoint) = descriptor.descriptor.public_endpoint.as_deref() else {
             return Ok(None);
         };
-        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Resolve
-        // the signed HTTP authority through the same canonical public socket
-        // as ADEA and the direct dialer, never by hashing URL text as a socket.
-        let Ok(socket) = canonical_attested_public_endpoint_socket_v1(endpoint) else {
-            return Ok(None);
-        };
-        let Ok(endpoint_commitment) = canonical_public_endpoint_commitment(&socket.to_string())
+        // [PHALA-DNS-ENDPOINT-COMMITMENT 2026-10-06 by Codex] Resolve the
+        // descriptor through the same IP-socket or TLS-DNS commitment used by
+        // ADEA; the durable promotion record retains only its fixed hash.
+        let Ok(endpoint_commitment) =
+            canonical_attested_public_endpoint_commitment_v1(endpoint)
         else {
             return Ok(None);
         };
@@ -370,10 +367,8 @@ mod tests {
         let descriptor = SignedNodeDescriptor::sign(descriptor, &target).expect("descriptor");
         let descriptor_pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
             .expect("descriptor commitment");
-        let socket = canonical_attested_public_endpoint_socket_v1(endpoint_text)
-            .expect("canonical endpoint");
-        let endpoint_commitment =
-            canonical_public_endpoint_commitment(&socket.to_string()).expect("endpoint commitment");
+        let endpoint_commitment = canonical_attested_public_endpoint_commitment_v1(endpoint_text)
+            .expect("canonical endpoint commitment");
         let inbox_config = DiscoveryEndpointAttestationInboxConfig {
             db_path: directory.path().join("attestation.sqlite3"),
             max_entries: 8,
@@ -573,7 +568,7 @@ mod tests {
         assert_eq!(first.descriptor_commitment().sequence, 7);
         assert_eq!(
             first.endpoint_commitment(),
-            canonical_public_endpoint_commitment(ENDPOINT).expect("endpoint")
+            canonical_attested_public_endpoint_commitment_v1(ENDPOINT).expect("endpoint")
         );
         assert_eq!(
             first.group_commitment(),
@@ -626,7 +621,8 @@ mod tests {
             .expect("exact material");
         assert_eq!(
             material.endpoint_commitment(),
-            canonical_public_endpoint_commitment("8.8.8.8:51820").expect("socket")
+            canonical_attested_public_endpoint_commitment_v1("8.8.8.8:51820")
+                .expect("socket")
         );
         for endpoint in ["https://9.9.9.9:51820", "https://8.8.8.8:51821"] {
             let mut body = fixture.descriptor.descriptor.clone();

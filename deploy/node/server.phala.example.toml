@@ -1,0 +1,29 @@
+# [PHALA-ISOLATED-PROFILE 2026-10-06 by Codex]
+# Isolated local trial only: no CMS, discovery, public endpoint, or inference.
+# The persistent identity key is generated under the Compose state volume.
+
+[network]
+listen_addr = "127.0.0.1:51820"
+
+[vpn]
+# [PHALA-ISOLATED-VPN-IMAGE 2026-10-08 by Codex] Exercise the actual
+# loopback UDP/TUN startup under the trial-only NET_ADMIN/device allowance.
+enabled = true
+dns_proxy_enabled = false
+
+[server_key]
+key_file = "/var/lib/aeronyx/server_key.json"
+
+[management]
+enabled = false
+cms_url = ""
+
+[memchain]
+mode = "off"
+
+[discovery]
+enabled = false
+public_discovery = false
+
+[reverse_onion.recipient]
+enabled = false

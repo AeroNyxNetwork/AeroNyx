@@ -20,7 +20,8 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::error::RuntimeTaskJoinFailureKind;
+use crate::error::{Result, RuntimeTaskJoinFailureKind, ServerError};
+use futures::FutureExt;
 
 use super::{
     CustodyWitnessReadinessBlockReason, Server, DATA_PLANE_RECV_FAILURE_LIMIT,
@@ -57,6 +58,67 @@ pub(super) fn required_runtime_supervisor_channel_closed() -> CriticalRuntimeFai
     }
 }
 
+// [REVERSE-ONION-WORKER-SUPERVISION 2026-10-05 by Codex] Keep a required
+// recipient worker failure actionable without forwarding panic/error details.
+pub(super) fn reverse_onion_recipient_worker_exited() -> CriticalRuntimeFailure {
+    CriticalRuntimeFailure {
+        task: "reverse-onion-recipient",
+        reason: "required recipient worker exited unexpectedly".to_string(),
+    }
+}
+
+// [PHALA-SOURCE-FAILURE-SUPERVISION 2026-10-07 by Codex] Keep the source
+// failure bucket stable and source-blind, like recipient worker supervision.
+pub(super) fn reverse_onion_source_failed() -> CriticalRuntimeFailure {
+    CriticalRuntimeFailure {
+        task: "reverse-onion-source",
+        reason: "required source owner failed".to_string(),
+    }
+}
+
+// [PHALA-SHUTDOWN-FAULT-RECONCILIATION 2026-10-07 by Codex] A normal
+// shutdown branch is not proof that accepted work stayed healthy. Re-read
+// sticky owners after select and after drain; retain an already chosen fault.
+// Disabled roles are inert. Normal stopped/drained owners are not failures.
+pub(super) fn reconcile_reverse_onion_runtime_failure(
+    selected: Option<CriticalRuntimeFailure>,
+    source: Option<&super::reverse_onion_source_runtime::ReverseOnionSourceLifecycle>,
+    recipient: Option<&super::reverse_onion_runtime::RecipientServerLifecycle>,
+) -> Option<CriticalRuntimeFailure> {
+    selected.or_else(|| {
+        if source.is_some_and(|owner| owner.has_failed()) {
+            Some(reverse_onion_source_failed())
+        } else if recipient.is_some_and(|owner| owner.has_failed()) {
+            Some(reverse_onion_recipient_worker_exited())
+        } else {
+            None
+        }
+    })
+}
+
+// [PHALA-READY-PUBLICATION 2026-10-07 by Codex] Fault-only fixture helper;
+// the actual publication gate below also rejects normal stopped owners.
+#[cfg(test)]
+pub(super) fn pre_ready_reverse_onion_source_failure(
+    source: Option<&super::reverse_onion_source_runtime::ReverseOnionSourceLifecycle>,
+) -> Option<CriticalRuntimeFailure> {
+    source.filter(|source| source.has_failed()).map(|_| reverse_onion_source_failed())
+}
+
+// [PHALA-SOURCE-FAILURE-SUPERVISION 2026-10-07 by Codex] A disabled role
+// is pending, not a failed/missing required owner. Select owns this future;
+// dropping a losing branch neither aborts source work nor loses sticky faults.
+pub(super) async fn wait_for_reverse_onion_source_failure(
+    source: Option<&super::reverse_onion_source_runtime::ReverseOnionSourceLifecycle>,
+) -> CriticalRuntimeFailure {
+    if let Some(source) = source {
+        source.wait_for_failure().await;
+        reverse_onion_source_failed()
+    } else {
+        std::future::pending().await
+    }
+}
+
 /// Consumes a failure already known before the process advertises readiness.
 ///
 /// [PRE-READY-RUNTIME-GATE 2026-07-30 by Codex] An empty channel means all
@@ -73,6 +135,166 @@ pub(super) fn take_pre_ready_runtime_failure(
             Some(required_runtime_supervisor_channel_closed())
         }
     }
+}
+
+// [PHALA-READY-PUBLICATION 2026-10-07 by Codex] No await may separate this
+// final decision from READY. This is a fresh local snapshot, not an atomic
+// promise about future faults, network delivery or Phala attestation.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PreReadyRuntimeDecision {
+    Ready,
+    Stopped,
+    Failed(CriticalRuntimeFailure),
+}
+
+// [PHALA-ORDERED-RUN-STOP 2026-10-08 by Codex] A stop request must wake
+// startup/runtime without telling dependency tasks that reverse drain ended.
+// watch retains the request across absent, cancelled and replacement waiters.
+#[derive(Clone)]
+pub(super) struct ReverseRunStop {
+    requested: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for ReverseRunStop {
+    fn default() -> Self {
+        let (requested, _) = tokio::sync::watch::channel(false);
+        Self { requested }
+    }
+}
+
+impl ReverseRunStop {
+    pub(super) fn request_stop(&self) { self.requested.send_replace(true); }
+
+    pub(super) fn is_requested(&self) -> bool { *self.requested.borrow() }
+
+    pub(super) async fn cancelled(&self) {
+        let mut receiver = self.requested.subscribe();
+        let _ = receiver.wait_for(|requested| *requested).await;
+    }
+
+    pub(super) fn before_ready(&self, decision: PreReadyRuntimeDecision) -> PreReadyRuntimeDecision {
+        if matches!(decision, PreReadyRuntimeDecision::Ready) && self.is_requested() {
+            PreReadyRuntimeDecision::Stopped
+        } else { decision }
+    }
+}
+
+// [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex] Register before
+// startup can yield. Reuse one listener future across the READY boundary and
+// retain its first observation through drain. Cancelling a select waiter must
+// not consume or replace the stop event.
+pub(super) struct ProcessShutdownSignals {
+    waiter: std::pin::Pin<Box<dyn std::future::Future<Output = Option<CriticalRuntimeFailure>> + Send>>,
+    observed: Option<Option<CriticalRuntimeFailure>>,
+}
+
+impl ProcessShutdownSignals {
+    pub(super) fn install() -> std::result::Result<Self, CriticalRuntimeFailure> {
+        #[cfg(unix)]
+        let mut signals = {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut terminate = signal(SignalKind::terminate())
+                .map_err(|error| Server::shutdown_signal_failure("SIGTERM", error))?;
+            let mut interrupt = signal(SignalKind::interrupt())
+                .map_err(|error| Server::shutdown_signal_failure("SIGINT", error))?;
+            Self::from_waiter(async move {
+                let (name, received) = tokio::select! {
+                    received = terminate.recv() => ("SIGTERM", received),
+                    received = interrupt.recv() => ("SIGINT", received),
+                };
+                match received {
+                    Some(()) => {
+                        info!(signal = name, "Shutdown signal received");
+                        None
+                    }
+                    None => Some(Server::shutdown_signal_failure(name, "signal stream closed unexpectedly")),
+                }
+            })
+        };
+        #[cfg(not(unix))]
+        let mut signals = {
+            // Poll once in from_waiter so CTRL_C registration is not delayed
+            // until the post-READY shutdown select on non-Unix platforms.
+            Self::from_waiter(async {
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => {
+                        info!(signal = "CTRL_C", "Shutdown signal received");
+                        None
+                    }
+                    Err(error) => Some(Server::shutdown_signal_failure("CTRL_C", error)),
+                }
+            })
+        };
+        if let Some(Some(failure)) = signals.take_pending() {
+            return Err(failure);
+        }
+        Ok(signals)
+    }
+
+    pub(super) fn from_waiter(
+        waiter: impl std::future::Future<Output = Option<CriticalRuntimeFailure>> + Send + 'static,
+    ) -> Self {
+        let mut signals = Self { waiter: Box::pin(waiter), observed: None };
+        let _ = signals.take_pending();
+        signals
+    }
+
+    pub(super) fn take_pending(&mut self) -> Option<Option<CriticalRuntimeFailure>> {
+        if self.observed.is_none() {
+            self.observed = self.waiter.as_mut().now_or_never();
+        }
+        self.observed.clone()
+    }
+
+    pub(super) async fn wait(&mut self) -> Option<CriticalRuntimeFailure> {
+        if let Some(result) = &self.observed { return result.clone(); }
+        let result = self.waiter.as_mut().await;
+        self.observed = Some(result.clone());
+        result
+    }
+
+    pub(super) fn before_ready(&mut self, decision: PreReadyRuntimeDecision) -> PreReadyRuntimeDecision {
+        // Known runtime failure outranks a racing ordinary signal. Neither
+        // case publishes global shutdown before reverse owners have drained.
+        if matches!(decision, PreReadyRuntimeDecision::Failed(_)) { return decision; }
+        match self.take_pending() {
+            Some(Some(failure)) => PreReadyRuntimeDecision::Failed(failure),
+            Some(None) => PreReadyRuntimeDecision::Stopped,
+            None => decision,
+        }
+    }
+}
+
+pub(super) fn pre_ready_runtime_decision(
+    critical_failure_rx: &mut mpsc::Receiver<CriticalRuntimeFailure>,
+    shutdown_requested: &AtomicBool,
+    source: Option<&super::reverse_onion_source_runtime::ReverseOnionSourceLifecycle>,
+    recipient: Option<&super::reverse_onion_runtime::RecipientServerLifecycle>,
+    recipient_wait_failed: bool,
+) -> PreReadyRuntimeDecision {
+    use super::reverse_onion_source_runtime::SourceRuntimeError;
+
+    if let Some(failure) = take_pre_ready_runtime_failure(critical_failure_rx) {
+        return PreReadyRuntimeDecision::Failed(failure);
+    }
+    let source_readiness = source.map(|owner| owner.verify_ready_now());
+    if matches!(source_readiness, Some(Err(error)) if error != SourceRuntimeError::Stopped) {
+        return PreReadyRuntimeDecision::Failed(reverse_onion_source_failed());
+    }
+    if let Some(owner) = recipient {
+        // [PHALA-RECIPIENT-PREFLIGHT-FAULT 2026-10-07 by Codex] An
+        // already published local fault outranks a racing normal cancellation.
+        if owner.has_failed() || (!owner.is_cancelled() && (recipient_wait_failed || owner.verify_ready_now().is_err())) {
+            return PreReadyRuntimeDecision::Failed(reverse_onion_recipient_worker_exited());
+        }
+    }
+    if shutdown_requested.load(Ordering::Acquire)
+        || matches!(source_readiness, Some(Err(SourceRuntimeError::Stopped)))
+        || recipient.is_some_and(|owner| owner.is_cancelled())
+    {
+        return PreReadyRuntimeDecision::Stopped;
+    }
+    PreReadyRuntimeDecision::Ready
 }
 
 /// Action after one consecutive required data-plane receive failure.
@@ -193,9 +415,59 @@ impl RuntimeTaskRegistry {
         self.tasks.push(task);
     }
 
-    pub(super) fn take_for_shutdown(mut self) -> Vec<(&'static str, JoinHandle<()>)> {
+    // [PHALA-RETAINED-UNWIND-DRAIN 2026-10-07 by Codex] The outer
+    // owner survives an inner unwind; taking tasks leaves it safely empty.
+    pub(super) fn take_for_shutdown(&mut self) -> Vec<(&'static str, JoinHandle<()>)> {
         std::mem::take(&mut self.tasks)
     }
+}
+
+// [PHALA-RETAINED-UNWIND-DRAIN 2026-10-07 by Codex] Keep handles and
+// queue permits outside the fallible startup/runtime future. Tasks and the
+// accepted worker/router clones retain their Arc dependencies through drain.
+// This protects Rust unwinding, not panic=abort, process kill or runtime loss.
+#[derive(Default)]
+pub(super) struct ReverseRuntimeDependencies {
+    pub(super) tasks: RuntimeTaskRegistry,
+    pub(super) queue: Option<super::ReverseOnionQueueRuntime>,
+}
+
+impl ReverseRuntimeDependencies {
+    pub(super) async fn drain_reverse_owners(
+        &self,
+        source: Option<&super::reverse_onion_source_runtime::ReverseOnionSourceLifecycle>,
+        recipient: Option<&super::reverse_onion_runtime::RecipientServerLifecycle>,
+    ) -> Result<()> {
+        // Stop every gate before the first await. A returned drain error must
+        // not skip another owner's accepted work or release generic handles.
+        if let Some(recipient) = recipient { recipient.request_stop(); }
+        if let Some(source) = source { source.request_stop(); }
+        if let Some(queue) = &self.queue { queue.request_stop(); }
+        let recipient_drain = if let Some(recipient) = recipient {
+            recipient.drain().await.map_err(|_| ServerError::startup_failed("Recipient drain failed"))
+        } else { Ok(()) };
+        let source_drain = if let Some(source) = source {
+            source.shutdown_and_drain().await.map_err(|_| ServerError::startup_failed("Source drain failed"))
+        } else { Ok(()) };
+        if let Some(queue) = &self.queue { queue.shutdown_and_drain().await; }
+        recipient_drain?;
+        source_drain
+    }
+}
+
+// [PHALA-RETAINED-UNWIND-DRAIN 2026-10-07 by Codex] Only the inner
+// future is unwound. Its caller must keep ReverseRuntimeDependencies alive
+// until reverse drain and generic task shutdown complete. Never expose payload.
+pub(super) async fn catch_reverse_runtime_unwind(
+    runtime: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    // [PHALA-UNWIND-BUILD-CONTRACT 2026-10-07 by Codex] Refuse before
+    // polling the inner future if this executable would abort instead of drain.
+    crate::config_reverse_onion::require_reverse_onion_unwind_support()?;
+    std::panic::AssertUnwindSafe(runtime).catch_unwind().await
+        .unwrap_or_else(|_| Err(ServerError::runtime_failed(
+            "reverse-owned-server", "required reverse server owner unwound",
+        )))
 }
 
 impl Drop for RuntimeTaskRegistry {
@@ -449,97 +721,40 @@ impl Server {
         .await
     }
 
+    // [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex] Reuse the
+    // pre-startup listener. A losing select leaves its sticky observation
+    // available to the READY gate and subsequent shutdown waiter.
     pub(super) async fn wait_for_shutdown(
         &self,
         critical_failure_rx: &mut mpsc::Receiver<CriticalRuntimeFailure>,
+        signals: &mut ProcessShutdownSignals,
     ) -> Option<CriticalRuntimeFailure> {
-        // [RUNTIME-SUPERVISION 2026-07-29 by Codex] `Server::shutdown()` is a
-        // first-class graceful stop source. Subscribe before checking the flag
-        // so a concurrent programmatic shutdown cannot be lost between them.
+        // Subscribe before the flag sample so programmatic stop is not lost.
         let mut programmatic_shutdown_rx = self.shutdown_tx.subscribe();
         if self.shutdown.load(Ordering::Acquire) {
             info!(signal = "PROGRAMMATIC", "Shutdown request already pending");
             return None;
         }
-
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-
-            let mut terminate = match signal(SignalKind::terminate()) {
-                Ok(terminate) => terminate,
-                Err(error) => {
-                    return Some(Self::shutdown_signal_failure("SIGTERM", error));
-                }
-            };
-            tokio::select! {
-                result = tokio::signal::ctrl_c() => {
-                    match result {
-                        Ok(()) => {
-                            info!(signal = "SIGINT", "Shutdown signal received");
-                            None
-                        }
-                        Err(error) => Some(Self::shutdown_signal_failure("SIGINT", error)),
-                    }
-                }
-                received = terminate.recv() => {
-                    match received {
-                        Some(()) => {
-                            info!(signal = "SIGTERM", "Shutdown signal received");
-                            None
-                        }
-                        None => Some(Self::shutdown_signal_failure(
-                            "SIGTERM",
-                            "signal stream closed unexpectedly",
-                        )),
-                    }
-                }
-                _ = programmatic_shutdown_rx.recv() => {
-                    info!(signal = "PROGRAMMATIC", "Shutdown signal received");
-                    None
-                }
-                failure = critical_failure_rx.recv() => {
-                    // [RUNTIME-SUPERVISION 2026-07-29 by Codex] Sender
-                    // disappearance is also fatal: it means the supervisor
-                    // vanished without preserving required service health.
-                    // A concurrent explicit shutdown takes precedence.
-                    if self.shutdown.load(Ordering::Acquire) {
-                        None
-                    } else {
-                        Some(
-                            failure
-                                .unwrap_or_else(required_runtime_supervisor_channel_closed),
-                        )
-                    }
-                }
-            }
+        // [PHALA-ORDERED-RUN-STOP 2026-10-08 by Codex] Observe a sticky
+        // reverse stop without closing dependencies. Known required failures
+        // retain priority; reverse owner faults are reconciled after drain.
+        if self.reverse_run_stop.is_requested() {
+            return take_pre_ready_runtime_failure(critical_failure_rx);
         }
-
-        #[cfg(not(unix))]
-        {
-            tokio::select! {
-                result = tokio::signal::ctrl_c() => {
-                    match result {
-                        Ok(()) => {
-                            info!(signal = "CTRL_C", "Shutdown signal received");
-                            None
-                        }
-                        Err(error) => Some(Self::shutdown_signal_failure("CTRL_C", error)),
-                    }
-                }
-                _ = programmatic_shutdown_rx.recv() => {
-                    info!(signal = "PROGRAMMATIC", "Shutdown signal received");
+        tokio::select! {
+            result = signals.wait() => result,
+            _ = self.reverse_run_stop.cancelled() => {
+                take_pre_ready_runtime_failure(critical_failure_rx)
+            }
+            _ = programmatic_shutdown_rx.recv() => {
+                info!(signal = "PROGRAMMATIC", "Shutdown signal received");
+                None
+            }
+            failure = critical_failure_rx.recv() => {
+                if self.shutdown.load(Ordering::Acquire) {
                     None
-                }
-                failure = critical_failure_rx.recv() => {
-                    if self.shutdown.load(Ordering::Acquire) {
-                        None
-                    } else {
-                        Some(
-                            failure
-                                .unwrap_or_else(required_runtime_supervisor_channel_closed),
-                        )
-                    }
+                } else {
+                    Some(failure.unwrap_or_else(required_runtime_supervisor_channel_closed))
                 }
             }
         }
@@ -560,6 +775,23 @@ impl Server {
     }
 
     pub fn shutdown(&self) {
+        // [PHALA-ORDERED-RUN-STOP 2026-10-08 by Codex] Reverse-enabled
+        // servers publish global stop only after accepted work has drained.
+        // Preserve immediate shutdown for unrelated legacy server roles.
+        if self.config.reverse_onion.queue.enabled || self.reverse_source.is_some()
+            || self.reverse_recipient.is_some()
+        {
+            if let Some(source) = &self.reverse_source { source.request_stop(); }
+            if let Some(recipient) = &self.reverse_recipient { recipient.request_stop(); }
+            self.reverse_run_stop.request_stop();
+            return;
+        }
+        self.publish_dependency_shutdown();
+    }
+
+    // [PHALA-ORDERED-RUN-STOP 2026-10-08 by Codex] Called by the retained
+    // reverse owner only after all drain attempts, including startup failure.
+    pub(super) fn publish_dependency_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
     }

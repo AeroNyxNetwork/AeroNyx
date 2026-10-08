@@ -4,8 +4,8 @@
 # ============================================
 # Interactive setup wizard that:
 #   1. Detects system resources (CPU, RAM, disk)
-#   2. Downloads AI models (EmbeddingGemma + GLiNER + ORT)
-#   3. Asks user preferences (LLM provider, privacy level)
+#   2. Explains the Phala-only inference boundary (no local model downloads)
+#   3. Asks local storage/API preferences; inference remains client-to-Phala
 #   4. Generates server.toml configuration
 #   5. Configures IP forwarding + NAT (VPN routing)
 #   6. Optionally builds and starts the server
@@ -21,6 +21,10 @@
 # v2.6.0 - Added Step 4.5: IP forwarding + iptables NAT setup
 
 set -euo pipefail
+umask 077
+
+# [MEMCHAIN-PHALA-SETUP 2026-10-06 by Codex] This wizard writes credentials;
+# keep generated configuration and backups private by default.
 
 # ── Colors ─────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -36,14 +40,15 @@ ok()      { echo -e "${GREEN}[✅]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; }
 header()  { echo -e "\n${BOLD}${CYAN}═══ $* ═══${NC}\n"; }
-ask()     { echo -en "${BOLD}$*${NC} "; }
+# [MEMCHAIN-PHALA-SETUP 2026-10-06 by Codex] Keep prompts off stdout so
+# command substitutions capture only values, never prompt text.
+ask()     { printf '%b ' "${BOLD}$*${NC}" >&2; }
 
 # ── Resolve paths ──────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIG_DIR="/etc/aeronyx"
 CONFIG_FILE="${CONFIG_DIR}/server.toml"
-MODELS_DIR="${PROJECT_ROOT}/crates/aeronyx-server/models"
 DB_DIR="/var/lib/aeronyx"
 
 # ── Parse arguments ────────────────────────────────────────────
@@ -101,6 +106,33 @@ prompt_yn() {
     esac
 }
 
+# [MEMCHAIN-PHALA-SETUP 2026-10-06 by Codex] Read credentials without terminal
+# echo; never route their prompt text through a captured stdout value.
+prompt_secret() {
+    local question="$1"
+    local answer
+    if [ "${USE_DEFAULTS}" = true ]; then
+        printf '%s' ""
+        return
+    fi
+    printf '%b' "${BOLD}${question}${NC} " >&2
+    IFS= read -r -s answer
+    printf '\n' >&2
+    printf '%s' "${answer}"
+}
+
+# [MEMCHAIN-PHALA-SETUP 2026-10-06 by Codex] Quote operator strings as TOML
+# basic strings rather than allowing key/model text to alter generated config.
+toml_quote() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\t'/\\t}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\n'/\\n}
+    printf '"%s"' "${value}"
+}
+
 # ── System detection ───────────────────────────────────────────
 detect_system() {
     CPU_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
@@ -143,46 +175,24 @@ echo ""
 
 if [ "${RAM_MB}" -lt 3072 ]; then
     warn "Low RAM (${RAM_MB}MB). Minimum 4GB recommended."
-    warn "EmbeddingGemma may fail. Consider using MiniLM (--embed-minilm)."
 fi
 if [ "${DISK_FREE_GB}" -lt 3 ]; then
-    warn "Low disk space (${DISK_FREE_GB}GB). Models need ~2GB."
+    warn "Low disk space (${DISK_FREE_GB}GB). Leave room for the database and durable queues."
 fi
 
 # ════════════════════════════════════════════════════════════════
-# Step 2: Model Download
+# Step 2: Inference Boundary
 # ════════════════════════════════════════════════════════════════
 
-header "Step 2/5 — AI Model Download"
+header "Step 2/5 — MemChain Inference Boundary"
 
-echo "  MemChain uses 3 local AI models (no API needed):"
+# [MEMCHAIN-PHALA-SETUP 2026-10-06 by Codex] Embeddings, extraction, and other
+# model inference belong to attested Phala ACI. This wizard never downloads
+# local models; encrypted storage and deterministic retrieval remain available.
+echo "  Local model downloads and inference are disabled on ordinary Rust nodes."
+echo "  MemChain can still store encrypted records and run deterministic indexes."
+echo "  Clients must use their own fail-closed Phala ACI route for model work."
 echo ""
-echo -e "  ${GREEN}1. EmbeddingGemma-300M${NC} — Semantic vectors (100+ languages)"
-echo -e "     Size: ~1.5GB | Quality: Best | ${DIM}Required${NC}"
-echo ""
-echo -e "  ${GREEN}2. GLiNER small-v2.1${NC} — Entity recognition (zero-shot NER)"
-echo -e "     Size: ~200MB | ${DIM}Required for knowledge graph${NC}"
-echo ""
-echo -e "  ${GREEN}3. ONNX Runtime${NC} — Inference engine"
-echo -e "     Size: ~30MB | ${DIM}Required${NC}"
-echo ""
-
-DOWNLOAD_MODELS=true
-if [ -f "${MODELS_DIR}/embeddinggemma/model.onnx" ] && [ -f "${MODELS_DIR}/gliner/model.onnx" ]; then
-    ok "Models already downloaded!"
-    if prompt_yn "Re-download models?" "n"; then
-        DOWNLOAD_MODELS=true
-    else
-        DOWNLOAD_MODELS=false
-    fi
-fi
-
-if [ "${DOWNLOAD_MODELS}" = true ]; then
-    info "Downloading models... (this may take a few minutes)"
-    echo ""
-    bash "${SCRIPT_DIR}/download_models.sh"
-    echo ""
-fi
 
 # ════════════════════════════════════════════════════════════════
 # Step 3: Configuration
@@ -195,6 +205,10 @@ echo -e "${BOLD}Network Settings${NC}"
 echo ""
 
 API_PORT=$(prompt "  API port" "8421")
+if ! [[ "${API_PORT}" =~ ^[0-9]{1,5}$ ]] || [ "${API_PORT}" -lt 1 ] || [ "${API_PORT}" -gt 65535 ]; then
+    error "API port must be an integer between 1 and 65535."
+    exit 1
+fi
 API_ADDR="127.0.0.1:${API_PORT}"
 
 VPN_ENABLED=false
@@ -206,11 +220,16 @@ fi
 echo ""
 echo -e "${BOLD}Miner Settings${NC}"
 echo ""
-echo "  The Miner automatically builds the knowledge graph from conversations."
+# [MEMCHAIN-PHALA-ONLY 2026-10-06 by Codex] Do not imply local extraction runs.
+echo "  Background maintenance interval; model-powered miner tasks stay disabled here."
 echo "  Interval = how often it runs (seconds)."
 echo ""
 
 MINER_INTERVAL=$(prompt "  Miner interval (seconds)" "60")
+if ! [[ "${MINER_INTERVAL}" =~ ^[0-9]+$ ]] || [ "${MINER_INTERVAL}" -lt 1 ]; then
+    error "Miner interval must be a positive integer."
+    exit 1
+fi
 
 # ── Security ───────────────────────────────────────────────────
 echo ""
@@ -219,142 +238,25 @@ echo ""
 
 API_SECRET=""
 if prompt_yn "  Require API key for access?" "n"; then
-    API_SECRET=$(prompt "  API secret (min 16 chars)" "$(openssl rand -hex 16 2>/dev/null || head -c 32 /dev/urandom | xxd -p)")
+    API_SECRET="$(prompt_secret "  API secret (leave blank to generate one):")"
     if [ ${#API_SECRET} -lt 16 ]; then
-        warn "Secret too short, generating random one"
+        [ -z "${API_SECRET}" ] || warn "Secret too short; generating a random one"
         API_SECRET=$(head -c 32 /dev/urandom | xxd -p | head -c 32)
     fi
-    ok "API secret set: ${API_SECRET:0:8}..."
+    ok "API secret configured (value hidden)"
 fi
 
-# ── SuperNode (LLM Enhancement) ───────────────────────────────
+# ── Model inference boundary ──────────────────────────────────
 echo ""
-echo -e "${BOLD}SuperNode — LLM Enhancement (Optional)${NC}"
+# [MEMCHAIN-PHALA-ONLY 2026-10-06 by Codex] This wizard creates a local-mode
+# MemChain service. Rust rejects server-side SuperNode outside SaaS mode, and
+# ordinary nodes must not accept plaintext model prompts. The client owns its
+# direct Phala route and its separate consent/attestation policy.
+echo -e "${BOLD}Phala-only model inference${NC}"
+echo "  This local MemChain profile stores records and deterministic indexes only."
+echo "  Model requests must go directly from the client to its approved Phala ACI route."
+echo "  This server will not proxy prompts or configure SuperNode in local mode."
 echo ""
-echo "  MemChain works fully without LLM. SuperNode adds:"
-echo "  • Better session titles (LLM-generated)"
-echo "  • Community narratives (natural language summaries)"
-echo "  • Entity descriptions (enriched from context)"
-echo ""
-
-SUPERNODE_ENABLED=false
-SUPERNODE_PROVIDER=""
-SUPERNODE_API_KEY=""
-SUPERNODE_MODEL=""
-SUPERNODE_API_BASE=""
-SUPERNODE_PROVIDER_NAME=""
-
-if prompt_yn "  Enable SuperNode LLM enhancement?" "n"; then
-    SUPERNODE_ENABLED=true
-    echo ""
-    echo "  Choose a provider:"
-    echo ""
-    echo -e "  ${BOLD}1${NC}) DeepSeek     — Cheapest (\$0.07/M tokens), good quality"
-    echo -e "  ${BOLD}2${NC}) OpenAI       — GPT-4o-mini, reliable"
-    echo -e "  ${BOLD}3${NC}) Anthropic    — Claude Sonnet, best reasoning"
-    echo -e "  ${BOLD}4${NC}) xAI Grok     — Grok-3-mini"
-    echo -e "  ${BOLD}5${NC}) Groq         — Fast inference, Llama models"
-    echo -e "  ${BOLD}6${NC}) Ollama       — Local, free, needs 16GB+ RAM"
-    echo -e "  ${BOLD}7${NC}) Custom       — Any OpenAI-compatible endpoint"
-    echo ""
-
-    PROVIDER_CHOICE=$(prompt "  Provider [1-7]" "1")
-
-    case "${PROVIDER_CHOICE}" in
-        1)
-            SUPERNODE_PROVIDER_NAME="deepseek"
-            SUPERNODE_API_BASE="https://api.deepseek.com"
-            SUPERNODE_MODEL="deepseek-chat"
-            ask "  DeepSeek API key: "; read -r SUPERNODE_API_KEY
-            ;;
-        2)
-            SUPERNODE_PROVIDER_NAME="openai"
-            SUPERNODE_API_BASE="https://api.openai.com"
-            SUPERNODE_MODEL="gpt-4o-mini"
-            ask "  OpenAI API key: "; read -r SUPERNODE_API_KEY
-            ;;
-        3)
-            SUPERNODE_PROVIDER_NAME="anthropic"
-            SUPERNODE_PROVIDER="anthropic"
-            SUPERNODE_API_BASE="https://api.anthropic.com"
-            SUPERNODE_MODEL="claude-sonnet-4-20250514"
-            ask "  Anthropic API key: "; read -r SUPERNODE_API_KEY
-            ;;
-        4)
-            SUPERNODE_PROVIDER_NAME="grok"
-            SUPERNODE_API_BASE="https://api.x.ai"
-            SUPERNODE_MODEL="grok-3-mini"
-            ask "  xAI API key: "; read -r SUPERNODE_API_KEY
-            ;;
-        5)
-            SUPERNODE_PROVIDER_NAME="groq"
-            SUPERNODE_API_BASE="https://api.groq.com/openai"
-            SUPERNODE_MODEL="llama-3.3-70b-versatile"
-            ask "  Groq API key: "; read -r SUPERNODE_API_KEY
-            ;;
-        6)
-            SUPERNODE_PROVIDER_NAME="ollama"
-            SUPERNODE_API_BASE="http://localhost:11434"
-            SUPERNODE_MODEL=$(prompt "  Ollama model name" "qwen2.5:7b")
-            SUPERNODE_API_KEY=""
-            if ! curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
-                warn "Ollama not running on localhost:11434"
-                warn "Install: curl -fsSL https://ollama.com/install.sh | sh"
-                warn "Then: ollama pull ${SUPERNODE_MODEL}"
-            fi
-            ;;
-        7)
-            SUPERNODE_PROVIDER_NAME=$(prompt "  Provider name" "custom")
-            SUPERNODE_API_BASE=$(prompt "  API base URL" "http://localhost:8080")
-            SUPERNODE_MODEL=$(prompt "  Model name" "default")
-            ask "  API key (empty for none): "; read -r SUPERNODE_API_KEY
-            ;;
-        *)
-            warn "Invalid choice, disabling SuperNode"
-            SUPERNODE_ENABLED=false
-            ;;
-    esac
-
-    if [ -z "${SUPERNODE_PROVIDER}" ]; then
-        SUPERNODE_PROVIDER="openai_compatible"
-    fi
-
-    if [ "${SUPERNODE_ENABLED}" = true ] && [ -n "${SUPERNODE_API_KEY}" ]; then
-        echo ""
-        info "Testing API connectivity..."
-        TEST_URL="${SUPERNODE_API_BASE}/v1/chat/completions"
-        if [ "${SUPERNODE_PROVIDER}" = "anthropic" ]; then
-            TEST_URL="${SUPERNODE_API_BASE}/v1/messages"
-        fi
-
-        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer ${SUPERNODE_API_KEY}" \
-            -H "Content-Type: application/json" \
-            --max-time 10 \
-            "${TEST_URL}" 2>/dev/null || echo "000")
-
-        if [ "${HTTP_CODE}" = "000" ]; then
-            warn "Cannot reach ${SUPERNODE_API_BASE} — check URL and network"
-        elif [ "${HTTP_CODE}" = "401" ] || [ "${HTTP_CODE}" = "403" ]; then
-            warn "API returned ${HTTP_CODE} — check your API key"
-        else
-            ok "API reachable (HTTP ${HTTP_CODE})"
-        fi
-    fi
-
-    if [ "${SUPERNODE_ENABLED}" = true ]; then
-        echo ""
-        echo -e "  ${BOLD}Privacy level for LLM:${NC}"
-        echo "  1) structured — Only entity names sent to LLM (safest, default)"
-        echo "  2) full       — Full conversation content sent (better quality)"
-        echo ""
-        PRIVACY_CHOICE=$(prompt "  Privacy level [1-2]" "1")
-        case "${PRIVACY_CHOICE}" in
-            2) PRIVACY_LEVEL="full" ;;
-            *) PRIVACY_LEVEL="structured" ;;
-        esac
-    fi
-fi
 
 # ════════════════════════════════════════════════════════════════
 # Step 4: Generate Configuration
@@ -409,76 +311,31 @@ TOML
 
 if [ -n "${API_SECRET}" ]; then
     cat >> "${CONFIG_FILE}" << TOML
-api_secret = "${API_SECRET}"
+api_secret = $(toml_quote "${API_SECRET}")
 TOML
 fi
 
 cat >> "${CONFIG_FILE}" << TOML
 
-# Local AI Models
-embed_model_path = "${MODELS_DIR}/embeddinggemma"
-embed_max_tokens = 256
-embed_output_dim = 384
+# [MEMCHAIN-PHALA-SETUP 2026-10-06 by Codex] Legacy model controls are kept
+# parse-compatible but explicitly disabled; no model bundle is installed.
+embed_enabled = false
+ner_enabled = false
+reranker_enabled = false
 
-# NER + Knowledge Graph
-ner_enabled = true
-ner_model_path = "${MODELS_DIR}/gliner"
-graph_enabled = true
+# Deterministic graph/index support does not execute local models.
+graph_enabled = false
 entropy_filter_enabled = true
 
-# Miner Cognitive Steps
-miner_entity_extraction = true
-miner_community_detection = true
-miner_session_summary = true
+# Model-powered tasks require a separately configured explicit consent policy.
+miner_entity_extraction = false
+miner_community_detection = false
+miner_session_summary = false
 TOML
-
-if [ "${SUPERNODE_ENABLED}" = true ]; then
-    cat >> "${CONFIG_FILE}" << TOML
-
-# ════════════════════════════════════════════════════════════════
-# SuperNode — LLM Cognitive Enhancement
-# ════════════════════════════════════════════════════════════════
-
-[memchain.supernode]
-enabled = true
-
-[[memchain.supernode.providers]]
-name = "${SUPERNODE_PROVIDER_NAME}"
-type = "${SUPERNODE_PROVIDER}"
-api_base = "${SUPERNODE_API_BASE}"
-TOML
-
-    if [ -n "${SUPERNODE_API_KEY}" ]; then
-        cat >> "${CONFIG_FILE}" << TOML
-api_key = "${SUPERNODE_API_KEY}"
-TOML
-    fi
-
-    cat >> "${CONFIG_FILE}" << TOML
-model = "${SUPERNODE_MODEL}"
-max_tokens = 1500
-temperature = 0.3
-
-[memchain.supernode.routing]
-fallback = "${SUPERNODE_PROVIDER_NAME}"
-
-[memchain.supernode.privacy]
-default_level = "${PRIVACY_LEVEL:-structured}"
-allow_full_for = ["session_title", "code_analysis"]
-
-[memchain.supernode.worker]
-poll_interval_secs = 5
-max_concurrent = 3
-max_retries = 3
-task_timeout_secs = 120
-TOML
-fi
 
 ok "Configuration written to: ${CONFIG_FILE}"
-echo ""
-echo -e "${DIM}─── Generated Config ───${NC}"
-cat "${CONFIG_FILE}"
-echo -e "${DIM}────────────────────────${NC}"
+chmod 600 "${CONFIG_FILE}"
+echo -e "${DIM}Configuration contents (including credentials) were not printed.${NC}"
 
 # ════════════════════════════════════════════════════════════════
 # Step 4.5: Network Setup (IP Forwarding + NAT)
@@ -654,15 +511,10 @@ if [ "${BUILD_NOW}" = true ]; then
             fi
 
             STATUS=$(curl -s "http://${API_ADDR}/api/mpi/status")
-            EMBED_READY=$(echo "${STATUS}" | jq -r '.embed_ready // false')
-            NER_READY=$(echo "${STATUS}" | jq -r '.ner_ready // false')
             GRAPH=$(echo "${STATUS}" | jq -r '.graph_enabled // false')
-            SN=$(echo "${STATUS}" | jq -r '.supernode.enabled // false')
 
-            echo -e "  Embedding Engine:  $([ "${EMBED_READY}" = "true" ] && echo -e "${GREEN}✅ Ready${NC}" || echo -e "${RED}❌ Not ready${NC}")"
-            echo -e "  NER Engine:        $([ "${NER_READY}" = "true" ] && echo -e "${GREEN}✅ Ready${NC}" || echo -e "${RED}❌ Not ready${NC}")"
+            echo -e "  Server-side model inference: ${DIM}Disabled (client-to-Phala ACI only)${NC}"
             echo -e "  Knowledge Graph:   $([ "${GRAPH}" = "true" ] && echo -e "${GREEN}✅ Enabled${NC}" || echo -e "${YELLOW}⚠️  Disabled${NC}")"
-            echo -e "  SuperNode LLM:     $([ "${SN}" = "true" ] && echo -e "${GREEN}✅ Enabled${NC}" || echo -e "${DIM}Disabled${NC}")"
         else
             warn "Server may still be starting. Check logs."
         fi
@@ -684,7 +536,6 @@ echo -e "${NC}"
 
 echo -e "  ${BOLD}Config:${NC}  ${CONFIG_FILE}"
 echo -e "  ${BOLD}Data:${NC}    ${DB_DIR}/memchain.db"
-echo -e "  ${BOLD}Models:${NC}  ${MODELS_DIR}/"
 echo -e "  ${BOLD}API:${NC}     http://${API_ADDR}/api/mpi/"
 echo ""
 
@@ -704,7 +555,7 @@ echo ""
 
 if [ -n "${API_SECRET}" ]; then
     echo -e "  ${BOLD}${YELLOW}API Key Required:${NC}"
-    echo "    Add header: -H 'Authorization: Bearer ${API_SECRET}'"
+    echo "    Read the key from ${CONFIG_FILE}; it is intentionally not displayed here."
     echo ""
 fi
 

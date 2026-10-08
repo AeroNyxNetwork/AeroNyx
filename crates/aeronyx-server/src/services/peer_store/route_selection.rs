@@ -12,7 +12,264 @@
 
 use super::*;
 
+// [PHALA-PINNED-RELAY-APPRAISAL 2026-10-07 by Codex] Not routing or TEE
+// authority. Private fields prevent arbitrary callers from marking an input
+// descriptor as operator-pinned. The verifier/cache still check exact bytes.
+pub(crate) struct PhalaPeerAppraisalTarget {
+    descriptor: SignedNodeDescriptor,
+    pinned_relay: bool,
+    // [PHALA-APPRAISAL-EGRESS-PIN 2026-10-07 by Codex] An immutable
+    // operator transport constraint, not descriptor or attestation authority.
+    origin_pin: Option<[u8; 32]>,
+}
+
+impl PhalaPeerAppraisalTarget {
+    pub(crate) fn descriptor(&self) -> &SignedNodeDescriptor { &self.descriptor }
+    pub(crate) fn permits_private_relay(&self) -> bool { self.pinned_relay }
+
+    pub(crate) fn transport_origin_is_permitted(&self) -> bool {
+        self.origin_pin.is_none_or(|origin| {
+            self.descriptor.descriptor.public_endpoint.as_deref().is_some_and(|endpoint| {
+                crate::api::reverse_onion_pinned_origin(endpoint, origin).is_ok()
+            })
+        })
+    }
+}
+
+// [PHALA-APPRAISAL-EGRESS-PIN 2026-10-07 by Codex] Private recipients
+// must not acquire public-peer egress merely by enabling strict appraisal.
+// Sources retain ordinary discovery, but their configured R cannot move its
+// transport origin through a signed descriptor update alone.
+pub(crate) struct PhalaPeerAppraisalEgress {
+    fixed_relay: Option<([u8; 32], [u8; 32])>,
+    relay_only: bool,
+}
+
+impl PhalaPeerAppraisalEgress {
+    pub(crate) fn discovery() -> Self { Self { fixed_relay: None, relay_only: false } }
+
+    pub(crate) fn fixed_relay(relay: [u8; 32], endpoint: &str, relay_only: bool) -> Option<Self> {
+        if relay == [0; 32]
+            || aeronyx_core::crypto::IdentityPublicKey::from_bytes(&relay).is_err() { return None; }
+        let origin = crate::api::reverse_onion_origin_commitment(endpoint).ok()?;
+        Some(Self { fixed_relay: Some((relay, origin)), relay_only })
+    }
+
+    fn origin_for(&self, node_id: [u8; 32]) -> Option<[u8; 32]> {
+        self.fixed_relay.filter(|(relay, _)| *relay == node_id).map(|(_, origin)| origin)
+    }
+
+    fn allows(&self, descriptor: &SignedNodeDescriptor) -> bool {
+        if let Some(origin) = self.origin_for(descriptor.node_id()) {
+            return descriptor.descriptor.public_endpoint.as_deref().is_some_and(|endpoint| {
+                crate::api::reverse_onion_pinned_origin(endpoint, origin).is_ok()
+            });
+        }
+        !self.relay_only
+    }
+}
+
 impl PeerStore {
+    // [PHALA-PINNED-RELAY-APPRAISAL 2026-10-07 by Codex] Appraise fixed
+    // egress relays independently of ordinary discovery peers, including evidence-only
+    // recovery and non-public discovery relays. Stage-A candidates, endpoint-
+    // free recipients, source-only pins and unknown identities are excluded.
+    pub(crate) fn next_phala_peer_appraisal_target(
+        &self, now: u64, limit: usize, cursor: usize, egress: &PhalaPeerAppraisalEgress,
+    ) -> Option<PhalaPeerAppraisalTarget> {
+        if limit == 0 || !self.phala_attested_peer_routes_required() { return None; }
+        let eligible = |descriptor: &SignedNodeDescriptor| {
+            egress.allows(descriptor)
+                && descriptor.verify_at(now).is_ok()
+                && descriptor.descriptor.capabilities.contains(&NodeCapability::ChatRelay)
+                && descriptor.descriptor.advertises_protocol_feature(NodeProtocolFeature::PhalaNodeAttestationV1)
+                && descriptor.descriptor.public_endpoint.as_deref()
+                    .is_some_and(crate::api::reverse_onion_endpoint_supported)
+                && !self.phala_peer_attestation_is_fresh(
+                    descriptor, now, self.phala_peer_attestation_max_age_secs())
+        };
+        let mut pinned = {
+            let _authority_epoch = self.private_onion_authority_read_guard();
+            let ids = self.private_onion_route_identity_pins.read().iter()
+                .map(|(relay, _)| *relay).collect::<HashSet<_>>();
+            let peers = self.peers.read();
+            ids.iter().filter_map(|id| peers.get(id).cloned()).collect::<Vec<_>>()
+        };
+        pinned.retain(|descriptor| eligible(descriptor));
+        pinned.sort_by_key(|descriptor| descriptor.node_id());
+        let priority_ids = pinned.iter().map(|descriptor| descriptor.node_id()).collect::<HashSet<_>>();
+        let mut public = self.valid_public_descriptors(now, limit);
+        public.retain(|descriptor| eligible(descriptor) && !priority_ids.contains(&descriptor.node_id()));
+        // A failed pinned relay cannot starve ordinary peer appraisal, and a
+        // large public peer set cannot strand a fixed recovery relay. Round-
+        // robin inside each lane; still at most one attempt per gossip round.
+        let both = !pinned.is_empty() && !public.is_empty();
+        let lane_cursor = if both { cursor / 2 } else { cursor };
+        let private = !pinned.is_empty() && (public.is_empty() || cursor % 2 == 0);
+        let candidates = if private { &pinned } else { &public };
+        if candidates.is_empty() { return None; }
+        Some(PhalaPeerAppraisalTarget {
+            origin_pin: egress.origin_for(candidates[lane_cursor % candidates.len()].node_id()),
+            descriptor: candidates[lane_cursor % candidates.len()].clone(), pinned_relay: private,
+        })
+    }
+
+    // [REVERSE-ONION-LIVE-RECIPIENT-AUTHORITY 2026-10-05 by Codex]
+    /// A fresh poll is admitted only against one current R/P descriptor pair
+    /// and the P-signed pull grant. Exact journal recovery deliberately uses
+    /// the lower-level route lookup and does not depend on fresh authority.
+    pub(crate) fn current_private_onion_pull_authority_snapshot(
+        &self,
+        relay: &[u8; 32],
+        recipient: &[u8; 32],
+        now: u64,
+    ) -> Option<PrivateOnionPullAuthoritySnapshot> {
+        // [PHALA-FINAL-ROUTE-ADMISSION 2026-10-07 by Codex] Keep the
+        // R/P/grant and appraisal policy in one read epoch, without recursively
+        // acquiring a read lock behind a queued authority writer.
+        let _authority_snapshot = self.private_onion_authority_read_guard();
+        self.current_private_onion_pull_authority_snapshot_under_guard(relay, recipient, now)
+    }
+
+    // [PHALA-FINAL-ROUTE-ADMISSION 2026-10-07 by Codex] Caller holds the
+    // authority read epoch before sampling the final HTTP admission clock.
+    pub(crate) fn current_private_onion_pull_authority_snapshot_under_guard(
+        &self, relay: &[u8; 32], recipient: &[u8; 32], now: u64,
+    ) -> Option<PrivateOnionPullAuthoritySnapshot> {
+        use aeronyx_core::protocol::onion::ONION_FORWARD_HOP_REQUIRED_CAPABILITIES;
+        let purpose = aeronyx_core::protocol::onion::OnionRoutePurpose::BlindVaultPull;
+        let (relay_descriptor, recipient_descriptor, authorization) =
+            self.current_private_onion_authority_snapshot_under_guard(relay, recipient, now)?;
+        let relay_body = &relay_descriptor.descriptor;
+        let recipient_body = &recipient_descriptor.descriptor;
+        if !relay_body.public_endpoint.as_deref()
+                .is_some_and(crate::api::reverse_onion_endpoint_supported)
+            // [PHALA-RECIPIENT-POLL-ROUTE-GATE 2026-10-06 by Codex] The
+            // authority snapshot is also the recipient carrier's final
+            // pre/post-DNS admission point; signed grants alone are not TEE
+            // appraisal evidence when strict peer routing is enabled.
+            || !self.phala_peer_route_is_eligible(&relay_descriptor, now)
+            || relay_body.x25519_kem_public().is_none()
+            || !ONION_FORWARD_HOP_REQUIRED_CAPABILITIES
+                .iter().all(|capability| relay_body.capabilities.contains(capability))
+            || !purpose.required_path_protocol_features().iter()
+                .all(|feature| relay_body.advertises_protocol_feature(*feature))
+            || recipient_body.public_endpoint.is_some()
+            || recipient_body.policy.public_discovery
+            // [PHALA-PULL-ROLE-REPAIR 2026-10-08 by Codex] Private Pull
+            // uses its signed terminal feature, not a public replica role.
+            || !purpose.specialized_terminal_capability()
+                .is_none_or(|capability| recipient_body.capabilities.contains(&capability))
+            || !purpose.required_terminal_protocol_features().iter()
+                .all(|feature| recipient_body.advertises_protocol_feature(*feature))
+        {
+            return None;
+        }
+        Some(PrivateOnionPullAuthoritySnapshot {
+            relay: relay_descriptor,
+            recipient: recipient_descriptor,
+            authorization,
+        })
+    }
+
+    // [REVERSE-ONION-RECIPIENT-ROUTE-REFRESH 2026-10-05 by Codex]
+    /// Returns the current signed relay descriptor only while it still
+    /// advertises the fixed private-Pull forwarding contract and an
+    /// authenticated HTTPS endpoint before constructing outbound URLs.
+    pub(crate) fn current_private_onion_relay_descriptor(
+        &self,
+        relay: &[u8; 32],
+        now: u64,
+    ) -> Option<SignedNodeDescriptor> {
+        // [PHALA-FINAL-ROUTE-ADMISSION 2026-10-07 by Codex] Recovery does
+        // not need a fresh P grant, but descriptor/appraisal must be coherent.
+        let _authority_snapshot = self.private_onion_authority_read_guard();
+        self.current_private_onion_relay_descriptor_under_guard(relay, now)
+    }
+
+    // [PHALA-FINAL-ROUTE-ADMISSION 2026-10-07 by Codex] Caller holds the
+    // authority read epoch; never hold it through HTTP/DNS awaits.
+    pub(crate) fn current_private_onion_relay_descriptor_under_guard(
+        &self, relay: &[u8; 32], now: u64,
+    ) -> Option<SignedNodeDescriptor> {
+        let descriptor = self.get_valid(relay, now)?;
+        let purpose = aeronyx_core::protocol::onion::OnionRoutePurpose::BlindVaultPull;
+        // [REVERSE-ONION-HTTPS-ONLY 2026-10-05 by Codex] This accessor is
+        // reverse-onion-specific; do not expose a cleartext relay target even
+        // though ordinary peer gossip continues to support public-IP HTTP.
+        // [PHALA-PEER-ATTESTED-ROUTING 2026-10-06 by Codex] Fixed recipient
+        // relay lookups are egress too, and may not bypass attestation policy.
+        if !self.phala_peer_route_is_eligible(&descriptor, now)
+            || !descriptor.descriptor.public_endpoint.as_deref()
+            .is_some_and(crate::api::reverse_onion_endpoint_supported)
+            || descriptor.descriptor.x25519_kem_public().is_none()
+            || !descriptor.descriptor.capabilities.contains(&NodeCapability::ChatRelay)
+            || !descriptor.descriptor.capabilities.contains(&NodeCapability::OnionMiddle)
+            || !purpose.required_path_protocol_features().iter().all(|feature| {
+                descriptor.descriptor.advertises_protocol_feature(*feature)
+            })
+        {
+            return None;
+        }
+        Some(descriptor)
+    }
+
+    // [PHALA-AUTHORITY-GOSSIP-FENCE 2026-10-07 by Codex] Caller holds the
+    // authority read epoch. Bootstrap grant gossip does not require a route
+    // appraisal, but may disclose P only to its pinned R or R's pinned source.
+    // New locally signed grants need not be cached yet; forwarded grants must
+    // be the exact current cache entry for this descriptor pair and purpose.
+    pub(crate) fn private_onion_gossip_bundle_is_current_under_guard(
+        &self,
+        local: [u8; 32],
+        target: &SignedNodeDescriptor,
+        authorization: &SignedPrivateOnionRecipientAuthorizationV1,
+        relay: &SignedNodeDescriptor,
+        recipient: &SignedNodeDescriptor,
+        now: u64,
+    ) -> bool {
+        let relay_id = relay.node_id();
+        let recipient_id = recipient.node_id();
+        let target_id = target.node_id();
+        let Some(purpose) = authorization.canonical_purpose() else { return false; };
+        if !matches!(purpose, "blind_vault_pull" | "blind_vault_lease_admission")
+            || local == [0; 32] || target_id == local || relay_id == recipient_id
+            || !self.has_private_onion_route_identity_pin(&relay_id, &recipient_id)
+            || self.get_valid(&target_id, now).as_ref() != Some(target)
+            || !target.descriptor.advertises_protocol_feature(
+                NodeProtocolFeature::PrivateOnionAuthorizationGossipV1,
+            )
+            || !target.descriptor.public_endpoint.as_deref()
+                .is_some_and(crate::api::reverse_onion_endpoint_supported)
+            || recipient.descriptor.public_endpoint.is_some()
+            || recipient.descriptor.policy.public_discovery
+            || authorization.verify_at(relay, recipient, purpose, now).is_err()
+        {
+            return false;
+        }
+        let Some((current_relay, current_recipient)) = self.get_valid_pair(&relay_id, &recipient_id, now) else {
+            return false;
+        };
+        if &current_relay != relay || &current_recipient != recipient { return false; }
+        if local == recipient_id {
+            // [PHALA-AUTHORITY-GOSSIP-FENCE 2026-10-07 by Codex] An
+            // uncached local grant may advance authority, never supersede a
+            // newer locally remembered grant with an older concurrent attempt.
+            return target_id == relay_id && self.private_onion_authorizations.read()
+                .get(&(relay_id, recipient_id, purpose.to_owned()))
+                .map_or(true, |current| authorization.issued_at() > current.issued_at()
+                    || authorization == current);
+        }
+        if local != relay_id || target_id == recipient_id
+            || !self.private_onion_source_identity_pins.read().contains(&target_id)
+        {
+            return false;
+        }
+        self.current_private_onion_authority_snapshot_for_purpose_under_guard(
+            &relay_id, &recipient_id, purpose, now,
+        ).is_some_and(|(_, _, current)| &current == authorization)
+    }
+
     /// Re-admits a previously selected route without selecting a replacement.
     ///
     /// [DIRECT-RELAY-READMISSION 2026-10-04 by Codex] Authenticate the pin,
@@ -39,7 +296,10 @@ impl PeerStore {
         let Some(current) = peers.get(&node_id) else {
             return false;
         };
+        // [PHALA-PEER-ATTESTED-ROUTING 2026-10-06 by Codex] Recheck freshness
+        // against the current descriptor at the final route admission point.
         if current.verify_at(now).is_err()
+            || !self.phala_peer_route_is_eligible(current, now)
             || !self.permissionless_gate_allows(current, now, true)
             || Self::descriptor_routeability_surface_fingerprint(current).as_deref()
                 != Some(expected_surface.as_str())
@@ -61,6 +321,132 @@ impl PeerStore {
             .cloned()
     }
 
+    /// Captures two current descriptors under one peer-map read lock so a
+    /// route authorization cannot combine opposite sides of a concurrent
+    /// descriptor rotation. Cryptographic and permissionless checks happen on
+    /// the cloned immutable snapshot after the lock is released.
+    // [PEER-STORE-ATOMIC-AUTHORITY-SNAPSHOT 2026-10-05 by Codex]
+    #[must_use]
+    pub(crate) fn get_valid_pair(
+        &self,
+        first: &[u8; 32],
+        second: &[u8; 32],
+        now: u64,
+    ) -> Option<(SignedNodeDescriptor, SignedNodeDescriptor)> {
+        if first == second { return None; }
+        let (first_descriptor, second_descriptor) = {
+            let peers = self.peers.read();
+            (peers.get(first)?.clone(), peers.get(second)?.clone())
+        };
+        for descriptor in [&first_descriptor, &second_descriptor] {
+            if descriptor.verify_at(now).is_err()
+                || !self.permissionless_gate_allows(descriptor, now, true)
+            {
+                return None;
+            }
+        }
+        Some((first_descriptor, second_descriptor))
+    }
+
+    /// Captures the exact current R/P descriptors and their current P grant
+    /// while descriptor and grant writers are excluded by the authority gate.
+    // [REVERSE-ONION-SOURCE-AUTHORITY-SNAPSHOT 2026-10-05 by Codex]
+    #[must_use]
+    pub(crate) fn current_private_onion_authority_snapshot(
+        &self,
+        relay: &[u8; 32],
+        recipient: &[u8; 32],
+        now: u64,
+    ) -> Option<(
+        SignedNodeDescriptor,
+        SignedNodeDescriptor,
+        SignedPrivateOnionRecipientAuthorizationV1,
+    )> {
+        self.current_private_onion_authority_snapshot_for_purpose(
+            relay,
+            recipient,
+            aeronyx_core::protocol::onion::OnionRoutePurpose::BlindVaultPull.as_str(),
+            now,
+        )
+    }
+
+    // [PRIVATE-ONION-AUTHORITY-PURPOSES 2026-10-05 by Codex]
+    /// Captures a grant by its exact canonical workload purpose.
+    #[must_use]
+    pub(crate) fn current_private_onion_authority_snapshot_for_purpose(
+        &self,
+        relay: &[u8; 32],
+        recipient: &[u8; 32],
+        purpose: &str,
+        now: u64,
+    ) -> Option<(
+        SignedNodeDescriptor,
+        SignedNodeDescriptor,
+        SignedPrivateOnionRecipientAuthorizationV1,
+    )> {
+        let _authority_snapshot = self.private_onion_authority_gate.read();
+        self.current_private_onion_authority_snapshot_for_purpose_under_guard(
+            relay, recipient, purpose, now,
+        )
+    }
+
+    // [REVERSE-ONION-SOURCE-AUTHORITY-SNAPSHOT 2026-10-05 by Codex]
+    // Caller must hold `private_onion_authority_read_guard`; this avoids
+    // recursively acquiring parking_lot's read lock while a writer is queued.
+    #[must_use]
+    pub(crate) fn current_private_onion_authority_snapshot_under_guard(
+        &self,
+        relay: &[u8; 32],
+        recipient: &[u8; 32],
+        now: u64,
+    ) -> Option<(
+        SignedNodeDescriptor,
+        SignedNodeDescriptor,
+        SignedPrivateOnionRecipientAuthorizationV1,
+    )> {
+        self.current_private_onion_authority_snapshot_for_purpose_under_guard(
+            relay,
+            recipient,
+            aeronyx_core::protocol::onion::OnionRoutePurpose::BlindVaultPull.as_str(),
+            now,
+        )
+    }
+
+    // [PRIVATE-ONION-AUTHORITY-PURPOSES 2026-10-05 by Codex]
+    /// Caller must hold the authority read guard for the full R/P/grant epoch.
+    #[must_use]
+    pub(crate) fn current_private_onion_authority_snapshot_for_purpose_under_guard(
+        &self,
+        relay: &[u8; 32],
+        recipient: &[u8; 32],
+        purpose: &str,
+        now: u64,
+    ) -> Option<(
+        SignedNodeDescriptor,
+        SignedNodeDescriptor,
+        SignedPrivateOnionRecipientAuthorizationV1,
+    )> {
+        if !matches!(purpose, "blind_vault_pull" | "blind_vault_lease_admission" | "anonymous_mailbox_v1") {
+            return None;
+        }
+        let (relay_descriptor, recipient_descriptor) =
+            self.get_valid_pair(relay, recipient, now)?;
+        let authorization = self
+            .private_onion_authorizations
+            .read()
+            .get(&(*relay, *recipient, purpose.to_owned()))
+            .cloned()?;
+        authorization
+            .verify_at(
+                &relay_descriptor,
+                &recipient_descriptor,
+                purpose,
+                now,
+            )
+            .ok()?;
+        Some((relay_descriptor, recipient_descriptor, authorization))
+    }
+
     /// Returns an authentic cached descriptor without requiring time validity.
     ///
     /// [PINNED-WITNESS-BOOTSTRAP 2026-07-26 by Codex] This narrow accessor
@@ -72,6 +458,10 @@ impl PeerStore {
     ///
     /// This accessor must never be used for liveness, gossip export, relay
     /// selection, route planning, quorum, capacity, or public peer counts.
+    /// [PHALA-SELF-DESCRIPTOR-SEQUENCE 2026-10-08 by Codex] Local signing
+    /// may inspect its own retained counter to avoid sequence reuse. Only the
+    /// newly signed current runtime descriptor may be published; cached KEM,
+    /// readiness and authority are not restored by that counter observation.
     #[must_use]
     pub(crate) fn get_signature_verified_cached(
         &self,
@@ -854,6 +1244,12 @@ impl PeerStore {
                 || !descriptor.descriptor.capabilities.contains(&capability)
                 || descriptor.descriptor.public_endpoint.is_none()
             {
+                continue;
+            }
+            // [PHALA-PEER-ATTESTED-ROUTING 2026-10-06 by Codex] A signed
+            // capability bit only opts a peer into quote appraisal; it is
+            // never itself evidence of TEE execution or application identity.
+            if !self.phala_peer_route_is_eligible(descriptor, now) {
                 continue;
             }
 

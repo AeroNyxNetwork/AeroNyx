@@ -224,6 +224,7 @@ async fn peer_request_in_flight_guard_enforces_backpressure_limit() {
     let (relay, path) = temp_chat_relay("blind-relay-backpressure");
     let peer_store = Arc::new(PeerStore::new());
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: Some(relay),
         blind_vault: None,
         anonymous_mailbox: None,
@@ -273,6 +274,7 @@ async fn forged_previous_hop_signatures_cannot_poison_node_quarantine() {
     let node_identity = Arc::new(IdentityKeyPair::generate());
     let peer_store = Arc::new(PeerStore::new());
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -415,6 +417,7 @@ async fn peer_declared_downstream_failure_does_not_poison_next_hop_reputation() 
     peer_store.record_route_forward_success(&next_hop_node_id, now);
 
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,

@@ -158,113 +158,19 @@ impl Server {
             VectorIndex::new()
         });
 
-        let owner = self.identity.public_key_bytes();
-        let rebuild_all_owners =
-            self.config.memchain.blind_storage_enabled || self.config.memchain.allow_remote_storage;
-        let records_with_model = if rebuild_all_owners {
-            storage.get_all_records_with_embedding().await
-        } else {
-            storage.get_records_with_embedding(&owner).await
-        };
-        let mut rebuilt_owners = std::collections::HashSet::new();
-        let mut rebuilt_partitions = std::collections::HashSet::new();
-        let mut integrity_rejected = 0usize;
-        for (r, model) in records_with_model {
-            if r.has_embedding() {
-                if let Some(reason) = memchain_index_rejection_reason(&r) {
-                    integrity_rejected += 1;
-                    warn!(
-                        reason,
-                        blind = r.blind,
-                        "[MEMCHAIN] Persisted record rejected from vector rebuild"
-                    );
-                    continue;
-                }
-                rebuilt_owners.insert(r.owner);
-                rebuilt_partitions.insert((r.owner, model.clone()));
-                vector_index.upsert(
-                    r.record_id,
-                    r.embedding.clone(),
-                    r.layer,
-                    r.timestamp,
-                    &r.owner,
-                    &model,
-                );
-            }
-        }
+        // [MEMCHAIN-SEALED-VECTOR-BOUNDARY 2026-10-05 by Codex] Keep historic
+        // vectors in SQLite for compatibility/recovery, but never read them
+        // into an ordinary node's transient semantic index.
         let rebuild_count = vector_index.total_vectors();
 
+        let record_count = storage.count().await;
         info!(
             db = %db_path,
-            records = storage.count().await,
+            records = record_count,
             vectors = rebuild_count,
-            owners = rebuilt_owners.len(),
-            partitions = rebuilt_partitions.len(),
-            integrity_rejected,
-            rebuild_scope = if rebuild_all_owners { "all_active_owners" } else { "local_owner" },
+            rebuild_scope = "disabled_node_blind_policy",
             "[MEMCHAIN] SQLite + VectorIndex initialized"
         );
-        if integrity_rejected > 0 {
-            warn!(
-                integrity_rejected,
-                "[MEMCHAIN] Integrity audit quarantined persisted records from recall"
-            );
-        }
-
-        if quantization_enabled && rebuild_count > 0 {
-            // Each owner/model pair is an independent security partition. A
-            // blind storage node may host many such partitions, so restoring
-            // only the node identity's quantizer would silently degrade remote
-            // recall after restart.
-            for (partition_owner, model_name) in rebuilt_partitions {
-                let owner_hex = hex::encode(partition_owner);
-                let cal_key = format!("{}:{}:{}", QUANTIZER_CAL_KEY_PREFIX, owner_hex, model_name);
-
-                let restored = {
-                    let conn = storage.conn_lock().await;
-                    let cal_data: Option<Vec<u8>> = conn
-                        .query_row(
-                            "SELECT value FROM chain_state WHERE key = ?1",
-                            rusqlite::params![cal_key],
-                            |row| row.get::<_, Vec<u8>>(0),
-                        )
-                        .optional()
-                        .unwrap_or(None);
-                    drop(conn);
-                    if let Some(data) = cal_data {
-                        vector_index.restore_quantizer(&partition_owner, &model_name, &data)
-                    } else {
-                        false
-                    }
-                };
-
-                if restored {
-                    info!(
-                        owner = %owner_hex,
-                        model = %model_name,
-                        "[VECTOR] Quantizer restored"
-                    );
-                    continue;
-                }
-
-                vector_index.calibrate_partition(&partition_owner, &model_name);
-                if let Some(cal_bytes) =
-                    vector_index.get_quantizer_bytes(&partition_owner, &model_name)
-                {
-                    let conn = storage.conn_lock().await;
-                    let _ = conn.execute(
-                        "INSERT OR REPLACE INTO chain_state (key, value) VALUES (?1, ?2)",
-                        rusqlite::params![cal_key, cal_bytes.as_slice()],
-                    );
-                    drop(conn);
-                    info!(
-                        owner = %owner_hex,
-                        model = %model_name,
-                        "[VECTOR] Quantizer calibrated and persisted"
-                    );
-                }
-            }
-        }
 
         let aof_path = &self.config.memchain.aof_path;
         if let Some(parent) = std::path::Path::new(aof_path).parent() {

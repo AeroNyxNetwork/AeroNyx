@@ -39,7 +39,10 @@
 //! ## ⚠️ Important Notes for Next Developer
 //! - Never log or persist the secret bytes. They are zeroized on drop.
 //! - `peel_secrets` returns `current` plus `previous` only while the latter is
-//!   within the rotation + grace window; do not widen this.
+//!   within its fixed retirement grace window; do not widen this.
+//! [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] Grace starts when a key is
+//! actually superseded, not when it was created. Delayed rotation must not
+//! discard a key still referenced by a recently issued signed descriptor.
 //! - When `kem_alg = 2` (X-Wing) lands, generate the hybrid keypair here and
 //!   keep the same rotate/grace lifecycle.
 //!
@@ -68,6 +71,25 @@ pub const ONION_KEY_GRACE_SECS: u64 = 60 * 60; // 1 hour floor
 
 /// Extra grace beyond the descriptor TTL to absorb clock skew and in-flight time.
 pub const GRACE_SKEW_SECS: u64 = 10 * 60; // 10 minutes
+
+// [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] A single previous generation
+// must retire before the next scheduled rotation, without silently clipping
+// the configured descriptor lifetime or extending the rotation interval.
+pub const MAX_ONION_DESCRIPTOR_TTL_SECS: u64 = ONION_KEY_ROTATION_SECS - GRACE_SKEW_SECS - 1;
+
+pub(crate) const fn descriptor_ttl_is_supported(ttl: u64) -> bool {
+    ttl >= 60 && ttl <= MAX_ONION_DESCRIPTOR_TTL_SECS
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum OnionKeyError {
+    #[error("onion key local time rejected")]
+    Time,
+    #[error("onion key descriptor lifetime rejected")]
+    DescriptorLifetime,
+    #[error("onion key manager unavailable")]
+    Unavailable,
+}
 
 /// One onion key generation. Stores the raw secret bytes (reconstructed into a
 /// `StaticSecret` on demand) and the derived public key.
@@ -102,13 +124,28 @@ impl Drop for OnionKeyEpoch {
     }
 }
 
+// [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] Retention is immutable for
+// this retired epoch, including if another embedded owner initializes later.
+struct RetiredOnionKeyEpoch {
+    key: OnionKeyEpoch,
+    retired_at: u64,
+    retained_until: u64,
+}
+
+impl RetiredOnionKeyEpoch {
+    fn is_live_at(&self, now: u64) -> bool {
+        now >= self.retired_at && now <= self.retained_until
+    }
+}
+
 /// In-memory rotating onion key store: the current key plus an optional
 /// previous key kept for the rotation grace window.
 pub struct OnionKeyManager {
     current: OnionKeyEpoch,
-    previous: Option<OnionKeyEpoch>,
+    previous: Option<RetiredOnionKeyEpoch>,
     rotation_secs: u64,
     grace_secs: u64,
+    observed_at: u64,
 }
 
 impl OnionKeyManager {
@@ -118,6 +155,7 @@ impl OnionKeyManager {
             previous: None,
             rotation_secs: ONION_KEY_ROTATION_SECS,
             grace_secs: ONION_KEY_GRACE_SECS,
+            observed_at: now,
         }
     }
 
@@ -126,12 +164,15 @@ impl OnionKeyManager {
     }
 
     /// Candidate secrets to attempt when peeling: always the current key, plus
-    /// the previous key while it is still inside the rotation + grace window.
+    /// the previous key while it is still inside its retirement grace window.
     fn peel_secrets(&self, now: u64) -> Vec<StaticSecret> {
+        if now == 0 || now < self.observed_at {
+            return Vec::new();
+        }
         let mut secrets = vec![self.current.static_secret()];
         if let Some(previous) = &self.previous {
-            if now.saturating_sub(previous.created_at) <= self.rotation_secs + self.grace_secs {
-                secrets.push(previous.static_secret());
+            if previous.is_live_at(now) {
+                secrets.push(previous.key.static_secret());
             }
         }
         secrets
@@ -140,16 +181,41 @@ impl OnionKeyManager {
     /// Rotates the current key once it reaches `rotation_secs`, retaining the old
     /// key as `previous`. Drops `previous` once it falls outside the grace
     /// window. Idempotent and cheap; safe to call frequently.
-    fn tick_rotation(&mut self, now: u64) {
+    fn tick_rotation(&mut self, now: u64) -> Result<(), OnionKeyError> {
+        // [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] A rollback cannot
+        // revive an old overlap or alter a key generation. Reject before RNG
+        // or mutation, and keep the last successful rotation observation.
+        if now == 0 || now < self.observed_at {
+            return Err(OnionKeyError::Time);
+        }
         if now.saturating_sub(self.current.created_at) >= self.rotation_secs {
+            let retained_until = now.checked_add(self.grace_secs).ok_or(OnionKeyError::Time)?;
             let superseded = std::mem::replace(&mut self.current, OnionKeyEpoch::generate(now));
-            self.previous = Some(superseded);
+            self.previous = Some(RetiredOnionKeyEpoch {
+                key: superseded,
+                retired_at: now,
+                retained_until,
+            });
         }
         if let Some(previous) = &self.previous {
-            if now.saturating_sub(previous.created_at) > self.rotation_secs + self.grace_secs {
+            if now > previous.retained_until {
                 self.previous = None;
             }
         }
+        self.observed_at = now;
+        Ok(())
+    }
+
+    fn public_keys_at(&self, now: u64) -> ([u8; 32], Option<[u8; 32]>) {
+        if now == 0 || now < self.observed_at {
+            return ([0; 32], None);
+        }
+        (
+            self.current_public(),
+            self.previous.as_ref()
+                .filter(|epoch| epoch.is_live_at(now))
+                .map(|epoch| epoch.key.public),
+        )
     }
 }
 
@@ -172,22 +238,39 @@ fn shared() -> &'static Arc<RwLock<OnionKeyManager>> {
 /// so the single retained previous key fully covers the grace window; the
 /// descriptor TTL is expected to be a few hours at most.
 pub fn init_shared(now: u64, descriptor_ttl_secs: u64) {
-    if let Ok(mut manager) = shared().write() {
-        manager.grace_secs = effective_grace_secs(descriptor_ttl_secs);
-        if manager.current.created_at == 0 {
-            manager.current = OnionKeyEpoch::generate(now);
-            manager.previous = None;
-        }
+    // [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] Retain the legacy public
+    // signature; server composition uses the checked entry below.
+    let _ = try_init_shared(now, descriptor_ttl_secs);
+}
+
+pub(crate) fn try_init_shared(now: u64, descriptor_ttl_secs: u64) -> Result<(), OnionKeyError> {
+    let grace = effective_grace_secs(descriptor_ttl_secs)?;
+    if now == 0 || now.checked_add(grace).is_none() {
+        return Err(OnionKeyError::Time);
     }
+    let mut manager = shared().write().map_err(|_| OnionKeyError::Unavailable)?;
+    if now < manager.observed_at {
+        return Err(OnionKeyError::Time);
+    }
+    // Never shorten an already published owner's future overlap. A retired
+    // epoch's fixed retained_until is neither extended nor shortened here.
+    manager.grace_secs = manager.grace_secs.max(grace);
+    if manager.current.created_at == 0 {
+        manager.current = OnionKeyEpoch::generate(now);
+        manager.previous = None;
+    }
+    manager.observed_at = now;
+    Ok(())
 }
 
 /// Effective previous-key grace window: the descriptor TTL plus clock-skew
 /// allowance, never below the floor. A previous key must outlive any descriptor
 /// still in circulation, so this is tied to the descriptor TTL.
-fn effective_grace_secs(descriptor_ttl_secs: u64) -> u64 {
-    descriptor_ttl_secs
-        .saturating_add(GRACE_SKEW_SECS)
-        .max(ONION_KEY_GRACE_SECS)
+fn effective_grace_secs(descriptor_ttl_secs: u64) -> Result<u64, OnionKeyError> {
+    if !descriptor_ttl_is_supported(descriptor_ttl_secs) {
+        return Err(OnionKeyError::DescriptorLifetime);
+    }
+    Ok((descriptor_ttl_secs + GRACE_SKEW_SECS).max(ONION_KEY_GRACE_SECS))
 }
 
 /// The current onion public key to publish in the node's signed descriptor.
@@ -198,6 +281,18 @@ pub fn current_public_key() -> [u8; 32] {
         .read()
         .map(|manager| manager.current_public())
         .unwrap_or([0u8; 32])
+}
+
+// [REVERSE-ONION-KEM-PUBLIC-OVERLAP 2026-10-04 by Codex] Expose only the
+// public KEM generations that a descriptor may still advertise.  The private
+// epochs remain inaccessible so restart/replay validation cannot obtain key
+// material or alter the rotation lifecycle.
+#[must_use]
+pub fn advertised_public_keys(now: u64) -> ([u8; 32], Option<[u8; 32]>) {
+    shared()
+        .read()
+        .map(|manager| manager.public_keys_at(now))
+        .unwrap_or(([0u8; 32], None))
 }
 
 /// Candidate secrets for peeling a received onion layer (current + in-grace
@@ -213,14 +308,22 @@ pub fn peel_secrets(now: u64) -> Vec<StaticSecret> {
 /// Advances key rotation. Called only by the discovery background task on its
 /// cadence, never by request paths — this keeps reads deterministic for tests.
 pub fn tick_rotation(now: u64) {
-    if let Ok(mut manager) = shared().write() {
-        manager.tick_rotation(now);
-    }
+    // [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] Legacy callers cannot
+    // mutate a failed epoch; production discovery observes the checked error.
+    let _ = try_tick_rotation(now);
+}
+
+pub(crate) fn try_tick_rotation(now: u64) -> Result<(), OnionKeyError> {
+    shared().write().map_err(|_| OnionKeyError::Unavailable)?.tick_rotation(now)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] These fixtures use
+    // local managers only; no process-global mutation or test execution.
+    use aeronyx_core::crypto::IdentityKeyPair;
+    use aeronyx_core::protocol::onion::{build_onion_envelope, try_open_onion_layer, OnionHop};
 
     #[test]
     fn rotation_moves_current_to_previous_and_keeps_both_peelable() {
@@ -229,11 +332,11 @@ mod tests {
         assert!(manager.peel_secrets(1_000).len() == 1);
 
         // Before the rotation period: no rotation.
-        manager.tick_rotation(1_000 + ONION_KEY_ROTATION_SECS - 1);
+        manager.tick_rotation(1_000 + ONION_KEY_ROTATION_SECS - 1).unwrap();
         assert_eq!(manager.current_public(), first);
 
         // At the rotation period: rotate, previous retained.
-        manager.tick_rotation(1_000 + ONION_KEY_ROTATION_SECS);
+        manager.tick_rotation(1_000 + ONION_KEY_ROTATION_SECS).unwrap();
         let second = manager.current_public();
         assert_ne!(second, first);
         assert_eq!(
@@ -243,15 +346,37 @@ mod tests {
     }
 
     #[test]
-    fn previous_key_dropped_after_grace() {
-        let mut manager = OnionKeyManager::new(0);
-        manager.tick_rotation(ONION_KEY_ROTATION_SECS); // rotate once
-        assert_eq!(manager.peel_secrets(ONION_KEY_ROTATION_SECS).len(), 2);
+    fn advertised_public_keys_expose_only_current_and_in_grace_previous() {
+        let mut manager = OnionKeyManager::new(1_000);
+        let first = manager.current_public();
+        manager.tick_rotation(1_000 + ONION_KEY_ROTATION_SECS).unwrap();
+        let second = manager.current_public();
+        let previous = manager.previous.as_ref().expect("rotation keeps previous");
+        assert_eq!(previous.key.public, first);
+        assert_eq!(second, manager.current_public());
+        let within_grace = 1_000 + ONION_KEY_ROTATION_SECS + ONION_KEY_GRACE_SECS;
+        let outside_grace = within_grace + 1;
+        // [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] Exercise actual
+        // candidate selection on both sides of the inclusive grace boundary.
+        assert_eq!(manager.public_keys_at(within_grace), (second, Some(first)));
+        assert_eq!(manager.peel_secrets(within_grace).len(), 2);
+        assert_eq!(manager.public_keys_at(outside_grace), (second, None));
+        assert_eq!(manager.peel_secrets(outside_grace).len(), 1);
+        assert_eq!(manager.previous.as_ref().unwrap().retained_until, within_grace);
+    }
 
-        // Well past rotation + grace from the previous key's creation (t=0).
-        let far = ONION_KEY_ROTATION_SECS + ONION_KEY_GRACE_SECS + 1;
-        manager.tick_rotation(far);
+    #[test]
+    fn previous_key_dropped_after_grace() {
+        let mut manager = OnionKeyManager::new(1);
+        let rotated_at = 1 + ONION_KEY_ROTATION_SECS;
+        manager.tick_rotation(rotated_at).unwrap();
+        assert_eq!(manager.peel_secrets(rotated_at).len(), 2);
+
+        // One second past the fixed deadline from actual retirement.
+        let far = rotated_at + ONION_KEY_GRACE_SECS + 1;
+        manager.tick_rotation(far).unwrap();
         assert_eq!(manager.peel_secrets(far).len(), 1);
+        assert!(manager.previous.is_none());
     }
 
     #[test]
@@ -259,12 +384,116 @@ mod tests {
         // Grace must be >= descriptor TTL (else onions built against a still-valid
         // descriptor fail to peel after rotation). Check the example TTL (7200)
         // and the default (3600), plus the floor for tiny TTLs.
-        assert!(effective_grace_secs(7200) >= 7200);
-        assert!(effective_grace_secs(3600) >= 3600);
-        assert_eq!(effective_grace_secs(7200), 7200 + GRACE_SKEW_SECS);
-        assert_eq!(effective_grace_secs(60), ONION_KEY_GRACE_SECS); // floor
-                                                                    // Must stay safely below the rotation period for the single-previous model.
-        assert!(effective_grace_secs(7200) < ONION_KEY_ROTATION_SECS);
+        assert!(effective_grace_secs(7200).unwrap() >= 7200);
+        assert!(effective_grace_secs(3600).unwrap() >= 3600);
+        assert_eq!(effective_grace_secs(7200).unwrap(), 7200 + GRACE_SKEW_SECS);
+        assert_eq!(effective_grace_secs(60).unwrap(), ONION_KEY_GRACE_SECS);
+        assert_eq!(effective_grace_secs(MAX_ONION_DESCRIPTOR_TTL_SECS).unwrap(),
+            ONION_KEY_ROTATION_SECS - 1);
+        for ttl in [0, 59, MAX_ONION_DESCRIPTOR_TTL_SECS + 1, u64::MAX] {
+            assert_eq!(effective_grace_secs(ttl), Err(OnionKeyError::DescriptorLifetime));
+        }
+    }
+
+    // [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] Authored only:
+    // these rejected initializations return before accessing global state.
+    #[test]
+    fn checked_initialization_rejects_bad_policy_or_time_before_shared_access() {
+        for ttl in [0, 59, MAX_ONION_DESCRIPTOR_TTL_SECS + 1, u64::MAX] {
+            assert_eq!(try_init_shared(1_000, ttl), Err(OnionKeyError::DescriptorLifetime));
+        }
+        for now in [0, u64::MAX - ONION_KEY_GRACE_SECS + 1, u64::MAX] {
+            assert_eq!(try_init_shared(now, 60), Err(OnionKeyError::Time));
+        }
+    }
+
+    // [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] Authored only:
+    // delayed discovery used to discard this just-retired key immediately.
+    #[test]
+    fn delayed_rotation_keeps_exact_old_ciphertext_for_full_retirement_grace() {
+        let mut manager = OnionKeyManager::new(1_000);
+        manager.grace_secs = effective_grace_secs(7200).unwrap();
+        let old = manager.current_public();
+        let retired_at = 1_000 + ONION_KEY_ROTATION_SECS + manager.grace_secs + 100;
+        let source = IdentityKeyPair::from_bytes(&[57; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[58; 32]).unwrap();
+        let hop = OnionHop { node_id: recipient.public_key_bytes(), kem_pub: old };
+        let payload = b"synthetic delayed onion";
+        let envelope = build_onion_envelope(&[hop], payload, [59; 16], 2, retired_at - 1, &source).unwrap();
+        manager.tick_rotation(retired_at).unwrap();
+        let current = manager.current_public();
+        let deadline = retired_at + manager.grace_secs;
+        for now in [retired_at, deadline - 1, deadline] {
+            assert_eq!(manager.public_keys_at(now), (current, Some(old)));
+            let peeled = try_open_onion_layer(&envelope.encrypted_blob, &manager.peel_secrets(now)).unwrap();
+            assert_eq!(peeled.inner.as_slice(), payload);
+            assert_eq!(peeled.next_hop, None);
+        }
+        assert!(try_open_onion_layer(&envelope.encrypted_blob, &manager.peel_secrets(deadline + 1)).is_err());
+        let current_envelope = build_onion_envelope(
+            &[OnionHop { node_id: recipient.public_key_bytes(), kem_pub: current }],
+            payload, [60; 16], 2, deadline + 1, &source,
+        ).unwrap();
+        assert!(try_open_onion_layer(&current_envelope.encrypted_blob,
+            &manager.peel_secrets(deadline + 1)).is_ok());
+        // Reads beyond expiry neither delete nor re-stamp the retired epoch.
+        assert_eq!(manager.previous.as_ref().unwrap().retained_until, deadline);
+        manager.tick_rotation(deadline + 1).unwrap();
+        assert!(manager.previous.is_none());
+    }
+
+    // [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] Authored only:
+    // reject before mutation/RNG, including checked deadline overflow.
+    #[test]
+    fn invalid_rotation_observations_do_not_replace_or_revive_keys() {
+        let mut manager = OnionKeyManager::new(1_000);
+        let retired_at = 1_000 + ONION_KEY_ROTATION_SECS;
+        manager.tick_rotation(retired_at).unwrap();
+        let public = manager.current_public();
+        let deadline = manager.previous.as_ref().unwrap().retained_until;
+        let previous_public = manager.previous.as_ref().unwrap().key.public;
+        for now in [0, retired_at - 1, u64::MAX] {
+            assert_eq!(manager.tick_rotation(now), Err(OnionKeyError::Time));
+            assert_eq!(manager.observed_at, retired_at);
+            assert_eq!(manager.current_public(), public);
+            assert_eq!(manager.previous.as_ref().unwrap().retained_until, deadline);
+            assert_eq!(manager.previous.as_ref().unwrap().key.public, previous_public);
+        }
+        for now in [0, retired_at - 1] {
+            assert!(manager.peel_secrets(now).is_empty());
+            assert_eq!(manager.public_keys_at(now), ([0; 32], None));
+        }
+        manager.tick_rotation(deadline + 1).unwrap();
+        assert_eq!(manager.tick_rotation(deadline), Err(OnionKeyError::Time));
+        assert!(manager.peel_secrets(deadline).is_empty());
+        assert!(manager.previous.is_none());
+    }
+
+    // [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] Authored only:
+    // two generations suffice at the maximum accepted TTL; restart does not
+    // reconstruct any old ephemeral secret from a signing identity.
+    #[test]
+    fn repeated_rotation_stays_bounded_and_restart_loses_old_keys() {
+        let mut manager = OnionKeyManager::new(1_000);
+        manager.grace_secs = effective_grace_secs(MAX_ONION_DESCRIPTOR_TTL_SECS).unwrap();
+        let source = IdentityKeyPair::from_bytes(&[61; 32]).unwrap();
+        for round in 1..=3 {
+            let old = manager.current_public();
+            let now = 1_000 + round * ONION_KEY_ROTATION_SECS;
+            manager.tick_rotation(now).unwrap();
+            assert_eq!(manager.public_keys_at(now), (manager.current_public(), Some(old)));
+            assert_eq!(manager.peel_secrets(now).len(), 2);
+            assert_eq!(manager.peel_secrets(now + manager.grace_secs + 1).len(), 1);
+        }
+        let now = manager.observed_at;
+        let envelope = build_onion_envelope(
+            &[OnionHop { node_id: source.public_key_bytes(), kem_pub: manager.current_public() }],
+            b"synthetic restart", [62; 16], 2, now, &source,
+        ).unwrap();
+        assert!(try_open_onion_layer(&envelope.encrypted_blob, &manager.peel_secrets(now)).is_ok());
+        let restarted = OnionKeyManager::new(now);
+        assert!(restarted.previous.is_none());
+        assert!(try_open_onion_layer(&envelope.encrypted_blob, &restarted.peel_secrets(now)).is_err());
     }
 
     #[test]

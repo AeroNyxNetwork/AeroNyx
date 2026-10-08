@@ -18,6 +18,18 @@ const DIRECT_PEER_RELAY_V3_RETRY_DELAY_MILLIS: u64 = 50;
 /// Numeric form keeps compatibility with the workspace's pinned http crate.
 pub(super) const HTTP_TOO_EARLY_STATUS_CODE: u16 = 425;
 
+// [PHALA-NODE-COMPILE-REPAIR 2026-10-08 by Codex] Gossip shares the
+// existing test-only exception; production always returns false.
+#[cfg(test)]
+pub(super) fn is_test_loopback_peer_endpoint(endpoint: &str) -> bool {
+    crate::api::peer_endpoint_is_loopback_ip(endpoint)
+}
+
+#[cfg(not(test))]
+pub(super) fn is_test_loopback_peer_endpoint(_endpoint: &str) -> bool {
+    false
+}
+
 /// Typed validation failures for one bounded direct-relay acknowledgement.
 ///
 /// [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] Keep this typed until the route
@@ -387,6 +399,61 @@ impl Server {
         Self::permissionless_peer_transport_url(endpoint, "/api/chat/peer/blind-relay")
     }
 
+    // [PHALA-PROMOTION-DNS-CONTROL-PROBE 2026-10-07 by Codex] Keep
+    // ordinary DNS probes closed. Only the exact, appraised promotion gate can
+    // authorize this control request before general route readiness exists.
+    pub(super) fn promotion_blind_relay_probe_url(
+        peer_store: &PeerStore,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+    ) -> Option<String> {
+        let endpoint = descriptor.descriptor.public_endpoint.as_deref()?;
+        if peer_endpoint_is_public_ip(endpoint) || is_test_loopback_peer_endpoint(endpoint) {
+            return Self::blind_relay_probe_url(endpoint);
+        }
+        peer_store.phala_promotion_control_probe_is_admitted(descriptor, now)
+            .then(|| Self::onion_middle_blind_relay_url(endpoint))?
+    }
+
+    // [PHALA-ONION-MIDDLE-DNS-ORIGIN 2026-10-06 by Codex] A DNS endpoint is
+    // eligible for the HTTPS onion-middle route.
+    // [PHALA-PROMOTION-DNS-CONTROL-PROBE 2026-10-08 by Codex]
+    // The separately appraised promotion control lane
+    // shares this URL shape; ordinary probes/transports remain IP-only.
+    pub(super) fn onion_middle_blind_relay_url(endpoint: &str) -> Option<String> {
+        let permitted = peer_endpoint_is_public_ip(endpoint)
+            || is_test_loopback_peer_endpoint(endpoint)
+            || crate::api::reverse_onion_endpoint_supported(endpoint);
+        permitted
+            .then(|| canonical_peer_http_url(endpoint, "/api/chat/peer/blind-relay").ok())?
+            .map(|url| url.to_string())
+    }
+
+    // [PHALA-ONION-MIDDLE-DNS-ORIGIN 2026-10-06 by Codex] Resolve and pin a
+    // signed HTTPS hostname before building route material or crossing the
+    // POST ambiguity boundary. TLS continues to authenticate the hostname.
+    // [PHALA-PROMOTION-DNS-CONTROL-PROBE 2026-10-07 by Codex] The
+    // separately admitted promotion probe shares this TLS/public-DNS transport.
+    pub(super) async fn resolve_onion_middle_blind_relay_target(
+        endpoint: &str,
+        client: &reqwest::Client,
+    ) -> Option<(reqwest::Client, String)> {
+        let url = Self::onion_middle_blind_relay_url(endpoint)?;
+        if peer_endpoint_is_public_ip(endpoint)
+            || is_test_loopback_peer_endpoint(endpoint)
+        {
+            return Some((client.clone(), url));
+        }
+        let parsed = canonical_peer_http_url(endpoint, "/api/chat/peer/blind-relay").ok()?;
+        let target = crate::api::resolve_pinned_peer_http_target(
+            parsed,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .ok()?;
+        Some((target.client, target.url.to_string()))
+    }
+
     /// Attempts authenticated client traffic over receipt-capable two-hop
     /// onion paths and returns aggregate delivery/replication evidence.
     ///
@@ -513,10 +580,16 @@ impl Server {
                 last_failure_reason = Some("onion_middle_endpoint_missing".to_string());
                 continue;
             };
-            let Some(url) = Self::blind_relay_probe_url(endpoint) else {
+            let Some((middle_client, url)) =
+                Self::resolve_onion_middle_blind_relay_target(endpoint, client).await
+            else {
                 last_failure_reason = Some("onion_middle_endpoint_invalid".to_string());
                 continue;
             };
+            if !peer_store.readmit_selected_route(&middle, unix_now_secs()) {
+                last_failure_reason = Some("onion_middle_admission_changed".to_string());
+                continue;
+            }
 
             let route_id = if let Some(request_id) = client_request_id {
                 // [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] An explicit
@@ -579,7 +652,7 @@ impl Server {
             // the send boundary, even if transport cannot confirm bytes sent.
             // Preflight continuations above never enter this exposed state.
             let mut posted_evidence = OnionPostedAttemptEvidence::Unconfirmed;
-            match client
+            match middle_client
                 .post(&url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(request.body())

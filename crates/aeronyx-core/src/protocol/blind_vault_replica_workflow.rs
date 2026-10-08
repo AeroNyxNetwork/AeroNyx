@@ -331,6 +331,12 @@ pub(crate) use sealed_local::{
     open_pull_restart, seal_pull_restart, MAX_PULL_RESTART_BODY_BYTES,
     MAX_PULL_RESTART_SEALED_BYTES,
 };
+// [BLIND-VAULT-ADMISSION-RESTART 2026-10-05 by Codex] Fixed local-only
+// operation domain, not a network codec or dispatch capability.
+pub(crate) use sealed_local::{
+    open_lease_admission_restart, seal_lease_admission_restart,
+    MAX_LEASE_ADMISSION_RESTART_BODY_BYTES, MAX_LEASE_ADMISSION_RESTART_SEALED_BYTES,
+};
 // [REVERSE-ONION-SOURCE-JOURNAL 2026-10-04 by Codex] Server-local record
 // sealing only, never a dispatch permit or public network codec.
 pub use sealed_local::{

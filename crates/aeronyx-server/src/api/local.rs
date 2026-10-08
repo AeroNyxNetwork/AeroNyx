@@ -1,85 +1,37 @@
 // ============================================
 // File: crates/aeronyx-server/src/api/local.rs
 // ============================================
-//! # Local MemChain API — Axum HTTP Server (MPI + Legacy)
+//! # Local MemChain API — Axum HTTP Server (Node-Blind Memory + Legacy Facts)
 //!
 //! ## Creation Reason
-//! Provides HTTP endpoints for trusted local clients to interact with the
-//! MemChain ledger. This is the loopback entry point for trusted local
-//! tools to write and read memory.
+//! Provides node-local fact endpoints and node-blind sealed-memory transport.
+//! Plaintext memory cognition, embeddings, extraction, and consolidation stay
+//! on clients or the configured Phala ACI route, never in an ordinary node.
 //!
 //! ## Modification Reason
 //! - 🌟 v0.3.0: Initial API implementation (POST /api/fact, GET /api/facts)
 //! - 🌟 v0.4.0: Added P2P broadcast on `POST /api/fact` + `POST /api/sync`
 //! - 🌟 v1.0.0: **Major refactor** — Added MPI (Memory Protocol Interface)
 //!   endpoints for the intelligent AI memory engine:
-//!   - `POST /api/mpi/remember` — store a new memory (dedup + encrypt + persist)
-//!   - `POST /api/mpi/recall` — semantic recall with composite scoring
+//!   - `POST /api/mpi/remember` — legacy path returns 410; use sealed ingress
+//!   - `POST /api/mpi/recall` — keyed-term search returning sealed bytes only
 //!   - `POST /api/mpi/forget` — revoke a memory (tombstone + erase content)
 //!   - `GET  /api/mpi/status` — memory statistics and layer distribution
 //!   Legacy endpoints (`/api/fact`, `/api/facts`, `/api/status`, `/api/sync`)
 //!   are preserved for backward compatibility with existing P2P flows.
 //!
-//! ## MPI Request / Response Formats
-//!
-//! ### POST /api/mpi/remember
-//! ```json
-//! // Request
-//! {
-//!   "content": "User prefers dark mode and Rust programming",
-//!   "layer": "identity",          // "identity" | "knowledge" | "episode"
-//!   "topic_tags": ["preference", "programming"],
-//!   "source_ai": "local-ml-v1",
-//!   "embedding": [0.1, 0.2, ...]  // optional f32 vector
-//! }
-//! // Response (201 Created)
-//! {
-//!   "record_id": "a1b2c3d4...",
-//!   "status": "created",
-//!   "duplicate_of": null           // or hex ID if dedup detected
-//! }
-//! ```
-//!
-//! ### POST /api/mpi/recall
-//! ```json
-//! // Request
-//! {
-//!   "query": "What programming language does the user prefer?",
-//!   "embedding": [0.1, 0.2, ...], // required f32 vector
-//!   "top_k": 5,                   // optional, default 10
-//!   "layer": null,                 // optional layer filter
-//!   "token_budget": 2000           // optional, max tokens in response
-//! }
-//! // Response (200 OK)
-//! {
-//!   "memories": [
-//!     {
-//!       "record_id": "a1b2c3d4...",
-//!       "layer": "identity",
-//!       "score": 0.92,
-//!       "content": "User prefers dark mode and Rust programming",
-//!       "topic_tags": ["preference"],
-//!       "source_ai": "local-ml-v1",
-//!       "timestamp": 1700000000
-//!     }
-//!   ],
-//!   "total_candidates": 42,
-//!   "token_estimate": 156
-//! }
-//! ```
-//!
-//! ### POST /api/mpi/forget
-//! ```json
-//! // Request
-//! { "record_id": "a1b2c3d4..." }
-//! // Response (200 OK)
-//! { "status": "revoked", "record_id": "a1b2c3d4..." }
-//! ```
+//! ## Memory Data Contract
+//! [MEMCHAIN-NODE-BLIND-API 2026-10-05 by Codex] Clients encrypt and sign
+//! memory before `POST /api/mpi/remember_sealed`; ordinary nodes reject legacy
+//! plaintext `remember`, `recall` queries, `recall/detail` content, and PATCH.
+//! Recall may carry keyed `query_terms`, and responses expose ciphertext in
+//! `sealed` / `sealed_v2`; clients decrypt and perform semantic ranking locally.
 //!
 //! ## Dependencies
 //! - `axum` for HTTP routing
 //! - `MemoryStorage` for SQLite persistence
-//! - `VectorIndex` for semantic search
+//! - `VectorIndex` remains for compatibility, but ordinary nodes do not load
+//!   legacy persisted vectors into it.
 //! - `IdentityKeyPair` for Ed25519 signing
 //! - Legacy: `MemPool`, `AofWriter` for Fact-based endpoints
 //!
@@ -87,11 +39,10 @@
 //! - All handlers are non-blocking (async).
 //! - MPI endpoints use `MemoryStorage` (SQLite) + `VectorIndex`.
 //! - Legacy endpoints still use `MemPool` + `AofWriter`.
-//! - The `owner` field for MPI operations uses the server's identity
-//!   public key. In future phases, clients will provide their own wallet key.
-//! - `embedding` in remember/recall is provided by a trusted local client.
-//!   The server does NOT generate embeddings itself.
-//! - P2P broadcast of MemoryRecords uses `BroadcastRecord` message type.
+//! - Sealed memory ownership uses the client's signing key; do not reintroduce
+//!   plaintext memory fields or semantic vectors on node-facing routes.
+//! - P2P legacy record framing remains version-compatible; audit its blind-data
+//!   marker before extending sealed-record replication.
 //!
 //! ## Last Modified
 //! v0.3.0 - Initial API implementation for MemChain Phase 1

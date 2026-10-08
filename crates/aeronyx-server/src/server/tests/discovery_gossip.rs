@@ -1,6 +1,801 @@
 // Split from crates/aeronyx-server/src/server.rs `mod tests` for navigation.
 // Behavior is unchanged. Names resolve through `use super::*;`.
 use super::*;
+// [PHALA-NODE-COMPILE-REPAIR 2026-10-08 by Codex] Import the signed grant
+// and the internal transport decision being asserted by these fixtures.
+use aeronyx_core::protocol::discovery::SignedPrivateOnionRecipientAuthorizationV1;
+use super::super::discovery_gossip_runtime::GossipTransportPin;
+
+// [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] Authored only: direct
+// descriptor builders cannot bypass the parent TTL/time rejection contract.
+#[test]
+fn self_descriptor_rejects_unretainable_kem_lifetime_and_expiry_overflow() {
+    let mut config = ServerConfig::default();
+    config.discovery.enabled = true;
+    config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+    let identity = IdentityKeyPair::from_bytes(&[47; 32]).unwrap();
+    let max = crate::services::onion_keys::MAX_ONION_DESCRIPTOR_TTL_SECS;
+    let now = 1_800_000_000;
+    for ttl in [60, 3600, 7200, max] {
+        config.discovery.descriptor_ttl_secs = ttl;
+        let descriptor = Server::build_self_discovery_descriptor_for(&config, &identity, now).unwrap();
+        assert_eq!(descriptor.descriptor.expires_at, now + ttl);
+        descriptor.verify_at(now).unwrap();
+    }
+    for ttl in [0, 59, max + 1, u64::MAX] {
+        config.discovery.descriptor_ttl_secs = ttl;
+        assert!(Server::build_self_discovery_descriptor_for(&config, &identity, now).is_err());
+    }
+    config.discovery.descriptor_ttl_secs = 60;
+    for rejected_time in [0, u64::MAX - 59, u64::MAX] {
+        assert!(Server::build_self_discovery_descriptor_for(&config, &identity, rejected_time).is_err());
+    }
+}
+
+// [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex] Authored only:
+// the actual source selector has bounded fanout, stable order and fair cursor
+// progression independent of an individual peer's later network outcome.
+#[test]
+fn private_authorization_source_batches_cover_pins_without_unbounded_fanout() {
+    let sources: Vec<[u8; 32]> = (1..=64).map(|byte| [byte; 32]).collect();
+    let mut cursor = 0;
+    let mut visited = Vec::new();
+    for _ in 0..8 {
+        let batch = Server::private_authorization_source_batch(&sources, &mut cursor, 8);
+        assert_eq!(batch.len(), 8);
+        visited.extend(batch);
+    }
+    assert_eq!(visited, sources);
+    assert_eq!(cursor, 0);
+    assert_eq!(Server::private_authorization_source_batch(&sources, &mut cursor, usize::MAX).len(), 8);
+    assert_eq!(cursor, 8);
+    assert_eq!(Server::private_authorization_source_batch(&sources, &mut cursor, 1), vec![sources[8]]);
+    assert_eq!(cursor, 9);
+    assert!(Server::private_authorization_source_batch(&sources, &mut cursor, 0).is_empty());
+    assert_eq!(cursor, 9);
+    assert!(Server::private_authorization_source_batch(&[], &mut cursor, 8).is_empty());
+    let oversized = vec![[1; 32]; 65];
+    assert!(Server::private_authorization_source_batch(&oversized, &mut cursor, 8).is_empty());
+    assert_eq!(cursor, 9);
+    let short = &sources[..3];
+    cursor = usize::MAX;
+    let start = cursor % short.len();
+    let expected: Vec<_> = (0..3).map(|offset| short[(start + offset) % short.len()]).collect();
+    assert_eq!(Server::private_authorization_source_batch(short, &mut cursor, 8), expected);
+    assert_eq!(cursor, start);
+}
+
+// [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex] Authored only:
+// coalescing uses exact confirmed authority, does not publish on signing, and
+// keeps Pull/admission purposes and post-lock observations independent.
+#[cfg(unix)]
+#[test]
+fn private_recipient_gossip_reuses_confirmed_grants_without_extending_or_publishing_them() {
+    use aeronyx_core::protocol::NodeProtocolFeature;
+    let fixture = crate::services::reverse_onion_source::tests::Fixture::new();
+    let (relay, recipient, _) = fixture.policy_parts();
+    let now = fixture.now();
+    let relay_key = IdentityKeyPair::from_bytes(&[42; 32]).unwrap();
+    let recipient_key = IdentityKeyPair::from_bytes(&[43; 32]).unwrap();
+    let admission = OnionRoutePurpose::BlindVaultLeaseAdmission;
+    let relay = SignedNodeDescriptor::sign(relay.descriptor.with_protocol_features(
+        admission.required_path_protocol_features().iter().copied()
+            .chain(std::iter::once(NodeProtocolFeature::PrivateOnionAuthorizationGossipV1)),
+    ), &relay_key).unwrap();
+    let recipient = SignedNodeDescriptor::sign(recipient.descriptor.with_protocol_features(
+        admission.required_terminal_protocol_features().iter().copied()
+            .chain(std::iter::once(NodeProtocolFeature::PrivateOnionBlindVaultAdmissionTerminalV1)),
+    ), &recipient_key).unwrap();
+    let peers = PeerStore::new();
+    peers.pin_private_onion_route_identities(relay.node_id(), recipient.node_id()).unwrap();
+    for descriptor in [&relay, &recipient] {
+        peers.upsert_verified_from_source(descriptor.clone(), now, "test_pin").unwrap();
+    }
+    let pull = OnionRoutePurpose::BlindVaultPull.as_str();
+    let (candidate, _, _, candidate_at) = Server::private_recipient_authorization_for_gossip(
+        &peers, &recipient_key, relay.node_id(), pull, now, || now,
+    ).unwrap();
+    assert_eq!(candidate.issued_at(), now);
+    assert_eq!(candidate_at, now);
+    assert_eq!(candidate.expires_at(), relay.descriptor.expires_at.min(recipient.descriptor.expires_at));
+    assert!(peers.current_private_onion_authorization(&relay.node_id(), &recipient.node_id(), now).is_none(),
+        "creating a request candidate is not a remote ACK");
+    let confirmed = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+        &relay, &recipient, pull, now, now + 120, &recipient_key,
+    ).unwrap();
+    peers.remember_issued_private_onion_authorization(confirmed.clone(), recipient.node_id(), now).unwrap();
+    let (reused, exact_relay, exact_recipient, checked_at) = Server::private_recipient_authorization_for_gossip(
+        &peers, &recipient_key, relay.node_id(), pull, now, || now + 60,
+    ).unwrap();
+    assert_eq!(reused, confirmed);
+    assert_eq!(checked_at, now + 60);
+    assert_eq!(exact_relay, relay);
+    assert_eq!(exact_recipient, recipient);
+    assert_eq!(reused.encode_canonical().unwrap(), confirmed.encode_canonical().unwrap());
+    let message = NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 {
+        authorization: reused.clone(), relay_descriptor: exact_relay.clone(),
+        recipient_descriptor: exact_recipient.clone(),
+    };
+    let url = Server::reverse_onion_private_gossip_url(
+        exact_relay.descriptor.public_endpoint.as_deref().unwrap(),
+    ).unwrap();
+    assert_eq!(Server::private_authorization_gossip_admitted_at(
+        &peers, recipient.node_id(), &exact_relay, &message, &url, checked_at, || now + 60,
+    ), Some(now + 60));
+    assert!(Server::private_authorization_gossip_admitted_at(
+        &peers, recipient.node_id(), &exact_relay, &message, &url, checked_at, || now + 59,
+    ).is_none(), "reused grant issued_at must not erase the latest selected-at observation");
+    for bad_now in [0, now - 1] {
+        assert!(Server::private_recipient_authorization_for_gossip(
+            &peers, &recipient_key, relay.node_id(), pull, now, || bad_now,
+        ).is_none());
+    }
+    assert!(Server::private_recipient_authorization_for_gossip(
+        &peers, &recipient_key, relay.node_id(), "anonymous_mailbox_v1", now, || now + 60,
+    ).is_none());
+    let (admission_grant, _, _, _) = Server::private_recipient_authorization_for_gossip(
+        &peers, &recipient_key, relay.node_id(), admission.as_str(), now, || now + 60,
+    ).unwrap();
+    assert_eq!(admission_grant.canonical_purpose(), Some(admission.as_str()));
+    admission_grant.verify_at(&relay, &recipient, admission.as_str(), now + 60).unwrap();
+    assert!(peers.current_private_onion_authorization(&relay.node_id(), &recipient.node_id(), now + 60)
+        .as_ref() == Some(&confirmed));
+    peers.remember_issued_private_onion_authorization(admission_grant.clone(), recipient.node_id(), now + 60).unwrap();
+    let (admission_reused, _, _, _) = Server::private_recipient_authorization_for_gossip(
+        &peers, &recipient_key, relay.node_id(), admission.as_str(), now + 60, || now + 61,
+    ).unwrap();
+    assert_eq!(admission_reused, admission_grant);
+    let (expired_replacement, _, _, _) = Server::private_recipient_authorization_for_gossip(
+        &peers, &recipient_key, relay.node_id(), pull, now + 120, || now + 120,
+    ).unwrap();
+    assert_ne!(expired_replacement, confirmed);
+    assert_eq!(expired_replacement.issued_at(), now + 120);
+    assert!(peers.current_private_onion_authorization(&relay.node_id(), &recipient.node_id(), now + 120).is_none(),
+        "a replacement is not cached before its ACK either");
+}
+
+// [PHALA-AUTHORITY-DELIVERY-CADENCE 2026-10-08 by Codex] Authored only:
+// a valid old signature never substitutes for changed R/P commitments, and
+// public recipient metadata cannot acquire the private issuance role.
+#[cfg(unix)]
+#[test]
+fn private_recipient_gossip_replaces_rotated_pairs_and_rejects_public_recipients() {
+    let fixture = crate::services::reverse_onion_source::tests::Fixture::new();
+    let (relay, recipient, confirmed) = fixture.policy_parts();
+    let now = fixture.now();
+    let relay_key = IdentityKeyPair::from_bytes(&[42; 32]).unwrap();
+    let recipient_key = IdentityKeyPair::from_bytes(&[43; 32]).unwrap();
+    let peers = PeerStore::new();
+    peers.pin_private_onion_route_identities(relay.node_id(), recipient.node_id()).unwrap();
+    for descriptor in [&relay, &recipient] {
+        peers.upsert_verified_from_source(descriptor.clone(), now, "test_pin").unwrap();
+    }
+    peers.remember_issued_private_onion_authorization(confirmed.clone(), recipient.node_id(), now).unwrap();
+    let mut renewed = relay.descriptor.clone();
+    renewed.sequence += 1;
+    renewed.issued_at = now + 1;
+    let renewed = SignedNodeDescriptor::sign(renewed, &relay_key).unwrap();
+    peers.upsert_verified_from_source(renewed.clone(), now + 1, "self").unwrap();
+    let pull = OnionRoutePurpose::BlindVaultPull.as_str();
+    let (replacement, exact_relay, exact_recipient, _) = Server::private_recipient_authorization_for_gossip(
+        &peers, &recipient_key, relay.node_id(), pull, now + 1, || now + 1,
+    ).unwrap();
+    assert_ne!(replacement, confirmed);
+    assert_eq!(exact_relay, renewed);
+    assert_eq!(exact_recipient, recipient);
+    assert!(confirmed.verify_at(&renewed, &recipient, pull, now + 1).is_err());
+    replacement.verify_at(&renewed, &recipient, pull, now + 1).unwrap();
+    assert!(Server::private_recipient_authorization_for_gossip(
+        &peers, &relay_key, relay.node_id(), pull, now + 1, || now + 1,
+    ).is_none(), "only the pinned P identity may issue a private grant");
+    let mut exposed = recipient.descriptor.clone();
+    exposed.sequence += 1;
+    exposed.issued_at = now + 2;
+    exposed.public_endpoint = Some("https://recipient.example".into());
+    exposed.policy.public_discovery = true;
+    let exposed = SignedNodeDescriptor::sign(exposed, &recipient_key).unwrap();
+    peers.upsert_verified_from_source(exposed, now + 2, "self").unwrap();
+    assert!(Server::private_recipient_authorization_for_gossip(
+        &peers, &recipient_key, relay.node_id(), pull, now + 2, || now + 2,
+    ).is_none());
+}
+
+// [PHALA-AUTHORITY-DESCRIPTOR-EPOCH 2026-10-08 by Codex] Authored only,
+// not executed: the real selector keeps exact bytes through heartbeat rounds,
+// but never carries them past renewal, changed readiness or a new owner.
+#[test]
+fn private_authority_descriptor_epoch_retains_only_unchanged_live_generations() {
+    let now = 1_800_000_000;
+    let key = IdentityKeyPair::from_bytes(&[0x76; 32]).unwrap();
+    let mut config = ServerConfig::default();
+    config.reverse_onion.queue.enabled = true;
+    config.discovery.descriptor_ttl_secs = 600;
+    config.discovery.public_endpoint = Some("https://relay.example".into());
+    let build = |config: &ServerConfig, at| {
+        Server::build_self_discovery_descriptor_for_runtime_state_with_private_pull(
+            config, &key, at, true, true, false, true,
+        ).unwrap()
+    };
+    let first = build(&config, now);
+    let heartbeat = build(&config, now + 60);
+    assert_ne!(first, heartbeat, "the old per-round builder changes the exact pin");
+    assert_eq!(Server::select_private_authority_descriptor_epoch(
+        &config, heartbeat.clone(), Some(&first), now + 60,
+    ), first);
+    assert_eq!(Server::select_private_authority_descriptor_epoch(
+        &config, heartbeat.clone(), None, now + 60,
+    ), heartbeat, "restart must not recover an in-memory generation from disk");
+    let last_retained = build(&config, now + 299);
+    assert_eq!(Server::select_private_authority_descriptor_epoch(
+        &config, last_retained, Some(&first), now + 299,
+    ), first);
+    for at in [now + 300, now + 600, now + 601] {
+        let renewed = build(&config, at);
+        assert_eq!(Server::select_private_authority_descriptor_epoch(
+            &config, renewed.clone(), Some(&first), at,
+        ), renewed);
+    }
+    let mut different_ttl = config.clone();
+    different_ttl.discovery.descriptor_ttl_secs = 1_200;
+    let changed = build(&different_ttl, now + 60);
+    assert_eq!(Server::select_private_authority_descriptor_epoch(
+        &different_ttl, changed.clone(), Some(&first), now + 60,
+    ), changed);
+    for role in 0..3 {
+        let mut live = config.clone();
+        live.reverse_onion.queue.enabled = role == 0;
+        live.reverse_onion.recipient.enabled = role == 1;
+        live.reverse_onion.source.enabled = role == 2;
+        assert_eq!(Server::select_private_authority_descriptor_epoch(
+            &live, heartbeat.clone(), Some(&first), now + 60,
+        ), first);
+        live.reverse_onion.queue.recovery_only = true;
+        live.reverse_onion.recipient.recovery_only = true;
+        live.reverse_onion.source.recovery_only = true;
+        assert_eq!(Server::select_private_authority_descriptor_epoch(
+            &live, heartbeat.clone(), Some(&first), now + 60,
+        ), heartbeat, "recovery-only roles retain the existing renewal behavior");
+    }
+    config.reverse_onion.queue.enabled = false;
+    assert_eq!(Server::select_private_authority_descriptor_epoch(
+        &config, heartbeat.clone(), Some(&first), now + 60,
+    ), heartbeat, "ordinary public discovery is unchanged");
+}
+
+// [PHALA-AUTHORITY-DESCRIPTOR-EPOCH 2026-10-08 by Codex] Authored only:
+// no signature/TTL or exact-field weakening may hide a real route withdrawal.
+#[test]
+fn private_authority_descriptor_epoch_replaces_every_changed_signed_surface() {
+    let now = 1_800_000_000;
+    let key = IdentityKeyPair::from_bytes(&[0x77; 32]).unwrap();
+    let mut config = ServerConfig::default();
+    config.reverse_onion.queue.enabled = true;
+    config.discovery.public_endpoint = Some("https://relay.example".into());
+    let first = Server::build_self_discovery_descriptor_for_runtime_state_with_private_pull(
+        &config, &key, now, true, true, false, true,
+    ).unwrap();
+    let heartbeat = Server::build_self_discovery_descriptor_for_runtime_state_with_private_pull(
+        &config, &key, now + 60, true, true, false, true,
+    ).unwrap();
+    for field in 0..7 {
+        let mut changed = heartbeat.descriptor.clone();
+        match field {
+            0 => changed.kem_public = key.x25519_public_key_bytes(),
+            1 => changed.public_endpoint = Some("https://new-relay.example".into()),
+            2 => changed.capabilities.clear(),
+            3 => changed.policy.public_discovery = !changed.policy.public_discovery,
+            4 => changed.capacity.max_sessions = changed.capacity.max_sessions.saturating_add(1),
+            5 => changed.software_version = "changed-runtime".into(),
+            _ => changed.policy.region = Some("changed-region".into()),
+        }
+        assert_ne!(changed, heartbeat.descriptor);
+        let changed = SignedNodeDescriptor::sign(changed, &key).unwrap();
+        assert!(changed.verify_at(now + 60).is_ok());
+        assert_eq!(Server::select_private_authority_descriptor_epoch(
+            &config, changed.clone(), Some(&first), now + 60,
+        ), changed);
+    }
+    // Enable an actual role-dependent readiness feature for this control.
+    config.blind_vault.enabled = true;
+    config.blind_vault.public_api_enabled = false;
+    config.memchain.chat_relay.enabled = true;
+    config.reverse_onion.queue.enabled = false;
+    config.reverse_onion.recipient.enabled = true;
+    config.discovery.enabled = true;
+    config.discovery.gossip_enabled = true;
+    config.discovery.public_discovery = false;
+    config.discovery.public_endpoint = None;
+    config.discovery.public_api_listen_addr = None;
+    let ready = Server::build_self_discovery_descriptor_for_runtime_state_with_private_pull(
+        &config, &key, now, true, true, false, true,
+    ).unwrap();
+    let withdrawn = Server::build_self_discovery_descriptor_for_runtime_state_with_private_pull(
+        &config, &key, now + 60, false, false, false, false,
+    ).unwrap();
+    assert_ne!(ready.descriptor.software_version, withdrawn.descriptor.software_version);
+    assert_eq!(Server::select_private_authority_descriptor_epoch(
+        &config, withdrawn.clone(), Some(&ready), now + 60,
+    ), withdrawn);
+    let mut invalid_previous = first.clone();
+    invalid_previous.signature[0] ^= 1;
+    assert_eq!(Server::select_private_authority_descriptor_epoch(
+        &config, heartbeat.clone(), Some(&invalid_previous), now + 60,
+    ), heartbeat);
+    let mut invalid_candidate = heartbeat.clone();
+    invalid_candidate.signature[0] ^= 1;
+    assert_eq!(Server::select_private_authority_descriptor_epoch(
+        &config, invalid_candidate.clone(), Some(&first), now + 60,
+    ), invalid_candidate, "a failed current candidate must not resurrect older readiness");
+}
+
+// [PHALA-SELF-DESCRIPTOR-SEQUENCE 2026-10-08 by Codex] Authored, not
+// executed: real PeerStore fences reject the old same-second sequence, while
+// current runtime bytes and nested signed policies use the newly chosen one.
+#[test]
+fn private_self_descriptor_counter_survives_same_second_changes_and_warm_restart() {
+    use aeronyx_core::protocol::discovery::SignedNodeDescriptor;
+    let now = 1_800_000_000;
+    let key = IdentityKeyPair::from_bytes(&[0x78; 32]).unwrap();
+    let runtime_kem = IdentityKeyPair::from_bytes(&[0x7c; 32]).unwrap().x25519_public_key_bytes();
+    let mut config = ServerConfig::default();
+    config.reverse_onion.queue.enabled = true;
+    config.discovery.public_endpoint = Some("https://relay.example".into());
+    config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+    config.memchain.chat_relay.enabled = true;
+    let peers = PeerStore::new();
+    let build = |sequence, ready| {
+        let descriptor = Server::build_self_discovery_descriptor_for_runtime_state_with_private_pull_and_sequence(
+            &config, &key, now, ready, ready, true, ready, sequence,
+        ).unwrap();
+        // Test-only public fixture: concurrent global KEM rotation cannot
+        // change which current key this sequence/policy control expects.
+        SignedNodeDescriptor::sign(
+            descriptor.descriptor.with_x25519_kem(runtime_kem), &key,
+        ).unwrap()
+    };
+    let current = build(now, true);
+    let mut cached_body = current.descriptor.clone();
+    cached_body.kem_public = key.x25519_public_key_bytes();
+    assert_ne!(cached_body.kem_public, current.descriptor.kem_public);
+    let first = SignedNodeDescriptor::sign(cached_body, &key).unwrap();
+    assert!(first.anonymous_mailbox_work_policy_at(now).is_ok());
+    peers.upsert_verified_from_source(first.clone(), now, "self").unwrap();
+    assert!(peers.upsert_verified_from_source(current.clone(), now, "self").is_err());
+    for role in 0..3 {
+        let mut role_config = config.clone();
+        role_config.reverse_onion.queue.enabled = role == 0;
+        role_config.reverse_onion.recipient.enabled = role == 1;
+        role_config.reverse_onion.source.enabled = role == 2;
+        assert_eq!(Server::private_authority_self_descriptor_sequence(
+            &role_config, &key, None, &peers, now,
+        ).unwrap(), now + 1);
+    }
+    let sequence = Server::private_authority_self_descriptor_sequence(
+        &config, &key, None, &peers, now,
+    ).unwrap();
+    let withdrawn = build(sequence, false);
+    assert_eq!(withdrawn.descriptor.issued_at, now);
+    assert_eq!(withdrawn.descriptor.expires_at, first.descriptor.expires_at);
+    assert_eq!(withdrawn.sequence(), now + 1);
+    assert_eq!(withdrawn.descriptor.kem_public, current.descriptor.kem_public);
+    assert_ne!(withdrawn.descriptor.kem_public, first.descriptor.kem_public);
+    assert_ne!(withdrawn.descriptor.capabilities, first.descriptor.capabilities);
+    assert_ne!(withdrawn.descriptor.software_version, first.descriptor.software_version);
+    assert!(withdrawn.verify_at(now).is_ok());
+    assert!(withdrawn.anonymous_mailbox_work_policy_at(now).is_ok(),
+        "the nested work policy must be signed after sequence selection");
+    assert!(peers.upsert_verified_from_source(withdrawn.clone(), now, "self").unwrap());
+    assert_eq!(peers.get_valid(&key.public_key_bytes(), now), Some(withdrawn.clone()));
+    let next = Server::private_authority_self_descriptor_sequence(
+        &config, &key, Some(&withdrawn), &peers, now,
+    ).unwrap();
+    assert_eq!(next, now + 2);
+    let changed = build(next, true);
+    assert!(changed.anonymous_mailbox_work_policy_at(now).is_ok());
+    assert!(peers.upsert_verified_from_source(changed, now, "self").unwrap());
+    assert_eq!(Server::private_authority_self_descriptor_sequence(
+        &ServerConfig::default(), &key, None, &peers, now,
+    ).unwrap(), now, "ordinary discovery keeps its existing sequence behavior");
+}
+
+// [PHALA-SELF-DESCRIPTOR-SEQUENCE 2026-10-08 by Codex] Authored only:
+// expired public evidence fences reuse without becoming live authority; bad
+// owner evidence, clock rollback and overflow never yield a signing counter.
+#[test]
+fn private_self_descriptor_counter_rejects_rollback_overflow_and_foreign_owner() {
+    use aeronyx_core::protocol::discovery::{NodeBootstrapSnapshot, SignedNodeDescriptor};
+    let now = 1_800_000_000;
+    let key = IdentityKeyPair::from_bytes(&[0x79; 32]).unwrap();
+    let foreign = IdentityKeyPair::from_bytes(&[0x7a; 32]).unwrap();
+    let mut config = ServerConfig::default();
+    config.reverse_onion.source.enabled = true;
+    config.reverse_onion.source.recovery_only = true;
+    let first = Server::build_self_discovery_descriptor_for(&config, &key, now).unwrap();
+    let empty = PeerStore::new();
+    assert_eq!(Server::private_authority_self_descriptor_sequence(
+        &config, &key, None, &empty, now,
+    ).unwrap(), now);
+    assert!(Server::private_authority_self_descriptor_sequence(
+        &config, &key, Some(&first), &empty, now - 1,
+    ).is_err());
+    let foreign_descriptor = Server::build_self_discovery_descriptor_for(&config, &foreign, now).unwrap();
+    assert!(Server::private_authority_self_descriptor_sequence(
+        &config, &key, Some(&foreign_descriptor), &empty, now,
+    ).is_err());
+    let mut corrupt = first.clone();
+    corrupt.signature[0] ^= 1;
+    assert!(Server::private_authority_self_descriptor_sequence(
+        &config, &key, Some(&corrupt), &empty, now,
+    ).is_err());
+    let mut body = first.descriptor.clone();
+    body.issued_at = now - 60;
+    body.expires_at = now - 1;
+    body.sequence = now + 20;
+    let expired = SignedNodeDescriptor::sign(body.clone(), &key).unwrap();
+    let peers = PeerStore::new();
+    let report = peers.load_peer_cache_snapshot_from_source(
+        &NodeBootstrapSnapshot::new(now, vec![expired]), now, "cache",
+    );
+    assert_eq!(report.inserted, 1);
+    assert!(peers.get_valid(&key.public_key_bytes(), now).is_none());
+    assert_eq!(Server::private_authority_self_descriptor_sequence(
+        &config, &key, None, &peers, now,
+    ).unwrap(), now + 21);
+    body.sequence = u64::MAX;
+    let exhausted = SignedNodeDescriptor::sign(body, &key).unwrap();
+    assert!(Server::private_authority_self_descriptor_sequence(
+        &config, &key, Some(&exhausted), &empty, now,
+    ).is_err());
+    assert!(Server::private_authority_self_descriptor_sequence(
+        &config, &key, None, &empty, 0,
+    ).is_err());
+}
+
+// [PHALA-SELF-CACHE-RESTART 2026-10-08 by Codex] Authored only: the
+// serialized cache carries a counter across fresh stores, never live authority
+// or an ephemeral KEM. This does not simulate disk durability or a process crash.
+#[test]
+fn private_self_counter_survives_serialized_expired_cache_without_reviving_authority() {
+    use aeronyx_core::protocol::discovery::{NodeBootstrapSnapshot, SignedNodeDescriptor};
+
+    let issued_at = 1_800_000_000;
+    let key = IdentityKeyPair::from_bytes(&[0x7d; 32]).unwrap();
+    let old_kem = IdentityKeyPair::from_bytes(&[0x7e; 32]).unwrap().x25519_public_key_bytes();
+    let new_kem = IdentityKeyPair::from_bytes(&[0x7f; 32]).unwrap().x25519_public_key_bytes();
+    let mut config = ServerConfig::default();
+    config.reverse_onion.queue.enabled = true;
+    config.discovery.descriptor_ttl_secs = 600;
+    config.discovery.public_endpoint = Some("https://relay.example".into());
+    config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+    config.memchain.chat_relay.enabled = true;
+    let first = Server::build_self_discovery_descriptor_for_runtime_state_with_private_pull_and_sequence(
+        &config, &key, issued_at, true, true, true, true, issued_at + 1_000_000,
+    ).unwrap();
+    let first = SignedNodeDescriptor::sign(first.descriptor.with_x25519_kem(old_kem), &key).unwrap();
+    assert!(first.anonymous_mailbox_work_policy_at(issued_at).is_ok());
+    let first_store = PeerStore::new();
+    assert!(first_store.upsert_verified_from_source(first.clone(), issued_at, "self").unwrap());
+    let expired_at = first.descriptor.expires_at.checked_add(1).unwrap();
+    assert_eq!(first_store.cleanup_expired(expired_at), 1);
+    assert!(first_store.get_valid(&key.public_key_bytes(), expired_at).is_none());
+    assert!(first_store.export_bootstrap_snapshot(expired_at, expired_at, false, None).peers.is_empty());
+
+    let cache_bytes = first_store.export_peer_cache_snapshot(expired_at).to_json_pretty().unwrap();
+    let cached = NodeBootstrapSnapshot::from_json_bytes(&cache_bytes).unwrap();
+    assert_eq!(cached.peers, vec![first.clone()]);
+    let restarted = PeerStore::new();
+    let report = restarted.load_peer_cache_snapshot_from_source(&cached, expired_at, "cache");
+    assert_eq!(report.inserted, 1);
+    assert_eq!(report.rejected, 0);
+    assert_eq!(restarted.snapshot(expired_at).valid_peers, 0);
+    assert!(restarted.get_valid(&key.public_key_bytes(), expired_at).is_none());
+    assert!(restarted.export_bootstrap_snapshot(expired_at, expired_at, false, None).peers.is_empty());
+    assert_eq!(restarted.cleanup_expired(expired_at), 0);
+
+    let mut corrupt = first.clone();
+    corrupt.signature[0] ^= 1;
+    let rejected = restarted.load_peer_cache_snapshot_from_source(
+        &NodeBootstrapSnapshot::new(expired_at, vec![corrupt]), expired_at, "cache",
+    );
+    assert_eq!(rejected.rejected, 1);
+    assert_eq!(rejected.inserted, 0);
+    let sequence = Server::private_authority_self_descriptor_sequence(
+        &config, &key, None, &restarted, expired_at,
+    ).unwrap();
+    assert_eq!(sequence, first.sequence() + 1);
+    let current = Server::build_self_discovery_descriptor_for_runtime_state_with_private_pull_and_sequence(
+        &config, &key, expired_at, false, false, true, false, sequence,
+    ).unwrap();
+    let current = SignedNodeDescriptor::sign(current.descriptor.with_x25519_kem(new_kem), &key).unwrap();
+    assert_eq!(current.descriptor.issued_at, expired_at);
+    assert_eq!(current.descriptor.kem_public, new_kem);
+    assert_ne!(current.descriptor.kem_public, first.descriptor.kem_public);
+    assert_ne!(current.descriptor.software_version, first.descriptor.software_version);
+    assert_ne!(current.descriptor.capabilities, first.descriptor.capabilities);
+    assert!(current.anonymous_mailbox_work_policy_at(expired_at).is_ok());
+    assert_eq!(Server::select_private_authority_descriptor_epoch(
+        &config, current.clone(), Some(&first), expired_at,
+    ), current);
+    assert!(restarted.upsert_verified_from_source(current.clone(), expired_at, "self").unwrap());
+    let stale = restarted.load_peer_cache_snapshot_from_source(&cached, expired_at, "cache");
+    assert_eq!(stale.stale, 1);
+    assert_eq!(restarted.get_valid(&key.public_key_bytes(), expired_at), Some(current.clone()));
+
+    let next_cache_bytes = restarted.export_peer_cache_snapshot(expired_at).to_json_pretty().unwrap();
+    let next_cached = NodeBootstrapSnapshot::from_json_bytes(&next_cache_bytes).unwrap();
+    assert_eq!(next_cached.peers, vec![current.clone()]);
+    let second_restart = PeerStore::new();
+    assert_eq!(second_restart.load_peer_cache_snapshot_from_source(
+        &next_cached, expired_at, "cache",
+    ).inserted, 1);
+    assert_eq!(Server::private_authority_self_descriptor_sequence(
+        &config, &key, None, &second_restart, expired_at,
+    ).unwrap(), current.sequence() + 1);
+}
+
+// [PHALA-POLICY-HEARTBEAT-EPOCH 2026-10-08 by Codex] Authored, not
+// executed: retain a real P-signed grant through an unchanged R heartbeat;
+// changing the nested work requirement must invalidate the exact commitment.
+#[cfg(unix)]
+#[test]
+fn private_gossip_mailbox_heartbeat_preserves_only_the_unchanged_authorized_epoch() {
+    use aeronyx_core::protocol::NodeProtocolFeature;
+    let fixture = crate::services::reverse_onion_source::tests::Fixture::new();
+    let (original, recipient, _) = fixture.policy_parts();
+    let now = fixture.now();
+    let relay_key = IdentityKeyPair::from_bytes(&[42; 32]).unwrap();
+    let recipient_key = IdentityKeyPair::from_bytes(&[43; 32]).unwrap();
+    let base = original.descriptor.with_protocol_features([NodeProtocolFeature::AnonymousMailboxV1]);
+    let relay = SignedNodeDescriptor::sign(
+        base.clone().with_anonymous_mailbox_work_policy(12, &relay_key).unwrap(), &relay_key,
+    ).unwrap();
+    let mut config = ServerConfig::default();
+    config.reverse_onion.queue.enabled = true;
+    let peers = PeerStore::new();
+    peers.pin_private_onion_route_identities(relay.node_id(), recipient.node_id()).unwrap();
+    for descriptor in [&relay, &recipient] {
+        peers.upsert_verified_from_source(descriptor.clone(), now, "test_pin").unwrap();
+    }
+    let purpose = OnionRoutePurpose::BlindVaultPull.as_str();
+    let grant = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+        &relay, &recipient, purpose, now, now + 120, &recipient_key,
+    ).unwrap();
+    peers.remember_issued_private_onion_authorization(grant.clone(), recipient.node_id(), now).unwrap();
+    let mut next = base;
+    next.sequence = Server::private_authority_self_descriptor_sequence(
+        &config, &relay_key, Some(&relay), &peers, now + 60,
+    ).unwrap();
+    next.issued_at = now + 60;
+    next.expires_at = next.issued_at + relay.descriptor.expires_at - relay.descriptor.issued_at;
+    let heartbeat = SignedNodeDescriptor::sign(
+        next.clone().with_anonymous_mailbox_work_policy(12, &relay_key).unwrap(), &relay_key,
+    ).unwrap();
+    assert!(heartbeat.anonymous_mailbox_work_policy_at(now + 60).is_ok());
+    assert_ne!(heartbeat.descriptor.software_version, relay.descriptor.software_version);
+    assert!(grant.verify_at(&heartbeat, &recipient, purpose, now + 60).is_err());
+    let selected = Server::select_private_authority_descriptor_epoch(
+        &config, heartbeat, Some(&relay), now + 60,
+    );
+    assert_eq!(selected.encode_canonical().unwrap(), relay.encode_canonical().unwrap());
+    assert!(!peers.upsert_verified_from_source(selected, now + 60, "self").unwrap());
+    assert_eq!(peers.current_private_onion_authorization(
+        &relay.node_id(), &recipient.node_id(), now + 60,
+    ), Some(grant.clone()));
+    let changed = SignedNodeDescriptor::sign(
+        next.with_anonymous_mailbox_work_policy(13, &relay_key).unwrap(), &relay_key,
+    ).unwrap();
+    let selected = Server::select_private_authority_descriptor_epoch(
+        &config, changed.clone(), Some(&relay), now + 60,
+    );
+    assert_eq!(selected, changed);
+    assert!(peers.upsert_verified_from_source(selected, now + 60, "self").unwrap());
+    assert!(peers.current_private_onion_authorization(
+        &relay.node_id(), &recipient.node_id(), now + 60,
+    ).is_none());
+    assert!(grant.verify_at(&changed, &recipient, purpose, now + 60).is_err());
+}
+
+// [PHALA-PROMOTION-DNS-CONTROL-PROBE 2026-10-07 by Codex] Authored,
+// not run: use the real promotion material/gate and URL selector, without
+// performing DNS, HTTP or synthetic quote verification.
+#[test]
+fn promoted_phala_dns_control_url_does_not_widen_ordinary_probe_policy() {
+    use aeronyx_core::protocol::discovery::{NodeDescriptor, NodeCapability, SignedNodeDescriptor};
+    use aeronyx_core::protocol::NodeProtocolFeature;
+    use crate::services::discovery_endpoint_promotion_material::VerifiedPromotionMaterial;
+    use crate::services::peer_store::PermissionlessNodeAdmissionOutcome;
+    let now = 1_780_000_000;
+    let identity = IdentityKeyPair::from_bytes(&[0x55; 32]).unwrap();
+    let mut body = NodeDescriptor::new(identity.public_key_bytes(), 1, now - 1, now + 600, "test")
+        .with_protocol_features([NodeProtocolFeature::PhalaNodeAttestationV1]);
+    // [PHALA-EXECUTED-PROFILE-FIXTURES 2026-10-08 by Codex] A reserved
+    // .example authority is not a valid positive public DNS fixture.
+    body.public_endpoint = Some("https://relay.aeronyx.network:443".into());
+    body.capabilities = vec![NodeCapability::PrivacyRelay, NodeCapability::ChatRelay];
+    let descriptor = SignedNodeDescriptor::sign(body, &identity).unwrap();
+    let peers = PeerStore::new();
+    peers.configure_phala_attested_peer_routes(true, 60);
+    assert!(Server::blind_relay_probe_url("https://relay.aeronyx.network:443").is_none());
+    assert!(Server::promotion_blind_relay_probe_url(&peers, &descriptor, now).is_none());
+    assert_eq!(peers.admit_permissionless_descriptor(descriptor.clone(), now),
+        PermissionlessNodeAdmissionOutcome::Admitted);
+    let material = VerifiedPromotionMaterial::test_only_from_descriptor(descriptor.clone(), now, now + 300).unwrap();
+    peers.promote_permissionless_candidate(&material, now).unwrap();
+    assert!(Server::promotion_blind_relay_probe_url(&peers, &descriptor, now).is_none());
+    assert!(peers.record_phala_peer_attestation(&descriptor, now));
+    assert!(peers.get_valid(&descriptor.node_id(), now).is_none());
+    assert_eq!(Server::promotion_blind_relay_probe_url(&peers, &descriptor, now).as_deref(),
+        Some("https://relay.aeronyx.network/api/chat/peer/blind-relay"));
+    assert!(Server::blind_relay_probe_url("https://relay.aeronyx.network:443").is_none(),
+        "ordinary warmup must not inherit promotion's DNS capability");
+    assert!(Server::promotion_blind_relay_probe_url(&peers, &descriptor, now + 61).is_none());
+    for endpoint in ["http://relay.example", "https://localhost", "https://10.0.0.8", "https://169.254.169.254"] {
+        let mut body = descriptor.descriptor.clone();
+        body.sequence += 1;
+        body.public_endpoint = Some(endpoint.into());
+        let altered = SignedNodeDescriptor::sign(body, &identity).unwrap();
+        assert!(Server::promotion_blind_relay_probe_url(&peers, &altered, now + 61).is_none());
+    }
+    let mut body = descriptor.descriptor.clone();
+    body.public_endpoint = Some("https://8.8.8.8:8422".into());
+    let legacy = SignedNodeDescriptor::sign(body, &identity).unwrap();
+    assert_eq!(Server::promotion_blind_relay_probe_url(&peers, &legacy, now),
+        Server::blind_relay_probe_url("https://8.8.8.8:8422"), "public-IP compatibility stays unchanged");
+}
+
+// [PHALA-APPRAISAL-EGRESS-PIN 2026-10-07 by Codex] Authored, not run:
+// exercise the same role-derived selector scope used by the gossip owner.
+#[test]
+fn phala_appraisal_role_scope_applies_in_live_and_recovery_modes() {
+    use aeronyx_core::protocol::discovery::{NodeCapability, NodeDescriptor, SignedNodeDescriptor};
+    use aeronyx_core::protocol::NodeProtocolFeature;
+    let now = 1_800_000_000;
+    let relay_key = IdentityKeyPair::from_bytes(&[48; 32]).unwrap();
+    let recipient_key = IdentityKeyPair::from_bytes(&[49; 32]).unwrap();
+    let public_key = IdentityKeyPair::from_bytes(&[50; 32]).unwrap();
+    let make = |key: &IdentityKeyPair, endpoint: &str| {
+        let mut body = NodeDescriptor::new(key.public_key_bytes(), 1, now - 1, now + 600, "test")
+            .with_protocol_features([NodeProtocolFeature::PhalaNodeAttestationV1]);
+        body.public_endpoint = Some(endpoint.into());
+        body.policy.public_discovery = true;
+        body.capabilities = vec![NodeCapability::ChatRelay];
+        SignedNodeDescriptor::sign(body, key).unwrap()
+    };
+    let relay = make(&relay_key, "https://relay.aeronyx.network");
+    // [PHALA-EXECUTED-PROFILE-FIXTURES 2026-10-08 by Codex]
+    let public = make(&public_key, "https://public-peer.aeronyx.network");
+    for recovery_only in [false, true] {
+        // [PHALA-EXECUTED-PROFILE-FIXTURES 2026-10-08 by Codex] Each
+        // role matrix starts from independent evidence. Expiry observations
+        // must not be undone by moving this store's wall clock backwards.
+        let peers = PeerStore::new();
+        peers.configure_phala_attested_peer_routes(true, 300);
+        for descriptor in [&relay, &public] {
+            peers.upsert_verified_from_source(descriptor.clone(), now, "test_pin").unwrap();
+        }
+        peers.pin_private_onion_route_identities(relay.node_id(), recipient_key.public_key_bytes()).unwrap();
+        let at = now;
+        assert!(peers.record_phala_peer_attestation(&relay, at));
+        let mut config = ServerConfig::default();
+        config.reverse_onion.recipient.enabled = true;
+        config.reverse_onion.recipient.recovery_only = recovery_only;
+        config.reverse_onion.recipient.relay_node_id = hex::encode(relay.node_id());
+        config.reverse_onion.recipient.relay_endpoint = "https://relay.aeronyx.network:443".into();
+        let scope = Server::phala_peer_appraisal_egress_for_config(&config).unwrap();
+        assert!(peers.next_phala_peer_appraisal_target(at, 64, 0, &scope).is_none(),
+            "recipient must not fall back to stale public peers when R is fresh");
+        assert_eq!(peers.next_phala_peer_appraisal_target(at + 301, 64, 1, &scope).unwrap().descriptor(), &relay);
+        assert!(peers.record_phala_peer_attestation(&relay, at + 301));
+        let mut malformed = config.clone();
+        malformed.reverse_onion.recipient.relay_node_id = "bad".into();
+        assert!(Server::phala_peer_appraisal_egress_for_config(&malformed).is_none());
+        malformed = config.clone();
+        malformed.reverse_onion.recipient.relay_endpoint = "http://relay.aeronyx.network".into();
+        assert!(Server::phala_peer_appraisal_egress_for_config(&malformed).is_none());
+
+        config.reverse_onion.recipient.enabled = false;
+        config.reverse_onion.source.enabled = true;
+        config.reverse_onion.source.recovery_only = recovery_only;
+        config.reverse_onion.source.relay_node_id = hex::encode(relay.node_id());
+        config.reverse_onion.source.recipient_node_id = hex::encode(recipient_key.public_key_bytes());
+        config.reverse_onion.source.relay_endpoint = "https://relay.aeronyx.network".into();
+        let scope = Server::phala_peer_appraisal_egress_for_config(&config).unwrap();
+        assert_eq!(peers.next_phala_peer_appraisal_target(at + 301, 64, 0, &scope).unwrap().descriptor(), &public);
+        config.reverse_onion.source.relay_endpoint = "https://other-relay.aeronyx.network".into();
+        let scope = Server::phala_peer_appraisal_egress_for_config(&config).unwrap();
+        assert_eq!(peers.next_phala_peer_appraisal_target(at + 301, 64, 0, &scope).unwrap().descriptor(), &public,
+            "configured source origin excludes even a known same-identity R at another origin");
+        config.reverse_onion.source.relay_node_id = "bad".into();
+        assert!(Server::phala_peer_appraisal_egress_for_config(&config).is_none());
+        config.reverse_onion.source.enabled = false;
+        let ordinary = Server::phala_peer_appraisal_egress_for_config(&config).unwrap();
+        assert_eq!(peers.next_phala_peer_appraisal_target(at + 301, 64, 0, &ordinary).unwrap().descriptor(), &public);
+    }
+}
+
+// [PHALA-AUTHORITY-GOSSIP-FENCE 2026-10-07 by Codex] Authored, not run:
+// exercise the actual private-authority POST gate, not a duplicate endpoint
+// comparison. Signed fixtures and controlled clocks perform no DNS or HTTP.
+#[cfg(unix)]
+#[test]
+fn private_authority_gossip_entry_rejects_stale_bundles_and_selected_origins() {
+    use aeronyx_core::protocol::discovery::{NodeDescriptor, SignedPrivateOnionRecipientAuthorizationV1};
+    use aeronyx_core::protocol::{NodeProtocolFeature, onion::OnionRoutePurpose};
+    let fixture = crate::services::reverse_onion_source::tests::Fixture::new();
+    let (relay, recipient, _) = fixture.policy_parts();
+    let now = fixture.now();
+    let relay_key = IdentityKeyPair::from_bytes(&[42; 32]).unwrap();
+    let recipient_key = IdentityKeyPair::from_bytes(&[43; 32]).unwrap();
+    let source_key = fixture.source_identity();
+    let relay = SignedNodeDescriptor::sign(relay.descriptor.with_protocol_features(
+        [NodeProtocolFeature::PrivateOnionAuthorizationGossipV1],
+    ), &relay_key).unwrap();
+    let mut source_body = NodeDescriptor::new(source_key.public_key_bytes(), 1, now - 1, now + 3_600, "test")
+        .with_protocol_features([NodeProtocolFeature::PrivateOnionAuthorizationGossipV1]);
+    source_body.public_endpoint = Some("https://8.8.8.8".to_owned());
+    let source = SignedNodeDescriptor::sign(source_body, &source_key).unwrap();
+    let grant = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+        &relay, &recipient, OnionRoutePurpose::BlindVaultPull.as_str(), now, now + 10, &recipient_key,
+    ).unwrap();
+    let message = NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 {
+        authorization: grant.clone(), relay_descriptor: relay.clone(), recipient_descriptor: recipient.clone(),
+    };
+    let peers = PeerStore::new();
+    for descriptor in [&relay, &recipient, &source] {
+        peers.upsert_verified_from_source(descriptor.clone(), now, "test_pin").unwrap();
+    }
+    peers.pin_private_onion_route_identities(relay.node_id(), recipient.node_id()).unwrap();
+    let relay_url = Server::reverse_onion_private_gossip_url(relay.descriptor.public_endpoint.as_deref().unwrap()).unwrap();
+    assert_eq!(Server::private_authorization_gossip_admitted_at(
+        &peers, recipient.node_id(), &relay, &message, &relay_url, now, || now,
+    ), Some(now));
+    for at in [0, now - 1, now + 10] {
+        assert_eq!(Server::private_authorization_gossip_admitted_at(
+            &peers, recipient.node_id(), &relay, &message, &relay_url, now, || at,
+        ), None);
+    }
+    assert_eq!(Server::private_authorization_gossip_admitted_at(
+        &peers, recipient.node_id(), &relay, &message, "https://8.8.4.4/api/discovery/gossip", now, || now,
+    ), None);
+    let source_url = Server::reverse_onion_private_gossip_url(source.descriptor.public_endpoint.as_deref().unwrap()).unwrap();
+    assert_eq!(Server::private_authorization_gossip_admitted_at(
+        &peers, relay.node_id(), &source, &message, &source_url, now, || now,
+    ), None);
+    peers.pin_private_onion_source_identity(source.node_id()).unwrap();
+    peers.remember_issued_private_onion_authorization(grant, recipient.node_id(), now).unwrap();
+    assert_eq!(Server::private_authorization_gossip_admitted_at(
+        &peers, relay.node_id(), &source, &message, &source_url, now, || now + 1,
+    ), Some(now + 1));
+
+    let mut new_source_body = source.descriptor.clone();
+    new_source_body.sequence += 1;
+    new_source_body.issued_at = now + 2;
+    new_source_body.public_endpoint = Some("https://8.8.4.4".to_owned());
+    let new_source = SignedNodeDescriptor::sign(new_source_body, &source_key).unwrap();
+    peers.upsert_verified_from_source(new_source.clone(), now + 2, "test_pin").unwrap();
+    assert_eq!(Server::private_authorization_gossip_admitted_at(
+        &peers, relay.node_id(), &source, &message, &source_url, now, || now + 2,
+    ), None);
+    assert_eq!(Server::private_authorization_gossip_admitted_at(
+        &peers, relay.node_id(), &new_source, &message, &source_url, now, || now + 2,
+    ), None);
+    let new_url = Server::reverse_onion_private_gossip_url(new_source.descriptor.public_endpoint.as_deref().unwrap()).unwrap();
+    assert_eq!(Server::private_authorization_gossip_admitted_at(
+        &peers, relay.node_id(), &new_source, &message, &new_url, now + 2, || now + 2,
+    ), Some(now + 2));
+
+    let mut new_recipient_body = recipient.descriptor.clone();
+    new_recipient_body.sequence += 1;
+    new_recipient_body.issued_at = now + 3;
+    let new_recipient = SignedNodeDescriptor::sign(new_recipient_body, &recipient_key).unwrap();
+    peers.upsert_verified_from_source(new_recipient, now + 3, "test_pin").unwrap();
+    assert_eq!(Server::private_authorization_gossip_admitted_at(
+        &peers, recipient.node_id(), &relay, &message, &relay_url, now, || now + 3,
+    ), None);
+    assert_eq!(Server::private_authorization_gossip_admitted_at(
+        &peers, relay.node_id(), &new_source, &message, &new_url, now, || now + 3,
+    ), None);
+}
 
 #[test]
 fn two_hop_onion_delivery_probe_request_uses_onion_blob_and_signed_probe_envelope() {
@@ -916,6 +1711,65 @@ fn self_discovery_descriptor_can_fallback_to_network_endpoint() {
         signed.descriptor.public_endpoint.as_deref(),
         Some("198.51.100.10:51820")
     );
+}
+
+// [PHALA-ROLE-ENDPOINT-OVERRIDE 2026-10-07 by Codex] Authored, unexecuted:
+// follow the real file/env loader into signed descriptor construction. This
+// checks support advertisement, not socket readiness or verified TEE evidence.
+#[tokio::test]
+async fn phala_loaded_role_controls_signed_origin_and_quote_support() {
+    if let Ok(case) = std::env::var("AERONYX_PHALA_CONFIG_TEST_CASE") {
+        let path = std::env::var("AERONYX_PHALA_CONFIG_TEST_PATH").unwrap();
+        let config = tokio::time::timeout(Duration::from_secs(30), ServerConfig::load(&path))
+            .await.expect("local config should load").unwrap();
+        let (origin, public, quote) = match case.as_str() {
+            "descriptor-missing" => (Some("https://old.aeronyx.network"), true, true),
+            "descriptor-public" => (Some("https://new.aeronyx.network"), true, true),
+            "descriptor-first-stage" => (None, true, false),
+            "descriptor-private" => (None, false, false),
+            _ => panic!("unknown Phala descriptor case"),
+        };
+        let identity = IdentityKeyPair::from_bytes(&[49; 32]).unwrap();
+        let now = 1_800_000_000;
+        let signed = Server::build_self_discovery_descriptor_for(&config, &identity, now).unwrap();
+        assert!(signed.verify_at(now + 1).is_ok());
+        assert_eq!(signed.node_id(), identity.public_key_bytes());
+        assert_eq!(signed.descriptor.public_endpoint.as_deref(), origin);
+        assert_eq!(signed.descriptor.policy.public_discovery, public);
+        assert!(!signed.descriptor.policy.allows_public_exit);
+        assert_eq!(signed.descriptor.advertises_protocol_feature(NodeProtocolFeature::PhalaNodeAttestationV1), quote);
+        assert!(!signed.descriptor.advertises_protocol_feature(NodeProtocolFeature::PhalaPrivateRecipientAttestationV1));
+        if origin.is_none() {
+            assert!(config.network.public_endpoint.is_none());
+            assert!(config.discovery.public_endpoint.is_none());
+        }
+        if case == "descriptor-private" {
+            assert!(config.reverse_onion.recipient.enabled);
+            assert!(!signed.descriptor.capabilities.contains(&NodeCapability::OnionMiddle));
+            assert!(!signed.descriptor.capabilities.contains(&NodeCapability::ChatRelay));
+        }
+        println!("PHALA_CONFIG_CASE_OK:{case}");
+        return;
+    }
+
+    use super::startup_runtime::{
+        phala_private_role_environment, phala_role_override_fixture, run_phala_config_environment_case,
+    };
+    let test_name = concat!(module_path!(), "::phala_loaded_role_controls_signed_origin_and_quote_support");
+    let base = phala_role_override_fixture();
+    run_phala_config_environment_case(test_name, &base, "descriptor-missing", &[]);
+    run_phala_config_environment_case(test_name, &base, "descriptor-private",
+        &phala_private_role_environment(false));
+    run_phala_config_environment_case(test_name, &base, "descriptor-first-stage", &[
+        ("AERONYX_DISCOVERY_PUBLIC_ENDPOINT", String::new()),
+        ("AERONYX_DISCOVERY_PHALA_ATTESTATION_SOCKET_PATH", String::new()),
+    ]);
+    let mut no_listener = base;
+    no_listener.discovery.public_api_listen_addr = None;
+    run_phala_config_environment_case(test_name, &no_listener, "descriptor-public", &[
+        ("AERONYX_DISCOVERY_PUBLIC_ENDPOINT", "https://new.aeronyx.network".into()),
+        ("AERONYX_DISCOVERY_PUBLIC_API_LISTEN_ADDR", "0.0.0.0:8422".into()),
+    ]);
 }
 
 #[test]
@@ -1873,6 +2727,30 @@ fn discovery_peer_identity_hints_fail_closed_on_endpoint_collision() {
 }
 
 #[test]
+fn private_gossip_transport_never_downgrades_on_identity_collision() {
+    // [REVERSE-ONION-GOSSIP-FAIL-CLOSED 2026-10-06 by Codex] A private
+    // target keeps its transport pin even when public identity hints collide;
+    // conflicting private pins or a contradictory unique identity reject.
+    let url = "https://relay.example/api/discovery/gossip".to_string();
+    let relay = [0x51; 32];
+    let other = [0x52; 32];
+    let mut hints = DiscoveryPeerIdentityHints::default();
+
+    assert_eq!(hints.transport_pin_for(&url, None), GossipTransportPin::Generic);
+    hints.observe_private_transport_target(url.clone(), relay);
+    hints.observe_verified(url.clone(), relay);
+    assert_eq!(hints.transport_pin_for(&url, Some(relay)), GossipTransportPin::Pinned(relay));
+
+    hints.observe_verified(url.clone(), other);
+    assert_eq!(hints.unique_node_id(&url), None);
+    assert_eq!(hints.transport_pin_for(&url, None), GossipTransportPin::Pinned(relay));
+    assert_eq!(hints.transport_pin_for(&url, Some(other)), GossipTransportPin::Reject);
+
+    hints.observe_private_transport_target(url.clone(), other);
+    assert_eq!(hints.transport_pin_for(&url, None), GossipTransportPin::Reject);
+}
+
+#[test]
 fn runtime_gossip_sample_is_not_monopolized_by_low_id_clique() {
     // [PERMISSIONLESS-GOSSIP-RUNTIME 2026-09-24 by Codex] The old
     // bootstrap-export prefix would always select the first two IDs,
@@ -1956,10 +2834,13 @@ async fn outbound_gossip_imports_snapshot_response_from_peer() {
                 calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
                 // [ENDPOINT-ATTESTATION-TRANSPORT 2026-09-24 by Codex]
                 // Test-only gossip mocks explicitly discard the dormant carrier.
+                // [REVERSE-ONION-AUTHORITY-GOSSIP 2026-10-05 by Codex]
+                // Test peers safely ignore the negotiated optional refresh frame.
                 let response = match message {
                     NodeDiscoveryMessage::DescriptorAnnounce { .. }
                     | NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. }
-                    | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => {
+                    | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. }
+                    | NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 { .. } => {
                         GossipResponse {
                             applied: PeerStoreImportReport::empty(),
                             response: None,
@@ -2037,7 +2918,8 @@ async fn outbound_gossip_preserves_proof_when_legacy_exchange_fails() {
                         }
                         NodeDiscoveryMessage::DescriptorAnnounce { .. }
                         | NodeDiscoveryMessage::SnapshotResponse { .. }
-                        | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => {
+                        | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. }
+                        | NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 { .. } => {
                             StatusCode::OK
                         }
                         NodeDiscoveryMessage::SnapshotRequest { .. } => {
@@ -2113,12 +2995,14 @@ async fn bounded_gossip_fanout_isolates_slow_peers() {
     let (fast_url, fast_peer) =
         spawn_legacy_gossip_mock(Duration::ZERO, Arc::clone(&fast_calls)).await;
     let now = unix_now_secs();
-    let started_at = tokio::time::Instant::now();
     let client = reqwest::Client::new();
     let peer_store = PeerStore::new();
     let self_descriptor =
         signed_chat_relay_peer_descriptor("http://127.0.0.1:1".to_string(), now, now + 300);
 
+    // [PHALA-GOSSIP-REGRESSION 2026-10-08 by Codex] Measure only the
+    // bounded exchange, not native TLS-root/client or signed-fixture setup.
+    let started_at = tokio::time::Instant::now();
     let reports = Server::gossip_with_peers_bounded(
         gossip_execution(&client, &peer_store, &[], now, Duration::from_millis(250)),
         vec![slow_url.clone(), slow_url, fast_url],
@@ -2194,7 +3078,8 @@ async fn outbound_gossip_skips_receiver_producer_and_uses_bounded_fallback() {
                             StatusCode::OK
                         }
                         NodeDiscoveryMessage::SnapshotResponse { .. }
-                        | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => {
+                        | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. }
+                        | NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 { .. } => {
                             StatusCode::OK
                         }
                     };
@@ -2285,7 +3170,8 @@ async fn outbound_gossip_does_not_retry_when_replica_is_unavailable() {
                             StatusCode::OK
                         }
                         NodeDiscoveryMessage::SnapshotResponse { .. }
-                        | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => {
+                        | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. }
+                        | NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 { .. } => {
                             StatusCode::OK
                         }
                     };
@@ -2458,7 +3344,8 @@ async fn outbound_gossip_keeps_legacy_exchange_when_directory_proof_is_rejected(
                             StatusCode::OK
                         }
                         NodeDiscoveryMessage::SnapshotResponse { .. }
-                        | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => {
+                        | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. }
+                        | NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 { .. } => {
                             StatusCode::OK
                         }
                     };

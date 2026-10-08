@@ -1,0 +1,136 @@
+# [PHALA-PEER-ATTESTATION-COMPOSE 2026-10-06 by Codex]
+# Phala Cloud image template. Public API/quote ingress is added only by the
+# explicit renderer mode; this does not publish a VPN UDP listener.
+services:
+  aeronyx-node:
+    # PHALA_PUBLIC_PEER_PROFILE
+    platform: linux/amd64
+    image: ${AERONYX_NODE_IMAGE:?Set AERONYX_NODE_IMAGE to a built image}
+    init: true
+    restart: unless-stopped
+    # [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex] Give the
+    # reverse owners time to drain before the container runtime forces exit.
+    stop_signal: SIGTERM
+    stop_grace_period: 2m
+    command: ["start", "--config", "/etc/aeronyx/server.toml"]
+    # [PHALA-PEER-INGRESS-OPT-IN 2026-10-06 by Codex] The renderer adds a
+    # public port mapping only when explicitly invoked with --public-peer.
+    # PHALA_PUBLIC_PEER_INGRESS
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    # [PHALA-PEER-LEAST-PRIVILEGE 2026-10-06 by Codex]
+    # Onion recipient and attestation API need neither TUN nor NET_ADMIN.
+    # [PHALA-STANDALONE-IDENTITY 2026-10-06 by Codex] management=false lets
+    # the server create a durable local key in this persistent state volume.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # [PHALA-ENDPOINT-BOOTSTRAP 2026-10-06 by Codex]
+      # Before Phala assigns an origin this renders empty and disables quote
+      # transport; a later render binds both to the assigned HTTPS origin.
+      # PHALA_PUBLIC_PEER_ENDPOINT_ENV
+      # PHALA_PUBLIC_PEER_DISCOVERY_ENV
+      # PHALA_PUBLIC_PEER_API_LISTENER_ENV
+      # PHALA_PUBLIC_PEER_ATTESTATION_SOCKET_ENV
+      # PHALA_PUBLIC_PEER_SEEDS_ENV
+      # [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] Outbound trust is
+      # independent of serving quotes. Empty values preserve mounted TOML.
+      AERONYX_DISCOVERY_PHALA_ATTESTED_PEERS_REQUIRED: "${AERONYX_DISCOVERY_PHALA_ATTESTED_PEERS_REQUIRED:-}"
+      AERONYX_DISCOVERY_PHALA_TRUSTED_APP_IDS: "${AERONYX_DISCOVERY_PHALA_TRUSTED_APP_IDS:-}"
+      AERONYX_DISCOVERY_PHALA_TRUSTED_COMPOSE_HASHES: "${AERONYX_DISCOVERY_PHALA_TRUSTED_COMPOSE_HASHES:-}"
+      AERONYX_DISCOVERY_PHALA_PEER_ATTESTATION_MAX_AGE_SECS: "${AERONYX_DISCOVERY_PHALA_PEER_ATTESTATION_MAX_AGE_SECS:-}"
+      # [PHALA-ONION-RELAY-OPT-IN 2026-10-06 by Codex]
+      AERONYX_PHALA_ONION_RELAY_ENABLED: "${AERONYX_PHALA_ONION_RELAY_ENABLED:-false}"
+      # [PHALA-REVERSE-QUEUE-CONFIG 2026-10-06 by Codex]
+      # Queue also requires the explicit OnionMiddle relay opt-in above.
+      # Queue opt-in additionally requires one recipient ID and source IDs
+      # unless recovery-only is explicitly selected.
+      # Keep false until Phala assigns the HTTPS origin and the peer profile is re-rendered.
+      # PHALA_PUBLIC_REVERSE_QUEUE_ENV
+    volumes:
+      # [PHALA-DSTACK-GUEST-SOCKET 2026-10-06 by Codex]
+      # PHALA_PUBLIC_PEER_DSTACK_SOCKET
+      - aeronyx-state:/var/lib/aeronyx
+
+  # [PHALA-PRIVATE-RECIPIENT-PROFILE 2026-10-06 by Codex]
+  # Optional second process with a separate persistent node identity. No host
+  # port is published and its signed descriptor remains endpoint-free.
+  aeronyx-private-recipient:
+    profiles: ["private-recipient"]
+    platform: linux/amd64
+    # [PHALA-PRIVATE-RECIPIENT-NETWORK 2026-10-06 by Codex]
+    # Keep this endpoint-free identity off the public peer's bridge while
+    # preserving outbound HTTPS/DNS for its pinned relay poller.
+    networks:
+      - private-recipient-egress
+    image: ${AERONYX_NODE_IMAGE:?Set AERONYX_NODE_IMAGE to a built image}
+    init: true
+    restart: unless-stopped
+    # [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex] The private
+    # terminal/journal drain needs the same explicit container stop policy.
+    stop_signal: SIGTERM
+    stop_grace_period: 2m
+    command: ["start", "--config", "/etc/aeronyx/server.toml"]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # A distinct descriptor identity is persisted in this service's volume.
+      # Never inherit the public peer's endpoint into this private role.
+      AERONYX_DISCOVERY_PUBLIC_ENDPOINT: ""
+      # It needs outbound gossip only; no other container should query its API.
+      AERONYX_DISCOVERY_PUBLIC_API_LISTEN_ADDR: ""
+      # [PHALA-PRIVATE-DISCOVERY-ISOLATION 2026-10-06 by Codex]
+      # The shared peer image template is public; this identity must not be.
+      AERONYX_DISCOVERY_PUBLIC_DISCOVERY: "false"
+      # [PHALA-ROLE-SEED-ISOLATION 2026-10-07 by Codex] An explicit empty
+      # override clears baked peers; only the separately pinned relay may gossip.
+      AERONYX_DISCOVERY_SEED_ENDPOINTS: ""
+      # [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] Outbound trust is
+      # independent of serving quotes. Empty values preserve mounted TOML.
+      AERONYX_DISCOVERY_PHALA_ATTESTED_PEERS_REQUIRED: "${AERONYX_DISCOVERY_PHALA_ATTESTED_PEERS_REQUIRED:-}"
+      AERONYX_DISCOVERY_PHALA_TRUSTED_APP_IDS: "${AERONYX_DISCOVERY_PHALA_TRUSTED_APP_IDS:-}"
+      AERONYX_DISCOVERY_PHALA_TRUSTED_COMPOSE_HASHES: "${AERONYX_DISCOVERY_PHALA_TRUSTED_COMPOSE_HASHES:-}"
+      AERONYX_DISCOVERY_PHALA_PEER_ATTESTATION_MAX_AGE_SECS: "${AERONYX_DISCOVERY_PHALA_PEER_ATTESTATION_MAX_AGE_SECS:-}"
+      # The private process does not host the quote API; the public peer
+      # serves the grant-bound recipient quote when its queue is configured.
+      AERONYX_DISCOVERY_PHALA_ATTESTATION_SOCKET_PATH: ""
+      # [PHALA-PRIVATE-RELAY-DURABILITY 2026-10-06 by Codex] Keep this
+      # endpoint-free identity unadvertised; Rust retains only the local
+      # ChatRelay durability needed by private recipient polling.
+      AERONYX_PHALA_ONION_RELAY_ENABLED: "false"
+      AERONYX_PHALA_REVERSE_ONION_QUEUE_ENABLED: "false"
+      AERONYX_PHALA_REVERSE_ONION_QUEUE_RECOVERY_ONLY: "false"
+      AERONYX_PHALA_REVERSE_ONION_QUEUE_RECIPIENT_NODE_IDS: ""
+      AERONYX_PHALA_REVERSE_ONION_QUEUE_SOURCE_NODE_IDS: ""
+      AERONYX_PHALA_REVERSE_ONION_QUEUE_RELAY_DESCRIPTOR_B64: ""
+      AERONYX_PHALA_REVERSE_ONION_QUEUE_RECIPIENT_DESCRIPTOR_B64: ""
+      AERONYX_PHALA_REVERSE_ONION_QUEUE_AUTHORIZATION_B64: ""
+      AERONYX_REVERSE_ONION_RECIPIENT_ENABLED: "true"
+      # [PHALA-RECIPIENT-RECOVERY-OVERRIDE 2026-10-06 by Codex]
+      # Empty preserves the baked TOML; only an explicit true/false changes it.
+      AERONYX_REVERSE_ONION_RECOVERY_ONLY: "${AERONYX_REVERSE_ONION_RECOVERY_ONLY:-}"
+      # [PHALA-RECIPIENT-BOOTSTRAP-RENDER 2026-10-06 by Codex]
+      # The renderer changes these to Compose required-value expressions only
+      # for an explicit --private-recipient output.
+      AERONYX_REVERSE_ONION_RELAY_NODE_ID: "${AERONYX_REVERSE_ONION_RELAY_NODE_ID:-}"
+      AERONYX_REVERSE_ONION_RELAY_ENDPOINT: "${AERONYX_REVERSE_ONION_RELAY_ENDPOINT:-}"
+    volumes:
+      - aeronyx-private-recipient-state:/var/lib/aeronyx
+
+volumes:
+  aeronyx-state:
+  aeronyx-private-recipient-state:
+
+# [PHALA-PRIVATE-RECIPIENT-NETWORK 2026-10-06 by Codex] A separate egress
+# bridge prevents direct peer-to-recipient container routing.
+networks:
+  private-recipient-egress:
+    driver: bridge

@@ -3,6 +3,29 @@
 use super::*;
 
 #[test]
+fn only_operator_scoped_onion_middle_transport_accepts_https_dns() {
+    // [PHALA-ONION-MIDDLE-DNS-ORIGIN 2026-10-06 by Codex] A Phala relay may
+    // use a signed public HTTPS hostname, while generic peer probes remain
+    // restricted to public IP literals.
+    let endpoint = "https://gateway.phala.ai:443";
+    assert!(Server::onion_middle_blind_relay_url(endpoint).is_some());
+    assert!(Server::blind_relay_probe_url(endpoint).is_none());
+
+    for endpoint in [
+        "http://relay.phala.ai:8422",
+        "https://localhost:8422",
+        "https://relay.local:8422",
+        "https://10.0.0.8:8422",
+        "https://169.254.169.254/latest/meta-data",
+    ] {
+        assert!(
+            Server::onion_middle_blind_relay_url(endpoint).is_none(),
+            "unexpectedly accepted {endpoint}"
+        );
+    }
+}
+
+#[test]
 fn configured_chat_relay_initialization_fails_closed_without_leaking_path() {
     // [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] A configured
     // durable relay must not disappear behind a healthy node. The returned

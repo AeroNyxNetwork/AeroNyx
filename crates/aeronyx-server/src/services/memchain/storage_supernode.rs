@@ -765,6 +765,90 @@ impl MemoryStorage {
             .await
     }
 
+    /// Quarantine a staged result whose security evidence cannot currently be
+    /// revalidated. Preserve the result and usage record for later audit, but
+    /// stop retrying and prevent automatic writeback.
+    // [MEMCHAIN-PHALA-RECOVERY-HOLD 2026-10-05 by Codex]
+    pub(crate) async fn quarantine_staged_task(
+        &self,
+        task_id: i64,
+        error_message: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "UPDATE cognitive_tasks SET
+                    status = 'failed', error_message = ?, started_at = NULL
+                 WHERE id = ? AND status = 'processing' AND result IS NOT NULL",
+                params![error_message, task_id],
+            )
+            .map_err(|e| format!("quarantine_staged_task {}: {}", task_id, e))?;
+        if affected != 1 {
+            return Err(format!(
+                "quarantine_staged_task {}: staged processing task not found",
+                task_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// Permanently reject a claimed task that violates startup policy without
+    /// spending retries or ever constructing a provider request.
+    // [MEMCHAIN-PHALA-EXTRACTION 2026-10-05 by Codex]
+    pub(crate) async fn reject_task_without_retry(
+        &self,
+        task_id: i64,
+        reason: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "UPDATE cognitive_tasks SET
+                    status = 'failed', started_at = NULL, error_message = ?
+                 WHERE id = ? AND status = 'processing' AND result IS NULL",
+                params![reason, task_id],
+            )
+            .map_err(|e| format!("reject_task_without_retry {}: {}", task_id, e))?;
+        if affected != 1 {
+            return Err(format!(
+                "reject_task_without_retry {}: claimed un-staged task not found",
+                task_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// Drop an unverified staged response and return the owned task to pending
+    /// so it can be recomputed through the configured provider policy.
+    ///
+    /// The usage-log row is intentionally retained: it records the original
+    /// provider call even though its response cannot safely be replayed.
+    // [MEMCHAIN-PHALA-STAGE-RECOVERY 2026-10-05 by Codex]
+    pub(crate) async fn discard_unverified_staged_task(
+        &self,
+        task_id: i64,
+        reason: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "UPDATE cognitive_tasks SET
+                    status = 'pending', started_at = NULL, result = NULL,
+                    provider_used = NULL, model_used = NULL, token_usage = NULL,
+                    error_message = ?
+                 WHERE id = ? AND status = 'processing' AND result IS NOT NULL",
+                params![reason, task_id],
+            )
+            .map_err(|e| format!("discard_unverified_staged_task {}: {}", task_id, e))?;
+        if affected != 1 {
+            return Err(format!(
+                "discard_unverified_staged_task {}: staged processing task not found",
+                task_id
+            ));
+        }
+        Ok(())
+    }
+
     /// Record a failure caused by invalid provider output and allow re-inference.
     ///
     /// The usage row remains as an accurate record of the provider call, while
@@ -1482,7 +1566,7 @@ mod tests {
             .stage_task_result_and_usage(
                 task_id,
                 "staged-title",
-                r#"{"input":1,"output":1,"cached":0}"#,
+                r#"{"input":1,"output":1,"cached":0,"aci_response_hints":{"version":"aci/1","keyset_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","receipt_id":"receipt-test"},"aci_verification":{"upstream_claim_scope":"gateway_assertion"}}"#,
                 &TaskUsageRecord {
                     provider: "test-provider",
                     model: "test-model",
@@ -1494,6 +1578,24 @@ mod tests {
             )
             .await
             .unwrap();
+        // [MEMCHAIN-PHALA-ACI-PINNED-CONTRACT 2026-10-06 by Codex]
+        // Pinned ACI v1 hints survive staging without schema changes.
+        let staged_usage = second
+            .get_task(task_id)
+            .await
+            .unwrap()
+            .token_usage
+            .unwrap();
+        let staged_usage: serde_json::Value = serde_json::from_str(&staged_usage).unwrap();
+        assert_eq!(
+            staged_usage["aci_response_hints"]["keyset_digest"],
+            format!("sha256:{}", "b".repeat(64))
+        );
+        // [MEMCHAIN-PHALA-ACI-PROOF-SCOPE 2026-10-06 by Codex]
+        assert_eq!(
+            staged_usage["aci_verification"]["upstream_claim_scope"],
+            "gateway_assertion"
+        );
         {
             let conn = first.conn.lock().await;
             conn.execute(
@@ -2005,6 +2107,49 @@ mod tests {
             .unwrap()
         };
         assert_eq!(usage_rows, 1, "actual provider usage must remain auditable");
+    }
+
+    // [MEMCHAIN-PHALA-RECOVERY-HOLD 2026-10-05 by Codex] Authored, not executed.
+    #[tokio::test]
+    async fn quarantining_staged_result_preserves_data_without_retrying() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let task_id = storage
+            .insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap()
+            .unwrap();
+        storage.claim_pending_tasks(1).await;
+        storage
+            .stage_task_result_and_usage(
+                task_id,
+                "retained title",
+                r#"{"input":2,"output":1,"cached":0}"#,
+                &TaskUsageRecord {
+                    provider: "test-provider",
+                    model: "test-model",
+                    input_tokens: 2,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    latency_ms: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        storage
+            .quarantine_staged_task(task_id, "llm_staged_aci_evidence_unverified")
+            .await
+            .unwrap();
+        let quarantined = storage.get_task(task_id).await.unwrap();
+        assert_eq!(quarantined.status, "failed");
+        assert_eq!(quarantined.result.as_deref(), Some("retained title"));
+        assert_eq!(quarantined.retry_count, 0);
+        assert_eq!(
+            quarantined.error_message.as_deref(),
+            Some("llm_staged_aci_evidence_unverified")
+        );
+
+        assert!(storage.claim_pending_tasks(1).await.is_empty());
     }
 
     #[tokio::test]

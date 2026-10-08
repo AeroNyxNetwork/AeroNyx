@@ -11,9 +11,8 @@
 //! independence, economic eligibility, or permission to skip quarantine.
 
 use std::collections::HashSet;
-use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,11 +21,13 @@ use aeronyx_core::protocol::discovery::{
     DirectoryDescriptorCommitmentV1, NodeCapability, NodeDiscoveryMessage, SignedNodeDescriptor,
 };
 use aeronyx_core::protocol::discovery_endpoint_attestation::{
-    canonical_attested_public_endpoint_socket_v1, discovery_endpoint_evidence_commitment_v1,
+    canonical_attested_public_endpoint_commitment_v1, canonical_attested_public_endpoint_socket_v1,
+    discovery_endpoint_evidence_commitment_v1,
     DiscoveryEndpointAttestationPurposeV1, DiscoveryEndpointEvidenceAttestationV1,
 };
 use aeronyx_core::protocol::discovery_endpoint_proof::{
-    canonical_public_endpoint_commitment, DiscoveryEndpointChallengeV1, DiscoveryEndpointProofV1,
+    canonical_public_endpoint_commitment, canonical_public_https_dns_endpoint_commitment_v1,
+    DiscoveryEndpointChallengeV1, DiscoveryEndpointProofV1,
     DISCOVERY_ENDPOINT_CHALLENGE_FRAME_BYTES_V1, DISCOVERY_ENDPOINT_PROOF_FRAME_BYTES_V1,
 };
 use axum::body::Bytes;
@@ -71,6 +72,7 @@ use super::peer_store::PeerStore;
 use crate::api::public_node_router::public_endpoint_flow_context;
 use crate::api::{
     canonical_peer_http_url, peer_endpoint_is_public_ip, privacy_safe_peer_http_client_builder,
+    resolve_pinned_peer_http_target,
 };
 
 const RESPOND_PATH: &str = "/api/discovery/endpoint-proof/respond";
@@ -104,6 +106,9 @@ pub(crate) struct PermissionlessPromotionCoordinator {
     revocations: SqliteDiscoveryEndpointQuarantineRevocationRegistry,
     observer: Arc<IdentityKeyPair>,
     client: reqwest::Client,
+    phala_attested_dns_required: bool,
+    phala_trusted_app_ids: Vec<String>,
+    phala_trusted_compose_hashes: Vec<String>,
     attestation_gossip_cursor: AtomicU64,
 }
 
@@ -111,6 +116,34 @@ pub(crate) struct PermissionlessPromotionCoordinator {
 struct PendingVerifiedObservation {
     challenge: DiscoveryEndpointQuarantineChallenge,
     fresh: DiscoveryEndpointFreshQuarantineAdmission,
+}
+
+// [PHALA-PROMOTION-CANCEL-OWNERSHIP 2026-10-08 by Codex] Async future
+// cancellation cannot stop a running blocking cell. Only this round's owner
+// may stop it; retained cells can test, but never reopen, publication admission.
+#[derive(Clone)]
+struct PromotionRoundState {
+    stopped: Arc<AtomicBool>,
+    process_shutdown: Arc<AtomicBool>,
+}
+
+impl PromotionRoundState {
+    fn is_running(&self) -> bool {
+        !self.stopped.load(Ordering::SeqCst)
+            && !self.process_shutdown.load(Ordering::SeqCst)
+    }
+}
+
+struct PromotionRoundOwner(PromotionRoundState);
+
+impl PromotionRoundOwner {
+    fn new(process_shutdown: Arc<AtomicBool>) -> Self {
+        Self(PromotionRoundState { stopped: Arc::new(AtomicBool::new(false)), process_shutdown })
+    }
+}
+
+impl Drop for PromotionRoundOwner {
+    fn drop(&mut self) { self.0.stopped.store(true, Ordering::SeqCst); }
 }
 
 /// Selects at most two already-verified public peers for one opaque fact.
@@ -156,6 +189,9 @@ impl PermissionlessPromotionCoordinator {
         peer_store: Arc<PeerStore>,
         inbox: Arc<SqliteDiscoveryEndpointAttestationInbox>,
         observer: Arc<IdentityKeyPair>,
+        phala_attested_dns_required: bool,
+        phala_trusted_app_ids: Vec<String>,
+        phala_trusted_compose_hashes: Vec<String>,
     ) -> Result<Self, EndpointPossessionError> {
         if prefix.trim().is_empty() {
             return Err(EndpointPossessionError::Rejected);
@@ -203,6 +239,9 @@ impl PermissionlessPromotionCoordinator {
             revocations,
             observer,
             client,
+            phala_attested_dns_required,
+            phala_trusted_app_ids,
+            phala_trusted_compose_hashes,
             // [PERMISSIONLESS-ATTESTATION-ROTATION 2026-09-25 by Codex]
             // A restart may repeat a bounded round, but never grants route
             // authority. Wall-clock seeding varies the initial offset when
@@ -216,7 +255,13 @@ impl PermissionlessPromotionCoordinator {
     /// never manufactures a second observer identity to satisfy the threshold.
     pub(crate) async fn advance_one(
         self: &Arc<Self>,
+        process_shutdown: Arc<AtomicBool>,
     ) -> Result<Option<SignedNodeDescriptor>, EndpointPossessionError> {
+        // [PHALA-PROMOTION-CANCEL-OWNERSHIP 2026-10-08 by Codex] Keep
+        // the owner in the async frame across every await, including publishers.
+        let owner = PromotionRoundOwner::new(process_shutdown);
+        let round = owner.0.clone();
+        if !round.is_running() { return Ok(None); }
         let now = unix_now_secs();
         let Some(descriptor) = self
             .peer_store
@@ -226,20 +271,49 @@ impl PermissionlessPromotionCoordinator {
         else {
             return Ok(None);
         };
-        let peer_store = Arc::clone(&self.peer_store);
-        let node_id = descriptor.node_id();
-        if !tokio::task::spawn_blocking(move || {
-            peer_store.prepare_permissionless_promotion_capacity_for(&node_id, now)
-        })
-        .await
-        .map_err(|_| EndpointPossessionError::Unavailable)?
-        {
-            // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] A
-            // saturated historic gate budget sends no new network probe.
+        // [PHALA-PROMOTION-NETWORK-ADMISSION 2026-10-07 by Codex] Even
+        // quote retrieval is network work. A full historic gate table must
+        // reject before appraisal, not merely before endpoint possession.
+        if !self.prepare_network_probe(&descriptor, &round).await? {
             return Ok(None);
         }
-        let admission_probe =
-            probe_exact_public_endpoint(&self.client, &self.observer, &descriptor, now).await?;
+        // [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] Carry the
+        // verifier-owned challenge across quarantine without renewing its age.
+        let phala_appraisal = if descriptor
+            .descriptor
+            .public_endpoint
+            .as_deref()
+            .is_some_and(|endpoint| canonical_public_https_dns_endpoint_commitment_v1(endpoint).is_ok())
+        {
+            if !self.phala_attested_dns_required
+                || self.phala_trusted_app_ids.is_empty()
+                || self.phala_trusted_compose_hashes.is_empty()
+            {
+                return Ok(None);
+            }
+            Some(crate::api::discovery::verify_phala_peer_attestation(
+                &descriptor,
+                &self.phala_trusted_app_ids,
+                &self.phala_trusted_compose_hashes,
+            )
+            .await
+            .map_err(|_| EndpointPossessionError::Rejected)?)
+        } else {
+            None
+        };
+        // [PHALA-PROMOTION-NETWORK-ADMISSION 2026-10-07 by Codex]
+        // Appraisal can wait on DNS/collateral/QVL. Never probe the old endpoint
+        // when its signed Stage-A descriptor rotated or expired in that wait.
+        if !self.prepare_network_probe(&descriptor, &round).await? {
+            return Ok(None);
+        }
+        let admission_probe = probe_exact_public_endpoint(
+            &self.client,
+            &self.observer,
+            &descriptor,
+            unix_now_secs(),
+        )
+        .await?;
         let attestation = self
             .retain_local_attestation(descriptor.clone(), admission_probe.clone())
             .await?;
@@ -257,10 +331,13 @@ impl PermissionlessPromotionCoordinator {
         .await
         .map_err(|_| EndpointPossessionError::Unavailable)??
         else {
-            self.gossip_attestation(&descriptor, attestation).await;
+            self.gossip_attestation(&descriptor, attestation, &round).await;
             return Ok(None);
         };
-        self.gossip_attestation(&descriptor, attestation).await;
+        self.gossip_attestation(&descriptor, attestation, &round).await;
+        if !self.prepare_network_probe(&descriptor, &round).await? {
+            return Ok(None);
+        }
         let first =
             probe_exact_public_endpoint(&self.client, &self.observer, &descriptor, unix_now_secs())
                 .await?;
@@ -277,17 +354,56 @@ impl PermissionlessPromotionCoordinator {
         .await
         .map_err(|_| EndpointPossessionError::Unavailable)??;
         tokio::time::sleep(Duration::from_secs(MINIMUM_OBSERVATION_SPAN_SECS)).await;
+        if !self.prepare_network_probe(&descriptor, &round).await? {
+            return Ok(None);
+        }
         let second =
             probe_exact_public_endpoint(&self.client, &self.observer, &descriptor, unix_now_secs())
                 .await?;
         let coordinator = Arc::clone(self);
         let promoted_descriptor = descriptor.clone();
+        let promotion_round = round.clone();
         tokio::task::spawn_blocking(move || {
-            coordinator.complete_verified_observation(&descriptor, &first, &second, pending)
+            coordinator.complete_verified_observation(&descriptor, &first, &second, pending, &promotion_round)
         })
         .await
         .map_err(|_| EndpointPossessionError::Unavailable)??;
+        if let Some(appraisal) = phala_appraisal {
+            let peer_store = Arc::clone(&self.peer_store);
+            let descriptor_for_appraisal = promoted_descriptor.clone();
+            let publication_round = round.clone();
+            if !tokio::task::spawn_blocking(move || {
+                // [PHALA-PROMOTION-CANCEL-OWNERSHIP 2026-10-08 by Codex]
+                // The existing publisher samples this after its lock waits.
+                peer_store.record_verified_phala_peer_attestation_if(
+                    &descriptor_for_appraisal, &appraisal, || publication_round.is_running(),
+                )
+            }).await.map_err(|_| EndpointPossessionError::Unavailable)? {
+                return Err(EndpointPossessionError::Rejected);
+            }
+        }
+        if !round.is_running() { return Ok(None); }
         Ok(Some(promoted_descriptor))
+    }
+
+    // [PHALA-PROMOTION-NETWORK-ADMISSION 2026-10-07 by Codex] Capacity
+    // cleanup can touch durable peer-cache state; keep it off async workers and
+    // sample time after blocking-pool waits, not at candidate selection time.
+    async fn prepare_network_probe(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        round: &PromotionRoundState,
+    ) -> Result<bool, EndpointPossessionError> {
+        let peer_store = Arc::clone(&self.peer_store);
+        let descriptor = descriptor.clone();
+        let round = round.clone();
+        tokio::task::spawn_blocking(move || {
+            round.is_running()
+                && peer_store.permissionless_candidate_probe_is_admitted(&descriptor, unix_now_secs())
+                && round.is_running()
+        })
+        .await
+        .map_err(|_| EndpointPossessionError::Unavailable)
     }
 
     async fn retain_local_attestation(
@@ -336,7 +452,7 @@ impl PermissionlessPromotionCoordinator {
         .map_err(|_| EndpointPossessionError::Unavailable)?
     }
 
-    async fn gossip_attestation(&self, candidate: &SignedNodeDescriptor, frame: Vec<u8>) {
+    async fn gossip_attestation(&self, candidate: &SignedNodeDescriptor, frame: Vec<u8>, round: &PromotionRoundState) {
         let message = NodeDiscoveryMessage::EndpointEvidenceAttestationV1 {
             attestation_frame: frame,
         };
@@ -345,7 +461,9 @@ impl PermissionlessPromotionCoordinator {
         // invalid/colliding public transports before consuming the two-peer
         // budget, then rotate the complete verified view each retry. An
         // attestation is only evidence; gossip never promotes a route.
-        let round = self
+        // [PHALA-NODE-COMPILE-REPAIR 2026-10-08 by Codex] Do not shadow
+        // the cancellation owner with the independent gossip rotation cursor.
+        let gossip_round = self
             .attestation_gossip_cursor
             .fetch_add(1, Ordering::Relaxed);
         let targets = select_attestation_gossip_targets(
@@ -353,9 +471,14 @@ impl PermissionlessPromotionCoordinator {
                 .valid_public_endpoint_identities(unix_now_secs()),
             observer_id,
             candidate.node_id(),
-            round,
+            gossip_round,
         );
         for url in targets {
+            // [PHALA-PROMOTION-NETWORK-ADMISSION 2026-10-07 by Codex]
+            // A delayed first send cannot authorize a stale second fanout.
+            if !matches!(self.prepare_network_probe(candidate, round).await, Ok(true)) {
+                return;
+            }
             let _ = self.client.post(url).json(&message).send().await;
         }
     }
@@ -479,7 +602,11 @@ impl PermissionlessPromotionCoordinator {
         first: &VerifiedEndpointPossession,
         second: &VerifiedEndpointPossession,
         pending: PendingVerifiedObservation,
+        round: &PromotionRoundState,
     ) -> Result<(), EndpointPossessionError> {
+        // [PHALA-PROMOTION-CANCEL-OWNERSHIP 2026-10-08 by Codex] A
+        // queued cell may enter only after its parent future has been dropped.
+        if !round.is_running() { return Err(EndpointPossessionError::Unavailable); }
         self.verify_possession(descriptor, first)?;
         self.verify_possession(descriptor, second)?;
         let now = second.observed_at;
@@ -558,7 +685,7 @@ impl PermissionlessPromotionCoordinator {
             return Err(EndpointPossessionError::Rejected);
         }
         self.peer_store
-            .promote_permissionless_candidate(&material, now)
+            .promote_permissionless_candidate_if(&material, now, || round.is_running())
             .map_err(|_| EndpointPossessionError::Rejected)?;
         Ok(())
     }
@@ -636,35 +763,37 @@ fn observation_context(
     hasher.finalize().into()
 }
 
-/// The descriptor transports an HTTP(S) endpoint, while ADEA commits to a
-/// canonical public IP socket. Both representations must resolve to the same
-/// literal host and effective port; no DNS, proxy, or redirect is admitted.
-// [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] This typed bridge
-// closes the URL-vs-socket commitment mismatch without changing core wire.
+/// Derives the exact descriptor endpoint commitment and probe URL. IP sockets
+/// retain legacy behavior; HTTPS DNS is only reachable after separate Phala
+/// appraisal in `advance_one`, and its request is DNS-pinned in the async
+/// transport below.
+// [PHALA-DNS-ENDPOINT-COMMITMENT 2026-10-06 by Codex]
 fn exact_probe_target(endpoint: &str) -> Result<(reqwest::Url, [u8; 32]), EndpointPossessionError> {
-    let attested_socket = canonical_attested_public_endpoint_socket_v1(endpoint)
+    let endpoint_commitment = canonical_attested_public_endpoint_commitment_v1(endpoint)
         .map_err(|_| EndpointPossessionError::Rejected)?;
-    if !peer_endpoint_is_public_ip(endpoint) {
-        return Err(EndpointPossessionError::Rejected);
-    }
     let url = canonical_peer_http_url(endpoint, RESPOND_PATH)
         .map_err(|_| EndpointPossessionError::Rejected)?;
-    let host = url.host_str().ok_or(EndpointPossessionError::Rejected)?;
-    let ip: IpAddr = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse()
-        .map_err(|_| EndpointPossessionError::Rejected)?;
-    let port = url
-        .port_or_known_default()
-        .ok_or(EndpointPossessionError::Rejected)?;
-    let socket = SocketAddr::new(ip, port);
-    if socket != attested_socket {
+    if peer_endpoint_is_public_ip(endpoint) {
+        let attested_socket = canonical_attested_public_endpoint_socket_v1(endpoint)
+            .map_err(|_| EndpointPossessionError::Rejected)?;
+        let host = url.host_str().ok_or(EndpointPossessionError::Rejected)?;
+        let ip = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .map_err(|_| EndpointPossessionError::Rejected)?;
+        let port = url
+            .port_or_known_default()
+            .ok_or(EndpointPossessionError::Rejected)?;
+        if std::net::SocketAddr::new(ip, port) != attested_socket {
+            return Err(EndpointPossessionError::Rejected);
+        }
+    } else if canonical_public_https_dns_endpoint_commitment_v1(endpoint).is_err()
+        || url.scheme() != "https"
+    {
         return Err(EndpointPossessionError::Rejected);
     }
-    let commitment = canonical_public_endpoint_commitment(&attested_socket.to_string())
-        .map_err(|_| EndpointPossessionError::Rejected)?;
-    Ok((url, commitment))
+    Ok((url, endpoint_commitment))
 }
 
 /// A verified challenge/proof pair delivered by one exact endpoint request.
@@ -745,6 +874,23 @@ pub(crate) async fn probe_exact_public_endpoint(
         .as_deref()
         .ok_or(EndpointPossessionError::Rejected)?;
     let (url, endpoint_commitment) = exact_probe_target(endpoint)?;
+    let pinned_target = if canonical_public_https_dns_endpoint_commitment_v1(endpoint).is_ok() {
+        Some(
+            resolve_pinned_peer_http_target(url.clone(), PROBE_TIMEOUT)
+                .await
+                .map_err(|_| EndpointPossessionError::Rejected)?,
+        )
+    } else {
+        None
+    };
+    let request_client = pinned_target
+        .as_ref()
+        .map(|target| &target.client)
+        .unwrap_or(client);
+    let request_url = pinned_target
+        .as_ref()
+        .map(|target| target.url.clone())
+        .unwrap_or(url);
     let pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(descriptor)
         .map_err(|_| EndpointPossessionError::Rejected)?;
     let mut nonce = [0u8; 32];
@@ -766,14 +912,14 @@ pub(crate) async fn probe_exact_public_endpoint(
         observer,
     )
     .map_err(|_| EndpointPossessionError::Rejected)?;
-    let mut response = client
-        .post(url.clone())
+    let mut response = request_client
+        .post(request_url.clone())
         .timeout(PROBE_TIMEOUT)
         .body(challenge.encode())
         .send()
         .await
         .map_err(|_| EndpointPossessionError::Unavailable)?;
-    if response.status() != reqwest::StatusCode::OK || response.url() != &url {
+    if response.status() != reqwest::StatusCode::OK || response.url() != &request_url {
         return Err(EndpointPossessionError::Rejected);
     }
     // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] A hostile
@@ -828,6 +974,34 @@ mod tests {
 
     const NOW: u64 = 2_000_000_000;
     const ENDPOINT: &str = "https://8.8.8.8:8422";
+
+    // [PHALA-PROMOTION-CANCEL-OWNERSHIP 2026-10-08 by Codex] Authored
+    // only: cancel an actually polled parent; retained blocking-state clones
+    // must observe its drop rather than depending on a graceful return path.
+    #[tokio::test]
+    async fn promotion_round_parent_abort_closes_retained_publication_state() {
+        let process_shutdown = Arc::new(AtomicBool::new(false));
+        let parent_shutdown = Arc::clone(&process_shutdown);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let parent = tokio::spawn(async move {
+            let owner = PromotionRoundOwner::new(parent_shutdown);
+            assert!(ready_tx.send(owner.0.clone()).is_ok());
+            std::future::pending::<()>().await;
+            drop(owner);
+        });
+        let retained = tokio::time::timeout(Duration::from_secs(1), ready_rx).await.unwrap().unwrap();
+        assert!(retained.is_running());
+        parent.abort();
+        assert!(parent.await.unwrap_err().is_cancelled());
+        assert!(!retained.is_running());
+        process_shutdown.store(true, Ordering::SeqCst);
+        process_shutdown.store(false, Ordering::SeqCst);
+        assert!(!retained.is_running(), "round cancellation is sticky");
+        let next = PromotionRoundOwner::new(Arc::clone(&process_shutdown));
+        assert!(next.0.is_running(), "a later round owns a different stop state");
+        process_shutdown.store(true, Ordering::SeqCst);
+        assert!(!next.0.is_running(), "process shutdown vetoes an undropped round too");
+    }
 
     fn key(seed: u8) -> IdentityKeyPair {
         IdentityKeyPair::from_bytes(&[seed; 32]).expect("fixed key")
@@ -1041,6 +1215,9 @@ mod tests {
                 Arc::clone(&store),
                 Arc::clone(&inbox),
                 Arc::clone(&observer_one),
+                false,
+                Vec::new(),
+                Vec::new(),
             )
             .expect("coordinator"),
         );
@@ -1118,8 +1295,9 @@ mod tests {
             .get_valid(&target.public_key_bytes(), NOW + 3)
             .is_none());
         let inbound = possession(&descriptor, &target, &observer_one, NOW + 9, 0x72);
+        let promotion_owner = PromotionRoundOwner::new(Arc::new(AtomicBool::new(false)));
         runtime
-            .complete_verified_observation(&descriptor, &outbound, &inbound, pending)
+            .complete_verified_observation(&descriptor, &outbound, &inbound, pending, &promotion_owner.0)
             .expect("promotion chain");
         eprintln!("four-node: promoted");
         assert!(store

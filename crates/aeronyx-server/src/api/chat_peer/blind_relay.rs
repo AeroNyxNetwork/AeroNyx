@@ -2,6 +2,11 @@
 // Opaque blind relay, onion terminal store, and middle-hop forward.
 // Bodies are unchanged. Private items are pub(super) so the parent flow can call them.
 use super::*;
+use aeronyx_core::protocol::chat::encode_blind_relay_envelope;
+// [REVERSE-WORKER-CLOCK-SHARED 2026-10-06 by Codex] Use the source API's
+// checked clock helper for DB-lock wait before durable enqueue.
+use crate::api::reverse_onion::worker_time;
+use base64::Engine as _;
 
 pub(crate) fn blind_relay_authenticated_request_commitment(
     request: &PeerBlindRelayRequest,
@@ -114,8 +119,65 @@ pub(super) fn rejected_blind_relay_response_with_status(
         .into_response()
 }
 
+fn decode_private_recipient_authorization(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<aeronyx_core::protocol::discovery::SignedPrivateOnionRecipientAuthorizationV1>, ()> {
+    const HEADER: &str = "x-aeronyx-private-recipient-authorization";
+    const MAX_ENCODED: usize = 2732;
+    let mut values = headers.get_all(HEADER).iter();
+    let Some(value) = values.next() else { return Ok(None) };
+    if values.next().is_some() || value.as_bytes().len() > MAX_ENCODED {
+        return Err(());
+    }
+    let encoded = value.to_str().map_err(|_| ())?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|_| ())?;
+    if bytes.is_empty() || bytes.len() > 2048
+        || base64::engine::general_purpose::STANDARD.encode(&bytes) != encoded
+    {
+        return Err(());
+    }
+    aeronyx_core::protocol::discovery::SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(&bytes)
+        .map(Some).map_err(|_| ())
+}
+
+#[cfg(test)]
+mod private_authorization_header_tests {
+    use super::decode_private_recipient_authorization;
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    // [REVERSE-ONION-AUTH-HEADER 2026-10-06 by Codex] Authored, not run:
+    // malformed, duplicate, and oversized renewal evidence must fail closed.
+    #[test]
+    fn private_authorization_header_rejects_malformed_duplicate_and_oversized_values() {
+        assert!(decode_private_recipient_authorization(&HeaderMap::new())
+            .expect("absent optional header")
+            .is_none());
+
+        let mut malformed = HeaderMap::new();
+        malformed.insert(
+            HeaderName::from_static("x-aeronyx-private-recipient-authorization"),
+            HeaderValue::from_static("not-base64!"),
+        );
+        assert!(decode_private_recipient_authorization(&malformed).is_err());
+
+        let mut duplicate = HeaderMap::new();
+        let name = HeaderName::from_static("x-aeronyx-private-recipient-authorization");
+        duplicate.append(name.clone(), HeaderValue::from_static("AQ=="));
+        duplicate.append(name, HeaderValue::from_static("Ag=="));
+        assert!(decode_private_recipient_authorization(&duplicate).is_err());
+
+        let mut oversized = HeaderMap::new();
+        oversized.insert(
+            HeaderName::from_static("x-aeronyx-private-recipient-authorization"),
+            HeaderValue::from_bytes(&vec![b'a'; 2733]).expect("valid bounded header bytes"),
+        );
+        assert!(decode_private_recipient_authorization(&oversized).is_err());
+    }
+}
+
 pub(super) async fn peer_blind_relay_handler(
     State(state): State<ChatPeerState>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<PeerBlindRelayRequest>,
 ) -> impl IntoResponse {
     let failure_route_id = request.envelope.route_id;
@@ -134,7 +196,18 @@ pub(super) async fn peer_blind_relay_handler(
         }
     };
     let failure_request_commitment = authenticated.failure_request_commitment;
-    match process_authenticated_peer_blind_relay(state, authenticated).await {
+    let supplied_authorization = match decode_private_recipient_authorization(&headers) {
+        Ok(value) => value,
+        Err(_) => return blind_relay_failure_response(
+            BlindRelayError::InvalidEnvelope,
+            failure_route_id,
+            Some(failure_request_commitment),
+            node_identity,
+        ).await,
+    };
+    match process_authenticated_peer_blind_relay_with_authority(
+        state, authenticated, supplied_authorization,
+    ).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => {
             blind_relay_failure_response(
@@ -556,6 +629,14 @@ pub(super) async fn process_authenticated_peer_blind_relay(
     state: ChatPeerState,
     authenticated: AuthenticatedPeerBlindRelayRequest,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+    process_authenticated_peer_blind_relay_with_authority(state, authenticated, None).await
+}
+
+async fn process_authenticated_peer_blind_relay_with_authority(
+    state: ChatPeerState,
+    authenticated: AuthenticatedPeerBlindRelayRequest,
+    supplied_authorization: Option<aeronyx_core::protocol::discovery::SignedPrivateOnionRecipientAuthorizationV1>,
+) -> Result<PeerBlindRelayResponse, BlindRelayError> {
     // [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Reaching route state
     // requires possession of the private authenticated request capability.
     let now = now_secs();
@@ -565,6 +646,14 @@ pub(super) async fn process_authenticated_peer_blind_relay(
     let previous_hop_node_id = request.previous_hop_node_id;
     let onward_descriptor_hint = request.onward_descriptor_hint;
     let envelope = request.envelope;
+
+    // [REVERSE-ONION-AUTHORITY-RENEWAL 2026-10-05 by Codex] A renewed P token
+    // is meaningful only for the private onion admission branch, never for a
+    // legacy opaque terminal or unrelated public relay request.
+    if supplied_authorization.is_some() && !is_onion_blob(&envelope.encrypted_blob) {
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
+        return Err(BlindRelayError::NoRoute);
+    }
 
     check_blind_relay_previous_hop_allowed(&state, previous_hop_node_id, now)?;
 
@@ -585,13 +674,14 @@ pub(super) async fn process_authenticated_peer_blind_relay(
         // (terminal) or forward the inner layer to the revealed next hop. Legacy
         // opaque blobs (no onion magic) fall through to the existing behavior.
         if is_onion_blob(&envelope.encrypted_blob) {
-            return process_onion_blind_relay(
+            return process_onion_blind_relay_with_authority(
                 state,
                 previous_hop_node_id,
                 envelope,
                 request_commitment,
                 now,
                 &route_started_at,
+                supplied_authorization,
             )
             .await;
         }
@@ -701,10 +791,19 @@ pub(super) async fn process_authenticated_peer_blind_relay(
             reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "missing_endpoint");
             BlindRelayError::InvalidEndpoint
         })?;
-    let url = blind_peer_relay_url(endpoint).ok_or_else(|| {
-        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "invalid_endpoint");
-        BlindRelayError::InvalidEndpoint
-    })?;
+    // [PHALA-ONION-DNS-PIN 2026-10-06 by Codex] Finish DNS/TLS preflight
+    // before route admission can cross the durable send boundary.
+    let target = resolve_blind_peer_relay_target(&state, endpoint)
+        .await
+        .ok_or_else(|| {
+            reject_blind_relay_previous_hop(
+                &state,
+                previous_hop_node_id,
+                now,
+                "invalid_endpoint",
+            );
+            BlindRelayError::InvalidEndpoint
+        })?;
 
     let original_envelope = Arc::new(envelope);
     let mut route_lease = match begin_blind_relay_route(
@@ -761,9 +860,9 @@ pub(super) async fn process_authenticated_peer_blind_relay(
     route_lease
         .arm_effect(forward_started_at)
         .map_err(|_| record_blind_relay_replay_protection_failure(&state, forward_started_at))?;
-    let observed_at = match forward_blind_relay_with_retry(
+    let observed_at = match forward_blind_relay_with_resolved_target(
         &state,
-        &url,
+        &target,
         &descriptor,
         prepared_forward,
         forward_started_at,
@@ -820,6 +919,20 @@ pub(super) async fn process_onion_blind_relay(
     request_commitment: [u8; 32],
     now: u64,
     route_started_at: &Instant,
+) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+    process_onion_blind_relay_with_authority(
+        state, previous_hop_node_id, envelope, request_commitment, now, route_started_at, None,
+    ).await
+}
+
+async fn process_onion_blind_relay_with_authority(
+    state: ChatPeerState,
+    previous_hop_node_id: [u8; 32],
+    envelope: BlindRelayEnvelope,
+    request_commitment: [u8; 32],
+    now: u64,
+    route_started_at: &Instant,
+    supplied_authorization: Option<aeronyx_core::protocol::discovery::SignedPrivateOnionRecipientAuthorizationV1>,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
     let self_node_id = state.node_identity.public_key_bytes();
     let envelope = Arc::new(envelope);
@@ -995,6 +1108,13 @@ pub(super) async fn process_onion_blind_relay(
         }
         // Entry/middle hop: forward the inner layer to the revealed next hop.
         Some(next_hop) => {
+            if supplied_authorization.is_some()
+                && !state.private_recipient_admission.as_ref()
+                    .is_some_and(|admission| next_hop == admission.recipient_node_id())
+            {
+                reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
+                return Err(BlindRelayError::NoRoute);
+            }
             if next_hop == self_node_id || next_hop == previous_hop_node_id {
                 reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "route_loop");
                 return Err(BlindRelayError::RouteLoop);
@@ -1033,6 +1153,7 @@ pub(super) async fn process_onion_blind_relay(
                     now,
                     route_started_at,
                     route_lease,
+                    supplied_authorization,
                 )
                 .await;
             }
@@ -1041,7 +1162,10 @@ pub(super) async fn process_onion_blind_relay(
                 reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
                 BlindRelayError::NoRoute
             })?;
-            if !descriptor
+            // [PHALA-PEER-ATTESTED-ROUTING 2026-10-06 by Codex] Enforce the
+            // local route policy at the actual forwarding boundary too.
+            if !state.peer_store.phala_peer_route_is_eligible(&descriptor, now)
+                || !descriptor
                 .descriptor
                 .capabilities
                 .contains(&NodeCapability::ChatRelay)
@@ -1072,15 +1196,19 @@ pub(super) async fn process_onion_blind_relay(
                     );
                     BlindRelayError::InvalidEndpoint
                 })?;
-            let url = blind_peer_relay_url(endpoint).ok_or_else(|| {
-                reject_blind_relay_previous_hop(
-                    &state,
-                    previous_hop_node_id,
-                    now,
-                    "invalid_endpoint",
-                );
-                BlindRelayError::InvalidEndpoint
-            })?;
+            // [PHALA-ONION-DNS-PIN 2026-10-06 by Codex] Resolve and pin this
+            // exact signed hop before arming its external effect.
+            let target = resolve_blind_peer_relay_target(&state, endpoint)
+                .await
+                .ok_or_else(|| {
+                    reject_blind_relay_previous_hop(
+                        &state,
+                        previous_hop_node_id,
+                        now,
+                        "invalid_endpoint",
+                    );
+                    BlindRelayError::InvalidEndpoint
+                })?;
 
             // [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] Preserve the
             // authenticated ingress timestamp when reconstructing this exact
@@ -1112,9 +1240,9 @@ pub(super) async fn process_onion_blind_relay(
             route_lease.arm_effect(forward_started_at).map_err(|_| {
                 record_blind_relay_replay_protection_failure(&state, forward_started_at)
             })?;
-            let next_hop_forward = match forward_blind_relay_with_retry(
+            let next_hop_forward = match forward_blind_relay_with_resolved_target(
                 &state,
-                &url,
+                &target,
                 &descriptor,
                 forwarded_request,
                 forward_started_at,
@@ -1200,6 +1328,16 @@ pub(super) fn decode_onion_terminal_payload(
     Ok(DecodedOnionTerminalPayload::Message(envelope))
 }
 
+// [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex] Keep the private recipient
+// terminal limited to the single read-only workload; public API enablement
+// retains the pre-existing broader terminal behavior.
+pub(super) const fn private_terminal_purpose_allowed(
+    public_api_enabled: bool,
+    purpose: OnionRoutePurpose,
+) -> bool {
+    public_api_enabled || matches!(purpose, OnionRoutePurpose::BlindVaultPull)
+}
+
 /// Performs terminal wire parsing and sender authentication without touching
 /// Blind Vault or pending-message storage.
 pub(super) async fn prepare_onion_terminal_payload(
@@ -1240,10 +1378,16 @@ pub(super) async fn prepare_onion_terminal_payload(
             }
         }
         DecodedOnionTerminalPayload::BlindVaultReply(reply) => {
-            state
+            let vault = state
                 .blind_vault
                 .as_ref()
                 .ok_or(BlindRelayError::ForwardFailed)?;
+            // [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex] A recipient-only
+            // peer router executes read-only source-sealed Pulls, never legacy
+            // Put or other direct-client Blind Vault mutations.
+            if !private_terminal_purpose_allowed(vault.public_api_enabled(), reply.purpose()) {
+                return Err(BlindRelayError::OnionTerminalPayloadRejected);
+            }
             let execution_permit = blind_vault_terminal_admission()
                 .try_acquire_owned()
                 .map_err(|_| BlindRelayError::Backpressure)?;
@@ -1253,10 +1397,13 @@ pub(super) async fn prepare_onion_terminal_payload(
             }
         }
         DecodedOnionTerminalPayload::LegacyBlindVaultPut(request) => {
-            state
+            let vault = state
                 .blind_vault
                 .as_ref()
                 .ok_or(BlindRelayError::ForwardFailed)?;
+            if !vault.public_api_enabled() {
+                return Err(BlindRelayError::OnionTerminalPayloadRejected);
+            }
             let execution_permit = blind_vault_terminal_admission()
                 .try_acquire_owned()
                 .map_err(|_| BlindRelayError::Backpressure)?;
@@ -1486,10 +1633,19 @@ pub(super) async fn process_onion_middle_blind_relay(
             reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "missing_endpoint");
             BlindRelayError::InvalidEndpoint
         })?;
-    let url = blind_peer_relay_url(endpoint).ok_or_else(|| {
-        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "invalid_endpoint");
-        BlindRelayError::InvalidEndpoint
-    })?;
+    // [PHALA-ONION-DNS-PIN 2026-10-06 by Codex] Resolve and pin this signed
+    // target before arming its external effect.
+    let target = resolve_blind_peer_relay_target(&state, endpoint)
+        .await
+        .ok_or_else(|| {
+            reject_blind_relay_previous_hop(
+                &state,
+                previous_hop_node_id,
+                now,
+                "invalid_endpoint",
+            );
+            BlindRelayError::InvalidEndpoint
+        })?;
 
     let mut route_lease = match begin_blind_relay_route(
         &state,
@@ -1533,9 +1689,9 @@ pub(super) async fn process_onion_middle_blind_relay(
     route_lease
         .arm_effect(forward_started_at)
         .map_err(|_| record_blind_relay_replay_protection_failure(&state, forward_started_at))?;
-    let next_hop_forward = match forward_blind_relay_with_retry(
+    let next_hop_forward = match forward_blind_relay_with_resolved_target(
         &state,
-        &url,
+        &target,
         &descriptor,
         forwarded_request,
         forward_started_at,
@@ -1587,6 +1743,7 @@ async fn process_private_recipient_admission(
     now: u64,
     route_started_at: &Instant,
     mut route_lease: BlindRelayRouteLease,
+    supplied_authorization: Option<aeronyx_core::protocol::discovery::SignedPrivateOnionRecipientAuthorizationV1>,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
     let admission = state
         .private_recipient_admission
@@ -1595,7 +1752,6 @@ async fn process_private_recipient_admission(
     let self_node_id = state.node_identity.public_key_bytes();
     if admission.local_relay_node_id() != self_node_id
         || previous_hop_node_id == self_node_id
-        || !admission.source_allowed(previous_hop_node_id)
         || admission.purpose() != OnionRoutePurpose::BlindVaultPull
         || outer_envelope.next_hop != self_node_id
         || next_hop != admission.recipient_node_id()
@@ -1605,9 +1761,68 @@ async fn process_private_recipient_admission(
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
         return Err(BlindRelayError::NoRoute);
     }
-    let route_deadline = admission
-        .route_deadline(outer_envelope.timestamp, now)
-        .map_err(|_| BlindRelayError::TimestampExpired)?;
+    // [PRIVATE-RECIPIENT-DURABLE-RECOVERY 2026-10-04 by Codex] The request
+    // commitment here is produced only after the authenticated source
+    // signature and canonical full request have been verified by the ingress
+    // path; a caller cannot choose this tuple by guessing a queue key.
+    // A committed
+    // source tuple remains replayable after allowlist rotation/revocation.
+    // Read that exact durable evidence before applying the fresh-authority
+    // gate for a NEW enqueue; this read has no mutation or network effect.
+    let preflight_now = now_secs();
+    if preflight_now == 0 {
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "timestamp_expired");
+        return Err(BlindRelayError::TimestampExpired);
+    }
+    let lookup_queue = Arc::clone(admission.queue());
+    let lookup_route_id = outer_envelope.route_id;
+    let lookup_permit = admission
+        .try_queue_permit()
+        .map_err(|_| BlindRelayError::Backpressure)?;
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let _lookup_permit = lookup_permit;
+        let lookup_now = now_secs();
+        if lookup_now == 0 || lookup_now < preflight_now {
+            return Err(ReverseOnionQueueDbError::Rejected);
+        }
+        lookup_queue
+            .lookup_source(
+                previous_hop_node_id,
+                lookup_route_id,
+                request_commitment,
+                lookup_now,
+            )
+            .map(|snapshot| snapshot)
+    })
+    .await
+    .map_err(|_| BlindRelayError::ForwardFailed)?
+    .map_err(|_| BlindRelayError::ForwardFailed)?;
+    if let Some(snapshot) = snapshot {
+        if snapshot.immediate_recipient() != admission.recipient_node_id() {
+            reject_blind_relay_previous_hop(&state, previous_hop_node_id, preflight_now, "no_route");
+            return Err(BlindRelayError::NoRoute);
+        }
+        let observed_at = blind_relay_response_observed_at(now, route_started_at);
+        let response = attach_blind_relay_success_receipt(
+            outer_envelope,
+            PeerBlindRelayResponse {
+                accepted: true,
+                terminal: false,
+                forwarded: true,
+                ttl_remaining: 1,
+                reason: None,
+                delivery_receipt: None,
+                success_receipt: None,
+                failure_receipt: None,
+                opaque_terminal_response_b64: None,
+            },
+            observed_at,
+            Arc::clone(&state.node_identity),
+        )
+        .await?;
+        complete_blind_relay_route(&state, route_lease, observed_at, response.clone())?;
+        return Ok(response);
+    }
 
     let forwarding_identity = Arc::clone(&state.node_identity);
     let forward_seed = BlindRelayForwardSeed::from(outer_envelope.as_ref());
@@ -1623,13 +1838,6 @@ async fn process_private_recipient_admission(
     let forwarded_bytes = encode_blind_relay_envelope(&forwarded_envelope)
         .map_err(|_| BlindRelayError::ForwardFailed)?;
     let envelope_commitment: [u8; 32] = Sha256::digest(&forwarded_bytes).into();
-    let mut route_body_hasher = Sha256::new();
-    route_body_hasher.update(b"AeroNyx-PrivateBlindRelay-RouteBody-v1");
-    route_body_hasher.update(admission.authority_commitment());
-    route_body_hasher.update(outer_envelope.route_id);
-    route_body_hasher.update(request_commitment);
-    route_body_hasher.update(&forwarded_bytes);
-    let route_body_commitment: [u8; 32] = route_body_hasher.finalize().into();
     let mut queue_key_hasher = Sha256::new();
     queue_key_hasher.update(b"AeroNyx-PrivateBlindRelay-QueueKey-v1");
     queue_key_hasher.update(previous_hop_node_id);
@@ -1638,30 +1846,78 @@ async fn process_private_recipient_admission(
     queue_key_hasher.update(admission.recipient_node_id());
     let queue_key: [u8; 32] = queue_key_hasher.finalize().into();
 
+    // Keep one Unix base for the whole route. The helper adds elapsed monotonic
+    // time exactly once; feeding it a fresh wall-clock sample would double
+    // count the time already represented by `route_started_at`.
     let forward_started_at = blind_relay_response_observed_at(now, route_started_at);
-    route_lease
-        .arm_effect(forward_started_at)
-        .map_err(|_| record_blind_relay_replay_protection_failure(&state, forward_started_at))?;
-
-    let item = ReverseOnionQueueItem::new(
-        queue_key,
-        outer_envelope.route_id,
-        request_commitment,
-        previous_hop_node_id,
-        route_body_commitment,
-        admission.recipient_node_id(),
-        envelope_commitment,
-        forwarded_bytes,
-        route_deadline,
-    )
-    .map_err(|_| BlindRelayError::ForwardFailed)?;
-    let queue = Arc::clone(admission.queue());
-    let queue_permit = admission
-        .try_queue_permit()
-        .map_err(|_| BlindRelayError::Backpressure)?;
+    // [PHALA-QUEUE-EFFECT-ADMISSION 2026-10-08 by Codex] A response-held
+    // slot can saturate intake after the earlier lookup. No DB work has begun:
+    // acquire capacity before arming fresh route custody, not the reverse.
+    let queue_permit = route_lease
+        .arm_private_queue_effect(admission, forward_started_at)
+        .map_err(|error| match error {
+            BlindRelayError::Backpressure => BlindRelayError::Backpressure,
+            _ => record_blind_relay_replay_protection_failure(&state, forward_started_at),
+        })?;
+    let enqueue_floor = preflight_now;
+    let enqueue_admission = Arc::clone(admission);
+    let enqueue_peer_store = Arc::clone(&state.peer_store);
+    let enqueue_queue = Arc::clone(admission.queue());
+    let route_id = outer_envelope.route_id;
+    let envelope_timestamp = outer_envelope.timestamp;
+    let recipient_node_id = admission.recipient_node_id();
+    let auth_for_enqueue = supplied_authorization.clone();
     let enqueue_result = tokio::task::spawn_blocking(move || {
         let _queue_permit = queue_permit;
-        queue.enqueue(&item, now)
+        let worker_now = now_secs();
+        if worker_now == 0 || worker_now < enqueue_floor {
+            return Err(ReverseOnionQueueDbError::Rejected);
+        }
+        // [PRIVATE-RECIPIENT-WRITE-PREFLIGHT 2026-10-04 by Codex] The final
+        // current-descriptor/authorization check and durable row commit share
+        // one immutable authority epoch inside the database boundary.
+        let mutation_now = now_secs();
+        if mutation_now == 0 || mutation_now < worker_now {
+            return Err(ReverseOnionQueueDbError::Rejected);
+        }
+        let enqueue_started_at = std::time::Instant::now();
+        enqueue_queue.enqueue_with_authority(
+            &enqueue_peer_store,
+            mutation_now,
+            move || worker_time(mutation_now, enqueue_started_at.elapsed()),
+            |mutation_now| {
+                // [REVERSE-ONION-AUTHORITY-RENEWAL 2026-10-05 by Codex] Commit
+                // the exact current signed descriptor/grant snapshot with the row.
+                let (route_deadline, authority_commitment) = enqueue_admission
+                    .validate_current_enqueue_authority_under_guard(
+                        &enqueue_peer_store,
+                        previous_hop_node_id,
+                        envelope_timestamp,
+                        mutation_now,
+                        auth_for_enqueue.as_ref(),
+                    )
+                    .map_err(|_| ReverseOnionQueueDbError::Rejected)?;
+                let mut route_body_hasher = Sha256::new();
+                route_body_hasher.update(b"AeroNyx-PrivateBlindRelay-RouteBody-v1");
+                route_body_hasher.update(authority_commitment);
+                route_body_hasher.update(route_id);
+                route_body_hasher.update(request_commitment);
+                route_body_hasher.update(&forwarded_bytes);
+                let route_body_commitment: [u8; 32] = route_body_hasher.finalize().into();
+                ReverseOnionQueueItem::new(
+                    queue_key,
+                    route_id,
+                    request_commitment,
+                    previous_hop_node_id,
+                    route_body_commitment,
+                    recipient_node_id,
+                    envelope_commitment,
+                    forwarded_bytes,
+                    route_deadline,
+                )
+                .map_err(|_| ReverseOnionQueueDbError::Rejected)
+            },
+        )
     })
     .await
     .map_err(|_| BlindRelayError::ForwardFailed)?;
@@ -1683,6 +1939,28 @@ async fn process_private_recipient_admission(
         Err(_) => return Err(BlindRelayError::ForwardFailed),
     }
 
+    // [PRIVATE-RECIPIENT-FRESH-PUBLISH 2026-10-04 by Codex] Recheck the
+    // current signed descriptors after the blocking durable operation and
+    // before publishing a success ACK. A rotation can invalidate a new
+    // effect during the await; the durable row remains recoverable, while the
+    // stale request does not receive a false success publication.
+    let publish_now = now_secs();
+    if admission
+        .validate_current_enqueue_authority(
+            &state.peer_store,
+            previous_hop_node_id,
+            outer_envelope.timestamp,
+            publish_now,
+            supplied_authorization.as_ref(),
+        )
+        .is_err()
+    {
+        // [PRIVATE-RECIPIENT-POST-COMMIT-AMBIGUITY 2026-10-04 by Codex] The
+        // queue mutation already committed before this observation. Preserve
+        // the armed route/recovery evidence and return a conservative coarse
+        // failure; never claim that the durable effect was undone.
+        return Err(BlindRelayError::ForwardFailed);
+    }
     let observed_at = blind_relay_response_observed_at(now, route_started_at);
     let response = attach_blind_relay_success_receipt(
         outer_envelope,
@@ -1723,14 +2001,23 @@ pub(super) fn resolve_blind_relay_next_hop_descriptor(
     descriptor_hint: Option<&SignedNodeDescriptor>,
 ) -> Option<(SignedNodeDescriptor, bool)> {
     if let Some(descriptor) = state.peer_store.get_valid(next_hop, now) {
-        return Some((descriptor, false));
+        // [PHALA-PEER-ATTESTED-ROUTING 2026-10-06 by Codex] A current signed
+        // descriptor alone is not route authority under strict Phala policy.
+        if state.peer_store.phala_peer_route_is_eligible(&descriptor, now) {
+            return Some((descriptor, false));
+        }
+        return None;
     }
 
     let descriptor = descriptor_hint?;
     if descriptor.node_id() != *next_hop {
         return None;
     }
-    if descriptor.verify_at(now).is_err() {
+    // [PHALA-APPRAISAL-OBSERVATION-FLOOR 2026-10-07 by Codex] Keep both
+    // signature/time and cached-appraisal rejection in the same hint gate.
+    if descriptor.verify_at(now).is_err()
+        || !state.peer_store.phala_peer_route_is_eligible(descriptor, now)
+    {
         return None;
     }
     if !descriptor

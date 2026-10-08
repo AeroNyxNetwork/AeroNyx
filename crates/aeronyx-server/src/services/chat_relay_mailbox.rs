@@ -595,6 +595,106 @@ pub(crate) struct PrivateSqliteTarget {
     pub(crate) parent: File,
 }
 
+// [PHALA-SQLITE-INODE-LOCK 2026-10-08 by Codex] Keep one durable owner
+// per inode. Darwin whole-file flock conflicts with SQLite's POSIX locks.
+// Its OFD byte-zero lock survives unrelated opens/closes and is disjoint
+// from SQLite's pending/shared lock region at 0x40000000. Unsupported locking
+// fails closed; Linux retains its independent whole-inode flock contract.
+#[cfg(unix)]
+pub(crate) fn lock_private_sqlite_inode(inode: &File) -> Result<(), AnonymousMailboxStoreError> {
+    #[cfg(target_os = "macos")]
+    let result = {
+        let mut lock = nix::libc::flock {
+            l_start: 0, l_len: 1, l_pid: 0,
+            l_type: nix::libc::F_WRLCK as _, l_whence: nix::libc::SEEK_SET as _,
+        };
+        // SAFETY: inode owns a live fd; lock is a valid initialized flock.
+        unsafe { nix::libc::fcntl(inode.as_raw_fd(), nix::libc::F_OFD_SETLK, &mut lock) }
+    };
+    #[cfg(not(target_os = "macos"))]
+    // SAFETY: inode owns the fd for the entire repository lifetime.
+    let result = unsafe { nix::libc::flock(inode.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) };
+    if result == 0 { return Ok(()); }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(nix::libc::EAGAIN | nix::libc::EACCES) => Err(AnonymousMailboxStoreError::Busy),
+        _ => Err(AnonymousMailboxStoreError::Unavailable),
+    }
+}
+
+// [PHALA-OWNED-RECOVERY-SCHEMA 2026-10-07 by Codex] Read only the locked
+// primary's documented SQLite header before writable recovery/PRAGMAs. This
+// is an ownership/version preflight, not a substitute for the full SQL audit.
+#[cfg(unix)]
+pub(crate) fn verify_private_sqlite_header(
+    inode: &File,
+    application_id: u32,
+    versions: &[u32],
+) -> Result<(), AnonymousMailboxStoreError> {
+    use std::os::unix::fs::FileExt;
+    let mut header = [0u8; 100];
+    inode.read_exact_at(&mut header, 0).map_err(|_| AnonymousMailboxStoreError::Corrupt)?;
+    let version = u32::from_be_bytes(header[60..64].try_into()
+        .map_err(|_| AnonymousMailboxStoreError::Corrupt)?);
+    if &header[..16] != b"SQLite format 3\0"
+        || !versions.contains(&version)
+        || header[68..72] != application_id.to_be_bytes()
+    {
+        return Err(AnonymousMailboxStoreError::Corrupt);
+    }
+    Ok(())
+}
+
+// [PHALA-EXISTING-CUSTODY-OPEN 2026-10-07 by Codex] Recovery never creates
+// directories/primary files or repairs permissions. Keep the exact descriptor
+// for the caller's lock/header audit instead of checking then reopening it.
+#[cfg(unix)]
+pub(crate) fn open_existing_private_sqlite_target(
+    path: &Path,
+) -> Result<(PrivateSqliteTarget, File), AnonymousMailboxStoreError> {
+    let name = path.file_name().ok_or(AnonymousMailboxStoreError::Rejected)?;
+    let parent_path = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut parent = open_directory_anchor(parent_path)?;
+    for component in parent_path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => parent = open_directory_at(&parent, name)?,
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(AnonymousMailboxStoreError::Rejected);
+            }
+        }
+    }
+    let parent_metadata = parent.metadata().map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+    if !parent_metadata.is_dir() || parent_metadata.uid() != effective_user_id()
+        || parent_metadata.mode() & 0o077 != 0
+    {
+        return Err(AnonymousMailboxStoreError::Rejected);
+    }
+    let raw = openat(Some(parent.as_raw_fd()), name,
+        OFlag::O_RDWR | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+        Mode::empty()).map_err(|_| AnonymousMailboxStoreError::Rejected)?;
+    // SAFETY: openat transfers one new owned descriptor into File.
+    let candidate = unsafe { File::from_raw_fd(raw) };
+    verify_private_descriptor(&candidate)?;
+    let metadata = candidate.metadata().map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+    if metadata.len() == 0 || metadata.mode() & 0o777 != 0o600 {
+        return Err(AnonymousMailboxStoreError::Rejected);
+    }
+    let resolved_parent = std::fs::canonicalize(parent_path)
+        .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+    let resolved_metadata = std::fs::metadata(&resolved_parent)
+        .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+    if resolved_metadata.dev() != parent_metadata.dev() || resolved_metadata.ino() != parent_metadata.ino() {
+        return Err(AnonymousMailboxStoreError::Rejected);
+    }
+    let resolved_path = resolved_parent.join(name);
+    let after = std::fs::symlink_metadata(&resolved_path)
+        .map_err(|_| AnonymousMailboxStoreError::Unavailable)?;
+    if after.dev() != metadata.dev() || after.ino() != metadata.ino() {
+        return Err(AnonymousMailboxStoreError::Rejected);
+    }
+    Ok((PrivateSqliteTarget { resolved_path, parent }, candidate))
+}
+
 #[cfg(unix)]
 pub(crate) fn prepare_private_sqlite_target(
     path: &Path,
@@ -869,6 +969,100 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
     const CURSOR_SECRET: [u8; 32] = [0xA5; 32];
+
+    // [PHALA-SQLITE-INODE-LOCK 2026-10-08 by Codex] A distinct handle
+    // cannot take custody while SQLite is active or after it closes. Only
+    // releasing the retained owner fd enables restart; unrelated closes must
+    // not silently release that owner lock (as process-scoped fcntl would).
+    #[cfg(unix)]
+    #[test]
+    fn reverse_onion_inode_lock_coexists_with_sqlite_and_survives_unrelated_close() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::Builder::new().prefix("phala-inode-lock-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+        let path = dir.path().join("synthetic.sqlite");
+        let owner = std::fs::OpenOptions::new().read(true).write(true).create_new(true)
+            .mode(0o600).open(&path).unwrap();
+        lock_private_sqlite_inode(&owner).unwrap();
+        let contender = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        assert_eq!(lock_private_sqlite_inode(&contender), Err(AnonymousMailboxStoreError::Busy));
+        drop(File::open(&path).unwrap());
+        let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW).unwrap();
+        db.execute_batch("PRAGMA busy_timeout=0; PRAGMA locking_mode=EXCLUSIVE; BEGIN IMMEDIATE; CREATE TABLE synthetic(value INTEGER); COMMIT;").unwrap();
+        assert_eq!(lock_private_sqlite_inode(&contender), Err(AnonymousMailboxStoreError::Busy));
+        drop(db);
+        assert_eq!(lock_private_sqlite_inode(&contender), Err(AnonymousMailboxStoreError::Busy));
+        drop(owner);
+        lock_private_sqlite_inode(&contender).unwrap();
+    }
+
+    // [PHALA-OWNED-RECOVERY-SCHEMA 2026-10-07 by Codex] Authored, not run.
+    #[cfg(unix)]
+    #[test]
+    fn private_sqlite_role_header_has_no_write_side_effect() {
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        let directory = tempfile::Builder::new().prefix("owned-header-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+        let path = directory.path().join("header.sqlite");
+        let inode = std::fs::OpenOptions::new().read(true).write(true).create_new(true)
+            .mode(0o600).open(&path).unwrap();
+        let mut header = [0u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        header[60..64].copy_from_slice(&1u32.to_be_bytes());
+        header[68..72].copy_from_slice(&0x41585250u32.to_be_bytes());
+        inode.write_all_at(&header, 0).unwrap();
+        assert!(verify_private_sqlite_header(&inode, 0x41585250, &[1, 2]).is_ok());
+        assert!(verify_private_sqlite_header(&inode, 0x41585350, &[1]).is_err());
+        assert!(verify_private_sqlite_header(&inode, 0x41585250, &[2]).is_err());
+        assert!(verify_private_sqlite_header(&inode, 0x41585250, &[]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), header);
+        inode.set_len(99).unwrap();
+        assert!(verify_private_sqlite_header(&inode, 0x41585250, &[1, 2]).is_err());
+        assert_eq!(inode.metadata().unwrap().len(), 99);
+    }
+
+    // [PHALA-EXISTING-CUSTODY-OPEN 2026-10-07 by Codex] Authored, not run.
+    #[cfg(unix)]
+    #[test]
+    fn existing_custody_target_does_not_create_repair_or_follow_links() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = tempfile::Builder::new().prefix("existing-custody-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+        let nested = directory.path().join("missing/state.sqlite");
+        assert!(open_existing_private_sqlite_target(&nested).is_err());
+        assert!(!nested.parent().unwrap().exists());
+        let path = directory.path().join("state.sqlite");
+        assert!(open_existing_private_sqlite_target(&path).is_err());
+        assert!(!path.exists());
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+            .mode(0o600).open(&path).unwrap();
+        assert!(open_existing_private_sqlite_target(&path).is_err());
+        std::io::Write::write_all(&mut file, b"synthetic custody").unwrap();
+        drop(file);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(open_existing_private_sqlite_target(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (target, inode) = open_existing_private_sqlite_target(&path).unwrap();
+        let metadata = inode.metadata().unwrap();
+        assert_eq!(target.resolved_path, std::fs::canonicalize(&path).unwrap());
+        assert_eq!((metadata.dev(), metadata.ino()), {
+            let named = std::fs::metadata(&path).unwrap(); (named.dev(), named.ino())
+        });
+        let link = directory.path().join("link.sqlite");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(open_existing_private_sqlite_target(&link).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::fs::hard_link(&path, &link).unwrap();
+        assert!(open_existing_private_sqlite_target(&path).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(open_existing_private_sqlite_target(&path).is_err());
+        assert_eq!(std::fs::metadata(directory.path()).unwrap().mode() & 0o777, 0o750);
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
 
     struct TestContext {
         _directory: TempDir,

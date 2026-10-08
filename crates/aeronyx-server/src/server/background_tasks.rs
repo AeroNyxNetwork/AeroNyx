@@ -105,6 +105,12 @@ impl Server {
         runtime: Arc<DirectoryReplicaSyncRuntime>,
         directory_http_client: Arc<reqwest::Client>,
     ) -> Result<Option<JoinHandle<()>>> {
+        // [PHALA-PRIVATE-RECIPIENT-EGRESS 2026-10-06 by Codex] A private pull
+        // recipient has no independent peer-sync authority. Enforce this at
+        // the task owner as well as in config validation.
+        if self.config.reverse_onion.recipient.enabled {
+            return Ok(None);
+        }
         let peers = self
             .config
             .discovery

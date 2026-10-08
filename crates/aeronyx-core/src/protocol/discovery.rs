@@ -167,6 +167,8 @@
 //!   targets because the selected target identity is part of the signature.
 //!
 //! ## Last Modified
+//! [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex] Separate signed private
+//! terminal Pull readiness from public Blind Vault replica admission.
 //! [PRIVATE-BLIND-VAULT-PULL 2026-10-04 by Codex] Explicit private Pull
 //! authorization policy; canonical V1 transcript and descriptor ABI unchanged.
 //! v0.35.0-OnionBlindVaultEncryptedFailure - Added signed negotiation for
@@ -252,6 +254,157 @@ use crate::protocol::discovery_endpoint_attestation::{
 /// Maximum canonical encoded length of one signed node descriptor.
 pub const MAX_SIGNED_NODE_DESCRIPTOR_BYTES: usize = 16 * 1024;
 const MAX_DESCRIPTOR_BYTES: u64 = 16 * 1024;
+
+// [PHALA-NODE-REPORT-DATA 2026-10-06 by Codex] The dstack quote binds a
+// verifier challenge to the AeroNyx node identity without changing the legacy
+// signed descriptor layout.
+pub const PHALA_NODE_ATTESTATION_NONCE_BYTES_V1: usize = 32;
+pub const PHALA_NODE_ATTESTATION_REPORT_DATA_BYTES_V1: usize = 32;
+pub const PHALA_NODE_ATTESTATION_CONTRACT_VERSION_V1: &str = "phala_node_attestation.v1";
+pub const PHALA_PRIVATE_RECIPIENT_ATTESTATION_CONTRACT_VERSION_V1: &str =
+    "phala_private_recipient_attestation.v1";
+pub const PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V1: &str = "dstack_guest_v1_msgpack";
+pub const PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V0: &str = "dstack_guest_v0_get_quote_json";
+pub const PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1: usize = 256 * 1024;
+// [PHALA-QUOTE-HEX-BOUND 2026-10-06 by Codex] Guest v1 hex-encodes opaque
+// evidence, so the bounded HTTP frame must allow 2x evidence plus framing.
+pub const PHALA_NODE_ATTESTATION_MAX_GUEST_HTTP_RESPONSE_BYTES_V1: usize =
+    PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1 * 2 + 16 * 1024;
+pub const PHALA_NODE_ATTESTATION_VERIFICATION_NOTE_V1: &str =
+    "opaque evidence; caller must verify quote, report_data, app identity, compose, and TCB against independently trusted policy";
+const PHALA_NODE_ATTESTATION_REPORT_DATA_DOMAIN_V1: &[u8] =
+    b"AeroNyx/PhalaNodeAttestationV1\0";
+// [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex] Additive domain
+// binding the quote to the relay identity, authorized terminal, and verifier
+// nonce without changing the existing node-only v1 transcript.
+const PHALA_PRIVATE_RECIPIENT_ATTESTATION_REPORT_DATA_DOMAIN_V1: &[u8] =
+    b"AeroNyx/PhalaPrivateRecipientAttestationV1\0";
+
+/// Derives the dstack `report_data` value for one node identity and verifier nonce.
+///
+/// A relying party must compare the quote's 64-byte report-data field with this
+/// digest followed by 32 zero bytes, as specified by dstack's padding rule.
+#[must_use]
+pub fn phala_node_attestation_report_data_v1(
+    node_id: &[u8; 32],
+    nonce: &[u8; PHALA_NODE_ATTESTATION_NONCE_BYTES_V1],
+) -> [u8; PHALA_NODE_ATTESTATION_REPORT_DATA_BYTES_V1] {
+    let mut hasher = Sha256::new();
+    hasher.update(PHALA_NODE_ATTESTATION_REPORT_DATA_DOMAIN_V1);
+    hasher.update(node_id);
+    hasher.update(nonce);
+    hasher.finalize().into()
+}
+
+/// Derives quote report-data binding one relay, its private recipient, the
+/// SHA-256 of the grant's canonical bytes, and a fresh verifier nonce.
+#[must_use]
+pub fn phala_private_recipient_attestation_report_data_v1(
+    relay_node_id: &[u8; 32],
+    recipient_node_id: &[u8; 32],
+    authorization_sha256: &[u8; 32],
+    nonce: &[u8; PHALA_NODE_ATTESTATION_NONCE_BYTES_V1],
+) -> [u8; PHALA_NODE_ATTESTATION_REPORT_DATA_BYTES_V1] {
+    let mut hasher = Sha256::new();
+    hasher.update(PHALA_PRIVATE_RECIPIENT_ATTESTATION_REPORT_DATA_DOMAIN_V1);
+    hasher.update(relay_node_id);
+    hasher.update(recipient_node_id);
+    hasher.update(authorization_sha256);
+    hasher.update(nonce);
+    hasher.finalize().into()
+}
+
+/// Shared JSON transport contract returned by the optional Phala quote API.
+///
+/// This validates the response's challenge and identity binding only. For
+/// `dstack_guest_v1_msgpack`, `attestation` is the hex encoding of the exact
+/// named MessagePack VersionedAttestation bytes; platform quote/event data and
+/// stack report/config data are not a JSON evidence object. Those bytes still
+/// require independent DCAP/TCB appraisal; decoding this type is never proof
+/// that a node runs in a TEE.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhalaNodeAttestationResponseV1 {
+    pub contract_version: String,
+    pub node_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient_node_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_sha256: Option<String>,
+    pub nonce: String,
+    pub expected_report_data: String,
+    pub attestation_format: String,
+    pub attestation: String,
+    pub verification: String,
+}
+
+impl PhalaNodeAttestationResponseV1 {
+    /// Checks the stable transport binding against the request the caller made.
+    /// `recipient_binding` is `(recipient_node_id, SHA-256(canonical grant))`.
+    pub fn validate_for(
+        &self,
+        node_id: &[u8; 32],
+        nonce: &[u8; PHALA_NODE_ATTESTATION_NONCE_BYTES_V1],
+        recipient_binding: Option<(&[u8; 32], &[u8; 32])>,
+    ) -> Result<(), &'static str> {
+        if node_id == &[0; 32] || nonce == &[0; PHALA_NODE_ATTESTATION_NONCE_BYTES_V1] {
+            return Err("invalid_request_binding");
+        }
+        if self.node_id != hex::encode(node_id) || self.nonce != hex::encode(nonce) {
+            return Err("request_binding_mismatch");
+        }
+        let report_data = match recipient_binding {
+            Some((recipient, authorization_sha256)) if recipient != &[0; 32] => {
+                let expected_recipient = hex::encode(recipient);
+                let expected_authorization_sha256 = hex::encode(authorization_sha256);
+                if self.contract_version != PHALA_PRIVATE_RECIPIENT_ATTESTATION_CONTRACT_VERSION_V1
+                    || self.recipient_node_id.as_deref() != Some(expected_recipient.as_str())
+                    || self.authorization_sha256.as_deref()
+                        != Some(expected_authorization_sha256.as_str())
+                {
+                    return Err("recipient_binding_mismatch");
+                }
+                phala_private_recipient_attestation_report_data_v1(
+                    node_id,
+                    recipient,
+                    authorization_sha256,
+                    nonce,
+                )
+            }
+            Some(_) => return Err("invalid_request_binding"),
+            None => {
+                if self.contract_version != PHALA_NODE_ATTESTATION_CONTRACT_VERSION_V1
+                    || self.recipient_node_id.is_some()
+                    || self.authorization_sha256.is_some()
+                {
+                    return Err("unexpected_recipient_binding");
+                }
+                phala_node_attestation_report_data_v1(node_id, nonce)
+            }
+        };
+        let mut padded_report_data = [0_u8; 64];
+        padded_report_data[..report_data.len()].copy_from_slice(&report_data);
+        if self.expected_report_data != hex::encode(padded_report_data) {
+            return Err("report_data_mismatch");
+        }
+        if !matches!(
+            self.attestation_format.as_str(),
+            PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V1 | PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V0
+        ) {
+            return Err("unsupported_attestation_format");
+        }
+        if self.attestation.len() > PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1 * 2 {
+            return Err("invalid_evidence_size");
+        }
+        let evidence = hex::decode(&self.attestation).map_err(|_| "invalid_evidence_encoding")?;
+        if evidence.is_empty() || evidence.len() > PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1 {
+            return Err("invalid_evidence_size");
+        }
+        if self.verification != PHALA_NODE_ATTESTATION_VERIFICATION_NOTE_V1 {
+            return Err("invalid_contract_note");
+        }
+        Ok(())
+    }
+}
 
 // [PRIVATE-ONION-RECIPIENT-AUTH 2026-10-04 by Codex] This authorization is
 // source-local carriage, not a descriptor/discovery-union extension. Keeping
@@ -546,11 +699,30 @@ pub enum NodeProtocolFeature {
     /// [ANONYMOUS-MAILBOX-V1 2026-09-02 by Codex] This advertises only protocol
     /// support. It is not a mailbox locator and discloses no tenant activity.
     AnonymousMailboxV1,
+    /// The node accepts P-signed private recipient authorization refreshes
+    /// through the bounded discovery gossip endpoint.
+    PrivateOnionAuthorizationGossipV1,
+    /// The node serves source-sealed Blind Vault Pulls as a private onion
+    /// terminal, independently of public replica mutation admission.
+    // [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex]
+    PrivateOnionBlindVaultPullTerminalV1,
+    /// The node serves source-sealed Blind Vault lease admission as a private
+    /// onion terminal, without advertising a public replica endpoint.
+    // [PRIVATE-ONION-ADMISSION-ROLE 2026-10-05 by Codex]
+    PrivateOnionBlindVaultAdmissionTerminalV1,
+    /// The node serves nonce-bound dstack v1 attestation responses and may
+    /// explicitly allow a tagged frozen-v0 TDX GetQuote fallback.
+    // [PHALA-NODE-ATTESTATION-API 2026-10-06 by Codex]
+    PhalaNodeAttestationV1,
+    /// The node can bind its nonce-bound quote to a current private recipient
+    /// authorization used by reverse-onion delivery.
+    // [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex]
+    PhalaPrivateRecipientAttestationV1,
 }
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 22] = [
         Self::BlindRelayFailureReceiptV1,
         Self::BlindRelaySuccessReceiptV1,
         Self::PurposeBoundDeliveryReceiptV2,
@@ -568,6 +740,11 @@ impl NodeProtocolFeature {
         Self::OnionBlindVaultLeaseInventoryV1,
         Self::OnionBlindVaultEncryptedFailureV1,
         Self::AnonymousMailboxV1,
+        Self::PrivateOnionAuthorizationGossipV1,
+        Self::PrivateOnionBlindVaultPullTerminalV1,
+        Self::PrivateOnionBlindVaultAdmissionTerminalV1,
+        Self::PhalaNodeAttestationV1,
+        Self::PhalaPrivateRecipientAttestationV1,
     ];
 
     /// Exact SemVer build-metadata identifier used on the signed wire.
@@ -591,6 +768,11 @@ impl NodeProtocolFeature {
             Self::OnionBlindVaultLeaseInventoryV1 => "anpf1-obli1",
             Self::OnionBlindVaultEncryptedFailureV1 => "anpf1-obef1",
             Self::AnonymousMailboxV1 => "anpf1-amb1",
+            Self::PrivateOnionAuthorizationGossipV1 => "anpf1-poag1",
+            Self::PrivateOnionBlindVaultPullTerminalV1 => "anpf1-pobpt1",
+            Self::PrivateOnionBlindVaultAdmissionTerminalV1 => "anpf1-pobat1",
+            Self::PhalaNodeAttestationV1 => "anpf1-pdna1",
+            Self::PhalaPrivateRecipientAttestationV1 => "anpf1-pprda1",
         }
     }
 }
@@ -846,7 +1028,13 @@ impl SignedAnonymousMailboxWorkPolicyV1 {
         encoded
     }
 
-    fn semver_build_token(&self) -> String {
+    /// Encodes the canonical policy token without granting freshness or trust.
+    /// Consumers must authenticate the enclosing descriptor and nested policy
+    /// with `anonymous_mailbox_work_policy_at` before comparing policy claims.
+    // [PHALA-POLICY-HEARTBEAT-EPOCH 2026-10-08 by Codex] Share the existing
+    // codec with the local epoch owner instead of duplicating token framing.
+    #[must_use]
+    pub fn semver_build_token(&self) -> String {
         format!(
             "{ANONYMOUS_MAILBOX_WORK_POLICY_TOKEN_PREFIX_V1}{}",
             hex::encode(self.encode_fixed())
@@ -1483,8 +1671,8 @@ impl std::fmt::Debug for SignedPrivateOnionRecipientAuthorizationV1 {
 
 impl SignedPrivateOnionRecipientAuthorizationV1 {
     /// Creates a P-signed authorization binding exact R/P descriptor versions.
-    /// Only canonical `anonymous_mailbox_v1` and `blind_vault_pull` purposes
-    /// are admitted. Aliases and other purposes do not grant a private role.
+    /// Only canonical mailbox, Pull, and lease-admission purposes are admitted.
+    /// Aliases and other purposes do not grant a private role.
     pub fn new_signed(
         relay: &SignedNodeDescriptor,
         recipient: &SignedNodeDescriptor,
@@ -1576,10 +1764,7 @@ impl SignedPrivateOnionRecipientAuthorizationV1 {
                 "private onion recipient authorization descriptor mismatch",
             ));
         }
-        IdentityPublicKey::from_bytes(&self.recipient_node_id)?.verify(
-            &self.signing_bytes(),
-            &self.signature,
-        )
+        self.verify_signature()
     }
 
     /// Returns the exact relay identity authorized by P.
@@ -1598,6 +1783,50 @@ impl SignedPrivateOnionRecipientAuthorizationV1 {
     #[must_use]
     pub const fn expires_at(&self) -> u64 {
         self.expires_at
+    }
+
+    /// [REVERSE-ONION-AUTHORITY-RENEWAL 2026-10-05 by Codex]
+    /// Returns the signed authorization's immutable issuance time.
+    #[must_use]
+    pub const fn issued_at(&self) -> u64 {
+        self.issued_at
+    }
+
+    /// Verifies the P signature without asserting descriptor freshness or role policy.
+    // [REVERSE-ONION-SOURCE-CALLER 2026-10-05 by Codex]
+    pub fn verify_signature(&self) -> Result<(), CoreError> {
+        if self.version != PRIVATE_ONION_RECIPIENT_AUTHORIZATION_VERSION_V1
+            || self.issued_at == 0
+            || self.expires_at <= self.issued_at
+            || self.expires_at - self.issued_at
+                > MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_LIFETIME_SECS_V1
+            || self.relay_node_id == [0; 32]
+            || self.recipient_node_id == [0; 32]
+        {
+            return Err(CoreError::malformed(
+                "private onion recipient authorization signature input is invalid",
+            ));
+        }
+        IdentityPublicKey::from_bytes(&self.recipient_node_id)?.verify(
+            &self.signing_bytes(),
+            &self.signature,
+        )
+    }
+
+    // [REVERSE-ONION-SOURCE-CALLER 2026-10-05 by Codex]
+    pub(crate) fn purpose_hash_matches(&self, purpose: &str) -> bool {
+        !purpose.is_empty()
+            && purpose.len() <= MAX_PRIVATE_ONION_RECIPIENT_PURPOSE_BYTES
+            && self.purpose_hash == private_onion_recipient_purpose_hash(purpose)
+    }
+
+    // [PRIVATE-ONION-AUTHORITY-PURPOSES 2026-10-05 by Codex]
+    /// Returns the exact canonical private workload authorized by this grant.
+    #[must_use]
+    pub fn canonical_purpose(&self) -> Option<&'static str> {
+        ["anonymous_mailbox_v1", "blind_vault_pull", "blind_vault_lease_admission"]
+            .into_iter()
+            .find(|purpose| self.purpose_hash_matches(purpose))
     }
 
     /// Encodes this standalone authorization canonically for source-local use.
@@ -1641,6 +1870,17 @@ impl SignedPrivateOnionRecipientAuthorizationV1 {
     }
 }
 
+// [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex] One shared
+// digest contract lets clients independently bind the exact canonical grant
+// bytes into dstack report data without duplicating serialization policy.
+pub fn phala_private_onion_authorization_sha256_v1(
+    authorization: &SignedPrivateOnionRecipientAuthorizationV1,
+) -> Result<[u8; 32], CoreError> {
+    authorization.verify_signature()?;
+    let canonical = authorization.encode_canonical()?;
+    Ok(Sha256::digest(canonical).into())
+}
+
 // [PRIVATE-BLIND-VAULT-PULL 2026-10-04 by Codex] Shared sign/verify policy,
 // not a codec or public-route relaxation. Preserve the mailbox branch's
 // original feature semantics; Pull alone adds its exact existing role/path
@@ -1654,15 +1894,30 @@ fn validate_private_recipient_purpose(
     let purpose = match purpose {
         "anonymous_mailbox_v1" => OnionRoutePurpose::AnonymousMailboxV1,
         "blind_vault_pull" => OnionRoutePurpose::BlindVaultPull,
+        "blind_vault_lease_admission" => OnionRoutePurpose::BlindVaultLeaseAdmission,
         _ => return Err(CoreError::malformed("private onion recipient purpose is unsupported")),
     };
     let admitted = match purpose {
         OnionRoutePurpose::AnonymousMailboxV1 => recipient.descriptor
             .advertises_protocol_feature(NodeProtocolFeature::AnonymousMailboxV1),
         OnionRoutePurpose::BlindVaultPull => {
+            // [PHALA-PULL-ROLE-REPAIR 2026-10-08 by Codex] None means no
+            // extra public storage role, not denial of signed private Pull.
             recipient.descriptor.capabilities.contains(&NodeCapability::ChatRelay)
-                && purpose.specialized_terminal_capability().is_some_and(|capability|
+                && purpose.specialized_terminal_capability().is_none_or(|capability|
                     recipient.descriptor.capabilities.contains(&capability))
+                && purpose.required_terminal_protocol_features().iter().all(|feature|
+                    recipient.descriptor.advertises_protocol_feature(*feature))
+                && ONION_FORWARD_HOP_REQUIRED_CAPABILITIES.iter().all(|capability|
+                    relay.descriptor.capabilities.contains(capability))
+                && purpose.required_path_protocol_features().iter().all(|feature|
+                    relay.descriptor.advertises_protocol_feature(*feature))
+        }
+        OnionRoutePurpose::BlindVaultLeaseAdmission => {
+            recipient.descriptor.public_endpoint.is_none()
+                && recipient.descriptor.advertises_protocol_feature(
+                    NodeProtocolFeature::PrivateOnionBlindVaultAdmissionTerminalV1,
+                )
                 && purpose.required_terminal_protocol_features().iter().all(|feature|
                     recipient.descriptor.advertises_protocol_feature(*feature))
                 && ONION_FORWARD_HOP_REQUIRED_CAPABILITIES.iter().all(|capability|
@@ -1686,12 +1941,15 @@ fn private_onion_recipient_purpose_hash(purpose: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Computes the stable digest committed by [`DirectoryDescriptorCommitmentV1`].
+/// [PHALA-PEER-ATTESTATION-BINDING 2026-10-06 by Codex] Computes the stable
+/// digest committed by [`DirectoryDescriptorCommitmentV1`]. The same exact
+/// signed-object digest binds process-local remote attestation decisions to
+/// the descriptor that was actually appraised.
 ///
 /// The descriptor signature is included so the commitment proves exactly which
 /// authenticated descriptor object was observed. A length prefix keeps the
 /// canonical field boundary explicit for future schema versions.
-fn signed_descriptor_commitment_hash(
+pub fn signed_descriptor_commitment_hash(
     descriptor: &SignedNodeDescriptor,
 ) -> Result<[u8; 32], CoreError> {
     let signing_bytes = descriptor.descriptor.signing_bytes()?;
@@ -4689,6 +4947,15 @@ pub enum NodeDiscoveryMessage {
         /// Exact fixed-width canonical ADAT V1 frame.
         attestation_frame: Vec<u8>,
     },
+    /// Refreshes one recipient's signed authorization for its exact relay.
+    /// Senders must observe `PrivateOnionAuthorizationGossipV1` on the
+    /// relay's signed descriptor before using this append-only variant.
+    PrivateOnionRecipientAuthorizationV1 {
+        authorization: SignedPrivateOnionRecipientAuthorizationV1,
+        /// Exact signed descriptor pair committed by the recipient grant.
+        relay_descriptor: SignedNodeDescriptor,
+        recipient_descriptor: SignedNodeDescriptor,
+    },
 }
 
 /// Encodes a discovery gossip message using bounded bincode.
@@ -4696,7 +4963,7 @@ pub enum NodeDiscoveryMessage {
 /// # Errors
 /// Returns `CoreError::MalformedMessage` when serialization fails.
 pub fn encode_discovery_message(message: &NodeDiscoveryMessage) -> Result<Vec<u8>, CoreError> {
-    validate_endpoint_attestation_message(message)?;
+    validate_discovery_message_payload(message)?;
     encode_bincode_bounded(message, MAX_DISCOVERY_MESSAGE_BYTES)
         .map_err(|err| CoreError::malformed(format!("discovery message encode: {err}")))
 }
@@ -4712,13 +4979,44 @@ pub fn decode_discovery_message(bytes: &[u8]) -> Result<NodeDiscoveryMessage, Co
         TrailingBytesPolicy::Reject,
     )
     .map_err(|err| CoreError::malformed(format!("discovery message decode: {err}")))?;
-    validate_endpoint_attestation_message(&message)?;
+    validate_discovery_message_payload(&message)?;
     Ok(message)
 }
 
 // [ENDPOINT-ATTESTATION-TRANSPORT 2026-09-24 by Codex] The outer discovery
 // ceiling must never turn a single fixed ADAT object into a large byte carrier.
-fn validate_endpoint_attestation_message(message: &NodeDiscoveryMessage) -> Result<(), CoreError> {
+// [REVERSE-ONION-AUTHORITY-GOSSIP 2026-10-05 by Codex]
+fn validate_discovery_message_payload(message: &NodeDiscoveryMessage) -> Result<(), CoreError> {
+    if let NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 {
+        authorization,
+        relay_descriptor,
+        recipient_descriptor,
+    } = message {
+        let relay_bytes = relay_descriptor.encode_canonical()?;
+        let recipient_bytes = recipient_descriptor.encode_canonical()?;
+        let Some(purpose) = authorization.canonical_purpose() else {
+            return Err(CoreError::malformed("private onion authority purpose is unsupported"));
+        };
+        if relay_bytes.len() > MAX_SIGNED_NODE_DESCRIPTOR_BYTES
+            || recipient_bytes.len() > MAX_SIGNED_NODE_DESCRIPTOR_BYTES
+            || relay_descriptor.verify_signature().is_err()
+            || recipient_descriptor.verify_signature().is_err()
+            || authorization.verify_at(
+                relay_descriptor,
+                recipient_descriptor,
+                purpose,
+                authorization.issued_at(),
+            ).is_err()
+        {
+            return Err(CoreError::malformed("private onion authority bundle is invalid"));
+        }
+        let encoded = authorization.encode_canonical()?;
+        if SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(&encoded)? != *authorization {
+            return Err(CoreError::malformed("private onion authorization is non-canonical"));
+        }
+        authorization.verify_signature()?;
+        return Ok(());
+    }
     let NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { attestation_frame } = message else {
         return Ok(());
     };
@@ -4755,6 +5053,149 @@ mod tests {
     use bincode::Options;
 
     const ENDPOINT_ATTESTATION_TEST_NOW: u64 = 1_780_000_000;
+
+    // [PHALA-ATTESTATION-RESPONSE-CONTRACT 2026-10-06 by Codex] Exercise the
+    // shared wire validator with positive and deliberately mismatched inputs.
+    fn phala_attestation_response_fixture(
+        node_id: &[u8; 32],
+        nonce: &[u8; 32],
+        recipient_binding: Option<(&[u8; 32], &[u8; 32])>,
+    ) -> PhalaNodeAttestationResponseV1 {
+        let report_data = match recipient_binding {
+            Some((recipient, grant_digest)) => {
+                phala_private_recipient_attestation_report_data_v1(
+                    node_id,
+                    recipient,
+                    grant_digest,
+                    nonce,
+                )
+            }
+            None => phala_node_attestation_report_data_v1(node_id, nonce),
+        };
+        let mut padded_report_data = [0_u8; 64];
+        padded_report_data[..report_data.len()].copy_from_slice(&report_data);
+        PhalaNodeAttestationResponseV1 {
+            contract_version: if recipient_binding.is_some() {
+                PHALA_PRIVATE_RECIPIENT_ATTESTATION_CONTRACT_VERSION_V1.into()
+            } else {
+                PHALA_NODE_ATTESTATION_CONTRACT_VERSION_V1.into()
+            },
+            node_id: hex::encode(node_id),
+            recipient_node_id: recipient_binding.map(|(recipient, _)| hex::encode(recipient)),
+            authorization_sha256: recipient_binding
+                .map(|(_, grant_digest)| hex::encode(grant_digest)),
+            nonce: hex::encode(nonce),
+            expected_report_data: hex::encode(padded_report_data),
+            attestation_format: PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V1.into(),
+            attestation: "aabb".into(),
+            verification: PHALA_NODE_ATTESTATION_VERIFICATION_NOTE_V1.into(),
+        }
+    }
+
+    #[test]
+    fn phala_attestation_response_contract_checks_request_and_recipient_bindings() {
+        let node_id = [0x17; 32];
+        let nonce = [0x42; 32];
+        let recipient = [0x21; 32];
+        let grant_digest = [0x31; 32];
+        let base = phala_attestation_response_fixture(&node_id, &nonce, None);
+        assert!(base.validate_for(&node_id, &nonce, None).is_ok());
+
+        let bound = phala_attestation_response_fixture(
+            &node_id,
+            &nonce,
+            Some((&recipient, &grant_digest)),
+        );
+        assert!(bound
+            .validate_for(&node_id, &nonce, Some((&recipient, &grant_digest)))
+            .is_ok());
+        assert_eq!(
+            bound.validate_for(&[0x18; 32], &nonce, Some((&recipient, &grant_digest))),
+            Err("request_binding_mismatch"),
+        );
+        assert_eq!(
+            bound.validate_for(&node_id, &[0x43; 32], Some((&recipient, &grant_digest))),
+            Err("request_binding_mismatch"),
+        );
+        assert_eq!(
+            bound.validate_for(&node_id, &nonce, Some((&recipient, &[0x32; 32]))),
+            Err("recipient_binding_mismatch"),
+        );
+        assert_eq!(
+            base.validate_for(&node_id, &nonce, Some((&recipient, &grant_digest))),
+            Err("recipient_binding_mismatch"),
+        );
+    }
+
+    #[test]
+    fn phala_attestation_response_contract_rejects_unsupported_or_invalid_evidence() {
+        let node_id = [0x17; 32];
+        let nonce = [0x42; 32];
+        let mut response = phala_attestation_response_fixture(&node_id, &nonce, None);
+        response.attestation_format = "unknown".into();
+        assert_eq!(
+            response.validate_for(&node_id, &nonce, None),
+            Err("unsupported_attestation_format"),
+        );
+
+        let mut response = phala_attestation_response_fixture(&node_id, &nonce, None);
+        response.attestation = "not-hex".into();
+        assert_eq!(
+            response.validate_for(&node_id, &nonce, None),
+            Err("invalid_evidence_encoding"),
+        );
+
+        let mut response = phala_attestation_response_fixture(&node_id, &nonce, None);
+        response.attestation.clear();
+        assert_eq!(
+            response.validate_for(&node_id, &nonce, None),
+            Err("invalid_evidence_size"),
+        );
+
+        let mut response = phala_attestation_response_fixture(&node_id, &nonce, None);
+        response.attestation = "aa".repeat(PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1 + 1);
+        assert_eq!(
+            response.validate_for(&node_id, &nonce, None),
+            Err("invalid_evidence_size"),
+        );
+    }
+
+    // [PHALA-NODE-REPORT-DATA 2026-10-06 by Codex] A verifier challenge and
+    // node identity both affect the quote-bound report-data commitment.
+    #[test]
+    fn phala_node_attestation_report_data_binds_identity_and_nonce() {
+        let nonce = [0x42; PHALA_NODE_ATTESTATION_NONCE_BYTES_V1];
+        let node_a = [0x17; 32];
+        let node_b = [0x18; 32];
+        let nonce_b = [0x43; PHALA_NODE_ATTESTATION_NONCE_BYTES_V1];
+        let expected = phala_node_attestation_report_data_v1(&node_a, &nonce);
+
+        assert_eq!(expected, phala_node_attestation_report_data_v1(&node_a, &nonce));
+        assert_ne!(expected, phala_node_attestation_report_data_v1(&node_b, &nonce));
+        assert_ne!(expected, phala_node_attestation_report_data_v1(&node_a, &nonce_b));
+
+        let recipient_a = [0x21; 32];
+        let recipient_b = [0x22; 32];
+        let grant_a = [0x31; 32];
+        let grant_b = [0x32; 32];
+        // [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex]
+        let bound = phala_private_recipient_attestation_report_data_v1(
+            &node_a, &recipient_a, &grant_a, &nonce,
+        );
+        assert_ne!(bound, expected);
+        assert_ne!(bound, phala_private_recipient_attestation_report_data_v1(
+            &node_b, &recipient_a, &grant_a, &nonce,
+        ));
+        assert_ne!(bound, phala_private_recipient_attestation_report_data_v1(
+            &node_a, &recipient_b, &grant_a, &nonce,
+        ));
+        assert_ne!(bound, phala_private_recipient_attestation_report_data_v1(
+            &node_a, &recipient_a, &grant_a, &nonce_b,
+        ));
+        assert_ne!(bound, phala_private_recipient_attestation_report_data_v1(
+            &node_a, &recipient_a, &grant_b, &nonce,
+        ));
+    }
 
     fn descriptor_for(kp: &IdentityKeyPair) -> NodeDescriptor {
         let mut descriptor = NodeDescriptor::new(
@@ -5003,8 +5444,23 @@ mod tests {
         // fleet-wide capability claim, never a mailbox or receiver locator.
         let feature = NodeProtocolFeature::AnonymousMailboxV1;
         assert_eq!(feature.semver_build_token(), "anpf1-amb1");
-        assert_eq!(NodeProtocolFeature::ALL.len(), 17);
+        // [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex]
+        assert_eq!(NodeProtocolFeature::ALL.len(), 22);
         assert_eq!(NodeProtocolFeature::ALL[16], feature);
+        assert_eq!(NodeProtocolFeature::ALL[17], NodeProtocolFeature::PrivateOnionAuthorizationGossipV1);
+        assert_eq!(
+            NodeProtocolFeature::ALL[18].semver_build_token(),
+            "anpf1-pobpt1"
+        );
+        assert_eq!(
+            NodeProtocolFeature::ALL[20].semver_build_token(),
+            "anpf1-pdna1"
+        );
+        // [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex]
+        assert_eq!(
+            NodeProtocolFeature::ALL[21].semver_build_token(),
+            "anpf1-pprda1"
+        );
 
         let identity = IdentityKeyPair::from_bytes(&[0x9a; 32]).expect("identity");
         let descriptor = descriptor_for(&identity).with_protocol_features([feature]);
@@ -5074,9 +5530,22 @@ mod tests {
             )
             .is_err());
         let encoded = authorization.encode_canonical().unwrap();
+        // [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex]
+        let expected_digest: [u8; 32] = Sha256::digest(&encoded).into();
+        assert_eq!(
+            phala_private_onion_authorization_sha256_v1(&authorization).unwrap(),
+            expected_digest,
+        );
         assert!(encoded.len() <= MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_BYTES);
         let decoded = SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(&encoded).unwrap();
         assert_eq!(decoded, authorization);
+        assert_eq!(
+            phala_private_onion_authorization_sha256_v1(&decoded).unwrap(),
+            expected_digest,
+        );
+        let mut invalid_signature = decoded.clone();
+        invalid_signature.signature[0] ^= 1;
+        assert!(phala_private_onion_authorization_sha256_v1(&invalid_signature).is_err());
         assert!(decoded
             .verify_at(
                 &relay_descriptor,
@@ -5108,6 +5577,113 @@ mod tests {
                 1_700_000_500,
             )
             .is_err());
+    }
+
+    // [PHALA-PULL-ROLE-REPAIR 2026-10-08 by Codex] Exercise both grant
+    // production and verification without the unrelated public replica role.
+    #[test]
+    fn private_pull_grant_requires_signed_features_not_public_replica_role() {
+        use crate::protocol::onion::{OnionRoutePurpose, ONION_FORWARD_HOP_REQUIRED_CAPABILITIES};
+        let relay = IdentityKeyPair::from_bytes(&[0x41; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[0x42; 32]).unwrap();
+        let purpose = OnionRoutePurpose::BlindVaultPull;
+        let mut relay_body = descriptor_for(&relay)
+            .with_protocol_features(purpose.required_path_protocol_features().iter().copied());
+        relay_body.capabilities = ONION_FORWARD_HOP_REQUIRED_CAPABILITIES.to_vec();
+        let mut recipient_body = descriptor_for(&recipient)
+            .with_protocol_features(purpose.required_terminal_protocol_features().iter().copied());
+        recipient_body.capabilities = vec![NodeCapability::ChatRelay];
+        recipient_body.public_endpoint = None;
+        recipient_body.policy.public_discovery = false;
+        let signed_relay = SignedNodeDescriptor::sign(relay_body.clone(), &relay).unwrap();
+        let signed_recipient = SignedNodeDescriptor::sign(recipient_body.clone(), &recipient).unwrap();
+        let grant = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &signed_relay, &signed_recipient, purpose.as_str(),
+            1_700_000_100, 1_700_001_000, &recipient,
+        ).unwrap();
+        grant.verify_at(&signed_relay, &signed_recipient, purpose.as_str(), 1_700_000_500).unwrap();
+        for feature in purpose.required_terminal_protocol_features() {
+            // [PHALA-PULL-ROLE-REPAIR 2026-10-08 by Codex] The builder
+            // merges features; reset metadata before making a missing-feature case.
+            let mut bad = recipient_body.clone();
+            bad.software_version = descriptor_for(&recipient).software_version;
+            let bad = bad.with_protocol_features(
+                purpose.required_terminal_protocol_features().iter().copied().filter(|f| f != feature),
+            );
+            let bad = SignedNodeDescriptor::sign(bad, &recipient).unwrap();
+            assert!(SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+                &signed_relay, &bad, purpose.as_str(), 1_700_000_100, 1_700_001_000, &recipient,
+            ).is_err());
+            assert!(grant.verify_at(&signed_relay, &bad, purpose.as_str(), 1_700_000_500).is_err());
+        }
+        relay_body.capabilities.clear();
+        let bad_relay = SignedNodeDescriptor::sign(relay_body, &relay).unwrap();
+        assert!(SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &bad_relay, &signed_recipient, purpose.as_str(), 1_700_000_100, 1_700_001_000, &recipient,
+        ).is_err());
+    }
+
+    #[test]
+    fn source_pull_request_builder_matches_signed_api_contract() {
+        use crate::protocol::onion::reverse_delivery::{
+            verify_reverse_onion_source_pull, ReverseOnionSourcePullRequestV1,
+        };
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use crate::protocol::blind_vault::BlindVaultPullRequest;
+
+        let relay = IdentityKeyPair::from_bytes(&[0x51; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[0x52; 32]).unwrap();
+        let caller = IdentityKeyPair::from_bytes(&[0x53; 32]).unwrap();
+        let purpose = crate::protocol::onion::OnionRoutePurpose::BlindVaultPull;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mut relay_body = descriptor_for(&relay)
+            .with_protocol_features(purpose.required_path_protocol_features().iter().copied());
+        relay_body.capabilities = crate::protocol::onion::ONION_FORWARD_HOP_REQUIRED_CAPABILITIES.to_vec();
+        relay_body.issued_at = timestamp.saturating_sub(60);
+        relay_body.expires_at = timestamp + 3_600;
+        let mut recipient_body = descriptor_for(&recipient)
+            .with_protocol_features(purpose.required_terminal_protocol_features().iter().copied());
+        recipient_body.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica];
+        recipient_body.public_endpoint = None;
+        recipient_body.issued_at = timestamp.saturating_sub(60);
+        recipient_body.expires_at = timestamp + 3_600;
+        let relay_descriptor = SignedNodeDescriptor::sign(relay_body, &relay).unwrap();
+        let recipient_descriptor = SignedNodeDescriptor::sign(recipient_body, &recipient).unwrap();
+        let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &relay_descriptor, &recipient_descriptor, purpose.as_str(),
+            timestamp.saturating_sub(30), timestamp + 600, &recipient,
+        ).unwrap();
+        authorization.verify_at(
+            &relay_descriptor, &recipient_descriptor, purpose.as_str(), timestamp,
+        ).unwrap();
+        let pull = BlindVaultPullRequest {
+            version: 1,
+            lease_id: [0x61; 32],
+            read_capability: [0x62; 32],
+            continuation_cursor: Vec::new(),
+            limit: 1,
+        };
+        let request = ReverseOnionSourcePullRequestV1::new_signed(
+            &caller, [0x63; 16], timestamp, pull.clone(), &authorization,
+        ).unwrap();
+        let request_json = request.encode_json().unwrap();
+        assert!(request_json.len() <= crate::protocol::onion::reverse_delivery::MAX_REVERSE_ONION_SOURCE_PULL_REQUEST_BYTES);
+        let authorization_bytes = STANDARD.decode(&request.authorization_b64).unwrap();
+        let signature: [u8; 64] = STANDARD.decode(&request.signature_b64).unwrap().try_into().unwrap();
+        verify_reverse_onion_source_pull(
+            &caller.public_key_bytes(), &[0x63; 16], timestamp, &request.pull,
+            &authorization_bytes, &signature,
+        ).unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json.get("wallet_b64").is_some());
+        assert!(json.get("authorization_b64").is_some());
+        assert!(json.get("signature_b64").is_some());
+        let mut forged = authorization;
+        forged.signature[0] ^= 1;
+        assert!(ReverseOnionSourcePullRequestV1::new_signed(
+            &caller, [0x64; 16], timestamp, pull, &forged,
+        ).is_err());
     }
 
     // [PRIVATE-BLIND-VAULT-PULL 2026-10-04 by Codex] Authored, unexecuted:
@@ -5168,11 +5744,23 @@ mod tests {
                 .iter().copied().filter(|feature| feature != removed));
             reject_policy(r, recipient_body.clone());
         }
-        for removed in [NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica] {
-            let mut p = recipient_body.clone();
-            p.capabilities.retain(|capability| *capability != removed);
-            reject_policy(relay_body.clone(), p);
-        }
+        // [PHALA-CORE-CONTRACT-REGRESSION 2026-10-08 by Codex] Public
+        // replica withdrawal is allowed only with a new descriptor-bound
+        // grant. Missing ChatRelay remains a signed-policy rejection.
+        let mut no_chat_role = recipient_body.clone();
+        no_chat_role.capabilities.retain(|capability| *capability != NodeCapability::ChatRelay);
+        reject_policy(relay_body.clone(), no_chat_role);
+        let mut private_only = recipient_body.clone();
+        private_only.capabilities.retain(|capability| *capability != NodeCapability::BlindVaultReplica);
+        let private_only = SignedNodeDescriptor::sign(private_only, &recipient).unwrap();
+        assert!(authorization.verify_at(&signed_relay, &private_only,
+            purpose.as_str(), 1_700_000_500).is_err());
+        let private_grant = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &signed_relay, &private_only, purpose.as_str(),
+            1_700_000_100, 1_700_001_000, &recipient,
+        ).unwrap();
+        private_grant.verify_at(&signed_relay, &private_only,
+            purpose.as_str(), 1_700_000_500).unwrap();
         for removed in ONION_FORWARD_HOP_REQUIRED_CAPABILITIES {
             let mut r = relay_body.clone();
             r.capabilities.retain(|capability| *capability != removed);
@@ -5202,6 +5790,68 @@ mod tests {
             let mut substituted = auth;
             substituted.purpose_hash = private_onion_recipient_purpose_hash(other);
             assert!(substituted.verify_at(&signed_relay, &both, other, 1_700_000_500).is_err());
+        }
+    }
+
+    // [PHALA-PRIVATE-AUTHORITY-GOSSIP-CODEC 2026-10-06 by Codex] Every
+    // supported grant purpose must survive the same canonical discovery wire
+    // validator; a Pull-only hardcode silently broke lease-admission gossip.
+    #[test]
+    fn private_onion_authority_gossip_codec_preserves_supported_purposes() {
+        use crate::protocol::onion::{
+            OnionRoutePurpose, ONION_FORWARD_HOP_REQUIRED_CAPABILITIES,
+        };
+
+        let relay = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[0x72; 32]).unwrap();
+        for purpose in [
+            OnionRoutePurpose::BlindVaultPull,
+            OnionRoutePurpose::BlindVaultLeaseAdmission,
+        ] {
+            let mut relay_body = descriptor_for(&relay);
+            relay_body.capabilities = ONION_FORWARD_HOP_REQUIRED_CAPABILITIES.to_vec();
+            relay_body = relay_body.with_protocol_features(
+                purpose.required_path_protocol_features().iter().copied(),
+            );
+            let relay_descriptor = SignedNodeDescriptor::sign(relay_body, &relay).unwrap();
+
+            let mut recipient_body = descriptor_for(&recipient);
+            recipient_body.public_endpoint = None;
+            recipient_body.policy.public_discovery = false;
+            recipient_body = recipient_body.with_protocol_features(
+                purpose.required_terminal_protocol_features().iter().copied(),
+            );
+            let recipient_descriptor =
+                SignedNodeDescriptor::sign(recipient_body, &recipient).unwrap();
+            let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+                &relay_descriptor,
+                &recipient_descriptor,
+                purpose.as_str(),
+                1_700_000_100,
+                1_700_001_000,
+                &recipient,
+            )
+            .unwrap();
+            if purpose == OnionRoutePurpose::BlindVaultPull {
+                let mut unsupported = authorization.clone();
+                unsupported.purpose_hash = private_onion_recipient_purpose_hash(
+                    "blind_vault_delete",
+                );
+                unsupported.signature = recipient.sign(&unsupported.signing_bytes());
+                let invalid_message = NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 {
+                    authorization: unsupported,
+                    relay_descriptor: relay_descriptor.clone(),
+                    recipient_descriptor: recipient_descriptor.clone(),
+                };
+                assert!(encode_discovery_message(&invalid_message).is_err());
+            }
+            let message = NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 {
+                authorization,
+                relay_descriptor,
+                recipient_descriptor,
+            };
+            let encoded = encode_discovery_message(&message).unwrap();
+            assert_eq!(decode_discovery_message(&encoded).unwrap(), message);
         }
     }
 

@@ -39,7 +39,9 @@
 //!   handler; that would apply backpressure after attacker-controlled buffering.
 //! - V1 admission is a signed one-time bearer credential, not blind issuance.
 //!
-//! Last Modified: v1.7.0-BlindVaultSharedAdmission - Allows every mounted
+//! Last Modified: v1.8.0-CancellationSafeBlockingBudget - Retains shared
+//! admission slots until queued/running blocking operations actually finish.
+//! v1.7.0-BlindVaultSharedAdmission - Allows every mounted
 //! client router to share one process-wide concurrency and rate budget.
 //! v1.6.0-BlindVaultDiskReserve - Keeps a failed local physical
 //! capacity probe inside the stable service-unavailable response.
@@ -67,7 +69,7 @@ use aeronyx_core::protocol::blind_vault::{
 };
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, Extension, Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -355,10 +357,10 @@ fn build_blind_vault_router_with_optional_replica_admission(
 
 async fn mutation_request_gate(
     State(state): State<BlindVaultApiState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    let Some(_in_flight) = InFlightRequestGuard::try_acquire(
+    let Some(in_flight) = InFlightRequestGuard::try_acquire(
         &state.admission.mutation_in_flight,
         MAX_IN_FLIGHT_MUTATIONS,
     ) else {
@@ -372,15 +374,20 @@ async fn mutation_request_gate(
     {
         return ApiFailure::backpressure().into_response();
     }
+    // [VAULT-CANCELLATION-BUDGET 2026-10-08 by Codex] The route and its
+    // blocking operation share one slot, not two independently acquired slots.
+    // Dropping the HTTP future cannot release queued/running blocking work.
+    let _in_flight = Arc::new(in_flight);
+    request.extensions_mut().insert(Arc::clone(&_in_flight));
     next.run(request).await
 }
 
 async fn pull_request_gate(
     State(state): State<BlindVaultApiState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    let Some(_in_flight) =
+    let Some(in_flight) =
         InFlightRequestGuard::try_acquire(&state.admission.pull_in_flight, MAX_IN_FLIGHT_PULLS)
     else {
         return ApiFailure::backpressure().into_response();
@@ -393,30 +400,48 @@ async fn pull_request_gate(
     {
         return ApiFailure::backpressure().into_response();
     }
+    // [VAULT-CANCELLATION-BUDGET 2026-10-08 by Codex] Pull and issuer work
+    // use the same cancellation-safe ownership as mutations, in their own pool.
+    let _in_flight = Arc::new(in_flight);
+    request.extensions_mut().insert(Arc::clone(&_in_flight));
     next.run(request).await
+}
+
+// [VAULT-CANCELLATION-BUDGET 2026-10-08 by Codex] Tokio does not cancel a
+// blocking closure when its awaiting request disappears. Move one shared
+// permit into that closure and retain it through success, error or unwinding.
+async fn vault_blocking<T: Send + 'static>(
+    in_flight: Arc<InFlightRequestGuard>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ApiFailure> {
+    tokio::task::spawn_blocking(move || {
+        let _in_flight = in_flight;
+        work()
+    })
+    .await
+    .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))
 }
 
 async fn lease_handler(
     State(state): State<BlindVaultApiState>,
+    Extension(in_flight): Extension<Arc<InFlightRequestGuard>>,
     body: Bytes,
 ) -> Result<Response, ApiFailure> {
     let outcome = match decode_frame(&body)? {
         BlindVaultFrame::LeaseAdmission(request) => {
             let service = Arc::clone(&state.service);
-            tokio::task::spawn_blocking(move || {
+            vault_blocking(in_flight, move || {
                 service.provision_lease_with_admission(&request, now_millis())
             })
-            .await
-            .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
+            .await?
             .map_err(map_service_error)?
         }
         BlindVaultFrame::BlindLeaseAdmission(request) => {
             let service = Arc::clone(&state.service);
-            tokio::task::spawn_blocking(move || {
+            vault_blocking(in_flight, move || {
                 service.provision_lease_with_blind_admission(&request, now_millis())
             })
-            .await
-            .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
+            .await?
             .map_err(map_service_error)?
         }
         _ => return Err(ApiFailure::invalid_frame()),
@@ -433,13 +458,13 @@ async fn lease_handler(
 
 async fn issuer_directory_handler(
     State(state): State<BlindVaultApiState>,
+    Extension(in_flight): Extension<Arc<InFlightRequestGuard>>,
 ) -> Result<Response, ApiFailure> {
     let generated_at_ms = now_millis();
     let service = Arc::clone(&state.service);
     let epochs =
-        tokio::task::spawn_blocking(move || service.blind_admission_issuer_epochs(generated_at_ms))
-            .await
-            .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
+        vault_blocking(in_flight, move || service.blind_admission_issuer_epochs(generated_at_ms))
+            .await?
             .map_err(map_service_error)?;
     let mut directory = BlindVaultBlindIssuerDirectory::new(
         generated_at_ms,
@@ -464,34 +489,39 @@ async fn issuer_directory_handler(
 
 async fn put_handler(
     State(state): State<BlindVaultApiState>,
+    Extension(in_flight): Extension<Arc<InFlightRequestGuard>>,
     body: Bytes,
 ) -> Result<Response, ApiFailure> {
     let BlindVaultFrame::Put(request) = decode_frame(&body)? else {
         return Err(ApiFailure::invalid_frame());
     };
     let service = Arc::clone(&state.service);
-    let receipt = tokio::task::spawn_blocking(move || service.put(&request, now_millis()))
-        .await
-        .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
+    let receipt = vault_blocking(in_flight, move || service.put(&request, now_millis()))
+        .await?
         .map_err(map_service_error)?;
     binary_response(StatusCode::CREATED, BlindVaultFrame::StoredReceipt(receipt))
 }
 
 async fn replica_job_handler(
     State(state): State<BlindVaultApiState>,
+    Extension(in_flight): Extension<Arc<InFlightRequestGuard>>,
     body: Bytes,
 ) -> Result<Response, ApiFailure> {
     let replica = state
         .replica
         .as_ref()
         .ok_or_else(|| ApiFailure::new(StatusCode::NOT_FOUND, "not_found"))?;
-    let now_ms = now_millis();
-    let submission = decode_replica_job_submission(&body, replica.policy.at(now_ms)?)?;
+    // [REPLICA-ADMISSION-CLOCK 2026-10-08 by Codex] The blocking pool may
+    // queue this request beyond target inventory freshness or source expiry.
+    // Decode and authenticate using the worker's own sample, retaining the
+    // ingress sample only as a rollback floor.
+    let received_at_ms = now_millis();
+    let policy = replica.policy;
     let admission = Arc::clone(&replica.admission);
-    let outcome = tokio::task::spawn_blocking(move || admission.admit_v1(submission, now_ms))
-        .await
-        .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
-        .map_err(map_replica_coordinator_error)?;
+    let outcome = vault_blocking(in_flight, move || {
+        admit_replica_job_body_at(&body, policy, admission.as_ref(), received_at_ms, now_millis())
+    })
+        .await??;
     Ok((
         StatusCode::ACCEPTED,
         Json(ReplicaJobAdmissionBody {
@@ -502,8 +532,25 @@ async fn replica_job_handler(
         .into_response())
 }
 
+// [REPLICA-ADMISSION-CLOCK 2026-10-08 by Codex] Shared with deterministic
+// queue-delay regressions; production invokes this only inside its owned lane.
+fn admit_replica_job_body_at(
+    body: &[u8],
+    policy: BlindVaultReplicaApiPolicyV1,
+    admission: &dyn BlindVaultReplicaJobAdmission,
+    received_at_ms: u64,
+    admitted_at_ms: u64,
+) -> Result<BlindVaultReplicaAdmissionOutcome, ApiFailure> {
+    if received_at_ms == 0 || admitted_at_ms < received_at_ms {
+        return Err(map_replica_coordinator_error(BlindVaultReplicaCoordinatorError::Unavailable));
+    }
+    let submission = decode_replica_job_submission(body, policy.at(admitted_at_ms)?)?;
+    admission.admit_v1(submission, admitted_at_ms).map_err(map_replica_coordinator_error)
+}
+
 async fn pull_handler(
     State(state): State<BlindVaultApiState>,
+    Extension(in_flight): Extension<Arc<InFlightRequestGuard>>,
     body: Bytes,
 ) -> Result<Response, ApiFailure> {
     let BlindVaultFrame::PullRequest(request) = decode_frame(&body)? else {
@@ -518,7 +565,7 @@ async fn pull_handler(
     let cursor = (!request.continuation_cursor.is_empty()).then_some(request.continuation_cursor);
     let limit = usize::from(request.limit);
     let generated_at_ms = now_millis();
-    let page = tokio::task::spawn_blocking(move || {
+    let page = vault_blocking(in_flight, move || {
         service.pull_page(
             &lease_id,
             &read_capability,
@@ -527,8 +574,7 @@ async fn pull_handler(
             generated_at_ms,
         )
     })
-    .await
-    .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
+    .await?
     .map_err(map_service_error)?;
 
     let objects = page
@@ -556,15 +602,15 @@ async fn pull_handler(
 
 async fn delete_handler(
     State(state): State<BlindVaultApiState>,
+    Extension(in_flight): Extension<Arc<InFlightRequestGuard>>,
     body: Bytes,
 ) -> Result<Response, ApiFailure> {
     let BlindVaultFrame::Delete(request) = decode_frame(&body)? else {
         return Err(ApiFailure::invalid_frame());
     };
     let service = Arc::clone(&state.service);
-    let receipt = tokio::task::spawn_blocking(move || service.delete(&request, now_millis()))
-        .await
-        .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
+    let receipt = vault_blocking(in_flight, move || service.delete(&request, now_millis()))
+        .await?
         .map_err(map_service_error)?;
     binary_response(StatusCode::OK, BlindVaultFrame::DeletedReceipt(receipt))
 }
@@ -1017,6 +1063,29 @@ mod tests {
         assert!(window.try_take(11, 2));
     }
 
+    // [REPLICA-ADMISSION-CLOCK 2026-10-08 by Codex] Exercise the exact
+    // blocking-lane producer with a valid wire body, no sleeps or network.
+    #[test]
+    fn replica_job_blocking_lane_revalidates_wire_at_its_own_clock() {
+        let now_ms = 2_000_000;
+        let body = replica_job_body(now_ms);
+        let policy = BlindVaultReplicaApiPolicyV1::new(120_000, 120_000, 1_000).unwrap();
+        assert!(decode_replica_job_submission(&body, policy.at(now_ms).unwrap()).is_ok());
+        for (received_at, admitted_at) in [
+            (0, now_ms), (now_ms, now_ms - 1),
+            (now_ms, now_ms + 1_001), (now_ms, now_ms + 60_000),
+        ] {
+            let admission = RecordingReplicaAdmission::new();
+            assert!(admit_replica_job_body_at(&body, policy, &admission,
+                received_at, admitted_at).is_err());
+            assert_eq!(admission.calls.load(Ordering::SeqCst), 0);
+        }
+        let admission = RecordingReplicaAdmission::new();
+        assert!(admit_replica_job_body_at(&body, policy, &admission,
+            now_ms, now_ms + 1_000).is_ok());
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn shared_admission_runtime_bounds_every_mounted_router() {
         let admission = Arc::new(BlindVaultApiAdmissionRuntime::default());
@@ -1040,6 +1109,116 @@ mod tests {
         drop(permits);
         let response = second.post_body("/api/vault/v1/put", Vec::new()).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // [VAULT-CANCELLATION-BUDGET 2026-10-08 by Codex] A real request reaches
+    // its blocking admission, then its HTTP owner is cancelled. Other mounts
+    // must still count that work until the synchronous admission returns.
+    struct ReleaseBlockingWork(Option<std::sync::mpsc::Sender<()>>);
+
+    impl Drop for ReleaseBlockingWork {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    struct GatedReplicaAdmission {
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        calls: AtomicUsize,
+    }
+
+    impl BlindVaultReplicaJobAdmission for GatedReplicaAdmission {
+        fn admit_v1(
+            &self,
+            _submission: BlindVaultReplicaJobSubmissionV1,
+            _now_ms: u64,
+        ) -> Result<BlindVaultReplicaAdmissionOutcome, BlindVaultReplicaCoordinatorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(started) = self.started.lock().take() {
+                let _ = started.send(());
+            }
+            self.release.lock().recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|_| BlindVaultReplicaCoordinatorError::Unavailable)?;
+            Ok(BlindVaultReplicaAdmissionOutcome::Inserted)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_replica_blocking_work_keeps_shared_budget_until_return() {
+        let budget = Arc::new(BlindVaultApiAdmissionRuntime::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = ReleaseBlockingWork(Some(release_tx));
+        let gate = Arc::new(GatedReplicaAdmission {
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(release_rx), calls: AtomicUsize::new(0),
+        });
+        let first = ApiFixture::with_components(Arc::clone(&budget), Some(gate.clone()));
+        let second = ApiFixture::with_components(Arc::clone(&budget), Some(gate.clone()));
+        let body = replica_job_body(now_millis());
+        let router = first.router.clone();
+        let task = tokio::spawn(async move {
+            router.oneshot(Request::builder().method("POST")
+                .uri("/api/vault/v1/replica-jobs")
+                .body(Body::from(body)).unwrap()).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), started_rx)
+            .await.expect("blocking admission started").expect("start signal");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(budget.mutation_in_flight.load(Ordering::Acquire), 1);
+        let remaining = (1..MAX_IN_FLIGHT_MUTATIONS).map(|_| {
+            InFlightRequestGuard::try_acquire(&budget.mutation_in_flight, MAX_IN_FLIGHT_MUTATIONS)
+                .expect("remaining shared slot")
+        }).collect::<Vec<_>>();
+        let response = second.post_body("/api/vault/v1/replica-jobs", Vec::new()).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+        drop(remaining);
+        assert_eq!(budget.mutation_in_flight.load(Ordering::Acquire), 1);
+        drop(release);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while budget.mutation_in_flight.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("blocking operation releases final shared owner");
+        let response = second.post_body("/api/vault/v1/replica-jobs", Vec::new()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(budget.mutation_in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn blocking_budget_releases_on_error_and_panic() {
+        // [VAULT-CANCELLATION-BUDGET 2026-10-08 by Codex] Unwinding and
+        // ordinary service failure both release the operation's owned slot.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let permit = Arc::new(InFlightRequestGuard::try_acquire(&counter, 1).unwrap());
+        assert!(vault_blocking(permit, || Err::<(), ()>(())).await.unwrap().is_err());
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        let permit = Arc::new(InFlightRequestGuard::try_acquire(&counter, 1).unwrap());
+        let result = vault_blocking(permit, || panic!("synthetic blocking-operation failure")).await;
+        assert!(matches!(result, Err(ApiFailure { status: StatusCode::INTERNAL_SERVER_ERROR, .. })));
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn extraction_failures_release_both_admission_pools() {
+        // [VAULT-CANCELLATION-BUDGET 2026-10-08 by Codex] A permit inserted
+        // before extraction must not leak on malformed or oversized bodies.
+        let budget = Arc::new(BlindVaultApiAdmissionRuntime::default());
+        let fixture = ApiFixture::with_components(Arc::clone(&budget),
+            Some(Arc::new(RecordingReplicaAdmission::new())));
+        for path in ["lease", "put", "delete", "pull", "replica-jobs"] {
+            let path = format!("/api/vault/v1/{path}");
+            assert_eq!(fixture.post_body(&path, Vec::new()).await.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(fixture.post_body(&path, vec![0; MUTATION_REQUEST_BODY_MAX_BYTES + 1])
+                .await.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(budget.mutation_in_flight.load(Ordering::Acquire), 0);
+            assert_eq!(budget.pull_in_flight.load(Ordering::Acquire), 0);
+        }
     }
 
     #[tokio::test]

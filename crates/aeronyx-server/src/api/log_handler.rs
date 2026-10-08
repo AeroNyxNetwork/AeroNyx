@@ -2,6 +2,9 @@
 // File: crates/aeronyx-server/src/api/log_handler.rs
 // ============================================
 //! # /api/mpi/log — Conversation Log Ingestion + Rule Engine
+//! [PHALA-LEGACY-MEMORY-INGRESS 2026-10-08 by Codex] Legacy ingestion is
+//! retained but disabled before body reads. Node-local auth is not TEE trust;
+//! historical raw logs and rule helpers remain untouched for migration.
 //!
 //! ## Modification History
 //! v2.1.0            - New file: /log endpoint with SKIP + rule engine + neg feedback
@@ -674,9 +677,17 @@ pub async fn mpi_log(
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
-                "error": "/log endpoint is local-only. Remote users should use the plugin rule engine and call /remember directly.",
+                "error": "/log endpoint is local-only; plaintext logging is disabled. Use owner-signed sealed storage.",
             })),
         ).into_response();
+    }
+
+    // [PHALA-LEGACY-MEMORY-INGRESS 2026-10-08 by Codex] Also fence direct
+    // mounts; do not rely solely on the production MPI middleware.
+    if !super::mpi::node_accepts_plaintext_memory_processing() {
+        // [PHALA-DISABLED-BODY-BOUNDARY 2026-10-08 by Codex] Keep direct
+        // mounts on the same no-store migration response as unified ingress.
+        return super::mpi::plaintext_memory_unavailable_response("/api/mpi/log");
     }
 
     let owner = auth.owner_bytes();
@@ -1064,7 +1075,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn log_probe_failure_is_retryable_and_writes_nothing() {
+    async fn legacy_log_rejects_before_growth_admission_and_writes_nothing() {
+        // [PHALA-LEGACY-MEMORY-INGRESS 2026-10-08 by Codex] A failing
+        // growth provider must not turn prohibited plaintext into a retry.
         let storage = Arc::new(
             MemoryStorage::open(":memory:", None)
                 .unwrap()
@@ -1116,13 +1129,13 @@ mod tests {
             .unwrap();
 
         let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::GONE);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-            serde_json::json!({"error": "storage capacity temporarily unavailable"})
+            serde_json::json!({"error": "plaintext memory processing is disabled; use client-local search and owner-signed sealed storage"})
         );
         assert!(storage.get_unprocessed_rawlogs(10).await.is_empty());
 
@@ -1139,14 +1152,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(empty_response.status(), StatusCode::ACCEPTED);
+        assert_eq!(empty_response.status(), StatusCode::GONE);
     }
 
     #[tokio::test]
     async fn missing_log_context_is_contained_without_weakening_remote_gate() {
         // [LOG-TYPED-CONTEXT 2026-08-12 by Codex] Missing auth/storage must
-        // never panic under the release `panic=abort` profile. Remote callers
-        // retain the same local-only 403 without learning storage wiring state.
+        // never panic. The migration gate precedes storage context; direct
+        // remote callers retain the old local-only 403 before that gate.
         let (state, local_auth) = make_test_state();
 
         let missing_auth = axum::Router::new()
@@ -1173,7 +1186,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             missing_storage.oneshot(request).await.unwrap().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::GONE
         );
 
         let owner = state.owner_key;

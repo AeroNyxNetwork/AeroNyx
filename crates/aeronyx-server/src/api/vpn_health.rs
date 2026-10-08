@@ -466,6 +466,7 @@ struct StartupSelfCheckStatus {
 #[derive(Debug, Serialize)]
 struct VpnHealthResponse {
     status: &'static str,
+    vpn_enabled: bool,
     checked_at: u64,
     listen_addr: String,
     gateway_ip: String,
@@ -768,9 +769,12 @@ pub(crate) async fn collect_node_operator_status_value_with_anonymous_mailbox_re
 
 async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse {
     let config = state.config;
+    let vpn_enabled = config.vpn_enabled();
     let gateway_ip = config.gateway_ip();
-    let dns_proxy_enabled = config.dns_proxy_enabled();
-    let dns_owner = if dns_proxy_enabled {
+    let dns_proxy_enabled = vpn_enabled && config.dns_proxy_enabled();
+    let dns_owner = if !vpn_enabled {
+        "not_applicable"
+    } else if dns_proxy_enabled {
         "rust_dns_proxy"
     } else {
         "external_gateway_dns"
@@ -780,45 +784,61 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     let configured_mtu = config.mtu();
     let ip_range = config.ip_range().to_string();
     let service_name = resolve_vpn_service_name();
-    // [HEALTH-SNAPSHOT-LATENCY 2026-08-12 by Codex] These probes do not
-    // depend on one another. Running them serially made one slow local command
-    // multiply the latency of every health request and management heartbeat.
-    let (
-        running_mtu_result,
-        service_manager,
-        udp_listener_check,
-        tun_device_check,
-        ip_forward_check,
-        nat_masquerade_check,
-        dns_socket_check,
-        dns_query_check,
-        internet_egress_check,
-    ) = tokio::join!(
-        read_tun_mtu(&tun_device),
-        collect_service_manager_status(&service_name),
-        check_udp_listener(listen_addr),
-        check_tun_device(&tun_device),
-        check_ip_forwarding(),
-        check_nat_masquerade(&ip_range),
-        check_dns_socket(gateway_ip),
-        check_dns_query(gateway_ip),
-        check_internet_egress(),
-    );
-    let running_mtu = running_mtu_result.ok();
-    let transport_health = collect_transport_health(&config, listen_addr, udp_listener_check.ok);
-    let checks = vec![
-        udp_listener_check,
-        tun_device_check,
-        check_mtu_config(&tun_device, configured_mtu, running_mtu).await,
-        ip_forward_check,
-        nat_masquerade_check,
-        dns_socket_check,
-        dns_query_check,
-        internet_egress_check,
-    ];
+    // [PHALA-NO-VPN-HEALTH 2026-10-06 by Codex] Relay-only peers must not
+    // probe host VPN prerequisites they deliberately do not provision.
+    let (running_mtu, service_manager, transport_health, checks) = if vpn_enabled {
+        // [HEALTH-SNAPSHOT-LATENCY 2026-08-12 by Codex] These probes do not
+        // depend on one another. Running them serially made one slow local
+        // command multiply every health request and management heartbeat.
+        let (
+            running_mtu_result,
+            service_manager,
+            udp_listener_check,
+            tun_device_check,
+            ip_forward_check,
+            nat_masquerade_check,
+            dns_socket_check,
+            dns_query_check,
+            internet_egress_check,
+        ) = tokio::join!(
+            read_tun_mtu(&tun_device),
+            collect_service_manager_status(&service_name),
+            check_udp_listener(listen_addr),
+            check_tun_device(&tun_device),
+            check_ip_forwarding(),
+            check_nat_masquerade(&ip_range),
+            check_dns_socket(gateway_ip),
+            check_dns_query(gateway_ip),
+            check_internet_egress(),
+        );
+        let running_mtu = running_mtu_result.ok();
+        let transport_health = collect_transport_health(&config, listen_addr, udp_listener_check.ok);
+        let checks = vec![
+            udp_listener_check,
+            tun_device_check,
+            check_mtu_config(&tun_device, configured_mtu, running_mtu).await,
+            ip_forward_check,
+            nat_masquerade_check,
+            dns_socket_check,
+            dns_query_check,
+            internet_egress_check,
+        ];
+        (running_mtu, service_manager, transport_health, checks)
+    } else {
+        let service_manager = collect_service_manager_status(&service_name).await;
+        let transport_health = collect_transport_health(&config, listen_addr, false);
+        let checks = vec![HealthCheck {
+            name: "vpn_data_plane",
+            ok: true,
+            detail: "VPN data plane is disabled by node configuration".to_string(),
+        }];
+        (None, service_manager, transport_health, checks)
+    };
 
     let failed = checks.iter().filter(|c| !c.ok).count();
-    let status = if failed == 0 {
+    let status = if !vpn_enabled {
+        "disabled"
+    } else if failed == 0 {
         "ok"
     } else if failed <= 2 {
         "degraded"
@@ -884,6 +904,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
 
     VpnHealthResponse {
         status,
+        vpn_enabled,
         checked_at,
         listen_addr: listen_addr.to_string(),
         gateway_ip: gateway_ip.to_string(),
@@ -892,7 +913,11 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         supported_transports: transport_health.supported_transports.clone(),
         preferred_transport: transport_health.preferred_transport.clone(),
         transport_health,
-        vpn_handshake_capability: collect_vpn_handshake_capability(),
+        vpn_handshake_capability: if vpn_enabled {
+            collect_vpn_handshake_capability()
+        } else {
+            None
+        },
         privacy_protocol_health,
         startup_self_check,
         virtual_ip_range: ip_range,
@@ -1027,94 +1052,104 @@ fn collect_startup_self_check(
         "Run deploy/node/aeronyx-node.sh status and logs --lines 200; restart only after confirming active sessions and maintenance mode.".to_string(),
     ));
 
-    push_runtime_health_check(
-        &mut checks,
-        health_checks,
-        "udp_listener",
-        "critical",
-        "Ensure UDP listen_addr is reachable and no other process owns the configured port, then restart the AeroNyx Rust node.".to_string(),
-    );
-    push_runtime_health_check(
-        &mut checks,
-        health_checks,
-        "tun_device",
-        "critical",
-        "Run deploy/node/aeronyx-node.sh network to recreate the TUN device and routing rules."
-            .to_string(),
-    );
-    push_runtime_health_check(
-        &mut checks,
-        health_checks,
-        "mtu_config",
-        "warning",
-        "Align tun.mtu with the running interface MTU during a maintenance window.".to_string(),
-    );
-    push_runtime_health_check(
-        &mut checks,
-        health_checks,
-        "ip_forward",
-        "critical",
-        "Enable net.ipv4.ip_forward=1, then rerun deploy/node/aeronyx-node.sh network.".to_string(),
-    );
-    push_runtime_health_check(
-        &mut checks,
-        health_checks,
-        "nat_masquerade",
-        "critical",
-        "Restore the VPN MASQUERADE rule with deploy/node/aeronyx-node.sh network.".to_string(),
-    );
-    push_runtime_health_check(
-        &mut checks,
-        health_checks,
-        "dns_stub",
-        "critical",
-        "Start the built-in DNS proxy or provide an external listener on gateway_ip:53."
-            .to_string(),
-    );
-    push_runtime_health_check(
-        &mut checks,
-        health_checks,
-        "dns_query",
-        "warning",
-        "Check upstream DNS reachability from the node and gateway DNS listener health."
-            .to_string(),
-    );
-    push_runtime_health_check(
-        &mut checks,
-        health_checks,
-        "internet_egress",
-        "critical",
-        "Verify host firewall, cloud security group, and default route before accepting traffic."
-            .to_string(),
-    );
+    if config.vpn_enabled() {
+        push_runtime_health_check(
+            &mut checks,
+            health_checks,
+            "udp_listener",
+            "critical",
+            "Ensure UDP listen_addr is reachable and no other process owns the configured port, then restart the AeroNyx Rust node.".to_string(),
+        );
+        push_runtime_health_check(
+            &mut checks,
+            health_checks,
+            "tun_device",
+            "critical",
+            "Run deploy/node/aeronyx-node.sh network to recreate the TUN device and routing rules."
+                .to_string(),
+        );
+        push_runtime_health_check(
+            &mut checks,
+            health_checks,
+            "mtu_config",
+            "warning",
+            "Align tun.mtu with the running interface MTU during a maintenance window.".to_string(),
+        );
+        push_runtime_health_check(
+            &mut checks,
+            health_checks,
+            "ip_forward",
+            "critical",
+            "Enable net.ipv4.ip_forward=1, then rerun deploy/node/aeronyx-node.sh network.".to_string(),
+        );
+        push_runtime_health_check(
+            &mut checks,
+            health_checks,
+            "nat_masquerade",
+            "critical",
+            "Restore the VPN MASQUERADE rule with deploy/node/aeronyx-node.sh network.".to_string(),
+        );
+        push_runtime_health_check(
+            &mut checks,
+            health_checks,
+            "dns_stub",
+            "critical",
+            "Start the built-in DNS proxy or provide an external listener on gateway_ip:53."
+                .to_string(),
+        );
+        push_runtime_health_check(
+            &mut checks,
+            health_checks,
+            "dns_query",
+            "warning",
+            "Check upstream DNS reachability from the node and gateway DNS listener health."
+                .to_string(),
+        );
+        push_runtime_health_check(
+            &mut checks,
+            health_checks,
+            "internet_egress",
+            "critical",
+            "Verify host firewall, cloud security group, and default route before accepting traffic."
+                .to_string(),
+        );
 
-    checks.push(startup_item(
-        "effective_transport",
-        transport_health.udp.active && transport_health.effective_transport == "udp",
-        "critical",
-        format!(
-            "effective_transport={} udp_active={} fallback_available={}",
-            transport_health.effective_transport,
-            transport_health.udp.active,
-            transport_health.fallback_available
-        ),
-        "Keep UDP active until TCP/TLS or WebSocket HTTPS fallback listeners are implemented."
-            .to_string(),
-    ));
+        checks.push(startup_item(
+            "effective_transport",
+            transport_health.udp.active && transport_health.effective_transport == "udp",
+            "critical",
+            format!(
+                "effective_transport={} udp_active={} fallback_available={}",
+                transport_health.effective_transport,
+                transport_health.udp.active,
+                transport_health.fallback_available
+            ),
+            "Keep UDP active until TCP/TLS or WebSocket HTTPS fallback listeners are implemented."
+                .to_string(),
+        ));
 
-    checks.push(startup_item(
-        "ip_pool_capacity",
-        capacity.ip_pool_free > 0 && capacity.max_connections <= capacity.ip_pool_capacity,
-        "warning",
-        format!(
-            "ip_pool_capacity={} used={} free={} max_connections={}",
-            capacity.ip_pool_capacity,
-            capacity.ip_pool_used,
-            capacity.ip_pool_free,
-            capacity.max_connections
-        ),
-        "Expand vpn.virtual_ip_range or lower limits.max_connections before commercial traffic exceeds the IP pool.".to_string(),
-    ));
+        checks.push(startup_item(
+            "ip_pool_capacity",
+            capacity.ip_pool_free > 0 && capacity.max_connections <= capacity.ip_pool_capacity,
+            "warning",
+            format!(
+                "ip_pool_capacity={} used={} free={} max_connections={}",
+                capacity.ip_pool_capacity,
+                capacity.ip_pool_used,
+                capacity.ip_pool_free,
+                capacity.max_connections
+            ),
+            "Expand vpn.virtual_ip_range or lower limits.max_connections before commercial traffic exceeds the IP pool.".to_string(),
+        ));
+    } else {
+        checks.push(startup_item(
+            "vpn_data_plane",
+            true,
+            "info",
+            "VPN is disabled; this node is operating as an HTTP peer/relay".to_string(),
+            "No action required unless this node is intended to accept VPN clients.".to_string(),
+        ));
+    }
 
     let discovery_enabled = config.discovery.enabled;
     let peer_cache_configured = discovery_bool(
@@ -1157,6 +1192,7 @@ fn collect_startup_self_check(
         &["recovery_anchor", "external_witness", "generation_aligned"],
     )
     .unwrap_or(false);
+    let private_recipient_outbound_only = private_recipient_outbound_only(config);
 
     checks.push(startup_item(
         "peer_store_restart_recovery",
@@ -1171,25 +1207,36 @@ fn collect_startup_self_check(
 
     checks.push(startup_item(
         "discovery_seed_recovery",
-        !gossip_enabled || seed_count > 0,
+        !gossip_enabled || seed_count > 0 || private_recipient_outbound_only,
         if gossip_enabled { "warning" } else { "info" },
         format!(
-            "gossip_enabled={} seed_endpoints_configured={}",
-            gossip_enabled, seed_count
+            "gossip_enabled={} seed_endpoints_configured={} private_recipient_relay_bootstrap={}",
+            gossip_enabled, seed_count, private_recipient_outbound_only
         ),
-        "Configure at least one discovery.seed_endpoints entry for live peer recovery.".to_string(),
+        if private_recipient_outbound_only {
+            "Keep the configured relay identity and HTTPS endpoint pinned; this recipient bootstraps authority refresh through that relay.".to_string()
+        } else {
+            "Configure at least one discovery.seed_endpoints entry for live peer recovery.".to_string()
+        },
     ));
 
     checks.push(startup_item(
         "public_discovery_api",
-        !discovery_enabled || config.discovery.public_api_listen_addr.is_some(),
+        !discovery_enabled
+            || config.discovery.public_api_listen_addr.is_some()
+            || private_recipient_outbound_only,
         if discovery_enabled { "warning" } else { "info" },
         format!(
-            "discovery_enabled={} public_api_listen_addr_configured={}",
+            "discovery_enabled={} public_api_listen_addr_configured={} private_recipient_outbound_only={}",
             discovery_enabled,
-            config.discovery.public_api_listen_addr.is_some()
+            config.discovery.public_api_listen_addr.is_some(),
+            private_recipient_outbound_only
         ),
-        "Set discovery.public_api_listen_addr when this node should be discoverable by other AeroNyx nodes.".to_string(),
+        if private_recipient_outbound_only {
+            "No inbound API is expected for this endpoint-free recipient; verify its pinned relay gossip path.".to_string()
+        } else {
+            "Set discovery.public_api_listen_addr when this node should be discoverable by other AeroNyx nodes.".to_string()
+        },
     ));
 
     checks.push(startup_item(
@@ -1275,6 +1322,22 @@ fn collect_startup_self_check(
             "ciphertext, voucher secrets, private keys, or wallet-level traffic"
         ),
     }
+}
+
+// [PHALA-PRIVATE-API-ISOLATION 2026-10-06 by Codex] A private recipient
+// discovers and refreshes authority through its pinned outbound relay. It is
+// healthy without public seeds or an inbound HTTP listener only when both
+// endpoint publication and listener configuration are absent.
+fn private_recipient_outbound_only(config: &ServerConfig) -> bool {
+    config.discovery.enabled
+        && config.discovery.gossip_enabled
+        && !config.vpn.enabled
+        && config.discovery.public_api_listen_addr.is_none()
+        && config.discovery.public_endpoint.as_deref().is_none_or(str::is_empty)
+        && config.network.public_endpoint.as_deref().is_none_or(str::is_empty)
+        && config.reverse_onion.recipient.enabled
+        && !config.reverse_onion.recipient.relay_node_id.is_empty()
+        && !config.reverse_onion.recipient.relay_endpoint.is_empty()
 }
 
 fn startup_item(
@@ -1395,13 +1458,18 @@ async fn collect_node_operator_status_response(
     services.push(OperatorServiceStatus {
         key: "privacy_protocol",
         label: "AeroNyx Privacy Protocol",
-        enabled: true,
+        enabled: config.vpn_enabled(),
         status: vpn_health.status,
-        summary: format!(
-            "{} active sessions, {} wallet devices, {} encrypted packets forwarded",
-            vpn_health.active_sessions, vpn_health.active_wallet_devices, encrypted_messages
-        ),
+        summary: if config.vpn_enabled() {
+            format!(
+                "{} active sessions, {} wallet devices, {} encrypted packets forwarded",
+                vpn_health.active_sessions, vpn_health.active_wallet_devices, encrypted_messages
+            )
+        } else {
+            "VPN is disabled; HTTP peer and encrypted relay services remain independent".to_string()
+        },
         metrics: serde_json::json!({
+            "vpn_enabled": vpn_health.vpn_enabled,
             "listen_addr": vpn_health.listen_addr,
             "gateway_ip": vpn_health.gateway_ip,
             "dns_proxy_enabled": vpn_health.dns_proxy_enabled,
@@ -1509,13 +1577,17 @@ async fn collect_node_operator_status_response(
         metrics: serde_json::json!({
             "remote_storage_enabled": remote_storage_enabled,
             "max_remote_owners": config.memchain.max_remote_owners,
+            // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Report only the
+            // authenticated sealed-V2 replication contract, not legacy rows.
             "current_protocol_basis": [
-                "MemoryRecord.owner",
-                "MemoryRecord.encrypted_content",
-                "MemoryRecord.signature",
-                "MemChainMessage::SyncRecordRequest",
-                "MemChainMessage::SyncRecordResponse"
+                "MemorySealedV2Envelope",
+                "memory_sealed_v2_record_id",
+                "memory_sealed_v2_signature_transcript",
+                "MemChainMessage::BroadcastSealedMemoryV2ReplicaV1",
+                "MemChainMessage::SyncSealedMemoryV2RequestV1",
+                "MemChainMessage::SyncSealedMemoryV2ResponseV1"
             ],
+            "legacy_untyped_record_sync": "disabled",
             "settlement_layer": "ethereum",
             "private_data_on_ethereum": false,
         }),
@@ -1775,6 +1847,33 @@ fn collect_transport_health(
     udp_listener_ok: bool,
 ) -> VpnTransportHealthStatus {
     let transports = config.vpn_transports();
+    if !config.vpn_enabled() {
+        let disabled_carrier = |key: &'static str| TransportCarrierStatus {
+            key,
+            enabled: false,
+            implemented: key == "udp",
+            active: false,
+            endpoint: None,
+            status: "disabled",
+            detail: "VPN data plane is disabled by node configuration".to_string(),
+        };
+        return VpnTransportHealthStatus {
+            supported_transports: Vec::new(),
+            configured_transports: Vec::new(),
+            preferred_transport: transports.preferred_transport.clone(),
+            effective_transport: "disabled",
+            fallback_available: false,
+            udp: disabled_carrier("udp"),
+            tcp_tls: disabled_carrier("tcp_tls"),
+            websocket_https: disabled_carrier("websocket_https"),
+            source: "rust_vpn_transport_capability_metadata",
+            privacy_boundary: concat!(
+                "transport capability metadata only; no packet payloads, DNS ",
+                "contents, destinations, domains, URLs, browsing history, voucher ",
+                "secrets, client public IPs, or wallet-level traffic"
+            ),
+        };
+    }
     let mut configured_transports = Vec::new();
     if transports.udp_enabled {
         configured_transports.push("udp");
@@ -1918,7 +2017,7 @@ fn collect_privacy_protocol_health(
         effective_transport: transport_health.effective_transport,
         service_active_state: service_manager.active_state.clone(),
         protocol_runtime: PrivacyProtocolRuntimeStatus {
-            active: status != "failed",
+            active: matches!(status, "ok" | "degraded"),
             status,
             detail: "This Rust node reports AeroNyx privacy protocol runtime health from aggregate service, transport, and routing checks.",
             source: "rust_vpn_health.protocol_model",
@@ -3369,6 +3468,27 @@ fn build_dns_query(name: &str) -> std::result::Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // [PHALA-PRIVATE-API-ISOLATION 2026-10-06 by Codex]
+    #[test]
+    fn private_recipient_health_requires_only_its_pinned_outbound_relay() {
+        let mut config = ServerConfig::default();
+        config.vpn.enabled = false;
+        config.discovery.enabled = true;
+        config.discovery.gossip_enabled = true;
+        config.reverse_onion.recipient.enabled = true;
+        config.reverse_onion.recipient.relay_node_id = "11".repeat(32);
+        config.reverse_onion.recipient.relay_endpoint = "https://relay.example".into();
+
+        assert!(private_recipient_outbound_only(&config));
+
+        config.vpn.enabled = true;
+        assert!(!private_recipient_outbound_only(&config));
+        config.vpn.enabled = false;
+
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        assert!(!private_recipient_outbound_only(&config));
+    }
 
     #[test]
     fn vpn_handshake_capability_reports_current_dual_stack_v2_default() {

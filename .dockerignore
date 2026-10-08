@@ -1,0 +1,61 @@
+# [PHALA-BUILD-CONTEXT-PRIVACY 2026-10-06 by Codex]
+# [PHALA-BUILD-CONTEXT-ALLOWLIST 2026-10-08 by Codex] Unknown root files,
+# operator records and private worktrees must not reach a remote builder.
+# Keep literal prefixes: parent-directory exceptions would admit siblings.
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/aeronyx-blind-issuer/Cargo.toml
+!crates/aeronyx-blind-issuer/src/**
+!crates/aeronyx-core/Cargo.toml
+!crates/aeronyx-core/src/**
+!crates/aeronyx-transport/Cargo.toml
+!crates/aeronyx-transport/src/**
+!crates/aeronyx-server/Cargo.toml
+!crates/aeronyx-server/src/**
+!crates/aeronyx-common/Cargo.toml
+!crates/aeronyx-common/src/**
+!deploy/node/server.phala.peer.example.toml
+# [PHALA-COPY-CONTEXT-CONTRACT 2026-10-08 by Codex] isolated-vpn has a
+# separate literal COPY; do not admit the surrounding operator directory.
+!deploy/node/server.phala.example.toml
+
+# Defense in depth inside the admitted public Rust source trees. Dockerfile
+# and .dockerignore remain builder control inputs, not runtime COPY inputs.
+.git
+**/.git
+.dart_tool
+.build
+build
+**/target
+**/node_modules
+**/.codex-cache
+**/.codex-target
+**/.codex-tmp
+*.log
+.env
+.env.*
+**/.env
+**/.env.*
+
+# This image builds only the Rust workspace; do not send private client trees.
+android
+assets
+ios
+lib
+macos
+windows
+linux
+web
+test
+integration_test
+
+# Local identities, databases, and generated operator state are never image inputs.
+**/server_key.json
+**/node_info.json
+**/.aeronyx-identity-*.pending
+**/*.db
+**/*.db-*
+**/*.sqlite*
+**/secrets

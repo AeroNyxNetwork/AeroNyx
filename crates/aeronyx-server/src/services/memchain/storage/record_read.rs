@@ -459,6 +459,40 @@ impl MemoryStorage {
         }
     }
 
+    /// Returns only active client-sealed records for node-blind recent recall.
+    /// [MEMCHAIN-NODE-BLIND-RECALL 2026-10-05 by Codex] This avoids loading
+    /// legacy sighted rows when a client requests its recent encrypted backup.
+    pub async fn get_active_blind_records(
+        &self,
+        owner: &[u8; 32],
+        layer: Option<MemoryLayer>,
+        limit: usize,
+    ) -> Vec<MemoryRecord> {
+        let limit = limit.min(1000).max(1);
+        let conn = self.conn.lock().await;
+        if let Some(layer) = layer {
+            self.query_rows(
+                &conn,
+                "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
+                        status,supersedes,encrypted_content,embedding,signature,access_count,
+                        positive_feedback,negative_feedback,conflict_with,blind
+                 FROM records WHERE owner=?1 AND status=0 AND blind=1 AND layer=?2
+                 ORDER BY timestamp DESC LIMIT ?3",
+                params![owner.as_slice(), layer as u8 as i64, limit as i64],
+            )
+        } else {
+            self.query_rows(
+                &conn,
+                "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
+                        status,supersedes,encrypted_content,embedding,signature,access_count,
+                        positive_feedback,negative_feedback,conflict_with,blind
+                 FROM records WHERE owner=?1 AND status=0 AND blind=1
+                 ORDER BY timestamp DESC LIMIT ?2",
+                params![owner.as_slice(), limit as i64],
+            )
+        }
+    }
+
     pub async fn query_by_owner_after(
         &self,
         owner: &[u8; 32],

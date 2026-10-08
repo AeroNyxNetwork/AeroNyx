@@ -1050,6 +1050,145 @@ impl BlindVaultOnionLeaseAdmissionSession {
         }
         Ok(receipt)
     }
+
+    // [BLIND-VAULT-ADMISSION-RESTART 2026-10-05 by Codex] Keep exact one-shot
+    // source reply authority recoverable only through a purpose-fixed seal.
+    /// Seals this single-use response session for source-local durable recovery.
+    /// The exact request is bound into the encrypted restart state; sealing is
+    /// not authority to send or replay that request.
+    pub fn seal_restart(
+        &self,
+        source_identity: &IdentityKeyPair,
+        expected_route_id: [u8; 16],
+        expected_terminal_node_id: [u8; 32],
+        exact_terminal_request: &[u8],
+    ) -> Result<Vec<u8>, BlindVaultOnionLeaseAdmissionRestartError> {
+        use super::blind_vault_replica_workflow::{
+            seal_lease_admission_restart, MAX_LEASE_ADMISSION_RESTART_BODY_BYTES,
+        };
+        use BlindVaultOnionLeaseAdmissionRestartError as Error;
+        self.validate_restart_binding(expected_route_id, expected_terminal_node_id, exact_terminal_request)?;
+        let state = self.reply_session.encode_restart_state().map_err(|_| Error::Malformed)?;
+        let body_len = LEASE_ADMISSION_RESTART_PREFIX_BYTES
+            .checked_add(state.as_bytes().len())
+            .filter(|length| *length <= MAX_LEASE_ADMISSION_RESTART_BODY_BYTES)
+            .ok_or(Error::TooLarge)?;
+        let state_len = u16::try_from(state.as_bytes().len()).map_err(|_| Error::TooLarge)?;
+        let mut body = Zeroizing::new(Vec::with_capacity(body_len));
+        body.extend_from_slice(&LEASE_ADMISSION_RESTART_BODY_MAGIC);
+        body.extend_from_slice(&LEASE_ADMISSION_RESTART_BODY_VERSION.to_be_bytes());
+        body.push(BlindVaultTerminalOperation::LeaseAdmission as u8);
+        body.extend_from_slice(&self.expected_version.to_be_bytes());
+        body.extend_from_slice(&self.expected_admission_spend_id);
+        body.extend_from_slice(&self.expected_lease_id);
+        body.extend_from_slice(&self.expected_request_id);
+        body.extend_from_slice(&self.expected_lease_expires_at_ms.to_be_bytes());
+        body.extend_from_slice(&lease_admission_restart_request_digest(exact_terminal_request));
+        body.extend_from_slice(&state_len.to_be_bytes());
+        body.extend_from_slice(state.as_bytes());
+        if body.len() != body_len { return Err(Error::Malformed); }
+        seal_lease_admission_restart(source_identity, &body)
+    }
+
+    /// Restores only an identity-sealed session bound to this exact source
+    /// route, terminal identity, proof mode, and encoded terminal request.
+    /// The durable caller must consume its one-shot opening authority first.
+    pub fn restore_restart(
+        source_identity: &IdentityKeyPair,
+        sealed: &[u8],
+        expected_route_id: [u8; 16],
+        expected_terminal_node_id: [u8; 32],
+        exact_terminal_request: &[u8],
+    ) -> Result<Self, BlindVaultOnionLeaseAdmissionRestartError> {
+        use super::blind_vault_replica_workflow::open_lease_admission_restart;
+        use BlindVaultOnionLeaseAdmissionRestartError as Error;
+        let body = open_lease_admission_restart(source_identity, sealed)?;
+        if body.len() < LEASE_ADMISSION_RESTART_PREFIX_BYTES || body[..4] != LEASE_ADMISSION_RESTART_BODY_MAGIC {
+            return Err(Error::Malformed);
+        }
+        if body[4..6] != LEASE_ADMISSION_RESTART_BODY_VERSION.to_be_bytes() {
+            return Err(Error::UnsupportedVersion);
+        }
+        if body[6] != BlindVaultTerminalOperation::LeaseAdmission as u8 {
+            return Err(Error::BindingMismatch);
+        }
+        let state_len_offset = LEASE_ADMISSION_RESTART_PREFIX_BYTES - 2;
+        let state_len = u16::from_be_bytes([body[state_len_offset], body[state_len_offset + 1]]) as usize;
+        if body.len() != LEASE_ADMISSION_RESTART_PREFIX_BYTES + state_len {
+            return Err(Error::Malformed);
+        }
+        let restored = Self {
+            expected_version: u16::from_be_bytes([body[7], body[8]]),
+            expected_admission_spend_id: body[9..41].try_into().map_err(|_| Error::Malformed)?,
+            expected_lease_id: body[41..73].try_into().map_err(|_| Error::Malformed)?,
+            expected_request_id: body[73..89].try_into().map_err(|_| Error::Malformed)?,
+            expected_lease_expires_at_ms: u64::from_be_bytes(
+                body[89..97].try_into().map_err(|_| Error::Malformed)?,
+            ),
+            reply_session: OnionReplySession::decode_restart_state(
+                &body[LEASE_ADMISSION_RESTART_PREFIX_BYTES..],
+            ).map_err(|_| Error::Malformed)?,
+        };
+        restored.validate_restart_binding(expected_route_id, expected_terminal_node_id, exact_terminal_request)?;
+        if body[97..129] != lease_admission_restart_request_digest(exact_terminal_request) {
+            return Err(Error::BindingMismatch);
+        }
+        Ok(restored)
+    }
+
+    fn validate_restart_binding(
+        &self,
+        route_id: [u8; 16],
+        terminal_node_id: [u8; 32],
+        exact_request: &[u8],
+    ) -> Result<(), BlindVaultOnionLeaseAdmissionRestartError> {
+        use BlindVaultOnionLeaseAdmissionRestartError as Error;
+        let response_size_class = ONION_REPLY_RESPONSE_SIZE_CLASSES[0] as usize;
+        if !self.reply_session.matches_restart_binding(
+            route_id,
+            terminal_node_id,
+            response_size_class,
+            super::onion_reply::OnionReplyProofMode::SourceSealedTerminalProof,
+        ) { return Err(Error::BindingMismatch); }
+        let payload = self.reply_session
+            .restart_request_payload(exact_request, MAX_LEASE_ADMISSION_RESTART_FRAME_BYTES)
+            .map_err(|_| Error::BindingMismatch)?;
+        let frame = decode_blind_vault_frame(payload).map_err(|_| Error::BindingMismatch)?;
+        let BlindVaultFrame::BlindLeaseAdmission(request) = frame else {
+            return Err(Error::BindingMismatch);
+        };
+        request.admission.validate_shape().map_err(|_| Error::BindingMismatch)?;
+        if request.lease.version != self.expected_version
+            || request.admission.spend_id() != self.expected_admission_spend_id
+            || request.lease.lease_id != self.expected_lease_id
+            || request.lease.request_id != self.expected_request_id
+            || request.lease.expires_at_ms != self.expected_lease_expires_at_ms
+        { return Err(Error::BindingMismatch); }
+        Ok(())
+    }
+}
+
+fn lease_admission_restart_request_digest(encoded: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(LEASE_ADMISSION_RESTART_REQUEST_DOMAIN);
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    hash.finalize().into()
+}
+
+/// Fail-closed source errors for sealed admission-session restart state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum BlindVaultOnionLeaseAdmissionRestartError {
+    #[error("lease-admission restart exceeds local size limit")]
+    TooLarge,
+    #[error("malformed lease-admission restart")]
+    Malformed,
+    #[error("unsupported lease-admission restart version")]
+    UnsupportedVersion,
+    #[error("lease-admission restart authentication failed")]
+    AuthenticationFailed,
+    #[error("lease-admission restart binding rejected")]
+    BindingMismatch,
 }
 
 /// Fail-closed source errors for anonymous blind-issued lease admission.
@@ -1625,6 +1764,15 @@ const PULL_RESTART_BODY_MAGIC: [u8; 4] = *b"AXPS";
 const PULL_RESTART_BODY_VERSION: u16 = 1;
 const PULL_RESTART_PREFIX_BYTES: usize = 4 + 2 + 1 + 32 + 32 + 2;
 const PULL_RESTART_REQUEST_DOMAIN: &[u8] = b"AeroNyx-BlindVault-OnionPull-ExactRequest-v1";
+// [BLIND-VAULT-ADMISSION-RESTART 2026-10-05 by Codex] Separate request
+// commitment and local frame prevent Pull state from substituting admission.
+const LEASE_ADMISSION_RESTART_BODY_MAGIC: [u8; 4] = *b"AXAS";
+const LEASE_ADMISSION_RESTART_BODY_VERSION: u16 = 1;
+const LEASE_ADMISSION_RESTART_REQUEST_DOMAIN: &[u8] =
+    b"AeroNyx-BlindVault-OnionLeaseAdmission-ExactRequest-v1";
+const LEASE_ADMISSION_RESTART_PREFIX_BYTES: usize = 4 + 2 + 1 + 2 + 32 + 32 + 16 + 8 + 32 + 2;
+const MAX_LEASE_ADMISSION_RESTART_FRAME_BYTES: usize =
+    FRAME_HEADER_BYTES + MAX_BLIND_VAULT_MUTATION_FRAME_BYTES as usize;
 // Existing bincode fixed-int Pull: version, lease, capability, cursor length,
 // bounded cursor, limit. This is an admission bound, not a new wire encoding.
 const MAX_PULL_RESTART_FRAME_BYTES: usize =
@@ -5541,6 +5689,48 @@ mod tests {
         );
         ticket.sign(&issuer).expect("matching admission issuer");
         ticket
+    }
+
+    fn signed_blind_admission_request() -> BlindVaultBlindLeaseAdmissionRequest {
+        let admission = BlindVaultBlindAdmissionToken::new(
+            [21; 32], [22; 32], [23; 32], vec![0xA7; MIN_BLIND_VAULT_BLIND_SIGNATURE_BYTES],
+        );
+        BlindVaultBlindLeaseAdmissionRequest { admission, lease: signed_lease() }
+    }
+
+    // [BLIND-VAULT-ADMISSION-RESTART 2026-10-05 by Codex] Test authoring
+    // only; restart is bound to one exact request and source-sealed route.
+    #[test]
+    fn lease_admission_restart_roundtrips_and_rejects_binding_changes() {
+        let source = IdentityKeyPair::from_bytes(&[41; 32]).expect("source fixture");
+        let terminal = node_key();
+        let route = [44; 16];
+        let request = signed_blind_admission_request();
+        let (encoded, session) = BlindVaultOnionLeaseAdmissionSession::prepare(
+            route, terminal.public_key_bytes(), request, NOW_MS, MAX_TTL_MS,
+        ).expect("prepare source session");
+        let sealed = session.seal_restart(&source, route, terminal.public_key_bytes(), &encoded)
+            .expect("seal local session");
+        let restored = BlindVaultOnionLeaseAdmissionSession::restore_restart(
+            &source, &sealed, route, terminal.public_key_bytes(), &encoded,
+        ).expect("restore exact session");
+        drop(restored);
+        assert!(BlindVaultOnionLeaseAdmissionSession::restore_restart(
+            &source, &sealed, [45; 16], terminal.public_key_bytes(), &encoded,
+        ).is_err());
+        assert!(BlindVaultOnionLeaseAdmissionSession::restore_restart(
+            &source, &sealed, route, [46; 32], &encoded,
+        ).is_err());
+        let mut changed = encoded.clone();
+        let last = changed.len() - 1;
+        changed[last] ^= 1;
+        assert!(BlindVaultOnionLeaseAdmissionSession::restore_restart(
+            &source, &sealed, route, terminal.public_key_bytes(), &changed,
+        ).is_err());
+        let other = IdentityKeyPair::from_bytes(&[42; 32]).expect("other source fixture");
+        assert!(BlindVaultOnionLeaseAdmissionSession::restore_restart(
+            &other, &sealed, route, terminal.public_key_bytes(), &encoded,
+        ).is_err());
     }
 
     fn signed_pull_response() -> BlindVaultPullResponse {

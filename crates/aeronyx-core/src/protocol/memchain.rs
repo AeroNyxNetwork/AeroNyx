@@ -149,6 +149,10 @@ use crate::crypto::{IdentityKeyPair, IdentityPublicKey};
 use crate::error::CoreError;
 #[allow(deprecated)]
 use crate::ledger::Fact;
+use crate::ledger::record::{
+    memory_sealed_v2_record_id, memory_sealed_v2_signature_transcript, MemorySealedV2Envelope,
+    MEMORY_SEALED_V2_MAX_ENVELOPE_BYTES, MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES,
+};
 use crate::ledger::{
     BlockHeader, MemoryRecord, RecordCommitmentBlockV1, RecordCommitmentHeaderV1,
     RecordCoordinatorHandoverV1,
@@ -163,6 +167,7 @@ use crate::protocol::chat::{
     encode_envelope, BlindRelayDeliveryReceipt, ChatEnvelope, CustodyAuditAnchorV1,
     CustodyAuditWitnessReceiptV1,
 };
+
 use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
 use crate::protocol::onion::OnionRoutePurpose;
 
@@ -172,6 +177,10 @@ use crate::protocol::onion::OnionRoutePurpose;
 
 /// Maximum accepted size for a single MemChain message payload (excluding magic byte).
 const MAX_MEMCHAIN_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024; // 2 MB
+
+// [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Three maximum-size sealed rows
+// remain below the existing UDP plaintext ceiling including wire overhead.
+pub const MAX_SEALED_MEMORY_P2P_PAGE_RECORDS: u16 = 3;
 
 // ============================================
 // Constants
@@ -683,6 +692,9 @@ pub struct RecordCheckpointCertificateMemberV1 {
 /// | 39    | ChatRelayVerifiedSubmitResponseV1 | v2.8.17-VerifiedChatSubmit |
 /// | 40    | AnonymousMailboxRouteV1 | v2.8.18-AnonymousMailboxV1 |
 /// | 41    | AnonymousMailboxRouteResponseV1 | v2.8.18-AnonymousMailboxV1 |
+/// | 42    | BroadcastSealedMemoryV2ReplicaV1 | v2.8.19-SealedMemoryP2P |
+/// | 43    | SyncSealedMemoryV2RequestV1 | v2.8.19-SealedMemoryP2P |
+/// | 44    | SyncSealedMemoryV2ResponseV1 | v2.8.19-SealedMemoryP2P |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(deprecated)]
 pub enum MemChainMessage {
@@ -1323,6 +1335,68 @@ pub enum MemChainMessage {
 
     /// [index 41] Carries one target-signed sealed anonymous mailbox response.
     AnonymousMailboxRouteResponseV1(AnonymousMailboxRouteResponseV1),
+
+    // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] These appended variants move
+    // only the already owner-signed, node-blind V2 envelope between peers.
+    /// [index 42] Broadcasts one owner-signed sealed-memory V2 replica.
+    BroadcastSealedMemoryV2ReplicaV1(SealedMemoryV2ReplicaV1),
+
+    /// [index 43] Requests a bounded owner-scoped sealed-memory V2 page.
+    SyncSealedMemoryV2RequestV1 {
+        owner: [u8; 32],
+        after_record_id: Option<[u8; 32]>,
+        limit: u16,
+    },
+
+    /// [index 44] Returns an owner-scoped sealed-memory V2 page.
+    SyncSealedMemoryV2ResponseV1 {
+        /// Requested owner namespace; every replica in the page must match.
+        owner: [u8; 32],
+        /// Exact request cursor echoed to reject stale or replayed pages.
+        after_record_id: Option<[u8; 32]>,
+        records: Vec<SealedMemoryV2ReplicaV1>,
+        /// Last returned ID when another page remains.
+        next_cursor: Option<[u8; 32]>,
+    },
+
+}
+
+/// A node-blind P2P copy of the exact owner-signed sealed-memory V2 row.
+///
+/// [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] There is intentionally no
+/// caller-controlled `blind` flag: the envelope, content ID, and owner
+/// signature are verified as one cryptographic unit before replication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealedMemoryV2ReplicaV1 {
+    pub record_id: [u8; 32],
+    pub owner: [u8; 32],
+    pub created_at: u64,
+    pub envelope: Vec<u8>,
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl SealedMemoryV2ReplicaV1 {
+    pub fn verify(&self) -> bool {
+        if self.created_at > i64::MAX as u64
+            || !(MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES..=MEMORY_SEALED_V2_MAX_ENVELOPE_BYTES)
+                .contains(&self.envelope.len())
+            || MemorySealedV2Envelope::decode(&self.envelope).is_err()
+            || memory_sealed_v2_record_id(&self.owner, self.created_at, &self.envelope)
+                != self.record_id
+        {
+            return false;
+        }
+        let transcript = memory_sealed_v2_signature_transcript(
+            &self.owner,
+            &self.record_id,
+            self.created_at,
+            &self.envelope,
+        );
+        IdentityPublicKey::from_bytes(&self.owner)
+            .and_then(|key| key.verify(&transcript, &self.signature))
+            .is_ok()
+    }
 }
 
 fn deserialize_chat_pull_cursor_v2<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -1838,20 +1912,21 @@ pub fn decode_memchain(payload: &[u8]) -> std::result::Result<MemChainMessage, b
         TrailingBytesPolicy::Allow,
     )?;
 
-    // [ANONYMOUS-MAILBOX-CANONICAL-OUTER 2026-09-02 by Codex] Legacy
-    // MemChain variants retain their deployed trailing-byte compatibility,
-    // but the new mailbox carriers have no legacy non-canonical form. Requiring
-    // the exact canonical bytes prevents an authenticated request from being
-    // padded into a different outer wire value with the same retry commitment.
+    // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Legacy variants retain their
+    // trailing-byte compatibility; new authenticated mailbox and sealed-memory
+    // carriers require exact canonical outer bytes.
     if matches!(
         &message,
         MemChainMessage::AnonymousMailboxRouteV1(_)
             | MemChainMessage::AnonymousMailboxRouteResponseV1(_)
+            | MemChainMessage::BroadcastSealedMemoryV2ReplicaV1(_)
+            | MemChainMessage::SyncSealedMemoryV2RequestV1 { .. }
+            | MemChainMessage::SyncSealedMemoryV2ResponseV1 { .. }
     ) {
         let canonical = encode_bincode_bounded(&message, MAX_MEMCHAIN_PAYLOAD_BYTES)?;
         if canonical.as_slice() != payload {
             return Err(Box::new(bincode::ErrorKind::Custom(
-                "anonymous mailbox outer frame is non-canonical".to_string(),
+                "versioned MemChain outer frame is non-canonical".to_string(),
             )));
         }
     }
@@ -2014,6 +2089,75 @@ mod tests {
             decode_memchain(&encoded[1..]).is_err(),
             "mailbox response must reject an otherwise valid frame with trailing bytes"
         );
+    }
+
+    // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Check wire stability,
+    // canonical framing, and owner authentication before peers can replicate.
+    #[test]
+    fn sealed_memory_p2p_replica_is_signed_canonical_and_appended() {
+        let owner = IdentityKeyPair::generate();
+        let owner_bytes = owner.public_key_bytes();
+        let created_at = 1_800_000_000;
+        let mut envelope = vec![0u8; MEMORY_SEALED_V2_MIN_ENVELOPE_BYTES];
+        envelope[..4].copy_from_slice(b"AMV2");
+        envelope[4] = crate::ledger::record::MEMORY_SEALED_V2_SUITE_AES_256_GCM;
+        envelope[17..21].copy_from_slice(&16u32.to_be_bytes());
+        let record_id = memory_sealed_v2_record_id(&owner_bytes, created_at, &envelope);
+        let signature = owner.sign(&memory_sealed_v2_signature_transcript(
+            &owner_bytes,
+            &record_id,
+            created_at,
+            &envelope,
+        ));
+        let replica = SealedMemoryV2ReplicaV1 {
+            record_id,
+            owner: owner_bytes,
+            created_at,
+            envelope,
+            signature,
+        };
+        assert!(replica.verify());
+        let mut tampered = replica.clone();
+        tampered.envelope[21] ^= 1;
+        assert!(!tampered.verify());
+
+        let message = MemChainMessage::BroadcastSealedMemoryV2ReplicaV1(replica);
+        let mut encoded = encode_memchain(&message).expect("encode sealed replica");
+        assert_eq!(u32::from_le_bytes(encoded[1..5].try_into().unwrap()), 42);
+        assert!(matches!(
+            decode_memchain(&encoded[1..]),
+            Ok(MemChainMessage::BroadcastSealedMemoryV2ReplicaV1(_))
+        ));
+        encoded.push(0xA5);
+        assert!(decode_memchain(&encoded[1..]).is_err());
+
+        let request = encode_memchain(&MemChainMessage::SyncSealedMemoryV2RequestV1 {
+            owner: owner_bytes,
+            after_record_id: None,
+            limit: 1,
+        })
+        .expect("encode sealed sync request");
+        let response = encode_memchain(&MemChainMessage::SyncSealedMemoryV2ResponseV1 {
+            owner: owner_bytes,
+            after_record_id: None,
+            records: vec![],
+            next_cursor: None,
+        })
+        .expect("encode sealed sync response");
+        assert_eq!(u32::from_le_bytes(request[1..5].try_into().unwrap()), 43);
+        assert_eq!(u32::from_le_bytes(response[1..5].try_into().unwrap()), 44);
+        assert!(matches!(
+            decode_memchain(&request[1..]),
+            Ok(MemChainMessage::SyncSealedMemoryV2RequestV1 { .. })
+        ));
+        assert!(matches!(
+            decode_memchain(&response[1..]),
+            Ok(MemChainMessage::SyncSealedMemoryV2ResponseV1 { .. })
+        ));
+        for mut frame in [request, response] {
+            frame.push(0x5A);
+            assert!(decode_memchain(&frame[1..]).is_err());
+        }
     }
 
     #[test]

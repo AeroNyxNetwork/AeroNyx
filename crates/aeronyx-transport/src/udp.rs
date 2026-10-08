@@ -101,9 +101,9 @@ impl ShutdownSignal {
 /// ```
 pub struct UdpTransport {
     /// Underlying UDP socket
-    socket: UdpSocket,
+    socket: Option<UdpSocket>,
     /// Local address we're bound to
-    local_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
     /// Race-free shutdown notification for current and future operations
     shutdown: ShutdownSignal,
 }
@@ -187,10 +187,21 @@ impl UdpTransport {
         info!("UDP transport bound to {}", local_addr);
 
         Ok(Self {
-            socket: tokio_socket,
-            local_addr,
+            socket: Some(tokio_socket),
+            local_addr: Some(local_addr),
             shutdown: ShutdownSignal::new(),
         })
+    }
+
+    /// [PHALA-NO-VPN-PROFILE 2026-10-06 by Codex] Creates a transport handle
+    /// for nodes that intentionally do not run VPN.
+    /// Calls that would send or receive packets fail closed with `NotConnected`.
+    pub fn disabled() -> Self {
+        Self {
+            socket: None,
+            local_addr: None,
+            shutdown: ShutdownSignal::new(),
+        }
     }
 
     /// Returns the number of bytes available to read.
@@ -242,6 +253,8 @@ impl Transport for UdpTransport {
     async fn recv(&self, buf: &mut [u8]) -> Result<(usize, PacketSource)> {
         let receive = async {
             self.socket
+                .as_ref()
+                .ok_or(TransportError::NotConnected)?
                 .recv_from(buf)
                 .await
                 .map_err(|error| TransportError::ReceiveFailed {
@@ -258,6 +271,8 @@ impl Transport for UdpTransport {
     async fn send(&self, buf: &[u8], dest: &SocketAddr) -> Result<usize> {
         let send = async {
             self.socket
+                .as_ref()
+                .ok_or(TransportError::NotConnected)?
                 .send_to(buf, dest)
                 .await
                 .map_err(|error| TransportError::SendFailed {
@@ -273,7 +288,7 @@ impl Transport for UdpTransport {
     }
 
     fn local_addr(&self) -> Result<SocketAddr> {
-        Ok(self.local_addr)
+        self.local_addr.ok_or(TransportError::NotConnected)
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -290,7 +305,7 @@ impl Transport for UdpTransport {
     }
 
     fn is_active(&self) -> bool {
-        !self.is_shutdown()
+        self.socket.is_some() && !self.is_shutdown()
     }
 }
 
@@ -310,6 +325,28 @@ impl std::fmt::Debug for UdpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // [PHALA-NO-VPN-PROFILE 2026-10-06 by Codex]
+    #[tokio::test]
+    async fn disabled_transport_fails_closed_without_a_socket() {
+        let transport = UdpTransport::disabled();
+        let mut buffer = [0u8; 1];
+        let destination = "127.0.0.1:9".parse().unwrap();
+
+        assert!(!transport.is_active());
+        assert!(matches!(
+            transport.local_addr(),
+            Err(TransportError::NotConnected)
+        ));
+        assert!(matches!(
+            transport.send(&buffer, &destination).await,
+            Err(TransportError::NotConnected)
+        ));
+        assert!(matches!(
+            transport.recv(&mut buffer).await,
+            Err(TransportError::NotConnected)
+        ));
+    }
 
     #[tokio::test]
     async fn test_bind_and_local_addr() {

@@ -321,7 +321,7 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Keep this visible only inside
 // the memchain module so cross-file migration tests assert the authoritative
 // current version without coupling production migration steps to this value.
-pub(super) const SCHEMA_VERSION: u32 = 18;
+pub(super) const SCHEMA_VERSION: u32 = 19;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;

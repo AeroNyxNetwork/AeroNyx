@@ -154,6 +154,24 @@ mod source_pull_journal_tests {
         trailing.push(0);
         assert!(open_blind_vault_source_pull_journal(&identity, &trailing).is_err());
     }
+
+    // [BLIND-VAULT-ADMISSION-RESTART 2026-10-05 by Codex] Authored only;
+    // admission state must not open through Pull or journal domains.
+    #[test]
+    fn admission_restart_container_has_independent_identity_and_purpose() {
+        let identity = IdentityKeyPair::from_bytes(&[63; 32]).expect("identity");
+        let other = IdentityKeyPair::from_bytes(&[64; 32]).expect("other identity");
+        let clear = zeroize::Zeroizing::new(vec![0x6b; MAX_LEASE_ADMISSION_RESTART_BODY_BYTES]);
+        let sealed = seal_lease_admission_restart(&identity, &clear).expect("maximum seal");
+        assert_eq!(sealed.len(), MAX_LEASE_ADMISSION_RESTART_SEALED_BYTES);
+        assert!(open_lease_admission_restart(&identity, &sealed).expect("open").as_slice() == clear.as_slice());
+        assert!(open_lease_admission_restart(&other, &sealed).is_err());
+        assert!(open_pull_restart(&identity, &sealed).is_err());
+        assert!(open_blind_vault_source_pull_journal(&identity, &sealed).is_err());
+        let too_large = vec![0; MAX_LEASE_ADMISSION_RESTART_BODY_BYTES + 1];
+        assert_eq!(seal_lease_admission_restart(&identity, &too_large),
+            Err(crate::protocol::blind_vault::BlindVaultOnionLeaseAdmissionRestartError::TooLarge));
+    }
 }
 
 // [BLIND-VAULT-PULL-RESTART 2026-10-04 by Codex] Independent local-only
@@ -203,6 +221,64 @@ fn pull_restart_error(
     error: IdentitySealedLocalError,
 ) -> super::super::blind_vault::BlindVaultOnionPullRestartError {
     use super::super::blind_vault::BlindVaultOnionPullRestartError as Error;
+    match error {
+        IdentitySealedLocalError::TooLarge => Error::TooLarge,
+        IdentitySealedLocalError::Malformed => Error::Malformed,
+        IdentitySealedLocalError::UnsupportedVersion => Error::UnsupportedVersion,
+        IdentitySealedLocalError::AuthenticationFailed => Error::AuthenticationFailed,
+    }
+}
+
+// [BLIND-VAULT-ADMISSION-RESTART 2026-10-05 by Codex] Separate local-only
+// key domain and container magic; admission restart state contains more
+// request bindings than Pull and must never decode as a Pull session.
+const LEASE_ADMISSION_RESTART_MAGIC: [u8; 4] = *b"AXLA";
+const LEASE_ADMISSION_RESTART_VERSION: u16 = 1;
+const LEASE_ADMISSION_RESTART_KEY_SALT: &[u8] =
+    b"AeroNyx-BlindVault-OnionLeaseAdmission-Restart-Key-v1";
+const LEASE_ADMISSION_RESTART_KEY_INFO: &[u8] =
+    b"AeroNyx-BlindVault-OnionLeaseAdmission-Restart-State-v1";
+pub(crate) const MAX_LEASE_ADMISSION_RESTART_SEALED_BYTES: usize = 1024;
+pub(crate) const MAX_LEASE_ADMISSION_RESTART_BODY_BYTES: usize =
+    MAX_LEASE_ADMISSION_RESTART_SEALED_BYTES - HEADER_BYTES - TAG_BYTES;
+
+pub(crate) fn seal_lease_admission_restart(
+    identity: &IdentityKeyPair,
+    body: &[u8],
+) -> Result<Vec<u8>, super::super::blind_vault::BlindVaultOnionLeaseAdmissionRestartError> {
+    seal_identity_bound(
+        identity,
+        LEASE_ADMISSION_RESTART_MAGIC,
+        LEASE_ADMISSION_RESTART_VERSION,
+        LEASE_ADMISSION_RESTART_KEY_SALT,
+        LEASE_ADMISSION_RESTART_KEY_INFO,
+        body,
+        MAX_LEASE_ADMISSION_RESTART_SEALED_BYTES,
+    )
+    .map_err(lease_admission_restart_error)
+}
+
+pub(crate) fn open_lease_admission_restart(
+    identity: &IdentityKeyPair,
+    sealed: &[u8],
+) -> Result<zeroize::Zeroizing<Vec<u8>>, super::super::blind_vault::BlindVaultOnionLeaseAdmissionRestartError> {
+    open_identity_bound(
+        identity,
+        sealed,
+        LEASE_ADMISSION_RESTART_MAGIC,
+        LEASE_ADMISSION_RESTART_VERSION,
+        LEASE_ADMISSION_RESTART_KEY_SALT,
+        LEASE_ADMISSION_RESTART_KEY_INFO,
+        MAX_LEASE_ADMISSION_RESTART_SEALED_BYTES,
+    )
+    .map(zeroize::Zeroizing::new)
+    .map_err(lease_admission_restart_error)
+}
+
+fn lease_admission_restart_error(
+    error: IdentitySealedLocalError,
+) -> super::super::blind_vault::BlindVaultOnionLeaseAdmissionRestartError {
+    use super::super::blind_vault::BlindVaultOnionLeaseAdmissionRestartError as Error;
     match error {
         IdentitySealedLocalError::TooLarge => Error::TooLarge,
         IdentitySealedLocalError::Malformed => Error::Malformed,

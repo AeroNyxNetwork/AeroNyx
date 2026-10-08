@@ -2,6 +2,78 @@
 // Behavior is unchanged. Names resolve through `use super::*;`.
 use super::*;
 
+// [PHALA-POLICY-HEARTBEAT-EPOCH 2026-10-08 by Codex] Authored only:
+// local comparison never substitutes a normalized policy into a published
+// descriptor or weakens the ordinary exact-pin mailbox admission contract.
+#[test]
+fn private_epoch_mailbox_policy_comparison_never_becomes_wire_authority() {
+    use aeronyx_core::protocol::discovery::{DirectoryDescriptorCommitmentV1, SignedNodeDescriptor};
+    let now = 1_800_000_000;
+    let identity = IdentityKeyPair::from_bytes(&[0x7b; 32]).unwrap();
+    let mut config = ServerConfig::default();
+    config.reverse_onion.queue.enabled = true;
+    config.discovery.descriptor_ttl_secs = 600;
+    let build = |config: &ServerConfig, at| {
+        let descriptor = Server::build_self_discovery_descriptor_for_runtime_state_with_private_pull(
+            config, &identity, at, true, true, true, true,
+        ).unwrap();
+        // A fixed synthetic public key isolates policy renewal from other
+        // tests rotating the process-wide onion key concurrently.
+        SignedNodeDescriptor::sign(descriptor.descriptor.with_x25519_kem(
+            identity.x25519_public_key_bytes(),
+        ), &identity).unwrap()
+    };
+    let original = build(&config, now);
+    let pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&original).unwrap();
+    let heartbeat = build(&config, now + 60);
+    let policy = heartbeat.anonymous_mailbox_work_policy_at(now + 60).unwrap();
+    let token = policy.semver_build_token();
+    assert_eq!(heartbeat.descriptor.software_version.split_once('+').unwrap().1
+        .split('.').filter(|part| *part == token.as_str()).count(), 1);
+    assert!(heartbeat.anonymous_mailbox_work_policy_for_pin_at(&pin, now + 60).is_err());
+    let selected = Server::select_private_authority_descriptor_epoch(
+        &config, heartbeat.clone(), Some(&original), now + 60,
+    );
+    assert_eq!(selected, original);
+    let retained = selected.anonymous_mailbox_work_policy_for_pin_at(&pin, now + 60).unwrap();
+    assert_eq!(retained.descriptor_sequence(), original.sequence());
+    assert_eq!(retained.expires_at(), original.descriptor.expires_at);
+    assert_ne!(retained.semver_build_token(), token);
+    for fault in 0..5 {
+        let mut body = heartbeat.descriptor.clone();
+        match fault {
+            0 => {
+                let (release, metadata) = body.software_version.split_once('+').unwrap();
+                body.software_version = format!("{release}+{}", metadata.split('.')
+                    .filter(|part| *part != token.as_str()).collect::<Vec<_>>().join("."));
+            }
+            1 => body.software_version.push_str(&format!(".{token}")),
+            2 => body.software_version = body.software_version.replace(
+                &token, &retained.semver_build_token(),
+            ),
+            3 => body.software_version.push_str(".different-runtime"),
+            _ => body.capacity.max_sessions += 1,
+        }
+        let changed = SignedNodeDescriptor::sign(body, &identity).unwrap();
+        if fault <= 2 {
+            assert!(changed.anonymous_mailbox_work_policy_at(now + 60).is_err());
+        }
+        assert_eq!(Server::select_private_authority_descriptor_epoch(
+            &config, changed.clone(), Some(&original), now + 60,
+        ), changed);
+    }
+    let withdrawn = Server::build_self_discovery_descriptor_for_runtime_state_with_private_pull(
+        &config, &identity, now + 60, true, true, false, true,
+    ).unwrap();
+    assert_eq!(Server::select_private_authority_descriptor_epoch(
+        &config, withdrawn.clone(), Some(&original), now + 60,
+    ), withdrawn);
+    let renewal = build(&config, now + 300);
+    assert_eq!(Server::select_private_authority_descriptor_epoch(
+        &config, renewal.clone(), Some(&original), now + 300,
+    ), renewal, "nested policy equivalence cannot extend the half-TTL epoch");
+}
+
 #[tokio::test]
 async fn anonymous_mailbox_custody_startup_cleanup_precedes_readiness() {
     // [ANONYMOUS-MAILBOX-CLEANUP-RUNTIME 2026-09-13 by Codex] Seed one

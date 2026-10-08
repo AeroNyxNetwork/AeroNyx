@@ -1,26 +1,14 @@
 // ============================================
 // File: crates/aeronyx-server/src/api/recall_handler.rs
 // ============================================
-//! # POST /api/mpi/recall — Hybrid Retrieval Pipeline
+//! # POST /api/mpi/recall — Sealed-Record Retrieval
 //!
-//! ## Pipeline
-//! ```text
-//! Step 1:      Query Analysis (GLiNER + regex + entity matching)
-//! Step 2a:     Vector search
-//! Step 2a-bis: BM25 FTS5 search
-//! Step 2a-ter: BM25 entity/session direct injection
-//! Step 2b:     Graph BFS
-//! Step 2c:     Graph content retrieval
-//! Step 3:      RRF fusion + MVF scoring
-//! Step 3.5:    Cross-encoder rerank (v2.4.0+Reranker)
-//! Step 4:      Token budget trimming
-//! Step 4.1:    🆕 v2.5.3+Isolation: Context filter (project_id isolation)
-//! Step 4.5:    Progressive mode branch (v2.4.0+Progressive)
-//! ```
+//! Ordinary nodes return opaque sealed records and keyed-term matches only.
+//! Free-text search and semantic inference remain client-side / Phala ACI.
 //!
-//! ## Progressive Retrieval (v2.4.0+Progressive)
-//! Pass 1: POST /recall { mode: "index" } → ~50 tokens/item
-//! Pass 2: POST /recall/detail { record_ids: [...] } → full content
+//! ## Sealed Retrieval
+//! Pass 1: POST /recall { query_terms, mode } → opaque ciphertext
+//! Pass 2: POST /recall/detail { record_ids } → sealed ciphertext/envelopes
 //!
 //! ## v2.5.3+Isolation: Context filter (Step 4.1)
 //! When `context` is set to a non-"all" value, `scored` is filtered to only
@@ -42,8 +30,8 @@
 //! - matched_json is computed BEFORE the index-mode early-return (borrow-after-move).
 //! - Owner/storage/vector context uses typed Axum extractors. Missing middleware
 //!   context must remain a contained HTTP error under release `panic=abort`.
-//! - Synthetic IDs (graph_*, bm25_*) in index results are silently skipped
-//!   by /recall/detail.
+//! - Ordinary-node recall does not return legacy sighted records or accept
+//!   plaintext query strings; clients decrypt and rank sealed data locally.
 //! - Context filter (Step 4.1) calls get_active_records_by_context() which
 //!   does a LEFT JOIN records → sessions. For records inserted via /remember
 //!   directly (no session), project_id on the record row itself is checked.
@@ -78,7 +66,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{body::Body, extract::State, http::StatusCode, response::IntoResponse, Extension, Json};
 use serde::Deserialize;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
@@ -220,6 +208,17 @@ pub async fn mpi_recall(
         }
     };
 
+    // [MEMCHAIN-NODE-BLIND-RECALL 2026-10-05 by Codex] Preserve the request
+    // shape, but never receive free-text queries at an ordinary node. Clients
+    // use local search and send only keyed query terms for sealed records.
+    if !rb.query.trim().is_empty() {
+        return (
+            StatusCode::GONE,
+            Json(serde_json::json!({"error":"plaintext recall is disabled; use client-local search and sealed query terms"})),
+        )
+            .into_response();
+    }
+
     // [MEMORY-SEALED-V2-ENUMERATION 2026-10-02 by Codex] Decode the cursor
     // before query analysis or session-cache work. Standard base64 is the
     // sole wire spelling; malformed, non-canonical, and wrong-length cursors
@@ -269,6 +268,16 @@ pub async fn mpi_recall(
         )
             .into_response();
     }
+    // [MEMCHAIN-SEALED-VECTOR-BOUNDARY 2026-10-05 by Codex] Legacy recall
+    // bodies still deserialize, but semantic vectors are not accepted by
+    // ordinary nodes. Search stays keyword-based here; vectors remain local.
+    if !rb.embedding.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"unsealed embeddings are not accepted for recall"})),
+        )
+            .into_response();
+    }
 
     let now = now_secs();
     let layer_filter = rb.layer.as_deref().and_then(parse_layer);
@@ -312,40 +321,8 @@ pub async fn mpi_recall(
     let mut total_tokens = 0usize;
     let mut seen_ids: Vec<[u8; 32]> = Vec::new();
 
-    // ── Identity forced injection ──
-    {
-        let cache = state.identity_cache.read();
-        let id_recs = cache.get(&owner_hex).cloned().unwrap_or_default();
-        drop(cache);
-        for r in &id_recs {
-            if !r.is_active() {
-                continue;
-            }
-            let content = String::from_utf8_lossy(&r.encrypted_content).to_string();
-            let tokens = estimate_tokens(&content);
-            if total_tokens + tokens > rb.token_budget && !memories.is_empty() {
-                break;
-            }
-            total_tokens += tokens;
-            seen_ids.push(r.record_id);
-            memories.push(RecalledMemory {
-                record_id: r.id_hex(),
-                layer: r.layer.to_string(),
-                score: r.layer.recall_weight() + 1.0,
-                content,
-                topic_tags: r.topic_tags.clone(),
-                source_ai: r.source_ai.clone(),
-                timestamp: r.timestamp,
-                access_count: r.access_count,
-                proactive: false,
-            });
-            let st = Arc::clone(&storage);
-            let rid = r.record_id;
-            tokio::spawn(async move {
-                st.increment_access(&rid).await;
-            });
-        }
-    }
+    // [MEMCHAIN-NODE-BLIND-RECALL 2026-10-05 by Codex] Legacy sighted identity
+    // cache entries are deliberately not injected into node recall results.
 
     // ── Step 2a: Vector search ──
     let idx_ready = state.index_ready.load(std::sync::atomic::Ordering::Relaxed);
@@ -732,8 +709,10 @@ pub async fn mpi_recall(
     // unmatched blind query returns recent memories as false positives and swamps
     // the blind-FTS ranking (breaking disambiguation and precision).
     if search.is_empty() && bm25_results.is_empty() && rb.query_terms.is_empty() {
+        // [MEMCHAIN-NODE-BLIND-RECALL 2026-10-05 by Codex] The no-query
+        // recovery path is restricted to client-sealed rows.
         let recent = storage
-            .get_active_records(&owner, layer_filter, top_k)
+            .get_active_blind_records(&owner, layer_filter, top_k)
             .await;
         for r in recent {
             if seen_ids.contains(&r.record_id) {
@@ -747,46 +726,6 @@ pub async fn mpi_recall(
     }
 
     scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // ── Step 3.5: Cross-encoder rerank ──
-    if let Some(ref reranker) = state.reranker_engine {
-        if !rb.query.is_empty() && !scored.is_empty() {
-            let rerank_n = scored.len().min(RERANK_TOP_N);
-            let doc_texts: Vec<String> = scored[..rerank_n]
-                .iter()
-                .map(|(r, _)| String::from_utf8_lossy(&r.encrypted_content).to_string())
-                .collect();
-            let doc_refs: Vec<&str> = doc_texts.iter().map(|s| s.as_str()).collect();
-
-            match reranker.rerank_batch(&rb.query, &doc_refs) {
-                Ok(reranked) => {
-                    let blend_w =
-                        crate::services::memchain::reranker::RerankerEngine::blend_weight();
-                    let mut new_scored: Vec<(MemoryRecord, f64)> = Vec::with_capacity(scored.len());
-                    for rc in &reranked {
-                        let (record, old_score) = &scored[rc.original_index];
-                        let rrf_norm = (old_score / 5.0).min(1.0);
-                        let blended = blend_w * rc.ce_score_normalized + (1.0 - blend_w) * rrf_norm;
-                        new_scored.push((record.clone(), blended));
-                    }
-                    for i in rerank_n..scored.len() {
-                        new_scored.push(scored[i].clone());
-                    }
-                    new_scored.sort_unstable_by(|a, b| {
-                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    scored = new_scored;
-                    debug!(
-                        reranked = reranked.len(),
-                        "[RECALL] Step 3.5 rerank complete"
-                    );
-                }
-                Err(e) => {
-                    warn!(error = %e, "[RECALL] Reranker failed, using RRF");
-                }
-            }
-        }
-    }
 
     // ── Step 4.1: Context / project scope (v2.5.3+Isolation) ──
     // Resolve the project id-set ONCE. It scopes BOTH the plaintext `scored`
@@ -815,6 +754,9 @@ pub async fn mpi_recall(
     let mut returned_ids = seen_ids.clone();
     let mut sealed_memories: Vec<SealedMemory> = Vec::new();
     for (r, score) in &scored {
+        if !r.blind {
+            continue;
+        }
         // Time-range scope also applies to the scored (vector / recent) path.
         if let Some(ref tr) = rb.time_range {
             let ts = r.timestamp as i64;
@@ -822,46 +764,15 @@ pub async fn mpi_recall(
                 continue;
             }
         }
-        if r.blind {
-            // Node-blind record: hand back the client ciphertext (base64) in a
-            // separate sealed list. The node cannot read it, and it does not
-            // consume the plaintext token budget.
-            use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-            returned_ids.push(r.record_id);
-            sealed_memories.push(SealedMemory {
-                record_id: r.id_hex(),
-                score: *score,
-                ciphertext_b64: BASE64.encode(&r.encrypted_content),
-                timestamp: r.timestamp,
-            });
-            let st = Arc::clone(&storage);
-            let rid = r.record_id;
-            tokio::spawn(async move {
-                st.increment_access(&rid).await;
-            });
-            continue;
-        }
-        let content = String::from_utf8_lossy(&r.encrypted_content).to_string();
-        let tokens = estimate_tokens(&content);
-        if total_tokens + tokens > rb.token_budget && !memories.is_empty() {
-            break;
-        }
-        let proactive = r.layer == MemoryLayer::Identity
-            && search
-                .iter()
-                .any(|sr| sr.record_id == r.record_id && sr.similarity > 0.3);
-        total_tokens += tokens;
+        // [MEMCHAIN-NODE-BLIND-RECALL 2026-10-05 by Codex] Only client-sealed
+        // record bytes may leave this handler; no sighted fallback projection.
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
         returned_ids.push(r.record_id);
-        memories.push(RecalledMemory {
+        sealed_memories.push(SealedMemory {
             record_id: r.id_hex(),
-            layer: r.layer.to_string(),
             score: *score,
-            content,
-            topic_tags: r.topic_tags.clone(),
-            source_ai: r.source_ai.clone(),
+            ciphertext_b64: BASE64.encode(&r.encrypted_content),
             timestamp: r.timestamp,
-            access_count: r.access_count,
-            proactive,
         });
         let st = Arc::clone(&storage);
         let rid = r.record_id;
@@ -1082,40 +993,22 @@ pub async fn mpi_recall(
 
     // ── Step 4.5: Progressive index mode ──
     if rb.mode == "index" {
-        let index_memories: Vec<RecalledMemory> = memories
-            .into_iter()
-            .map(|mut m| {
-                if m.content.chars().count() > 80 {
-                    let byte_offset = m
-                        .content
-                        .char_indices()
-                        .nth(80)
-                        .map(|(i, _)| i)
-                        .unwrap_or(m.content.len());
-                    m.content = format!("{}...", &m.content[..byte_offset]);
-                }
-                m
-            })
-            .collect();
-
-        let token_estimate: usize = index_memories
-            .iter()
-            .map(|m| estimate_tokens(&m.content) + 30)
-            .sum();
-
         return (
             StatusCode::OK,
             Json(serde_json::json!({
                 "mode": "index",
-                "memories": index_memories,
+                // [MEMCHAIN-NODE-BLIND-RECALL 2026-10-05 by Codex] Keep the
+                // legacy response key, but only ciphertext-bearing sealed
+                // collections may leave this node.
+                "memories": Vec::<RecalledMemory>::new(),
                 "total_candidates": total_candidates,
-                "token_estimate": token_estimate,
+                "token_estimate": 0,
                 "query_type": query_type_str,
                 "matched_entities": matched_json,
                 "sealed": sealed_memories,
                 "sealed_v2": sealed_v2,
                 "sealed_v2_next_cursor": sealed_v2_next_cursor,
-                "hint": "Use POST /api/mpi/recall/detail with record_ids to fetch full content.",
+                "hint": "Decrypt returned sealed ciphertext on the client.",
             })),
         )
             .into_response();
@@ -1138,9 +1031,11 @@ pub async fn mpi_recall(
     (
         StatusCode::OK,
         Json(serde_json::json!(RecallResponse {
-            memories,
+            // [MEMCHAIN-NODE-BLIND-RECALL 2026-10-05 by Codex] Preserve the
+            // wire field without returning historical plaintext records.
+            memories: Vec::new(),
             total_candidates,
-            token_estimate: total_tokens,
+            token_estimate: 0,
             query_type: Some(query_type_str),
             matched_entities: matched_json,
             sealed: sealed_memories,
@@ -1160,7 +1055,8 @@ pub struct DetailRequest {
     pub record_ids: Vec<String>,
 }
 
-/// Fetch full content for selected memory IDs (progressive retrieval pass 2).
+/// Fetch sealed envelopes/ciphertext for selected IDs. Legacy plaintext
+/// records are never serialized by this ordinary-node endpoint.
 ///
 /// Synthetic IDs (graph_*, bm25_*) are silently skipped — no backing records.
 /// Max 20 record_ids per request.
@@ -1226,9 +1122,9 @@ pub async fn mpi_recall_detail(
             .into_response();
     }
 
-    let mut memories: Vec<RecalledMemory> = Vec::new();
+    let memories: Vec<RecalledMemory> = Vec::new();
+    let mut sealed: Vec<SealedMemory> = Vec::new();
     let mut sealed_v2: Vec<SealedV2Memory> = Vec::new();
-    let mut total_tokens = 0usize;
 
     for rid_hex in &dr.record_ids {
         if rid_hex.starts_with("graph_") || rid_hex.starts_with("bm25_") {
@@ -1271,23 +1167,15 @@ pub async fn mpi_recall_detail(
         }
 
         if let Some(record) = storage.get(&rid).await {
-            if !record.is_active() || record.owner != owner {
+            if !record.is_active() || record.owner != owner || !record.blind {
                 continue;
             }
-            let content = String::from_utf8_lossy(&record.encrypted_content).to_string();
-            let tokens = estimate_tokens(&content);
-            total_tokens += tokens;
-
-            memories.push(RecalledMemory {
+            use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+            sealed.push(SealedMemory {
                 record_id: rid_hex.clone(),
-                layer: record.layer.to_string(),
                 score: 0.0,
-                content,
-                topic_tags: record.topic_tags.clone(),
-                source_ai: record.source_ai.clone(),
+                ciphertext_b64: BASE64.encode(&record.encrypted_content),
                 timestamp: record.timestamp,
-                access_count: record.access_count,
-                proactive: false,
             });
 
             let st = Arc::clone(&storage);
@@ -1301,7 +1189,8 @@ pub async fn mpi_recall_detail(
         StatusCode::OK,
         Json(serde_json::json!({
             "memories": memories,
-            "token_estimate": total_tokens,
+            "token_estimate": 0,
+            "sealed": sealed,
             "sealed_v2": sealed_v2,
         })),
     )
@@ -1377,6 +1266,96 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }
+    }
+
+    #[tokio::test]
+    async fn recall_rejects_unsealed_embedding_before_search() {
+        // [MEMCHAIN-SEALED-VECTOR-BOUNDARY 2026-10-05 by Codex] Old request
+        // fields remain deserializable, but remote semantic vectors are refused.
+        let (state, auth) = make_test_state();
+        let app = axum::Router::new()
+            .route("/recall", axum::routing::post(mpi_recall))
+            .layer(Extension(auth))
+            .with_state(Arc::new(state));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/recall")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"embedding":[0.1]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn recall_rejects_plaintext_query_before_search() {
+        // [MEMCHAIN-NODE-BLIND-RECALL 2026-10-05 by Codex] Ordinary nodes
+        // accept keyed query terms, not user plaintext.
+        let (state, auth) = make_test_state();
+        let app = axum::Router::new()
+            .route("/recall", axum::routing::post(mpi_recall))
+            .layer(Extension(auth))
+            .with_state(Arc::new(state));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/recall")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"private search terms"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn recent_recall_returns_no_legacy_sighted_content() {
+        // [MEMCHAIN-NODE-BLIND-RECALL 2026-10-05 by Codex] The empty-query
+        // recovery path enumerates only blind rows and never projects old text.
+        let (state, auth) = make_test_state();
+        let storage = Arc::clone(state.storage.as_ref().unwrap());
+        let owner = auth.owner_bytes();
+        let mut record = MemoryRecord::new(
+            owner,
+            now_secs(),
+            MemoryLayer::Knowledge,
+            vec![],
+            "legacy".into(),
+            b"private historical text".to_vec(),
+            vec![],
+        );
+        record.signature = state.identity.sign(&record.record_id);
+        assert!(storage.insert(&record, "").await);
+
+        let app = axum::Router::new()
+            .route("/recall", axum::routing::post(mpi_recall))
+            .layer(Extension(auth))
+            .with_state(Arc::new(state));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/recall")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["memories"], serde_json::json!([]));
+        assert_eq!(json["sealed"], serde_json::json!([]));
+        assert_eq!(storage.count().await, 1);
     }
 
     #[tokio::test]

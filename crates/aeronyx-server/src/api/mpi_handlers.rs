@@ -27,13 +27,13 @@
 //!                           Axum typed extractors across core MPI endpoints.
 //!
 //! ## Main Functionality
-//! - POST /api/mpi/remember    - store a new memory record
+//! - POST /api/mpi/remember    - legacy path returns migration error; use sealed storage
 //! - POST /api/mpi/forget      - soft-revoke a memory record
 //! - GET  /api/mpi/status      - system health + SuperNode queue metrics
-//! - GET  /api/mpi/record/:id  - fetch a single record by ID
+//! - GET  /api/mpi/record/:id  - fetch sealed record bytes; legacy plaintext is refused
 //! - GET  /api/mpi/records/overview - layer-grouped record summary
-//! - POST /api/mpi/embed       - local MiniLM batch embed
-//! - PATCH /api/mpi/record/:id - v2.5.2 partial record update
+//! - POST /api/mpi/embed       - legacy path returns migration error; use Phala ACI
+//! - PATCH /api/mpi/record/:id - legacy path returns migration error
 //! - GET  /api/mpi/record/:id/provenance - v2.5.2 traceability chain
 //!
 //! ## SaaS Compatibility (v1.0.1-SaaSFix)
@@ -55,7 +55,7 @@
 //! - MAX_IDENTITY_CACHE_PER_OWNER caps hot cache to avoid unbounded growth.
 //! - RecallRequest.context is passed to recall_handler for project isolation.
 //! - revoke_owned() enforces owner in SQL (fix TOCTOU in mpi_forget).
-//! - PATCH clears embedding on content change; Miner re-embeds (~60s).
+//! - Ordinary nodes do not accept plaintext record mutations or local model work.
 //! - Byte-growing SaaS mutations must hold the storage growth permit through
 //!   all SQLite/FTS side effects. Reads and forget/revoke remain ungated.
 //! - record_commitment_chain is aggregate and privacy-safe. Do not expose
@@ -203,153 +203,18 @@ pub struct RememberResponse {
 }
 
 pub async fn mpi_remember(
-    State(state): State<Arc<MpiState>>,
-    Extension(auth): Extension<AuthenticatedOwner>,
-    Extension(storage): Extension<Arc<MemoryStorage>>,
-    Extension(vi): Extension<Arc<VectorIndex>>,
-    req: Request<axum::body::Body>,
+    State(_state): State<Arc<MpiState>>,
+    Extension(_auth): Extension<AuthenticatedOwner>,
+    Extension(_storage): Extension<Arc<MemoryStorage>>,
+    Extension(_vi): Extension<Arc<VectorIndex>>,
+    _req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let owner = auth.owner_bytes();
-    let owner_hex = auth.owner_hex();
-
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error":"failed to read body"})),
-            )
-                .into_response()
-        }
-    };
-    let growth_bytes = minimum_growth_bytes(body_bytes.len());
-    let rb: RememberRequest = match serde_json::from_slice(&body_bytes) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("invalid JSON: {}", e)})),
-            )
-                .into_response()
-        }
-    };
-
-    if rb.content.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"content empty"})),
-        )
-            .into_response();
-    }
-    let layer = match parse_layer(&rb.layer) {
-        Some(l) => l,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error":"invalid layer"})),
-            )
-                .into_response()
-        }
-    };
-
-    let ts = now_secs();
-
-    if !rb.embedding.is_empty() {
-        let dedup = vi.check_duplicate(&rb.embedding, &owner, &rb.embedding_model, layer, ts);
-        if dedup.is_duplicate {
-            let dup_hex = hex::encode(dedup.existing_id.unwrap_or([0; 32]));
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!(RememberResponse {
-                    record_id: dup_hex.clone(),
-                    status: "duplicate".into(),
-                    duplicate_of: Some(dup_hex),
-                })),
-            )
-                .into_response();
-        }
-    }
-
-    let encrypted_content = rb.content.as_bytes().to_vec();
-    let mut record = MemoryRecord::new(
-        owner,
-        ts,
-        layer,
-        rb.topic_tags.clone(),
-        rb.source_ai.clone(),
-        encrypted_content,
-        rb.embedding.clone(),
-    );
-    record.signature = state.identity.sign(&record.record_id);
-    let rid_hex = record.id_hex();
-
-    // Exact duplicate handling remains available even when the volume is full.
-    if storage.get(&record.record_id).await.is_some() {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error":"exists","record_id":rid_hex})),
-        )
-            .into_response();
-    }
-    let _growth_permit = match storage.acquire_growth_permit(growth_bytes).await {
-        Ok(permit) => permit,
-        Err(error) => return growth_failure_response(error),
-    };
-
-    // [MEMORY-V2-OWNER-SLOT-WIRING 2026-10-03 by Codex] The durable owner
-    // ceiling is checked in the same IMMEDIATE transaction as this insert;
-    // the local owner bypasses the remote slot count.
-    match storage
-        .insert_with_owner_slot(&record, &rb.embedding_model, owner_slot_policy(&state))
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error":"exists","record_id":rid_hex})),
-            )
-                .into_response();
-        }
-        Err(error) => return owner_slot_failure_response(error),
-    }
-
-    if !rb.embedding.is_empty() {
-        vi.upsert(
-            record.record_id,
-            rb.embedding,
-            layer,
-            ts,
-            &owner,
-            &rb.embedding_model,
-        );
-    }
-
-    let tags_str = serde_json::to_string(&rb.topic_tags).unwrap_or_default();
-    storage
-        .fts_index_record(&record.record_id, &owner, &rb.content, &tags_str)
-        .await;
-
-    // Fix #11: cap identity cache size per owner.
-    if layer == MemoryLayer::Identity {
-        let mut cache = state.identity_cache.write();
-        let entries = cache.entry(owner_hex.clone()).or_default();
-        entries.push(record.clone());
-        if entries.len() > MAX_IDENTITY_CACHE_PER_OWNER {
-            entries.remove(0);
-        }
-    }
-
-    info!(id = %rid_hex, layer = %layer, "[MPI_REMEMBER] Stored");
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!(RememberResponse {
-            record_id: rid_hex,
-            status: "created".into(),
-            duplicate_of: None,
-        })),
-    )
-        .into_response()
+    // [MEMCHAIN-NODE-BLIND-WRITES 2026-10-05 by Codex] Keep the legacy route
+    // mounted for a clear migration error, but never receive plaintext memory
+    // or unsealed semantic vectors in an ordinary node process.
+    // [PHALA-DISABLED-BODY-BOUNDARY 2026-10-08 by Codex] Direct mounts
+    // retain the same error and never cache this migration response.
+    super::mpi::plaintext_memory_unavailable_response("/api/mpi/remember")
 }
 
 // ============================================
@@ -378,12 +243,11 @@ pub struct SealedRememberRequest {
     pub topic_tags: Vec<String>,
     #[serde(default = "default_source")]
     pub source_ai: String,
-    /// Client-precomputed embedding (the node cannot embed ciphertext). Optional.
-    /// Stored with the record; server-side vector indexing of blind records is a
-    /// follow-up (kept out of this endpoint so blind records are not yet surfaced
-    /// by the plaintext recall path).
+    /// Legacy wire field. Empty is accepted; non-empty vectors are rejected so
+    /// ordinary nodes do not retain unsealed semantic representations.
     #[serde(default)]
     pub embedding: Vec<f32>,
+    /// Legacy wire field retained for deserialization compatibility.
     #[serde(default = "default_model")]
     pub embedding_model: String,
     /// Client Ed25519 signature over `record_id` (base64). Verified against `owner`.
@@ -670,7 +534,6 @@ pub async fn mpi_remember_sealed(
     State(state): State<Arc<MpiState>>,
     Extension(auth): Extension<AuthenticatedOwner>,
     Extension(storage): Extension<Arc<MemoryStorage>>,
-    Extension(vi): Extension<Arc<VectorIndex>>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -721,6 +584,18 @@ pub async fn mpi_remember_sealed(
                 .into_response()
         }
     };
+
+    // [MEMCHAIN-SEALED-VECTOR-BOUNDARY 2026-10-05 by Codex] Keep the legacy
+    // fields deserializable, but never retain or index caller-supplied semantic
+    // vectors on an ordinary node. Clients keep vectors in their encrypted
+    // local store and send only ciphertext plus blind FTS terms here.
+    if !rb.embedding.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"unsealed embeddings are not accepted for sealed memory"})),
+        )
+            .into_response();
+    }
 
     let ciphertext = match BASE64.decode(rb.ciphertext_b64.as_bytes()) {
         Ok(c) if !c.is_empty() => c,
@@ -815,20 +690,6 @@ pub async fn mpi_remember_sealed(
                 .into_response();
         }
         Err(error) => return owner_slot_failure_response(error),
-    }
-
-    // Index the client-supplied embedding so blind records are vector-searchable.
-    // The node searches over opaque vectors; content stays sealed and recall
-    // returns it as ciphertext.
-    if !rb.embedding.is_empty() {
-        vi.upsert(
-            record.record_id,
-            rb.embedding,
-            layer,
-            rb.timestamp,
-            &owner,
-            &rb.embedding_model,
-        );
     }
 
     // Index client-supplied keyed token-hashes for node-blind full-text (BM25).
@@ -1018,8 +879,10 @@ pub async fn mpi_attest(
 pub struct RecallRequest {
     #[serde(default)]
     pub query: String,
+    /// Legacy wire field. Empty is accepted; non-empty vectors are rejected.
     #[serde(default)]
     pub embedding: Vec<f32>,
+    /// Legacy wire field retained for deserialization compatibility.
     #[serde(default = "default_model")]
     pub embedding_model: String,
     #[serde(default = "default_top_k")]
@@ -1111,8 +974,8 @@ pub struct RecallResponse {
     pub token_estimate: usize,
     pub query_type: Option<String>,
     pub matched_entities: Option<Vec<serde_json::Value>>,
-    /// Node-blind memories (ciphertext) matched by vector search. Empty unless
-    /// the owner uses node-blind storage.
+    /// Node-blind memories matched by keyed terms or returned for recent
+    /// recovery. The node never ranks them with semantic vectors.
     #[serde(default)]
     pub sealed: Vec<SealedMemory>,
     /// Additive opaque V2 list; never enters legacy scoring or projections.
@@ -1310,19 +1173,19 @@ pub struct TodayStats {
     pub estimated_cost_usd: String,
 }
 
-/// Privacy-safe readiness of the node's optional local inference engines.
+/// Compatibility shape for legacy clients; local model inference is disabled.
 ///
 /// The snapshot exposes capabilities only; it never includes filesystem paths,
 /// model contents, prompts, memory records, or user identifiers.
 #[derive(Debug, Serialize)]
 pub struct LocalInferenceStatus {
-    /// True when the local embedding model loaded successfully.
+    /// Always false on ordinary nodes.
     pub embed_ready: bool,
-    /// Active embedding output dimension, absent when embedding is unavailable.
+    /// Always absent on ordinary nodes.
     pub embed_dim: Option<usize>,
-    /// True when the local named-entity model loaded successfully.
+    /// Always false on ordinary nodes.
     pub ner_ready: bool,
-    /// True when the local cross-encoder reranker loaded successfully.
+    /// Always false on ordinary nodes.
     pub reranker_ready: bool,
 }
 
@@ -1332,12 +1195,14 @@ impl LocalInferenceStatus {
     /// [MEMCHAIN-INFERENCE-READINESS 2026-07-30 by Codex] Keep all inference
     /// status fields in this constructor so adding an engine cannot silently
     /// update runtime state without updating the operator API.
-    fn from_state(state: &MpiState) -> Self {
+    fn from_state(_state: &MpiState) -> Self {
         Self {
-            embed_ready: state.embed_engine.is_some(),
-            embed_dim: state.embed_engine.as_ref().map(|engine| engine.dim()),
-            ner_ready: state.ner_engine.is_some(),
-            reranker_ready: state.reranker_engine.is_some(),
+            // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Keep response keys
+            // stable while never advertising node-side inference capability.
+            embed_ready: false,
+            embed_dim: None,
+            ner_ready: false,
+            reranker_ready: false,
         }
     }
 }
@@ -1364,6 +1229,10 @@ pub struct MpiStatusResponse {
     pub mvf: MvfMetrics,
     pub remote_storage_enabled: bool,
     pub blind_storage_enabled: bool,
+    // [PHALA-LEGACY-MEMORY-INGRESS 2026-10-08 by Codex] Additive,
+    // effective node capabilities, independent of auth mode/graph config.
+    pub plaintext_log_enabled: bool,
+    pub plaintext_search_enabled: bool,
     pub graph_enabled: bool,
     pub graph_stats: Option<crate::services::memchain::storage_graph::GraphStats>,
     pub supernode: SuperNodeStatus,
@@ -1551,6 +1420,8 @@ pub async fn mpi_status(
             },
             remote_storage_enabled: state.allow_remote_storage,
             blind_storage_enabled: state.blind_storage_enabled,
+            plaintext_log_enabled: super::mpi::node_accepts_plaintext_memory_processing(),
+            plaintext_search_enabled: super::mpi::node_accepts_plaintext_memory_processing(),
             graph_enabled: state.graph_enabled,
             graph_stats: gs,
             supernode: supernode_status,
@@ -1582,8 +1453,7 @@ pub struct RecordDetailResponse {
     pub embedding_model: String,
     pub has_embedding: bool,
     pub status: String,
-    /// True when `content` is base64 client ciphertext (a node-blind record the
-    /// node cannot decrypt); false when `content` is plaintext.
+    /// True when `content` is base64 client ciphertext.
     #[serde(default)]
     pub sealed: bool,
     /// Source record_ids (hex) this record was derived from (node-blind
@@ -1630,26 +1500,24 @@ pub async fn mpi_get_record(
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error":"access denied"})),
         )
+        .into_response();
+    }
+
+    // [MEMCHAIN-NODE-BLIND-READS 2026-10-05 by Codex] Do not serialize legacy
+    // sighted record bytes as text from an ordinary node. Sealed records keep
+    // the existing response shape and return their ciphertext as base64.
+    if !record.blind {
+        return (
+            StatusCode::GONE,
+            Json(serde_json::json!({"error":"plaintext records are unavailable from ordinary nodes"})),
+        )
             .into_response();
     }
 
     let em = storage.get_embedding_model(&rid).await.unwrap_or_default();
-    // Node-blind records return their client ciphertext as base64 (the node
-    // cannot decrypt them); sighted records return plaintext.
-    let (content, sealed) = if record.blind {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-        (BASE64.encode(&record.encrypted_content), true)
-    } else {
-        (
-            String::from_utf8_lossy(&record.encrypted_content).to_string(),
-            false,
-        )
-    };
-    let derived_from = if record.blind {
-        storage.get_blind_provenance(&rid).await
-    } else {
-        Vec::new()
-    };
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    let content = BASE64.encode(&record.encrypted_content);
+    let derived_from = storage.get_blind_provenance(&rid).await;
 
     (
         StatusCode::OK,
@@ -1672,7 +1540,7 @@ pub async fn mpi_get_record(
                 "revoked"
             }
             .into(),
-            sealed,
+            sealed: true,
             derived_from,
         })),
     )
@@ -1700,8 +1568,9 @@ pub async fn mpi_records_overview(
             "by_layer": ov.by_layer,
             "recent_by_layer": ov.recent_by_layer,
             "last_memory_at": ov.last_memory_at,
-            "embed_ready": state.embed_engine.is_some(),
-            "embed_dim": state.embed_engine.as_ref().map(|e| e.dim()),
+            // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex]
+            "embed_ready": false,
+            "embed_dim": serde_json::Value::Null,
         })),
     )
 }
@@ -1718,77 +1587,14 @@ pub struct EmbedRequest {
 }
 
 pub async fn mpi_embed(
-    State(state): State<Arc<MpiState>>,
+    State(_state): State<Arc<MpiState>>,
     Extension(_auth): Extension<AuthenticatedOwner>,
-    req: Request<axum::body::Body>,
+    _req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error":"failed to read body"})),
-            )
-                .into_response()
-        }
-    };
-    let rb: EmbedRequest = match serde_json::from_slice(&body_bytes) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("invalid JSON: {}", e)})),
-            )
-                .into_response()
-        }
-    };
-    let engine = match &state.embed_engine {
-        Some(e) => e,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error":"local embed engine not available"})),
-            )
-                .into_response()
-        }
-    };
-    if rb.texts.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"texts array is empty"})),
-        )
-            .into_response();
-    }
-    if rb.texts.len() > 100 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"batch too large","max":100})),
-        )
-            .into_response();
-    }
-
-    let refs: Vec<&str> = rb.texts.iter().map(|s| s.as_str()).collect();
-    match engine.embed_batch(&refs) {
-        Ok(embs) => {
-            let dim = embs.first().map(|v| v.len()).unwrap_or(0);
-            debug!(batch = embs.len(), dim = dim, "[MPI_EMBED] Generated");
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "embeddings": embs, "model": "minilm-l6-v2", "dim": dim
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            warn!(error = %e, "[MPI_EMBED] Inference failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("embed failed: {}", e)})),
-            )
-                .into_response()
-        }
-    }
+    // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] This node endpoint must not
+    // expose locally generated semantic vectors. Clients use Phala ACI.
+    // [PHALA-DISABLED-BODY-BOUNDARY 2026-10-08 by Codex]
+    super::mpi::plaintext_memory_unavailable_response("/api/mpi/embed")
 }
 
 // ============================================
@@ -1821,170 +1627,18 @@ pub struct PatchRecordRequest {
 }
 
 pub async fn mpi_patch_record(
-    State(state): State<Arc<MpiState>>,
-    Path(record_id_hex): Path<String>,
-    Extension(auth): Extension<AuthenticatedOwner>,
-    Extension(storage): Extension<Arc<MemoryStorage>>,
-    Extension(vi): Extension<Arc<VectorIndex>>,
-    req: Request<axum::body::Body>,
+    State(_state): State<Arc<MpiState>>,
+    Path(_record_id_hex): Path<String>,
+    Extension(_auth): Extension<AuthenticatedOwner>,
+    Extension(_storage): Extension<Arc<MemoryStorage>>,
+    Extension(_vi): Extension<Arc<VectorIndex>>,
+    _req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let owner = auth.owner_bytes();
-
-    let rid: [u8; 32] = match hex::decode(&record_id_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut a = [0u8; 32];
-            a.copy_from_slice(&b);
-            a
-        }
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error":"invalid record_id format"})),
-            )
-                .into_response()
-        }
-    };
-
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 512 * 1024).await {
-        Ok(b) => b,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error":"failed to read body"})),
-            )
-                .into_response()
-        }
-    };
-    let growth_bytes = minimum_growth_bytes(body_bytes.len());
-    let patch: PatchRecordRequest = match serde_json::from_slice(&body_bytes) {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("invalid JSON: {}", e)})),
-            )
-                .into_response()
-        }
-    };
-
-    if patch.content.is_none()
-        && patch.topic_tags.is_none()
-        && patch.layer.is_none()
-        && patch.source_ai.is_none()
-    {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "at least one field must be provided: content, topic_tags, layer, source_ai"
-        }))).into_response();
-    }
-
-    let new_layer: Option<MemoryLayer> = match &patch.layer {
-        Some(l) => match parse_layer(l) {
-            Some(ml) => Some(ml),
-            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": format!("invalid layer '{}': use identity|knowledge|episode|archive", l)
-            }))).into_response(),
-        },
-        None => None,
-    };
-
-    // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] A missing, revoked, or
-    // foreign record is not a byte-growing mutation; preserve the established
-    // privacy-safe 404 response even at capacity.
-    match storage.get(&rid).await {
-        Some(record) if record.owner == owner && record.is_active() => {}
-        _ => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": "record not found, not active, or access denied"
-                })),
-            )
-                .into_response()
-        }
-    }
-
-    let _growth_permit = match storage.acquire_growth_permit(growth_bytes).await {
-        Ok(permit) => permit,
-        Err(error) => return growth_failure_response(error),
-    };
-
-    match storage
-        .update_record_content(
-            &rid,
-            &owner,
-            patch.content.as_deref(),
-            patch.topic_tags.as_deref(),
-            new_layer,
-            patch.source_ai.as_deref(),
-        )
-        .await
-    {
-        Ok(true) => {
-            let content_changed = patch.content.is_some();
-            let needs_fts = content_changed || patch.topic_tags.is_some();
-
-            if needs_fts {
-                let index_content: Option<String> = if let Some(ref c) = patch.content {
-                    Some(c.clone())
-                } else {
-                    storage
-                        .get(&rid)
-                        .await
-                        .map(|r| String::from_utf8_lossy(&r.encrypted_content).into_owned())
-                };
-
-                if let Some(ref cs) = index_content {
-                    let tags_str = patch
-                        .topic_tags
-                        .as_ref()
-                        .and_then(|t| serde_json::to_string(t).ok())
-                        .unwrap_or_default();
-                    storage.fts_remove_record(&rid).await;
-                    storage.fts_index_record(&rid, &owner, cs, &tags_str).await;
-                }
-            }
-
-            if content_changed {
-                vi.remove(&rid);
-            }
-
-            {
-                let oh = auth.owner_hex();
-                let mut cache = state.identity_cache.write();
-                if let Some(entries) = cache.get_mut(&oh) {
-                    entries.retain(|r| r.record_id != rid);
-                }
-            }
-
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "record_id": record_id_hex,
-                    "status": "updated",
-                    "embedding_invalidated": content_changed,
-                    "fts_updated": needs_fts,
-                    "note": if content_changed {
-                        "Embedding cleared. Miner will re-embed on next cycle (~60s)."
-                    } else { "Update applied." }
-                })),
-            )
-                .into_response()
-        }
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "record not found, not active, or access denied"
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("update failed: {}", e)
-            })),
-        )
-            .into_response(),
-    }
+    // [MEMCHAIN-NODE-BLIND-WRITES 2026-10-05 by Codex] Legacy PATCH accepts
+    // plaintext content and metadata. Keep its route but reject before reading
+    // the body; signed sealed updates require a separate wire contract.
+    // [PHALA-DISABLED-BODY-BOUNDARY 2026-10-08 by Codex]
+    super::mpi::plaintext_memory_unavailable_response("/api/mpi/record/:record_id")
 }
 
 // ============================================
@@ -2154,6 +1808,74 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn sealed_v1_rejects_unsealed_embedding_before_storage() {
+        // [MEMCHAIN-SEALED-VECTOR-BOUNDARY 2026-10-05 by Codex] Legacy JSON
+        // remains parseable, but a supplied vector must not reach persistence.
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let (mut state, auth, vector_index) =
+            make_test_state_with_storage(Arc::clone(&storage));
+        Arc::get_mut(&mut state).unwrap().blind_storage_enabled = true;
+        let app = axum::Router::new()
+            .route("/remember_sealed", axum::routing::post(mpi_remember_sealed))
+            .layer(Extension(vector_index))
+            .layer(Extension(storage.clone()))
+            .layer(Extension(auth))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/remember_sealed")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "ciphertext_b64": "YQ==",
+                            "timestamp": 1,
+                            "signature_b64": "AA==",
+                            "embedding": [0.1],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(storage.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn remote_plaintext_remember_is_disabled_before_body_processing() {
+        // [MEMCHAIN-NODE-BLIND-WRITES 2026-10-05 by Codex] Ordinary nodes do
+        // not accept plaintext through the legacy route for any identity.
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let (state, _local_auth, vector_index) =
+            make_test_state_with_storage(Arc::clone(&storage));
+        let auth = AuthenticatedOwner::Remote {
+            owner: [7; 32],
+            owner_hex: hex::encode([7; 32]),
+        };
+        let app = axum::Router::new()
+            .route("/remember", axum::routing::post(mpi_remember))
+            .layer(Extension(vector_index))
+            .layer(Extension(storage.clone()))
+            .layer(Extension(auth))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/remember")
+                    .body(Body::from(r#"{"content":"must stay private"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(storage.count().await, 0);
+    }
+
     fn invalid_signature_request(
         key: &IdentityKeyPair,
         method: &str,
@@ -2191,7 +1913,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn byte_growing_remember_fails_closed_with_compatible_json_schema() {
+    // [MEMCHAIN-NODE-BLIND-WRITES 2026-10-05 by Codex]
+    async fn plaintext_remember_is_disabled_before_growth_admission() {
         let storage = Arc::new(
             MemoryStorage::open(":memory:", None)
                 .unwrap()
@@ -2212,40 +1935,23 @@ mod tests {
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status().as_u16(), 507);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({"error": "storage capacity reached"})
-        );
+        assert_eq!(response.status(), StatusCode::GONE);
         assert_eq!(storage.count().await, 0);
     }
 
+    // [MEMCHAIN-NODE-BLIND-WRITES 2026-10-05 by Codex]
     #[tokio::test]
-    async fn duplicate_remember_remains_available_at_capacity() {
+    async fn plaintext_remember_is_disabled_without_persisting_content() {
         let storage = Arc::new(
             MemoryStorage::open(":memory:", None)
                 .unwrap()
                 .with_growth_admission(Arc::new(AtCapacityAdmission)),
         );
         let (state, auth, vector_index) = make_test_state_with_storage(Arc::clone(&storage));
-        let owner = auth.owner_bytes();
-        let embedding = vec![0.1_f32, 0.2, 0.3];
-        vector_index.upsert(
-            [0x44; 32],
-            embedding.clone(),
-            MemoryLayer::Knowledge,
-            now_secs(),
-            &owner,
-            "minilm-l6-v2",
-        );
         let app = axum::Router::new()
             .route("/remember", axum::routing::post(mpi_remember))
             .layer(Extension(auth))
-            .layer(Extension(storage))
+            .layer(Extension(storage.clone()))
             .layer(Extension(vector_index))
             .with_state(state);
         let request = Request::builder()
@@ -2254,17 +1960,75 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({
-                    "content": "duplicate",
+                    "content": "must stay client-side plaintext",
                     "layer": "knowledge",
-                    "embedding": embedding,
-                    "embedding_model": "minilm-l6-v2"
+                    "embedding": [0.1, 0.2, 0.3],
+                    "embedding_model": "legacy-model"
                 })
                 .to_string(),
             ))
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(storage.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_record_read_and_patch_do_not_expose_or_mutate_plaintext() {
+        // [MEMCHAIN-NODE-BLIND-READS 2026-10-05 by Codex] Existing sighted
+        // rows remain stored, but legacy read/update routes cannot return them.
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let (state, auth, vector_index) = make_test_state_with_storage(Arc::clone(&storage));
+        let owner = auth.owner_bytes();
+        let mut record = MemoryRecord::new(
+            owner,
+            now_secs(),
+            MemoryLayer::Knowledge,
+            vec![],
+            "legacy".into(),
+            b"private historical text".to_vec(),
+            vec![],
+        );
+        record.signature = state.identity.sign(&record.record_id);
+        assert!(storage.insert(&record, "").await);
+
+        let app = axum::Router::new()
+            .route(
+                "/record/:record_id",
+                axum::routing::get(mpi_get_record).patch(mpi_patch_record),
+            )
+            .layer(Extension(auth))
+            .layer(Extension(storage.clone()))
+            .layer(Extension(vector_index))
+            .with_state(state);
+        let record_id = hex::encode(record.record_id);
+        let read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/record/{record_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::GONE);
+
+        let patch = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/record/{record_id}"))
+                    .body(Body::from(r#"{"content":"replacement text"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patch.status(), StatusCode::GONE);
+        let stored = storage.get(&record.record_id).await.unwrap();
+        assert_eq!(stored.encrypted_content.as_slice(), b"private historical text");
     }
 
     #[tokio::test]
@@ -2859,6 +2623,127 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    // [PHALA-SEALED-MPI-REOPEN 2026-10-08 by Codex] Exercise signed
+    // production routers across closed/reopened SQLite connections. The opaque
+    // AMV2 fixture tests byte/signature custody, not source AES decryption,
+    // independent-host delivery, process death or filesystem power-loss safety.
+    #[tokio::test]
+    async fn sealed_v2_router_preserves_signed_custody_and_revocation_across_disk_reopen() {
+        async fn response_json(response: axum::response::Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await.unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let directory = tempfile::Builder::new().prefix("phala-sealed-mpi-reopen-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+        let path = directory.path().join("memory.sqlite");
+        let source = IdentityKeyPair::generate();
+        let other = IdentityKeyPair::generate();
+        let owner = source.public_key_bytes();
+        let (body, record_id, envelope, signature) = sealed_v2_body(&source, 73);
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let created_at = request["created_at"].as_u64().unwrap();
+        let detail = serde_json::json!({"record_ids": [BASE64.encode(record_id)]})
+            .to_string().into_bytes();
+        let mut previous_node = None;
+
+        for round in 0..3 {
+            let storage = Arc::new(MemoryStorage::open(&path, None).unwrap());
+            let (mut state, _auth, _vector_index) =
+                make_test_state_with_storage(Arc::clone(&storage));
+            Arc::get_mut(&mut state).unwrap().blind_storage_enabled = true;
+            // A fresh node key cannot rewrite the source's signed custody.
+            let node = state.identity.public_key_bytes();
+            assert_ne!(node, owner);
+            assert_ne!(previous_node, Some(node));
+            previous_node = Some(node);
+            let app = crate::api::mpi::build_mpi_router(Arc::clone(&state));
+            let response = app.clone().oneshot(signed_remote_request(&source,
+                "POST", "/api/mpi/remember_sealed_v2", body.clone())).await.unwrap();
+            assert_eq!(response.status(), match round {
+                0 => StatusCode::CREATED,
+                1 => StatusCode::OK,
+                _ => StatusCode::CONFLICT,
+            });
+            let result = response_json(response).await;
+            if round < 2 {
+                assert_eq!(result["record_id"], BASE64.encode(record_id));
+                assert_eq!(result["status"], if round == 0 { "created" } else { "exists" });
+            }
+
+            for (route, query) in [
+                ("/api/mpi/recall", br#"{"mode":"index"}"#.to_vec()),
+                ("/api/mpi/recall/detail", detail.clone()),
+            ] {
+                let response = app.clone().oneshot(signed_remote_request(&source,
+                    "POST", route, query.clone())).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let recalled = response_json(response).await;
+                assert_eq!(recalled["memories"], serde_json::json!([]));
+                assert_eq!(recalled["sealed"], serde_json::json!([]));
+                let rows = recalled["sealed_v2"].as_array().unwrap();
+                assert_eq!(rows.len(), if round < 2 { 1 } else { 0 });
+                if let Some(row) = rows.first() {
+                    assert_eq!(row["created_at"], created_at);
+                    assert_eq!(BASE64.decode(row["record_id_b64"].as_str().unwrap()).unwrap(), record_id);
+                    let recalled_envelope = BASE64.decode(row["envelope_b64"].as_str().unwrap()).unwrap();
+                    let recalled_signature: [u8; 64] = BASE64
+                        .decode(row["signature_b64"].as_str().unwrap()).unwrap().try_into().unwrap();
+                    assert_eq!(recalled_envelope, envelope);
+                    assert_eq!(recalled_signature, signature);
+                    assert_eq!(memory_sealed_v2_record_id(&owner, created_at, &recalled_envelope), record_id);
+                    let transcript = memory_sealed_v2_signature_transcript(
+                        &owner, &record_id, created_at, &recalled_envelope);
+                    source.public_key().verify(&transcript, &recalled_signature).unwrap();
+                    assert!(other.public_key().verify(&transcript, &recalled_signature).is_err());
+                }
+                let response = app.clone().oneshot(signed_remote_request(&other,
+                    "POST", route, query)).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let foreign = response_json(response).await;
+                assert_eq!(foreign["sealed_v2"], serde_json::json!([]));
+                assert!(!foreign.to_string().contains(&BASE64.encode(&envelope)));
+            }
+
+            let mut changed_envelope = envelope.clone();
+            *changed_envelope.last_mut().unwrap() ^= 1;
+            let mut tampered = request.clone();
+            tampered["envelope_b64"] = BASE64.encode(changed_envelope).into();
+            // HTTP authentication is valid; the inner source commitment is not.
+            let response = app.clone().oneshot(signed_remote_request(&source,
+                "POST", "/api/mpi/remember_sealed_v2", tampered.to_string().into_bytes()))
+                .await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+            if round == 1 {
+                let forget = serde_json::json!({"record_id": BASE64.encode(record_id)})
+                    .to_string().into_bytes();
+                let response = app.clone().oneshot(signed_remote_request(&source,
+                    "POST", "/api/mpi/forget", forget)).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response_json(response).await["status"], "revoked");
+            }
+            {
+                let conn = storage.conn_lock().await;
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM memory_sealed_v2", [],
+                    |row| row.get(0)).unwrap();
+                assert_eq!(count, 1);
+                let (stored_envelope, stored_signature, status): (Vec<u8>, Vec<u8>, i64) = conn
+                    .query_row("SELECT envelope, signature, status FROM memory_sealed_v2", [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+                assert_eq!(stored_envelope, envelope);
+                assert_eq!(stored_signature, signature);
+                assert_eq!(status, if round == 0 { 0 } else { 2 });
+            }
+            drop(app);
+            drop(state);
+            assert_eq!(Arc::strong_count(&storage), 1, "all router owners must close before reopening");
+            drop(storage);
+            assert!(path.is_file());
+        }
+    }
+
     #[tokio::test]
     async fn missing_core_extensions_return_internal_server_error_without_panicking() {
         // [MPI-TYPED-EXTENSIONS 2026-08-12 by Codex] Each middleware wiring
@@ -2915,8 +2800,8 @@ mod tests {
 
     #[test]
     fn local_inference_status_serializes_stable_operator_contract() {
-        // [MEMCHAIN-INFERENCE-READINESS 2026-07-30 by Codex] This locks the
-        // flattened API names consumed by nodeboard and health tooling.
+        // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Preserve flattened API
+        // names while keeping local inference capability disabled.
         #[derive(Serialize)]
         struct FlattenedStatusContract {
             status: &'static str,
@@ -2927,19 +2812,21 @@ mod tests {
         let value = serde_json::to_value(FlattenedStatusContract {
             status: "ready",
             inference: LocalInferenceStatus {
-                embed_ready: true,
-                embed_dim: Some(384),
+                // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Preserve the old
+                // response keys while advertising no local model capability.
+                embed_ready: false,
+                embed_dim: None,
                 ner_ready: false,
-                reranker_ready: true,
+                reranker_ready: false,
             },
         })
         .unwrap();
 
         assert_eq!(value["status"], "ready");
-        assert_eq!(value["embed_ready"], true);
-        assert_eq!(value["embed_dim"], 384);
+        assert_eq!(value["embed_ready"], false);
+        assert!(value["embed_dim"].is_null());
         assert_eq!(value["ner_ready"], false);
-        assert_eq!(value["reranker_ready"], true);
+        assert_eq!(value["reranker_ready"], false);
         assert!(value.get("inference").is_none());
     }
 

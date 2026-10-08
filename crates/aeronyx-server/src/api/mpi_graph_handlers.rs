@@ -46,6 +46,9 @@
 //! - mpi_artifact_detail and mpi_artifact_versions are still stubs (Phase D).
 //! - conn_lock() in mpi_entity_graph is Local-mode only; SaaS returns empty.
 //! - make_state() in tests must stay in sync with MpiState struct fields.
+//! - [PHALA-LEGACY-MEMORY-INGRESS 2026-10-08 by Codex] Plaintext search
+//!   and artifact filename queries are disabled, including direct mounts.
+//!   Opaque artifact enumeration and historical owner-scoped data remain.
 //! - [GRAPH-EXTENSION-EXTRACTORS 2026-08-12 by Codex] Request context uses
 //!   Axum's typed `Extension<T>` extractors. Missing middleware state must be
 //!   rejected as HTTP 500 by Axum and must never panic a request task.
@@ -336,6 +339,14 @@ pub async fn mpi_artifacts_search(
     Extension(auth): Extension<AuthenticatedOwner>,
     Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
+    // [PHALA-LEGACY-MEMORY-INGRESS 2026-10-08 by Codex] No filename
+    // matching, storage lookup or query telemetry for plaintext terms.
+    if !super::mpi::node_accepts_plaintext_memory_processing()
+        && params.q.as_ref().is_some_and(|query| !query.is_empty())
+    {
+        // [PHALA-DISABLED-BODY-BOUNDARY 2026-10-08 by Codex]
+        return super::mpi::plaintext_memory_unavailable_response("/api/mpi/artifacts/search");
+    }
     let owner = auth.owner_bytes();
 
     let limit = params.limit.min(100).max(1);
@@ -368,8 +379,6 @@ pub async fn mpi_artifacts_search(
     artifacts.truncate(limit);
 
     debug!(
-        owner = &hex::encode(owner)[..8],
-        q = pattern,
         results = artifacts.len(),
         "[MPI] GET /artifacts/search"
     );
@@ -384,7 +393,7 @@ pub async fn mpi_artifacts_search(
                 "has_more": artifacts.len() == limit,
             }
         })),
-    )
+    ).into_response()
 }
 /// `GET /api/mpi/artifacts/:id` — Artifact detail. (stub, Phase D)
 pub async fn mpi_artifact_detail(
@@ -541,6 +550,12 @@ pub async fn mpi_search(
     Extension(auth): Extension<AuthenticatedOwner>,
     Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
+    // [PHALA-LEGACY-MEMORY-INGRESS 2026-10-08 by Codex] Keep the old
+    // implementation/data for migration, never run plaintext FTS on a node.
+    if !super::mpi::node_accepts_plaintext_memory_processing() {
+        // [PHALA-DISABLED-BODY-BOUNDARY 2026-10-08 by Codex]
+        return super::mpi::plaintext_memory_unavailable_response("/api/mpi/search");
+    }
     let owner = auth.owner_bytes();
 
     let limit = params.limit.min(100).max(1);
@@ -559,7 +574,7 @@ pub async fn mpi_search(
     let groups = storage.group_hits_by_session(&hits).await;
     let total_results: usize = groups.iter().map(|g| g.hits.len()).sum();
 
-    debug!(query = %params.q, groups = groups.len(), total = total_results, "[MPI] GET /search");
+    debug!(groups = groups.len(), total = total_results, "[MPI] GET /search");
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1088,6 +1103,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_empty_query_rejected() {
+        // [PHALA-LEGACY-MEMORY-INGRESS 2026-10-08 by Codex] Migration
+        // rejection precedes legacy query validation/FTS, even for empty q.
         let s = make_state().await;
         let app = build_mpi_router(s);
         let req = Request::builder()
@@ -1096,12 +1113,34 @@ mod tests {
             .unwrap();
         assert_eq!(
             app.oneshot(req).await.unwrap().status(),
-            StatusCode::BAD_REQUEST
+            StatusCode::GONE
         );
     }
 
+    // [PHALA-LEGACY-MEMORY-INGRESS 2026-10-08 by Codex] Direct mounts
+    // must not restore FTS merely by omitting the production auth middleware.
     #[tokio::test]
-    async fn test_search_no_results() {
+    async fn plaintext_graph_queries_are_closed_on_direct_mounts() {
+        let state = make_state().await;
+        let storage = Arc::clone(state.storage.as_ref().unwrap());
+        let app = axum::Router::new()
+            .route("/search", axum::routing::get(mpi_search))
+            .route("/artifacts/search", axum::routing::get(mpi_artifacts_search))
+            .layer(Extension(AuthenticatedOwner::Local { owner: state.owner_key }))
+            .layer(Extension(storage))
+            .with_state(state);
+        for path in ["/search?q=secret", "/artifacts/search?q=secret"] {
+            let response = app.clone().oneshot(Request::builder().uri(path)
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::GONE);
+        }
+        let response = app.oneshot(Request::builder().uri("/artifacts/search?limit=5")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_plaintext_search_is_not_executed() {
         let s = make_state().await;
         let app = build_mpi_router(s);
         let req = Request::builder()
@@ -1109,16 +1148,17 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::GONE);
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["total_results"], 0);
+        assert!(json.get("total_results").is_none());
+        assert!(json.get("query").is_none());
     }
 
     #[tokio::test]
-    async fn test_artifacts_search_empty() {
+    async fn test_artifacts_plaintext_search_is_rejected() {
         let s = make_state().await;
         let app = build_mpi_router(s);
         let req = Request::builder()
@@ -1126,13 +1166,13 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::GONE);
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["artifacts"].as_array().unwrap().is_empty());
-        assert!(json["pagination"].is_object());
+        assert!(json.get("artifacts").is_none());
+        assert!(json.get("pagination").is_none());
     }
 
     #[tokio::test]

@@ -1,0 +1,40 @@
+# [PHALA-ISOLATED-COMPOSE 2026-10-06 by Codex]
+services:
+  aeronyx-node:
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: deploy/node/Dockerfile
+      # [PHALA-ISOLATED-VPN-IMAGE 2026-10-08 by Codex] The default peer
+      # image deliberately omits the ip tool needed for Linux TUN startup.
+      target: isolated-vpn
+    # [PHALA-ISOLATED-VPN-IMAGE 2026-10-08 by Codex] Never overwrite
+    # the default peer image tag with the trial's different config/toolset.
+    image: aeronyx-node:isolated-vpn-local
+    init: true
+    restart: unless-stopped
+    # [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex] Match the
+    # peer/private role policy without changing trial ports or permissions.
+    stop_signal: SIGTERM
+    stop_grace_period: 2m
+    command: ["start", "--config", "/etc/aeronyx/server.toml"]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: ${AERONYX_SERVER_CONFIG:?Set AERONYX_SERVER_CONFIG to an absolute config path}
+        target: /etc/aeronyx/server.toml
+        read_only: true
+      - aeronyx-state:/var/lib/aeronyx
+
+volumes:
+  aeronyx-state:

@@ -2,6 +2,68 @@
 // Behavior is unchanged. Names resolve through `use super::*;`.
 use super::*;
 
+// [PHALA-QUOTE-RESPONSE-OWNERSHIP 2026-10-08 by Codex] Authored only.
+// Local registries/permits keep paused-clock fixtures independent of public
+// process admission and unrelated tests; the production body code is reused.
+#[tokio::test(start_paused = true)]
+async fn phala_quote_response_retains_capacity_and_expires_unpolled_buffers() {
+    let registry = Arc::new(PhalaQuoteResponseRegistry::default());
+    let owner = Arc::new(PhalaAttestationDeliveryOwner {
+        closed: std::sync::atomic::AtomicBool::new(false), registry: Arc::clone(&registry),
+    });
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let body = owner.response_body(vec![17; PHALA_QUOTE_RESPONSE_CHUNK_BYTES * 3],
+        Arc::clone(&permits).try_acquire_owned().unwrap()).unwrap();
+    assert_eq!(permits.available_permits(), 0);
+    let mut stream = body.into_data_stream();
+    let first = stream.next().await.unwrap().unwrap();
+    assert_eq!(first.len(), PHALA_QUOTE_RESPONSE_CHUNK_BYTES);
+    assert_eq!(permits.available_permits(), 0);
+    tokio::time::advance(PHALA_QUOTE_RESPONSE_TIMEOUT).await;
+    owner.expire_buffers();
+    assert_eq!(permits.available_permits(), 1, "no HTTP poll is needed to reclaim the remaining large allocation");
+    assert!(registry.responses.lock().is_empty());
+    assert_eq!(first.as_ref(), vec![17u8; PHALA_QUOTE_RESPONSE_CHUNK_BYTES].as_slice(), "detached socket chunk remains bounded");
+    assert!(stream.next().await.unwrap().is_err(), "expiry cannot turn a truncated response into successful EOF");
+    assert!(stream.next().await.is_none());
+    let body = owner.response_body(vec![19; 3], Arc::clone(&permits).try_acquire_owned().unwrap()).unwrap();
+    drop(body);
+    assert_eq!(permits.available_permits(), 1);
+    let body = owner.response_body(vec![21; 5], Arc::clone(&permits).try_acquire_owned().unwrap()).unwrap();
+    let mut stream = body.into_data_stream();
+    assert_eq!(stream.next().await.unwrap().unwrap().as_ref(), &[21; 5]);
+    assert!(stream.next().await.is_none());
+    assert_eq!(permits.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn phala_quote_response_stop_fences_handoff_without_stopping_other_owner() {
+    let registry = Arc::new(PhalaQuoteResponseRegistry::default());
+    let owner = Arc::new(PhalaAttestationDeliveryOwner {
+        closed: std::sync::atomic::AtomicBool::new(false), registry: Arc::clone(&registry),
+    });
+    let other = Arc::new(PhalaAttestationDeliveryOwner {
+        closed: std::sync::atomic::AtomicBool::new(false), registry: Arc::clone(&registry),
+    });
+    let permits = Arc::new(tokio::sync::Semaphore::new(2));
+    let body = owner.response_body(vec![11; 10], Arc::clone(&permits).try_acquire_owned().unwrap()).unwrap();
+    let other_body = other.response_body(vec![13; 10], Arc::clone(&permits).try_acquire_owned().unwrap()).unwrap();
+    owner.stop();
+    assert!(owner.is_stopped());
+    assert!(!other.is_stopped());
+    assert_eq!(permits.available_permits(), 1);
+    assert!(owner.response_body(vec![15; 10], Arc::clone(&permits).try_acquire_owned().unwrap()).is_err());
+    assert_eq!(permits.available_permits(), 1, "rejected handoff returns its permit");
+    assert!(body.into_data_stream().next().await.unwrap().is_err());
+    assert_eq!(other_body.into_data_stream().next().await.unwrap().unwrap().as_ref(), &[13; 10]);
+    assert_eq!(permits.available_permits(), 2);
+    assert!(other.response_body(vec![0; PHALA_QUOTE_RESPONSE_MAX_BYTES + 1],
+        Arc::clone(&permits).try_acquire_owned().unwrap()).is_err());
+    assert_eq!(permits.available_permits(), 2);
+    let policy = DiscoveryApiPolicy::default();
+    assert!(Arc::ptr_eq(&policy.phala_attestation_delivery_owner(), &policy.clone().phala_attestation_delivery_owner()));
+}
+
 // [PUBLIC-DISCOVERY-PROJECTION 2026-09-01 by Codex] These fixtures bind
 // public handler output to full verified descriptor membership and exercise
 // both the direct snapshot leak and every prefix-only status projection.

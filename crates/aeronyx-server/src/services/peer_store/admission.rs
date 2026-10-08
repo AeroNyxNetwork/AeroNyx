@@ -63,7 +63,18 @@ impl PeerStore {
         let Some(endpoint) = descriptor.descriptor.public_endpoint.as_deref() else {
             return false;
         };
-        if endpoint.trim() != endpoint || !crate::api::peer_endpoint_is_public_ip(endpoint) {
+        // [PHALA-ATTESTED-DNS-ADMISSION 2026-10-06 by Codex] DNS can enter
+        // Stage-A only as an HTTPS authority that opts into signed Phala
+        // attestation; route authority is withheld until quote appraisal.
+        let phala_dns_endpoint = descriptor
+            .descriptor
+            .advertises_protocol_feature(NodeProtocolFeature::PhalaNodeAttestationV1)
+            && aeronyx_core::protocol::discovery_endpoint_proof::
+                canonical_public_https_dns_endpoint_commitment_v1(endpoint)
+                .is_ok();
+        if endpoint.trim() != endpoint
+            || (!crate::api::peer_endpoint_is_public_ip(endpoint) && !phala_dns_endpoint)
+        {
             return false;
         }
 
@@ -96,6 +107,13 @@ impl PeerStore {
 
     pub(super) fn has_locally_established_identity(&self, node_id: &[u8; 32]) -> bool {
         self.peers.read().contains_key(node_id)
+            || self.private_onion_source_identity_pins.read().contains(node_id)
+            // [REVERSE-ONION-PINNED-IDENTITY-REFRESH 2026-10-06 by Codex]
+            // Route identities are operator-established even after their
+            // expired descriptor has been pruned from the live peer map.
+            || self.private_onion_route_identity_pins.read().iter().any(
+                |(relay, recipient)| node_id == relay || node_id == recipient,
+            )
     }
 
     pub(super) fn prune_untrusted_candidate_state(

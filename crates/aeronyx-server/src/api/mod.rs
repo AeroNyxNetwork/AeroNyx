@@ -140,6 +140,220 @@ use std::sync::{
 };
 
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
+
+// [PHALA-QUEUE-RESPONSE-DRAIN 2026-10-08 by Codex] Shared by source and
+// adjacent-hop HTTP owners. A response retains its already-acquired permit,
+// never allocates another slot, and never changes a durable task deadline.
+pub(crate) const REVERSE_ONION_RESPONSE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+pub(crate) const REVERSE_ONION_RESPONSE_CHUNK_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReverseOnionResponseError { Busy, Unavailable }
+
+pub(crate) struct ReverseOnionResponseRegistry {
+    responses: std::sync::Mutex<Vec<std::sync::Weak<ReverseOnionResponseState>>>,
+    max_responses: usize,
+    changed: tokio::sync::Notify,
+}
+
+impl ReverseOnionResponseRegistry {
+    pub(crate) fn new(max_responses: usize) -> Self {
+        Self { responses: std::sync::Mutex::new(Vec::new()),
+            max_responses, changed: tokio::sync::Notify::new() }
+    }
+
+    pub(crate) fn bound_body(&self, body: axum::body::Body,
+        permit: impl Send + Sync + 'static, max_bytes: usize,
+    ) -> Result<axum::body::Body, ReverseOnionResponseError> {
+        self.expire();
+        let mut responses = self.responses.lock()
+            .map_err(|_| ReverseOnionResponseError::Unavailable)?;
+        if max_bytes == 0 || responses.len() >= self.max_responses {
+            return Err(ReverseOnionResponseError::Busy);
+        }
+        let deadline = tokio::time::Instant::now() + REVERSE_ONION_RESPONSE_TIMEOUT;
+        let state = Arc::new(ReverseOnionResponseState {
+            data: std::sync::Mutex::new(Some(ReverseOnionResponseData {
+                stream: body.into_data_stream(), pending: axum::body::Bytes::new(),
+                remaining: max_bytes, _permit: Box::new(permit),
+            })),
+            deadline, expired: std::sync::atomic::AtomicBool::new(false),
+            waker: futures::task::AtomicWaker::new(),
+        });
+        responses.push(Arc::downgrade(&state));
+        self.changed.notify_one();
+        Ok(axum::body::Body::from_stream(ReverseOnionResponseStream {
+            state, deadline: Box::pin(tokio::time::sleep_until(deadline)), terminated: false,
+        }))
+    }
+
+    // Weak entries cannot retain abandoned bodies. Admission, polling and drain
+    // reclaim the same idle allocation; no unbounded background timers are added.
+    pub(crate) fn expire(&self) -> Option<tokio::time::Instant> {
+        let now = tokio::time::Instant::now();
+        let mut earliest = None;
+        let mut responses = self.responses.lock().unwrap_or_else(|error| error.into_inner());
+        responses.retain(|entry| {
+            let Some(state) = entry.upgrade() else { return false; };
+            if now >= state.deadline { state.finish(true); }
+            if !state.active() { return false; }
+            earliest = Some(earliest.map_or(state.deadline,
+                |at: tokio::time::Instant| at.min(state.deadline)));
+            true
+        });
+        earliest
+    }
+
+    // Caller closes intake first. Cancellation leaves bodies and their original
+    // deadlines registered, so a later drain still observes accepted work.
+    pub(crate) async fn drain(&self, permits: Arc<tokio::sync::Semaphore>, capacity: u32) {
+        let all = permits.acquire_many_owned(capacity);
+        tokio::pin!(all);
+        loop {
+            let deadline = self.expire().unwrap_or_else(||
+                tokio::time::Instant::now() + REVERSE_ONION_RESPONSE_TIMEOUT);
+            tokio::select! {
+                _all = &mut all => return,
+                _ = self.changed.notified() => {},
+                _ = tokio::time::sleep_until(deadline) => {},
+            }
+        }
+    }
+}
+
+struct ReverseOnionResponseData {
+    stream: axum::body::BodyDataStream,
+    pending: axum::body::Bytes,
+    remaining: usize,
+    _permit: Box<dyn Send + Sync>,
+}
+
+struct ReverseOnionResponseState {
+    data: std::sync::Mutex<Option<ReverseOnionResponseData>>,
+    deadline: tokio::time::Instant,
+    expired: std::sync::atomic::AtomicBool,
+    waker: futures::task::AtomicWaker,
+}
+
+impl ReverseOnionResponseState {
+    fn finish(&self, expired: bool) {
+        if expired { self.expired.store(true, Ordering::Release); }
+        let data = self.data.lock().unwrap_or_else(|error| error.into_inner()).take();
+        // Drop the large frame and permit outside the lock, before waking HTTP.
+        drop(data);
+        self.waker.wake();
+    }
+
+    fn active(&self) -> bool {
+        self.data.lock().unwrap_or_else(|error| error.into_inner()).is_some()
+    }
+}
+
+struct ReverseOnionResponseStream {
+    state: Arc<ReverseOnionResponseState>,
+    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+    terminated: bool,
+}
+
+impl futures::Stream for ReverseOnionResponseStream {
+    type Item = Result<axum::body::Bytes, axum::Error>;
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
+        use futures::Stream;
+        if self.terminated { return std::task::Poll::Ready(None); }
+        self.state.waker.register(cx.waker());
+        if self.deadline.as_mut().poll(cx).is_ready() { self.state.finish(true); }
+        let state = Arc::clone(&self.state);
+        let mut slot = state.data.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(data) = slot.as_mut() else {
+            drop(slot);
+            self.terminated = true;
+            if state.expired.load(Ordering::Acquire) {
+                return std::task::Poll::Ready(Some(Err(axum::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut, "reverse onion response delivery expired",
+                )))));
+            }
+            return std::task::Poll::Ready(None);
+        };
+        // Empty frames must not let a malformed stream monopolize the executor.
+        for _ in 0..8 {
+            if !data.pending.is_empty() {
+                let size = data.pending.len().min(REVERSE_ONION_RESPONSE_CHUNK_BYTES);
+                // A shared Bytes slice would keep the entire allocation alive
+                // in a slow socket after expiry. Detach only this bounded chunk.
+                let chunk = axum::body::Bytes::copy_from_slice(&data.pending[..size]);
+                data.pending = if size == data.pending.len() { axum::body::Bytes::new() }
+                    else { data.pending.slice(size..) };
+                return std::task::Poll::Ready(Some(Ok(chunk)));
+            }
+            match std::pin::Pin::new(&mut data.stream).poll_next(cx) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(Some(Ok(bytes))) if bytes.len() <= data.remaining => {
+                    data.remaining -= bytes.len();
+                    data.pending = bytes;
+                }
+                std::task::Poll::Ready(Some(Ok(_))) => {
+                    drop(slot);
+                    state.finish(false);
+                    self.terminated = true;
+                    return std::task::Poll::Ready(Some(Err(axum::Error::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData, "reverse onion response exceeds bound",
+                    )))));
+                }
+                std::task::Poll::Ready(Some(Err(error))) => {
+                    drop(slot);
+                    state.finish(false);
+                    self.terminated = true;
+                    return std::task::Poll::Ready(Some(Err(error)));
+                }
+                std::task::Poll::Ready(None) => {
+                    drop(slot);
+                    state.finish(false);
+                    self.terminated = true;
+                    return std::task::Poll::Ready(None);
+                }
+            }
+        }
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for ReverseOnionResponseStream {
+    fn drop(&mut self) { self.state.finish(false); }
+}
+
+// [PHALA-REVERSE-BODY-ADMISSION 2026-10-07 by Codex] This timeout covers
+// only pre-effect request buffering, never DB work, execution or result drain.
+pub(crate) const REVERSE_ONION_REQUEST_BODY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+// [PHALA-REVERSE-BODY-ADMISSION 2026-10-07 by Codex] Call only after the
+// route's DefaultBodyLimit and bounded admission have been installed. Reuse
+// Axum's Bytes extractor/rejections so per-route byte caps and 413 responses
+// stay intact. Preserve the original headers/auth/permit extensions for the
+// handler, without cloning or buffering attacker data outside that admission.
+pub(crate) async fn buffer_reverse_onion_request(
+    mut request: axum::extract::Request,
+) -> Result<axum::extract::Request, axum::response::Response> {
+    use axum::extract::FromRequest;
+    use axum::response::IntoResponse;
+    let body = std::mem::replace(request.body_mut(), axum::body::Body::empty());
+    let mut buffering = axum::extract::Request::new(body);
+    *buffering.extensions_mut() = request.extensions().clone();
+    match tokio::time::timeout(REVERSE_ONION_REQUEST_BODY_TIMEOUT,
+        axum::body::Bytes::from_request(buffering, &())).await {
+        Ok(Ok(bytes)) => {
+            *request.body_mut() = axum::body::Body::from(bytes);
+            Ok(request)
+        }
+        Ok(Err(rejection)) => Err(rejection.into_response()),
+        Err(_) => Err(axum::http::StatusCode::REQUEST_TIMEOUT.into_response()),
+    }
+}
 
 /// Structural failures while deriving a canonical outbound peer URL.
 ///
@@ -199,6 +413,198 @@ pub(crate) fn privacy_safe_peer_http_client_builder() -> reqwest::ClientBuilder 
         .redirect(reqwest::redirect::Policy::none())
 }
 
+/// [REVERSE-ONION-PINNED-HOST 2026-10-05 by Codex] A route-specific client
+/// retains the URL hostname for TLS SNI/certificate verification while
+/// forcing the connector to the public addresses resolved for this request.
+#[derive(Clone)]
+pub(crate) struct PinnedPeerHttpTarget {
+    pub(crate) client: reqwest::Client,
+    pub(crate) url: reqwest::Url,
+}
+
+// [PHALA-DNS-SEED-PIN 2026-10-07 by Codex] Operator-configured HTTPS DNS
+// bootstrap targets use the same public-answer pinning as attested peers.
+pub(crate) fn peer_http_target_requires_dns_pin(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    url.scheme() == "https"
+        && host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_err()
+}
+
+/// Reverse-onion alone may use a signed HTTPS DNS endpoint. Ordinary
+/// permissionless transports remain restricted to IP literals.
+// [REVERSE-ONION-PINNED-HOST 2026-10-05 by Codex]
+pub(crate) fn reverse_onion_endpoint_supported(endpoint: &str) -> bool {
+    let Ok(url) = canonical_peer_http_url(endpoint, "/") else {
+        return false;
+    };
+    // [REVERSE-ONION-HTTPS-ONLY 2026-10-05 by Codex] Relay acknowledgements
+    // retire durable claims/results, so this private transport must always
+    // authenticate the peer and response body with TLS, including IP routes.
+    if url.scheme() != "https" || url.port() == Some(0) {
+        return false;
+    }
+    if peer_endpoint_is_public_ip(endpoint) {
+        return true;
+    }
+    is_public_dns_https_url(&url)
+}
+
+// [REVERSE-ONION-ORIGIN-BINDING 2026-10-06 by Codex] Bind durable exact-frame
+// retries to the signed transport origin, while excluding path and DNS answers.
+pub(crate) fn reverse_onion_origin_commitment(
+    endpoint: &str,
+) -> Result<[u8; 32], PeerEndpointUrlError> {
+    let url = canonical_peer_http_url(endpoint, "/")?;
+    if url.scheme() != "https" || !reverse_onion_endpoint_supported(endpoint) {
+        return Err(PeerEndpointUrlError::Invalid);
+    }
+    let host = url.host_str().ok_or(PeerEndpointUrlError::Invalid)?;
+    let port = url.port_or_known_default().ok_or(PeerEndpointUrlError::Invalid)?;
+    let host_len = u16::try_from(host.len()).map_err(|_| PeerEndpointUrlError::Invalid)?;
+    let mut digest = Sha256::new();
+    digest.update(b"AeroNyx-ReverseOnion-TransportOrigin-v1");
+    digest.update((url.scheme().len() as u16).to_be_bytes());
+    digest.update(url.scheme().as_bytes());
+    digest.update(host_len.to_be_bytes());
+    digest.update(host.as_bytes());
+    digest.update(port.to_be_bytes());
+    Ok(digest.finalize().into())
+}
+
+// [PHALA-PRIVATE-EGRESS-ORIGIN 2026-10-07 by Codex] Discovery refresh and
+// exact-frame transport share the same public HTTPS origin contract. A signed
+// identity renewal cannot authorize a new host, port, or cleartext scheme.
+pub(crate) fn reverse_onion_pinned_origin(
+    endpoint: &str,
+    expected: [u8; 32],
+) -> Result<[u8; 32], PeerEndpointUrlError> {
+    let origin = reverse_onion_origin_commitment(endpoint)?;
+    if origin != expected {
+        return Err(PeerEndpointUrlError::Invalid);
+    }
+    Ok(origin)
+}
+
+pub(crate) fn reverse_onion_same_origin(left: &str, right: &str) -> bool {
+    let Ok(expected) = reverse_onion_origin_commitment(left) else {
+        return false;
+    };
+    reverse_onion_pinned_origin(right, expected).is_ok()
+}
+
+/// Resolves and pins one peer target before any durable send boundary.
+/// DNS rebinding cannot change the destination after validation; mixed public
+/// and private answer sets fail closed. Rustls still verifies the original
+/// HTTPS hostname, with proxy inheritance and redirects disabled.
+// [REVERSE-ONION-PINNED-HOST 2026-10-05 by Codex]
+pub(crate) async fn resolve_pinned_peer_http_target(
+    url: reqwest::Url,
+    timeout: std::time::Duration,
+) -> Result<PinnedPeerHttpTarget, PeerEndpointUrlError> {
+    // [REVERSE-ONION-HTTPS-ONLY 2026-10-05 by Codex] This resolver is private
+    // to reverse onion; accepting HTTP here would make relay receipts spoofable.
+    if timeout.is_zero() || url.scheme() != "https"
+        || !url.username().is_empty() || url.password().is_some()
+        || url.query().is_some() || url.fragment().is_some()
+        || url.port() == Some(0)
+    {
+        return Err(PeerEndpointUrlError::Invalid);
+    }
+    let host = url.host_str().ok_or(PeerEndpointUrlError::Invalid)?;
+    let ip = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().ok();
+    let mut builder = privacy_safe_peer_http_client_builder()
+        .connect_timeout(timeout)
+        .timeout(timeout);
+    if let Some(ip) = ip {
+        if !ip_is_public_unicast(ip) {
+            return Err(PeerEndpointUrlError::Invalid);
+        }
+    } else {
+        if !is_public_dns_https_url(&url) {
+            return Err(PeerEndpointUrlError::Invalid);
+        }
+        let port = url.port_or_known_default().ok_or(PeerEndpointUrlError::Invalid)?;
+        let lookup = tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
+            .await
+            .map_err(|_| PeerEndpointUrlError::Invalid)?
+            .map_err(|_| PeerEndpointUrlError::Invalid)?;
+        let addresses = validated_public_dns_addresses(
+            lookup, port,
+        ).ok_or(PeerEndpointUrlError::Invalid)?;
+        builder = builder.resolve_to_addrs(host, &addresses);
+    }
+    let client = builder.build().map_err(|_| PeerEndpointUrlError::Invalid)?;
+    Ok(PinnedPeerHttpTarget { client, url })
+}
+
+// [REVERSE-ONION-PINNED-HOST 2026-10-05 by Codex] Validate the complete DNS
+// answer set before constructing a client; filtering unsafe answers would
+// leave resolver ordering as a destination-selection side channel.
+fn validated_public_dns_addresses(
+    addresses: impl IntoIterator<Item = std::net::SocketAddr>,
+    port: u16,
+) -> Option<Vec<std::net::SocketAddr>> {
+    let mut pinned = Vec::new();
+    for address in addresses {
+        if !ip_is_public_unicast(address.ip()) {
+            return None;
+        }
+        let address = std::net::SocketAddr::new(address.ip(), port);
+        if !pinned.contains(&address) {
+            if pinned.len() == 16 {
+                return None;
+            }
+            pinned.push(address);
+        }
+    }
+    (!pinned.is_empty()).then_some(pinned)
+}
+
+fn is_public_dns_https_url(url: &reqwest::Url) -> bool {
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    if url.port() == Some(0) {
+        return false;
+    }
+    let Some(host) = url.host_str() else { return false; };
+    let host = host.to_ascii_lowercase();
+    if host.parse::<IpAddr>().is_ok()
+        || !host.contains('.')
+        || host.starts_with('.')
+        || host.ends_with('.')
+        || host.len() > 253
+        // [PHALA-RENDER-DNS-PARITY 2026-10-07 by Codex] Only canonical
+        // DNS labels may reach resolution; URL parsing alone allows labels
+        // such as underscores and leading hyphens.
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+        || [".localhost", ".local", ".internal", ".test", ".invalid", ".example", ".onion"]
+            .iter().any(|suffix| host.ends_with(suffix))
+    {
+        return false;
+    }
+    true
+}
+
+fn ip_is_public_unicast(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => ipv4_is_public_unicast(address),
+        IpAddr::V6(address) => ipv6_is_public_unicast(address),
+    }
+}
+
 /// Accepts only public IP literals for permissionless outbound peer traffic.
 ///
 /// A descriptor signature authenticates the advertiser, not the destination's
@@ -209,10 +615,7 @@ pub(crate) fn peer_endpoint_is_public_ip(endpoint: &str) -> bool {
     let Some(address) = peer_endpoint_ip_literal(endpoint) else {
         return false;
     };
-    match address {
-        IpAddr::V4(address) => ipv4_is_public_unicast(address),
-        IpAddr::V6(address) => ipv6_is_public_unicast(address),
-    }
+    ip_is_public_unicast(address)
 }
 
 /// Localhost-only seam for integration tests that bind ephemeral listeners.
@@ -257,7 +660,17 @@ fn ipv6_is_public_unicast(address: Ipv6Addr) -> bool {
         return ipv4_is_public_unicast(mapped);
     }
     let segments = address.segments();
-    (segments[0] & 0xe000) == 0x2000 && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+    // [REVERSE-ONION-PINNED-HOST 2026-10-05 by Codex] A global-unicast
+    // prefix alone is insufficient: special-purpose 2001::/23, 6to4's
+    // embedded-IPv4 2002::/16, and documentation 3fff::/20 are not valid
+    // externally selected peer destinations.
+    (segments[0] & 0xe000) == 0x2000
+        && !(segments[0] == 0x2001 && segments[1] <= 0x01ff)
+        // [PHALA-RENDER-DNS-PARITY 2026-10-07 by Codex] Documentation
+        // 2001:db8::/32 is outside 2001::/23 and needs its own exclusion.
+        && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+        && segments[0] != 0x2002
+        && !(segments[0] == 0x3fff && (segments[1] & 0xfff0) == 0)
 }
 
 /// One lock-free permit for a bounded class of in-flight public requests.
@@ -449,6 +862,22 @@ mod tests {
     }
 
     #[test]
+    fn only_https_dns_peer_targets_require_resolution_pinning() {
+        assert!(peer_http_target_requires_dns_pin(
+            &reqwest::Url::parse("https://seed.example.net/api/discovery/gossip").unwrap()
+        ));
+        assert!(!peer_http_target_requires_dns_pin(
+            &reqwest::Url::parse("https://8.8.8.8/api/discovery/gossip").unwrap()
+        ));
+        assert!(!peer_http_target_requires_dns_pin(
+            &reqwest::Url::parse("https://[2606:4700:4700::1111]/api/discovery/gossip").unwrap()
+        ));
+        assert!(!peer_http_target_requires_dns_pin(
+            &reqwest::Url::parse("http://seed.example.net/api/discovery/gossip").unwrap()
+        ));
+    }
+
+    #[test]
     fn permissionless_peer_endpoint_rejects_ssrf_targets() {
         assert!(peer_endpoint_is_public_ip("http://8.8.8.8:8422"));
         assert!(peer_endpoint_is_public_ip(
@@ -480,6 +909,134 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn reverse_onion_hostname_policy_is_narrow_and_dns_answers_fail_closed() {
+        assert!(reverse_onion_endpoint_supported("https://relay.example.net:443"));
+        // [PHALA-GATEWAY-ORIGIN-REGRESSION 2026-10-06 by Codex] Phala's
+        // app-port origin must retain HTTPS hostname validation for onion
+        // transport; this is not permission for generic peer DNS traffic.
+        assert!(reverse_onion_endpoint_supported(
+            "https://1e598a2f983dd80c413627e0b50d91905f3f48be-8422.dstack-prod5.phala.network"
+        ));
+        assert!(reverse_onion_endpoint_supported("https://8.8.8.8:8422"));
+        for endpoint in [
+            "http://relay.example.net:8422",
+            "http://8.8.8.8:8422",
+            "https://localhost",
+            "https://relay.localhost",
+            "https://relay.internal",
+            "https://relay.onion",
+            "https://a.b.invalid",
+            "http://10.0.0.1:8422",
+            "https://8.8.8.8:0",
+            // [PHALA-RENDER-DNS-PARITY 2026-10-07 by Codex]
+            "https://relay..example.net",
+            "https://-relay.example.net",
+            "https://relay-.example.net",
+            "https://relay_name.example.net",
+            "https://[2001:db8::1]",
+            "https://[ff0e::1]",
+        ] {
+            assert!(!reverse_onion_endpoint_supported(endpoint), "{endpoint}");
+        }
+        let oversized_label = format!("https://{}.example.net", "a".repeat(64));
+        assert!(!reverse_onion_endpoint_supported(&oversized_label));
+
+        let public = "8.8.8.8:0".parse().expect("socket address");
+        assert_eq!(validated_public_dns_addresses([public], 443), Some(vec![
+            "8.8.8.8:443".parse().expect("pinned address"),
+        ]));
+        let mixed = [
+            public,
+            "127.0.0.1:0".parse().expect("socket address"),
+        ];
+        assert!(validated_public_dns_addresses(mixed, 443).is_none());
+        assert!(validated_public_dns_addresses([], 443).is_none());
+        let overbound = (1..=17).map(|last| {
+            format!("8.8.8.{last}:0").parse().expect("socket address")
+        });
+        assert!(validated_public_dns_addresses(overbound, 443).is_none());
+    }
+
+    // [REVERSE-ONION-ORIGIN-BINDING 2026-10-06 by Codex] Canonical URL
+    // decoration and DNS rotation do not change origin, but authority changes do.
+    #[test]
+    fn reverse_onion_origin_commitment_tracks_scheme_host_and_effective_port() {
+        let canonical = reverse_onion_origin_commitment("https://Relay.Example.net:443/a?x=1").unwrap();
+        assert_eq!(canonical, reverse_onion_origin_commitment(" HTTPS://relay.example.net/other ").unwrap());
+        assert_ne!(canonical, reverse_onion_origin_commitment("https://other.example.net").unwrap());
+        assert_ne!(canonical, reverse_onion_origin_commitment("https://relay.example.net:8443").unwrap());
+        // [PHALA-GATEWAY-ORIGIN-REGRESSION 2026-10-06 by Codex] The origin
+        // persisted with a Phala onion lease remains hostname-bound, not IP-bound.
+        let phala = reverse_onion_origin_commitment(
+            "https://1e598a2f983dd80c413627e0b50d91905f3f48be-8422.dstack-prod5.phala.network",
+        )
+        .unwrap();
+        assert_eq!(
+            phala,
+            reverse_onion_origin_commitment(
+                // [PHALA-ORIGIN-FIXTURE-REPAIR 2026-10-08 by Codex] Same
+                // hostname, not the distinct phala.net origin.
+                " HTTPS://1E598A2F983DD80C413627E0B50D91905F3F48BE-8422.DSTACK-PROD5.PHALA.NETWORK:443/other"
+            )
+            .unwrap()
+        );
+        assert_ne!(canonical, phala);
+        assert!(reverse_onion_origin_commitment("http://relay.example.net").is_err());
+        assert!(reverse_onion_origin_commitment("https://relay.internal").is_err());
+    }
+
+    // [PHALA-PRIVATE-EGRESS-ORIGIN 2026-10-07 by Codex] Authored, not run.
+    #[test]
+    fn private_origin_comparison_rejects_invalid_and_rotated_targets() {
+        let pinned = "https://relay.example.net";
+        let origin = reverse_onion_origin_commitment(pinned).unwrap();
+        let renewed = "https://RELAY.example.net:443/api/discovery/gossip";
+        assert_eq!(reverse_onion_pinned_origin(renewed, origin).unwrap(), origin);
+        assert!(reverse_onion_same_origin(pinned, renewed));
+        for candidate in [
+            "https://other.example.net", "https://relay.example.net:8443",
+            "http://relay.example.net", "https://relay.internal",
+            "https://127.0.0.1", "https://user@relay.example.net",
+            "https://relay.example.net:0", "not a URL",
+        ] {
+            assert!(reverse_onion_pinned_origin(candidate, origin).is_err(), "{candidate}");
+            assert!(!reverse_onion_same_origin(pinned, candidate), "{candidate}");
+        }
+        assert!(!reverse_onion_same_origin("http://relay.example.net", "http://relay.example.net"));
+        assert!(!reverse_onion_same_origin("https://relay.internal", "https://relay.internal"));
+    }
+
+    // [REVERSE-ONION-HTTPS-ONLY 2026-10-05 by Codex] Reject cleartext before
+    // DNS or connection setup, even when a future caller skips endpoint policy.
+    #[tokio::test]
+    async fn pinned_reverse_onion_resolver_rejects_http_before_network_io() {
+        let url = reqwest::Url::parse("http://8.8.8.8:8422/").unwrap();
+        assert!(matches!(
+            resolve_pinned_peer_http_target(url, std::time::Duration::from_secs(1)).await,
+            Err(PeerEndpointUrlError::Invalid),
+        ));
+    }
+
+    // [REVERSE-ONION-PINNED-HOST 2026-10-05 by Codex] Calibrate the shared
+    // address gate with special-purpose ranges and an ordinary global unicast.
+    #[test]
+    fn public_ipv6_gate_rejects_special_purpose_and_tunnel_ranges() {
+        for address in [
+            "2001:0:1::1",
+            "2001:2::1",
+            "2001:db8::1",
+            "2002:c000:0201::1",
+            "3fff::1",
+        ] {
+            let address = address.parse().expect("IPv6 address");
+            assert!(!ipv6_is_public_unicast(address), "unexpectedly accepted {address}");
+        }
+        assert!(ipv6_is_public_unicast(
+            "2606:4700:4700::1111".parse().expect("global IPv6 address")
+        ));
+    }
 }
 
 // ── Core MPI module (state, auth, router) ──
@@ -488,6 +1045,8 @@ pub mod mpi;
 // registration here mounts no HTTP route. Queue handlers remain unmounted.
 pub(crate) mod reverse_onion;
 pub(crate) mod reverse_onion_terminal;
+// [REVERSE-ONION-SOURCE-API 2026-10-05 by Codex] VPN/MPI source-only entry.
+pub(crate) mod reverse_onion_source;
 // ── Handler modules ──
 pub mod mpi_graph_handlers;
 pub mod mpi_handlers;

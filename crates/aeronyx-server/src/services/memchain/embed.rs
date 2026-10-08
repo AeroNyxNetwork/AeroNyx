@@ -954,6 +954,12 @@ pub struct EmbedEngine {
     output_dim: usize,
 }
 
+// [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Deliberately non-const: the
+// compatibility loader keeps its historical implementation typechecked, but
+// cannot reach model initialization in an ordinary Rust node.
+#[inline(never)]
+fn local_model_execution_disabled() -> bool { true }
+
 impl EmbedEngine {
     /// Load ONNX model and tokenizer from the given directory.
     ///
@@ -977,6 +983,13 @@ impl EmbedEngine {
         max_seq_length: usize,
         output_dim: usize,
     ) -> Result<Self, String> {
+        // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Keep this legacy API
+        // source-compatible, but never initialize ONNX or produce embeddings
+        // in an ordinary Rust node. Embedding inference belongs to Phala ACI.
+        if local_model_execution_disabled() {
+            return Err("local embedding inference is disabled; use the attested Phala ACI route".into());
+        }
+
         let model_dir = model_dir.as_ref();
 
         let model_path = model_dir.join(MODEL_FILENAME);
@@ -1843,13 +1856,13 @@ mod tests {
         assert!(error.contains("batch index 3"));
     }
 
-    /// Helper: skip test if model files are not downloaded.
+    /// Legacy model-backed checks remain skipped because node-local inference is disabled.
     fn try_load_engine() -> Option<EmbedEngine> {
         match EmbedEngine::load(&model_dir(), 0, 0) {
             Ok(e) => Some(e),
             Err(e) => {
                 eprintln!("⏭️ Skipping embed test (model not available): {}", e);
-                eprintln!("   Run `scripts/download_models.sh` to download model files.");
+                eprintln!("   Embeddings are available only through the attested Phala ACI route.");
                 None
             }
         }
@@ -1860,16 +1873,7 @@ mod tests {
         let result = EmbedEngine::load("/nonexistent/path/to/model", 128, 0);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            err.contains("not found"),
-            "Error should mention 'not found': {}",
-            err
-        );
-        assert!(
-            err.contains("download_models.sh"),
-            "Error should hint at download script: {}",
-            err
-        );
+        assert!(err.contains("disabled"), "unexpected error: {}", err);
     }
 
     #[test]

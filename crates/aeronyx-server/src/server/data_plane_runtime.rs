@@ -8,6 +8,11 @@ use super::*;
 
 const KEEPALIVE_PROBE_INTERVAL_SECS: u64 = 60;
 const KEEPALIVE_ACK_TIMEOUT_SECS: u64 = 90;
+// [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Periodic full scans make restart
+// recovery idempotent; bounded pages and rotating peers/owners cap each round.
+const SEALED_MEMORY_SYNC_INTERVAL_SECS: u64 = 120;
+const SEALED_MEMORY_SYNC_PEERS_PER_TICK: usize = 16;
+const SEALED_MEMORY_SYNC_OWNERS_PER_PEER: usize = 4;
 /// Closed, privacy-safe reason vocabulary for handshake admission failures.
 ///
 /// [V2-HANDSHAKE-LOG-PRIVACY 2026-09-20 by Codex] The UDP dispatcher must not
@@ -113,10 +118,70 @@ impl Server {
             let crypto = DefaultTransportCrypto::new();
             let handshake_limiter = crate::services::HandshakeLimiter::production();
             let mut consecutive_receive_failures = 0u32;
+            let mut sync_owners = memchain_config
+                .trusted_agents
+                .iter()
+                .filter_map(|owner| {
+                    let mut bytes = [0u8; 32];
+                    (owner.len() == 64 && hex::decode_to_slice(owner, &mut bytes).is_ok())
+                        .then_some(bytes)
+                })
+                .collect::<Vec<_>>();
+            sync_owners.push(self_node_id);
+            sync_owners.sort_unstable();
+            sync_owners.dedup();
+            let mut sync_peer_offset = 0usize;
+            let mut sync_owner_offset = 0usize;
+            let sync_interval = Duration::from_secs(SEALED_MEMORY_SYNC_INTERVAL_SECS);
+            let mut sync_timer = tokio::time::interval_at(
+                tokio::time::Instant::now() + sync_interval,
+                sync_interval,
+            );
+            sync_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {
                     _ = shutdown_rx.recv() => break,
+                    // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Re-scan from
+                    // the beginning after restart; session-bound cursors make
+                    // each live multi-page pass monotonic and replay-resistant.
+                    _ = sync_timer.tick(), if storage.is_some() && !sync_owners.is_empty() => {
+                        if shutdown.load(Ordering::SeqCst) { break; }
+                        let now = unix_now_secs();
+                        let mut peers = sessions.all_sessions().into_iter()
+                            .filter(|session| session.is_established())
+                            .filter(|session| {
+                                let node_id = session.client_public_key.to_bytes();
+                                peer_store.get_valid(&node_id, now).is_some()
+                            })
+                            .collect::<Vec<_>>();
+                        peers.sort_unstable_by_key(|session| *session.id.as_bytes());
+                        if !peers.is_empty() {
+                            let peer_count = peers.len().min(SEALED_MEMORY_SYNC_PEERS_PER_TICK);
+                            let peer_start = sync_peer_offset % peers.len();
+                            let owner_count = sync_owners.len().min(SEALED_MEMORY_SYNC_OWNERS_PER_PEER);
+                            let owner_start = sync_owner_offset % sync_owners.len();
+                            for peer_index in 0..peer_count {
+                                let session = Arc::clone(&peers[(peer_start + peer_index) % peers.len()]);
+                                for owner_index in 0..owner_count {
+                                    let owner = sync_owners[(owner_start + owner_index) % sync_owners.len()];
+                                    if !session.reserve_sealed_sync_page(owner, None) {
+                                        continue;
+                                    }
+                                    let request = MemChainMessage::SyncSealedMemoryV2RequestV1 {
+                                        owner,
+                                        after_record_id: None,
+                                        limit: aeronyx_core::protocol::memchain::MAX_SEALED_MEMORY_P2P_PAGE_RECORDS,
+                                    };
+                                    if !Self::send_to_session(&request, &session, &udp_reply, &crypto).await {
+                                        session.abandon_sealed_sync_page(&owner, None);
+                                    }
+                                }
+                            }
+                            sync_peer_offset = (peer_start + peer_count) % peers.len();
+                            sync_owner_offset = (owner_start + owner_count) % sync_owners.len();
+                        }
+                    }
                     result = udp.recv(&mut buf) => {
                         match result {
                             Ok((len, source)) => {

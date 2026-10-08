@@ -69,7 +69,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use tracing::warn;
 
 use super::storage::{embedding_to_bytes, MemoryStorage};
@@ -270,6 +270,161 @@ impl MemoryStorage {
 // ============================================
 
 impl MemoryStorage {
+    // [MEMCHAIN-PHALA-EXTRACTION 2026-10-05 by Codex]
+    pub(crate) async fn session_belongs_to_owner(
+        &self,
+        session_id: &str,
+        owner: &[u8; 32],
+    ) -> bool {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1 AND owner = ?2)",
+            params![session_id, owner.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap_or(false)
+    }
+
+    /// Atomically persist Phala-extracted graph facts and complete their source
+    /// session. Stable episode links make a replayed writeback idempotent.
+    // [MEMCHAIN-PHALA-EXTRACTION 2026-10-05 by Codex]
+    pub(crate) async fn apply_phala_entity_extraction(
+        &self,
+        owner: &[u8; 32],
+        session_id: &str,
+        entities: &[(String, String)],
+        relations: &[(String, String, String, String)],
+    ) -> Result<(), String> {
+        use sha2::{Digest, Sha256};
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let owner_hex = hex::encode(owner);
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("Phala extraction transaction: {error}"))?;
+        let session: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT entities_extracted, started_at FROM sessions
+                 WHERE session_id = ?1 AND owner = ?2",
+                params![session_id, owner.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Phala extraction session read: {error}"))?;
+        let Some((already_extracted, started_at)) = session else {
+            return Err("Phala extraction source session not found".into());
+        };
+        if already_extracted != 0 {
+            tx.commit()
+                .map_err(|error| format!("Phala extraction no-op commit: {error}"))?;
+            return Ok(());
+        }
+
+        let episode_id = format!("ep_{session_id}_{started_at}");
+        let mut entity_ids = HashMap::with_capacity(entities.len());
+        for (name, entity_type) in entities {
+            let normalized = name.trim().to_lowercase();
+            let mut hasher = Sha256::new();
+            hasher.update(owner_hex.as_bytes());
+            hasher.update(b":");
+            hasher.update(normalized.as_bytes());
+            let entity_id = format!("ent_{}", &hex::encode(hasher.finalize())[..16]);
+            let already_linked: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM episode_edges
+                     WHERE owner = ?1 AND episode_id = ?2 AND entity_id = ?3)",
+                    params![owner.as_slice(), episode_id, entity_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("Phala extraction episode lookup: {error}"))?;
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO entities
+                     (entity_id, owner, name, name_normalized, entity_type,
+                      embedding, created_at, updated_at, mention_count)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6, 1)",
+                    params![entity_id, owner.as_slice(), name.trim(), normalized, entity_type, now],
+                )
+                .map_err(|error| format!("Phala extraction entity insert: {error}"))?;
+            if inserted == 0 && !already_linked {
+                let updated = tx
+                    .execute(
+                        "UPDATE entities SET mention_count = mention_count + 1,
+                            updated_at = ?1 WHERE entity_id = ?2 AND owner = ?3",
+                        params![now, entity_id, owner.as_slice()],
+                    )
+                    .map_err(|error| format!("Phala extraction entity update: {error}"))?;
+                if updated != 1 {
+                    return Err("Phala extraction entity owner mismatch".into());
+                }
+            }
+            tx.execute(
+                "INSERT INTO episode_edges (owner, episode_id, entity_id, role, created_at)
+                 SELECT ?1, ?2, ?3, 'mentioned', ?4
+                 WHERE NOT EXISTS (SELECT 1 FROM episode_edges
+                    WHERE owner = ?1 AND episode_id = ?2 AND entity_id = ?3)",
+                params![owner.as_slice(), episode_id, entity_id, now],
+            )
+            .map_err(|error| format!("Phala extraction episode edge: {error}"))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO fts_index
+                 (source_type, source_id, owner_hex, content, tags)
+                 VALUES ('entity', ?1, ?2, ?3, ?4)",
+                params![entity_id, owner_hex, name.trim(), entity_type],
+            )
+            .map_err(|error| format!("Phala extraction FTS index: {error}"))?;
+            entity_ids.insert(normalized, entity_id);
+        }
+
+        for (source, target, relation_type, fact) in relations {
+            let source_id = entity_ids
+                .get(source)
+                .ok_or_else(|| "Phala extraction relation source missing".to_string())?;
+            let target_id = entity_ids
+                .get(target)
+                .ok_or_else(|| "Phala extraction relation target missing".to_string())?;
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM knowledge_edges WHERE owner = ?1
+                     AND source_id = ?2 AND target_id = ?3 AND relation_type = ?4
+                     AND episode_id = ?5 AND valid_until IS NULL)",
+                    params![owner.as_slice(), source_id, target_id, relation_type, episode_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("Phala extraction relation lookup: {error}"))?;
+            if !exists {
+                tx.execute(
+                    "INSERT INTO knowledge_edges
+                     (owner, source_id, target_id, relation_type, fact_text, weight,
+                      confidence, valid_from, episode_id, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1.0, 1.0, ?6, ?7, ?6, ?6)",
+                    params![
+                        owner.as_slice(), source_id, target_id, relation_type,
+                        (!fact.is_empty()).then_some(fact.as_str()), now, episode_id
+                    ],
+                )
+                .map_err(|error| format!("Phala extraction relation insert: {error}"))?;
+            }
+        }
+
+        let affected = tx
+            .execute(
+                "UPDATE sessions SET entities_extracted = 1
+                 WHERE session_id = ?1 AND owner = ?2 AND entities_extracted = 0",
+                params![session_id, owner.as_slice()],
+            )
+            .map_err(|error| format!("Phala extraction session update: {error}"))?;
+        if affected != 1 {
+            return Err("Phala extraction session state changed".into());
+        }
+        tx.commit()
+            .map_err(|error| format!("Phala extraction commit: {error}"))
+    }
+
     /// Upsert an entity. If entity_id already exists, increment mention_count
     /// and update description/updated_at.
     pub async fn upsert_entity(
@@ -282,6 +437,23 @@ impl MemoryStorage {
         description: Option<&str>,
         embedding: Option<&[f32]>,
     ) -> Result<bool, String> {
+        self.upsert_entity_with_embedding_model(
+            entity_id, owner, name, name_normalized, entity_type, description, embedding, None,
+        ).await
+    }
+
+    // [MEMCHAIN-PHALA-EMBEDDINGS 2026-10-06 by Codex]
+    pub async fn upsert_entity_with_embedding_model(
+        &self,
+        entity_id: &str,
+        owner: &[u8; 32],
+        name: &str,
+        name_normalized: &str,
+        entity_type: &str,
+        description: Option<&str>,
+        embedding: Option<&[f32]>,
+        embedding_model: Option<&str>,
+    ) -> Result<bool, String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -293,8 +465,8 @@ impl MemoryStorage {
             .execute(
                 "INSERT OR IGNORE INTO entities
                 (entity_id, owner, name, name_normalized, entity_type, description,
-                 embedding, created_at, updated_at, mention_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+                 embedding, embedding_model, created_at, updated_at, mention_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, ''), ?9, ?10, 1)",
                 params![
                     entity_id,
                     owner.as_slice(),
@@ -303,6 +475,7 @@ impl MemoryStorage {
                     entity_type,
                     description,
                     emb_blob.as_deref(),
+                    embedding_model,
                     now,
                     now,
                 ],
@@ -313,9 +486,10 @@ impl MemoryStorage {
             conn.execute(
                 "UPDATE entities SET mention_count = mention_count + 1, updated_at = ?1,
                     description = COALESCE(?2, description),
-                    embedding = COALESCE(?3, embedding)
-                 WHERE entity_id = ?4",
-                params![now, description, emb_blob.as_deref(), entity_id],
+                    embedding = COALESCE(?3, embedding),
+                    embedding_model = CASE WHEN ?3 IS NOT NULL THEN COALESCE(?4, '') ELSE embedding_model END
+                 WHERE entity_id = ?5 AND owner = ?6",
+                params![now, description, emb_blob.as_deref(), embedding_model, entity_id, owner.as_slice()],
             )
             .map_err(|e| format!("Entity update: {}", e))?;
             Ok(false)
@@ -1044,6 +1218,62 @@ impl MemoryStorage {
         );
     }
 
+    // [MEMCHAIN-PHALA-SUMMARY-WRITEBACK 2026-10-06 by Codex]
+    /// Complete an asynchronous summary only while it is still pending.
+    /// Returns the owner and persisted summary for follow-up FTS indexing.
+    pub async fn complete_session_summary_from_task(
+        &self,
+        session_id: &str,
+        summary: &str,
+        key_decisions: Option<&str>,
+    ) -> Result<([u8; 32], String), String> {
+        let mut conn = self.conn.lock().await;
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("summary writeback begin: {error}"))?;
+        let owner_bytes: Vec<u8> = transaction
+            .query_row(
+                "SELECT owner FROM sessions WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("summary writeback owner lookup: {error}"))?;
+        let owner: [u8; 32] = owner_bytes
+            .try_into()
+            .map_err(|_| "summary writeback owner has invalid length".to_string())?;
+        let updated = transaction
+            .execute(
+                "UPDATE sessions SET summary = ?1, key_decisions = ?2, summary_generated = 1
+                 WHERE session_id = ?3 AND summary_generated = 0",
+                rusqlite::params![summary, key_decisions, session_id],
+            )
+            .map_err(|error| format!("summary writeback update: {error}"))?;
+        if updated == 0 {
+            let completed = transaction
+                .query_row(
+                    "SELECT summary_generated FROM sessions WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| format!("summary writeback state lookup: {error}"))?;
+            if completed == 0 {
+                return Err("summary writeback target was not updated".to_string());
+            }
+        }
+        let persisted_summary: String = transaction
+            .query_row(
+                "SELECT COALESCE(summary, '') FROM sessions WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("summary writeback result lookup: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("summary writeback commit: {error}"))?;
+        drop(conn);
+        Ok((owner, persisted_summary))
+    }
+
     /// Mark a session as having completed entity extraction.
     pub async fn mark_session_entities_extracted(&self, session_id: &str) {
         let conn = self.conn.lock().await;
@@ -1261,6 +1491,39 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // [MEMCHAIN-PHALA-SUMMARY-WRITEBACK 2026-10-06 by Codex]
+    #[tokio::test]
+    async fn summary_task_writeback_is_idempotent_and_stale_safe() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0x5A; 32];
+        storage
+            .upsert_session("session-summary", &owner, None, "chat", 1, 3)
+            .await
+            .unwrap();
+
+        let (stored_owner, stored_summary) = storage
+            .complete_session_summary_from_task("session-summary", "Phala summary", None)
+            .await
+            .unwrap();
+        assert_eq!(stored_owner, owner);
+        assert_eq!(stored_summary, "Phala summary");
+
+        let (_, replayed_summary) = storage
+            .complete_session_summary_from_task("session-summary", "stale result", None)
+            .await
+            .unwrap();
+        assert_eq!(replayed_summary, "Phala summary");
+        assert_eq!(
+            storage
+                .get_session("session-summary", &owner)
+                .await
+                .unwrap()
+                .summary
+                .as_deref(),
+            Some("Phala summary")
+        );
+    }
+
     #[tokio::test]
     async fn test_entity_upsert_new() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
@@ -1306,6 +1569,43 @@ mod tests {
         let ent = s.get_entity("ent_jwt").await.unwrap();
         assert_eq!(ent.mention_count, 2);
         assert_eq!(ent.description, Some("Updated desc".into()));
+    }
+
+    // [MEMCHAIN-PHALA-EMBEDDING-BOUNDS 2026-10-06 by Codex]
+    #[tokio::test]
+    async fn entity_embedding_backfill_skips_oversized_text_without_starving_valid_rows() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xA3; 32];
+        storage
+            .upsert_entity(
+                "entity_oversized",
+                &owner,
+                "Large entity",
+                "large-entity",
+                "concept",
+                Some(&"x".repeat(16 * 1024 + 1)),
+                None,
+            )
+            .await
+            .unwrap();
+        storage
+            .upsert_entity(
+                "entity_valid",
+                &owner,
+                "Small entity",
+                "small-entity",
+                "concept",
+                Some("bounded description"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pending = storage
+            .get_entities_needing_embedding(&owner, "phala-model", 32)
+            .await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "entity_valid");
     }
 
     #[tokio::test]

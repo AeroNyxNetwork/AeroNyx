@@ -688,8 +688,13 @@ impl MemoryStorage {
     /// with its own key (which would double-wrap the origin's ciphertext and make
     /// the replica unreadable). `insert()`'s `verify_id()` still guards content
     /// integrity. The caller MUST have already verified the origin's Ed25519
-    /// signature (same as the P2P `BroadcastRecord` path). Returns true if stored.
+    /// signature. [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Reject vectors
+    /// again at the storage boundary, even when the wire validator already did.
     pub async fn insert_blind_replica(&self, record: &MemoryRecord, embedding_model: &str) -> bool {
+        if record.has_embedding() {
+            self.total_rejected.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         let mut replica = record.clone();
         replica.blind = true;
         self.insert(&replica, embedding_model).await

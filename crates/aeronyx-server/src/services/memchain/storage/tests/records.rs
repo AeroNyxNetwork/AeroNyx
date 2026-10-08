@@ -110,7 +110,7 @@ async fn test_insert_blind_replica_stored_verbatim() {
         vec![],
         "peer".into(),
         foreign_ct.clone(),
-        vec![0.3, 0.4],
+        vec![],
     );
     let rid = replica.record_id;
     assert!(!replica.blind);
@@ -127,11 +127,18 @@ async fn test_insert_blind_replica_stored_verbatim() {
     );
     assert_eq!(got.owner, [0xEE; 32]);
 
+    let mut vector_bearing_replica = replica.clone();
+    vector_bearing_replica.embedding = vec![0.3, 0.4];
+    assert!(!s
+        .insert_blind_replica(&vector_bearing_replica, "peer-model")
+        .await);
+
     // A tampered record (content no longer matches record_id) is rejected.
     let mut bad = replica.clone();
     bad.encrypted_content = b"tampered".to_vec();
     assert!(!s.insert_blind_replica(&bad, "peer-model").await);
 }
+
 
 #[tokio::test]
 async fn test_insert_and_get() {

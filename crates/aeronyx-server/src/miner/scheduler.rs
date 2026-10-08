@@ -142,6 +142,7 @@ pub struct MinerScheduler {
     max_rounds_per_hour: u32,
     identity: IdentityKeyPair,
     llm_router: Option<Arc<LlmRouter>>,
+    allow_full_entity_extraction: bool,
     embed_engine: Option<Arc<EmbedEngine>>,
     ner_engine: Option<Arc<NerEngine>>,
 
@@ -189,6 +190,35 @@ impl MinerScheduler {
         embed_engine: Option<Arc<EmbedEngine>>,
         ner_engine: Option<Arc<NerEngine>>,
     ) -> ServerResult<Arc<Self>> {
+        Self::new_with_full_entity_extraction_allowed(
+            storage_pool,
+            system_db,
+            max_owners_per_tick,
+            max_rounds_per_hour,
+            identity,
+            llm_router,
+            embed_engine,
+            ner_engine,
+            false,
+        )
+        .await
+    }
+
+    // [MEMCHAIN-PHALA-EXTRACTION 2026-10-05 by Codex] Keep the established
+    // constructor source-compatible; explicit full-content consent is only
+    // supplied by the server's validated SaaS configuration path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_full_entity_extraction_allowed(
+        storage_pool: Arc<StoragePool>,
+        system_db: Arc<SystemDb>,
+        max_owners_per_tick: usize,
+        max_rounds_per_hour: u32,
+        identity: IdentityKeyPair,
+        llm_router: Option<Arc<LlmRouter>>,
+        _embed_engine: Option<Arc<EmbedEngine>>,
+        _ner_engine: Option<Arc<NerEngine>>,
+        allow_full_entity_extraction: bool,
+    ) -> ServerResult<Arc<Self>> {
         // ── Stub AofWriter ─────────────────────────────────────────────
         // Write to a process-unique temp file. The SaaS Miner never calls
         // legacy_mine() (stub_mempool is always empty), so this file stays
@@ -208,8 +238,12 @@ impl MinerScheduler {
             max_rounds_per_hour,
             identity,
             llm_router,
-            embed_engine,
-            ner_engine,
+            allow_full_entity_extraction,
+            // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Legacy constructor
+            // arguments remain accepted, but ordinary SaaS workers never keep
+            // or pass local inference engines into the miner.
+            embed_engine: None,
+            ner_engine: None,
             quotas: TokioMutex::new(HashMap::new()),
             stub_mempool: Arc::new(MemPool::new()),
             stub_aof,
@@ -351,27 +385,10 @@ impl MinerScheduler {
             .await
             .map_err(|e| format!("StoragePool error: {}", e))?;
 
-        // Build a fresh VectorIndex and pre-populate it from this user's DB.
-        // Step 0.5 also backfills embeddings, but having the index pre-loaded
-        // makes Step 0.6 (correction chaining) and Step 9 (merge) functional
-        // on the very first tick.
-        //
-        // TODO: Replace with VectorIndexPool::get_or_create() when the pool
-        // is plumbed through to MinerScheduler — avoids rebuild every tick.
+        // [MEMCHAIN-SEALED-VECTOR-BOUNDARY 2026-10-05 by Codex] Keep the
+        // transient index empty: old persisted vectors are retained as opaque
+        // legacy data but must not be loaded or searched by ordinary nodes.
         let vector_index = Arc::new(VectorIndex::new());
-        let records_with_model = storage.get_records_with_embedding(owner).await;
-        for (record, model) in &records_with_model {
-            if record.has_embedding() {
-                vector_index.upsert(
-                    record.record_id,
-                    record.embedding.clone(),
-                    record.layer,
-                    record.timestamp,
-                    owner,
-                    model,
-                );
-            }
-        }
 
         // [VOLUME-GROWTH-ADMISSION 2026-08-31 by Codex] Reads and recovery
         // above remain available at capacity. Hold the same-volume permit only
@@ -425,6 +442,9 @@ impl MinerScheduler {
             Some(lr) => miner.with_llm_router(Arc::clone(lr)),
             None => miner,
         };
+        let miner = miner.with_full_entity_extraction_allowed(
+            self.allow_full_entity_extraction,
+        );
 
         miner
     }
@@ -514,9 +534,11 @@ mod tests {
             Duration::from_secs(3600),
         );
         let identity = aeronyx_core::crypto::IdentityKeyPair::generate();
-        MinerScheduler::new(pool, db, 3, 6, identity, None, None, None)
+        let scheduler = MinerScheduler::new(pool, db, 3, 6, identity, None, None, None)
             .await
-            .unwrap()
+            .unwrap();
+        assert!(!scheduler.allow_full_entity_extraction);
+        scheduler
     }
 
     // ── Quota mechanics ───────────────────────────────────────────────

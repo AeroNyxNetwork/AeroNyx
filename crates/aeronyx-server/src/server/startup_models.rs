@@ -122,77 +122,24 @@ impl Server {
     // ============================================
 
     pub(super) fn init_embed_engine(&self) -> Option<Arc<EmbedEngine>> {
-        if !self.config.memchain.embed_enabled {
-            info!("[EMBED] Local embedding engine disabled by memchain.embed_enabled=false");
-            return None;
-        }
-
-        let model_path = &self.config.memchain.embed_model_path;
-        match EmbedEngine::load(
-            model_path,
-            self.config.memchain.embed_max_tokens,
-            self.config.memchain.embed_output_dim,
-        ) {
-            Ok(engine) => {
-                info!(model = %model_path, model_type = %engine.model_type(), dim = engine.dim(), "[EMBED] Local embedding engine loaded");
-                Some(Arc::new(engine))
-            }
-            Err(e) => {
-                warn!(model = %model_path, error = %e, "[EMBED] Unavailable");
-                None
-            }
-        }
+        // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Never load a local model
+        // on ordinary nodes; the legacy config path remains parse-compatible.
+        info!("[EMBED] Local model loading is fail-closed; embeddings require attested Phala ACI");
+        None
     }
 
     pub(super) fn init_ner_engine(&self) -> Option<Arc<NerEngine>> {
-        if !self.config.memchain.ner_enabled {
-            debug!("[NER] Disabled");
-            return None;
-        }
-        let model_path = &self.config.memchain.ner_model_path;
-        let tokenizer_path = self.config.memchain.effective_ner_tokenizer_path();
-        let threshold = self.config.memchain.ner_confidence_threshold;
-        // [NER-RUNTIME-INDEPENDENCE 2026-07-30 by Codex] Honor the existing
-        // tokenizer override instead of silently forcing model_dir/tokenizer.json.
-        match NerEngine::load_with_tokenizer(model_path, &tokenizer_path, threshold, 0) {
-            Ok(engine) => {
-                info!(
-                    model = %model_path,
-                    tokenizer = %tokenizer_path,
-                    threshold,
-                    "[NER] Local NER engine loaded"
-                );
-                Some(Arc::new(engine))
-            }
-            Err(e) => {
-                warn!(
-                    model = %model_path,
-                    tokenizer = %tokenizer_path,
-                    error = %e,
-                    "[NER] Unavailable"
-                );
-                None
-            }
-        }
+        // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Extraction is model
+        // inference too; never load the legacy local GLiNER bundle.
+        debug!("[NER] Local model loading is fail-closed; extraction requires attested Phala ACI");
+        None
     }
 
     pub(super) fn init_reranker_engine(&self) -> Option<Arc<RerankerEngine>> {
-        if !self.config.memchain.reranker_enabled {
-            debug!("[RERANKER] Disabled");
-            return None;
-        }
-        let model_path = &self.config.memchain.reranker_model_path;
-        let max_seq = self.config.memchain.reranker_max_seq_length;
-        match RerankerEngine::load(model_path, max_seq) {
-            Ok(engine) => {
-                info!(model = %model_path, blend_weight = %RerankerEngine::blend_weight(), "[RERANKER] Cross-encoder loaded");
-                Some(Arc::new(engine))
-            }
-            Err(e) => {
-                warn!(model = %model_path, error = %e, "[RERANKER] Unavailable");
-                None
-            }
-        }
+        // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Cross-encoder inference
+        // also stays in the attested Phala route, never in a node process.
+        debug!("[RERANKER] Local model loading is fail-closed; ranking requires attested Phala ACI");
+        None
     }
 
     // ============================================
@@ -215,6 +162,23 @@ impl Server {
             debug!("[SUPERNODE] Disabled");
             return Ok(None);
         }
+        // [MEMCHAIN-PHALA-E2EE-BOUNDARY 2026-10-06 by Codex] ACI verification
+        // protects workload identity, not payloads from this node. Do not start
+        // a server-side model worker until requests and responses are E2EE-bound
+        // between the source client and the attested Phala workload.
+        if self.config.memchain.supernode.enabled {
+            return Err(ServerError::startup_failed(
+                "SuperNode initialization failed (client_to_tee_e2ee_transport_unavailable)",
+            ));
+        }
+        // [MEMCHAIN-PHALA-NODE-BOUNDARY 2026-10-05 by Codex] Config validation
+        // enforces this too; retain the startup guard so future callers cannot
+        // construct a plaintext cognition worker in ordinary node mode.
+        if !self.config.memchain.is_saas() {
+            return Err(ServerError::startup_failed(
+                "SuperNode initialization failed (plaintext_cognition_requires_saas_mode)",
+            ));
+        }
         if !self.config.memchain.is_enabled() {
             return Err(ServerError::startup_failed(
                 "SuperNode initialization failed (memchain_runtime_required)",
@@ -230,11 +194,17 @@ impl Server {
 
         let mut providers: Vec<(String, String, String, Arc<dyn LlmProvider>)> = Vec::new();
 
+        // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex] Resolve the only
+        // supported confidential provider to Phala's canonical endpoint.
         for provider_cfg in &supernode.providers {
             let api_base = if provider_cfg.api_base.is_empty()
                 && provider_cfg.provider_type == ProviderType::Anthropic
             {
                 "https://api.anthropic.com".to_string()
+            } else if provider_cfg.api_base.is_empty()
+                && provider_cfg.provider_type == ProviderType::PhalaAci
+            {
+                crate::services::memchain::llm_provider::PHALA_ACI_API_BASE_DEFAULT.to_owned()
             } else {
                 provider_cfg.api_base.clone()
             };
@@ -259,6 +229,19 @@ impl Server {
                         provider_cfg.temperature,
                     )
                     .map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>),
+                    ProviderType::PhalaAci => OpenAiCompatProvider::new_phala_aci(
+                        provider_cfg.name.clone(),
+                        api_base.clone(),
+                        provider_cfg.api_key.clone().unwrap_or_default(),
+                        provider_cfg.model.clone(),
+                        provider_cfg.max_tokens,
+                        provider_cfg.temperature,
+                        &supernode.accepted_compose_hashes,
+                        // [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex]
+                        &supernode.accepted_source_provenance,
+                        &supernode.accepted_kms_root_public_keys,
+                    )
+                    .map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>),
                 };
 
             let provider = provider_result.map_err(|error| {
@@ -270,6 +253,19 @@ impl Server {
                 ServerError::startup_failed(format!("SuperNode initialization failed ({reason})"))
             })?;
 
+            // [MEMCHAIN-PHALA-VERIFIER-GATE 2026-10-05 by Codex] SuperNode
+            // is a required runtime contract: do not start its queue worker
+            // unless the provider both requests and verifies ACI cryptographically.
+            if !provider.supports_aci_verified() || !provider.has_cryptographic_aci_verifier() {
+                warn!(
+                    reason = "aci_verifier_unavailable",
+                    "[SUPERNODE] Confidential provider is not ready"
+                );
+                return Err(ServerError::startup_failed(
+                    "SuperNode initialization failed (aci_verifier_unavailable)",
+                ));
+            }
+
             info!(type_ = ?provider_cfg.provider_type, model = %provider_cfg.model, "[SUPERNODE] Provider registered");
             providers.push((
                 provider_cfg.name.clone(),
@@ -279,7 +275,20 @@ impl Server {
             ));
         }
 
-        let router = LlmRouter::new(providers, supernode.routing.clone());
+        let mut router = LlmRouter::new(providers, supernode.routing.clone());
+        // [MEMCHAIN-PHALA-EMBEDDINGS 2026-10-06 by Codex] Semantic vectors
+        // are opt-in and bind to one named Phala ACI provider/model; no generic
+        // provider or local engine is considered as a fallback.
+        if let (Some(provider), Some(model)) = (
+            supernode.embedding_provider.as_deref(),
+            supernode.embedding_model.as_deref(),
+        ) {
+            router = router.with_embedding_route(provider, model).map_err(|_| {
+                ServerError::startup_failed(
+                    "SuperNode initialization failed (phala_embedding_route_invalid)",
+                )
+            })?;
+        }
         info!(providers = supernode.providers.len(), fallback = ?supernode.routing.fallback, "[SUPERNODE] LlmRouter initialized");
         Ok(Some(Arc::new(router)))
     }

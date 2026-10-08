@@ -249,33 +249,53 @@
 // ============================================================================
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::io;
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aeronyx_core::protocol::discovery::{
     decode_route_domain_attestation_certificate,
     MAX_ROUTE_DOMAIN_ATTESTATION_CERTIFICATE_FRAME_BYTES, MAX_SIGNED_NODE_DESCRIPTOR_BYTES,
+    // [PHALA-NODE-COMPILE-REPAIR 2026-10-08 by Codex] Use the defining module.
+    PHALA_NODE_ATTESTATION_MAX_GUEST_HTTP_RESPONSE_BYTES_V1,
 };
 use aeronyx_core::protocol::{
     DiscoveryEndpointEvidenceAttestationV1, NodeBootstrapSnapshot, NodeCapability,
-    NodeDiscoveryMessage, NodeProtocolFeature, OnionRoutePurpose, SignedNodeDescriptor,
+    NodeDiscoveryMessage, NodeProtocolFeature, OnionRoutePurpose,
+    PhalaNodeAttestationResponseV1, SignedNodeDescriptor,
     MAX_VERIFIED_ONION_ROUTE_HOPS, ONION_FORWARD_HOP_REQUIRED_CAPABILITIES,
-    ONION_ROUTE_PURPOSE_VALUES,
+    ONION_ROUTE_PURPOSE_VALUES, PHALA_NODE_ATTESTATION_CONTRACT_VERSION_V1,
+    PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V0, PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V1,
+    PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1,
+    PHALA_NODE_ATTESTATION_VERIFICATION_NOTE_V1,
+    PHALA_PRIVATE_RECIPIENT_ATTESTATION_CONTRACT_VERSION_V1,
+};
+use aeronyx_core::protocol::{
+    phala_node_attestation_report_data_v1,
+    phala_private_onion_authorization_sha256_v1,
+    phala_private_recipient_attestation_report_data_v1,
 };
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use futures::StreamExt;
 use parking_lot::Mutex;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 
 use crate::api::directory_replica_sync::admit_directory_gossip_descriptor;
 use crate::api::public_node_router::public_endpoint_flow_context;
 use crate::config::DiscoveryConfig;
+use crate::config_reverse_onion::ReverseOnionQueueConfig;
 use crate::services::peer_store::PermissionlessNodeAdmissionOutcome;
 use crate::services::{
     DirectoryReplicaStore, DiscoveryEndpointAttestationInboxError,
@@ -296,6 +316,158 @@ const ONION_CANDIDATES_CONTRACT_VERSION: &str = "onion_candidates.v1";
 /// 1 MiB while still preventing unbounded allocation from untrusted peers.
 const DISCOVERY_REQUEST_BODY_MAX_BYTES: usize = 1024 * 1024;
 const ROUTE_DOMAIN_CERTIFICATE_RATE_LIMIT_PER_MINUTE: u32 = 60;
+const PHALA_NODE_ATTESTATION_RATE_LIMIT_PER_MINUTE: u32 = 12;
+const PHALA_NODE_ATTESTATION_TIMEOUT_SECS: u64 = 8;
+// [PHALA-ATTESTATION-CONCURRENCY 2026-10-06 by Codex] A minute-window limit
+// still permits a full burst; bound simultaneous work sent to the local agent.
+const PHALA_NODE_ATTESTATION_MAX_IN_FLIGHT: usize = 2;
+// [PHALA-ATTESTATION-PROCESS-LIMIT 2026-10-06 by Codex] The discovery router
+// is mounted on more than one listener; share one limiter across all of them.
+static PHALA_NODE_ATTESTATION_PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+// [PHALA-ATTESTATION-PROCESS-LIMIT 2026-10-06 by Codex] Apply the request
+// budget process-wide too; listener-specific counters multiply the allowance.
+static PHALA_NODE_ATTESTATION_RATE_LIMIT: OnceLock<Mutex<RateLimitState>> = OnceLock::new();
+
+fn phala_node_attestation_permits() -> Arc<tokio::sync::Semaphore> {
+    Arc::clone(PHALA_NODE_ATTESTATION_PERMITS.get_or_init(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            PHALA_NODE_ATTESTATION_MAX_IN_FLIGHT,
+        ))
+    }))
+}
+
+fn phala_node_attestation_rate_limit() -> &'static Mutex<RateLimitState> {
+    PHALA_NODE_ATTESTATION_RATE_LIMIT.get_or_init(|| Mutex::new(RateLimitState::new()))
+}
+
+// [PHALA-QUOTE-RESPONSE-OWNERSHIP 2026-10-08 by Codex] The process-wide
+// quote permit follows its large response buffer until EOS/drop/expiry. A
+// weak registry allows admission and the owned server sweeper to reclaim an
+// unpolled buffer without retaining it after HTTP cancellation.
+const PHALA_QUOTE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const PHALA_QUOTE_RESPONSE_CHUNK_BYTES: usize = 16 * 1024;
+const PHALA_QUOTE_RESPONSE_MAX_BYTES: usize = PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1 * 2 + 16_384;
+static PHALA_QUOTE_RESPONSES: OnceLock<Arc<PhalaQuoteResponseRegistry>> = OnceLock::new();
+
+#[derive(Default)]
+struct PhalaQuoteResponseRegistry {
+    responses: Mutex<Vec<std::sync::Weak<PhalaQuoteResponseState>>>,
+}
+
+pub(crate) struct PhalaAttestationDeliveryOwner {
+    closed: std::sync::atomic::AtomicBool,
+    registry: Arc<PhalaQuoteResponseRegistry>,
+}
+
+impl std::fmt::Debug for PhalaAttestationDeliveryOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PhalaAttestationDeliveryOwner").field("stopped", &self.is_stopped()).finish()
+    }
+}
+
+impl Default for PhalaAttestationDeliveryOwner {
+    fn default() -> Self {
+        Self { closed: std::sync::atomic::AtomicBool::new(false),
+            registry: Arc::clone(PHALA_QUOTE_RESPONSES.get_or_init(|| Arc::new(PhalaQuoteResponseRegistry::default()))) }
+    }
+}
+
+impl PhalaAttestationDeliveryOwner {
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn stop(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.expire_buffers();
+    }
+
+    pub(crate) fn expire_buffers(&self) {
+        let now = tokio::time::Instant::now();
+        self.registry.responses.lock().retain(|weak| {
+            let Some(state) = weak.upgrade() else { return false; };
+            if state.owner.is_stopped() || now >= state.deadline { state.finish(true); }
+            let active = state.data.lock().is_some();
+            active
+        });
+    }
+
+    fn response_body(self: &Arc<Self>, bytes: Vec<u8>, permit: tokio::sync::OwnedSemaphorePermit) -> Result<axum::body::Body, ()> {
+        self.expire_buffers();
+        let mut responses = self.registry.responses.lock();
+        // Registration and stop's sweep share this lock. Stop either rejects
+        // this handoff or sees the registered buffer; it cannot miss both.
+        if self.is_stopped() || bytes.len() > PHALA_QUOTE_RESPONSE_MAX_BYTES { return Err(()); }
+        let state = Arc::new(PhalaQuoteResponseState {
+            data: Mutex::new(Some(PhalaQuoteResponseData { bytes, offset: 0, _permit: permit })),
+            deadline: tokio::time::Instant::now() + PHALA_QUOTE_RESPONSE_TIMEOUT,
+            expired: std::sync::atomic::AtomicBool::new(false),
+            owner: Arc::clone(self), waker: futures::task::AtomicWaker::new(),
+        });
+        responses.push(Arc::downgrade(&state));
+        Ok(axum::body::Body::from_stream(PhalaQuoteResponseStream { state, terminated: false }))
+    }
+}
+
+struct PhalaQuoteResponseData {
+    bytes: Vec<u8>,
+    offset: usize,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+struct PhalaQuoteResponseState {
+    data: Mutex<Option<PhalaQuoteResponseData>>,
+    deadline: tokio::time::Instant,
+    expired: std::sync::atomic::AtomicBool,
+    owner: Arc<PhalaAttestationDeliveryOwner>,
+    waker: futures::task::AtomicWaker,
+}
+
+impl PhalaQuoteResponseState {
+    fn finish(&self, expired: bool) {
+        if expired { self.expired.store(true, std::sync::atomic::Ordering::SeqCst); }
+        let data = self.data.lock().take();
+        drop(data);
+        self.waker.wake();
+    }
+}
+
+struct PhalaQuoteResponseStream {
+    state: Arc<PhalaQuoteResponseState>,
+    terminated: bool,
+}
+
+impl futures::Stream for PhalaQuoteResponseStream {
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        if self.terminated { return Poll::Ready(None); }
+        self.state.waker.register(cx.waker());
+        if self.state.owner.is_stopped() || tokio::time::Instant::now() >= self.state.deadline { self.state.finish(true); }
+        let state = Arc::clone(&self.state);
+        let mut slot = state.data.lock();
+        if let Some(data) = slot.as_mut() {
+            if data.offset < data.bytes.len() {
+                let end = data.offset.saturating_add(PHALA_QUOTE_RESPONSE_CHUNK_BYTES).min(data.bytes.len());
+                // Never lend a Bytes slice of the whole quote to a slow socket.
+                let chunk = Bytes::copy_from_slice(&data.bytes[data.offset..end]);
+                data.offset = end;
+                return Poll::Ready(Some(Ok(chunk)));
+            }
+        }
+        drop(slot);
+        state.finish(false);
+        self.terminated = true;
+        if state.expired.load(std::sync::atomic::Ordering::SeqCst) {
+            Poll::Ready(Some(Err(io::Error::new(io::ErrorKind::TimedOut, "attestation response delivery stopped"))))
+        } else { Poll::Ready(None) }
+    }
+}
+
+impl Drop for PhalaQuoteResponseStream {
+    fn drop(&mut self) { self.state.finish(false); }
+}
 const ONION_CANDIDATES_SOURCE: &str = "rust_discovery_onion_candidates";
 const ONION_CANDIDATES_SELECTION_POLICY: &str =
     "fresh_routeable_signed_chat_relays_with_kem_public_key";
@@ -313,6 +485,35 @@ const ONION_RELAY_ADMISSION_STABILITY_MIN_PROOFS: u64 = 3;
 const ONION_RELAY_ADMISSION_STABILITY_SUCCESS_PERCENT: u8 = 80;
 const DISCOVERY_PUBLIC_CARD_CONTRACT_VERSION: &str = "discovery_public_card.v1";
 const DISCOVERY_PUBLIC_CARD_SOURCE: &str = "rust_discovery_public_card";
+
+// [PHALA-NODE-ATTESTATION-API 2026-10-06 by Codex] The public endpoint is
+// opt-in, challenge-bound, size/rate bounded, and returns opaque evidence only.
+#[derive(Debug, Deserialize)]
+struct PhalaNodeAttestationQuery {
+    nonce: String,
+    #[serde(default)]
+    recipient_node_id: Option<String>,
+}
+
+// [PHALA-DSTACK-V0-FALLBACK 2026-10-06 by Codex] The evidence format is
+// explicit so callers never parse legacy GetQuote JSON as a v1 attestation.
+#[derive(Debug, Serialize)]
+struct PhalaNodeAttestationError {
+    error: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct DstackAttestBody {
+    attestation: String,
+}
+
+// [PHALA-DSTACK-V0-FALLBACK 2026-10-06 by Codex]
+#[derive(Debug, Deserialize)]
+struct DstackV0QuoteBody {
+    quote: String,
+    event_log: serde_json::Value,
+    report_data: String,
+}
 
 #[derive(Clone)]
 struct DiscoveryApiState {
@@ -342,6 +543,12 @@ pub struct DiscoveryApiPolicy {
     /// must never be serialized by discovery APIs.
     pinned_route_domains: HashMap<String, String>,
     require_pinned_route_domains_for_multi_hop: bool,
+    phala_attestation_socket_path: Option<String>,
+    phala_attestation_allow_legacy_v0: bool,
+    phala_private_recipient_node_id: Option<[u8; 32]>,
+    // [PHALA-QUOTE-RESPONSE-OWNERSHIP 2026-10-08 by Codex] Policy clones
+    // on local/public listeners share one server lifetime, not a new budget.
+    phala_attestation_delivery: Arc<PhalaAttestationDeliveryOwner>,
 }
 
 impl DiscoveryApiPolicy {
@@ -365,7 +572,29 @@ impl DiscoveryApiPolicy {
                 .collect(),
             require_pinned_route_domains_for_multi_hop: config
                 .require_pinned_route_domains_for_multi_hop,
+            phala_attestation_socket_path: config.phala_attestation_socket_path.clone(),
+            phala_attestation_allow_legacy_v0: config.phala_attestation_allow_legacy_v0,
+            phala_private_recipient_node_id: None,
+            phala_attestation_delivery: Arc::new(PhalaAttestationDeliveryOwner::default()),
         }
+    }
+
+    pub(crate) fn phala_attestation_delivery_owner(&self) -> Arc<PhalaAttestationDeliveryOwner> {
+        Arc::clone(&self.phala_attestation_delivery)
+    }
+
+    // [PHALA-QUEUE-RECOVERY-GATE 2026-10-06 by Codex] Derive quote authority
+    // from the same live queue policy used by signed discovery advertisement.
+    pub(crate) fn with_phala_private_recipient_queue(
+        mut self,
+        queue: &ReverseOnionQueueConfig,
+    ) -> Self {
+        let recipient_node_id = (queue.permits_new_claims()
+            && queue.recipient_node_ids.len() == 1)
+            .then(|| queue.recipient_node_ids[0].as_str());
+        self.phala_private_recipient_node_id =
+            recipient_node_id.and_then(parse_phala_recipient_node_id);
+        self
     }
 
     fn route_domain_certificate_rate_limit_per_minute(&self) -> u32 {
@@ -379,7 +608,11 @@ impl DiscoveryApiPolicy {
             .min(self.max_snapshot_limit)
     }
 
-    fn message_allowed(&self, message: &NodeDiscoveryMessage) -> bool {
+    fn message_allowed(
+        &self,
+        message: &NodeDiscoveryMessage,
+        has_local_identity: bool,
+    ) -> bool {
         match message {
             NodeDiscoveryMessage::SnapshotRequest { .. } => true,
             NodeDiscoveryMessage::DescriptorAnnounce { descriptor } => {
@@ -392,6 +625,12 @@ impl DiscoveryApiPolicy {
                 DiscoveryEndpointEvidenceAttestationV1::decode(attestation_frame)
                     .map(|attestation| self.node_allowed(&attestation.subject_node_id()))
                     .unwrap_or(false)
+            }
+            NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 { authorization, .. } => {
+                has_local_identity
+                    && authorization.relay_node_id() != authorization.recipient_node_id()
+                    && self.node_allowed(&authorization.relay_node_id())
+                    && self.node_allowed(&authorization.recipient_node_id())
             }
             NodeDiscoveryMessage::SnapshotResponse { snapshot } => snapshot
                 .peers
@@ -448,6 +687,10 @@ impl Default for DiscoveryApiPolicy {
             denied_peer_ids: HashSet::new(),
             pinned_route_domains: HashMap::new(),
             require_pinned_route_domains_for_multi_hop: false,
+            phala_attestation_socket_path: None,
+            phala_attestation_allow_legacy_v0: false,
+            phala_attestation_delivery: Arc::new(PhalaAttestationDeliveryOwner::default()),
+            phala_private_recipient_node_id: None,
         }
     }
 }
@@ -485,6 +728,641 @@ impl RateLimitState {
         self.used += 1;
         true
     }
+}
+
+// [PHALA-NODE-ATTESTATION-API 2026-10-06 by Codex] This route asks the local
+// dstack agent for a challenge-bound quote; it deliberately does not decide
+// whether that quote, compose, app identity, or TCB is trusted.
+async fn phala_node_attestation_handler(
+    State(state): State<DiscoveryApiState>,
+    Query(query): Query<PhalaNodeAttestationQuery>,
+) -> impl IntoResponse {
+    let Some(socket_path) = state.policy.phala_attestation_socket_path.as_deref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(PhalaNodeAttestationError {
+                error: "attestation_unavailable",
+            }),
+        )
+            .into_response();
+    };
+    let Some(node_id) = state.local_node_id else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(PhalaNodeAttestationError {
+                error: "attestation_unavailable",
+            }),
+        )
+            .into_response();
+    };
+    let Some(nonce) = parse_phala_attestation_nonce(&query.nonce) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(PhalaNodeAttestationError {
+                error: "invalid_nonce",
+            }),
+        )
+            .into_response();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    if !phala_node_attestation_rate_limit()
+        .lock()
+        .allow(now, PHALA_NODE_ATTESTATION_RATE_LIMIT_PER_MINUTE)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(PhalaNodeAttestationError {
+                error: "rate_limited",
+            }),
+        )
+            .into_response();
+    }
+    // [PHALA-ATTESTATION-CONCURRENCY 2026-10-06 by Codex] Do not queue
+    // anonymous quote requests behind the guest agent. Bound its concurrent
+    // work and let callers retry after a short, explicit overload response.
+    // [PHALA-QUOTE-RESPONSE-OWNERSHIP 2026-10-08 by Codex] Admission
+    // reclaims expired buffers even for embedded routers without a sweeper.
+    let delivery_owner = state.policy.phala_attestation_delivery_owner();
+    delivery_owner.expire_buffers();
+    if delivery_owner.is_stopped() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(PhalaNodeAttestationError { error: "attestation_unavailable" })).into_response();
+    }
+    let permits = phala_node_attestation_permits();
+    let Ok(attestation_permit) = permits.try_acquire_owned()
+    else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(PhalaNodeAttestationError {
+                error: "rate_limited",
+            }),
+        )
+            .into_response();
+    };
+
+    let recipient_authority = match query.recipient_node_id.as_deref() {
+        Some(value) => match parse_phala_recipient_node_id(value) {
+            Some(recipient) => {
+                if !phala_private_recipient_pin_matches(&state.policy, &recipient) {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(PhalaNodeAttestationError {
+                            error: "attestation_unavailable",
+                        }),
+                    )
+                        .into_response();
+                }
+                let authority = state.peer_store.current_private_onion_authority_snapshot(
+                    &node_id,
+                    &recipient,
+                    now,
+                );
+                let Some((_, _, authorization)) = authority else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(PhalaNodeAttestationError {
+                            error: "attestation_unavailable",
+                        }),
+                    )
+                        .into_response();
+                };
+                let Ok(digest) = phala_private_onion_authorization_sha256_v1(&authorization) else {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(PhalaNodeAttestationError {
+                            error: "attestation_unavailable",
+                        }),
+                    )
+                        .into_response();
+                };
+                // [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex]
+                Some((recipient, digest))
+            }
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(PhalaNodeAttestationError {
+                        error: "invalid_recipient_node_id",
+                    }),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    // [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex] A recipient
+    // quote requires the relay's exact current signed R/P/grant snapshot.
+    // This endpoint transports evidence; it does not appraise TCB or prove
+    // that the recipient key itself is held in the TEE.
+    let report_data = match recipient_authority.as_ref() {
+        Some((recipient, authorization_sha256)) => phala_private_recipient_attestation_report_data_v1(
+            &node_id,
+            recipient,
+            authorization_sha256,
+            &nonce,
+        ),
+        None => phala_node_attestation_report_data_v1(&node_id, &nonce),
+    };
+    let expected_report_data = {
+        let mut padded = [0_u8; 64];
+        padded[..report_data.len()].copy_from_slice(&report_data);
+        hex::encode(padded)
+    };
+    let request = serde_json::json!({"report_data": hex::encode(report_data)});
+    let request = match serde_json::to_vec(&request) {
+        Ok(request) => request,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PhalaNodeAttestationError {
+                    error: "attestation_unavailable",
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(PHALA_NODE_ATTESTATION_TIMEOUT_SECS),
+        fetch_dstack_attestation(
+            socket_path,
+            &request,
+            &expected_report_data,
+            state.policy.phala_attestation_allow_legacy_v0,
+        ),
+    )
+    .await;
+    let (attestation_format, attestation) = match fetched {
+        Ok(Ok(attestation)) => attestation,
+        Ok(Err(_)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(PhalaNodeAttestationError {
+                    error: "attestation_unavailable",
+                }),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(PhalaNodeAttestationError {
+                    error: "attestation_timeout",
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex] Quote
+    // generation awaits the guest agent; do not return recipient-bound
+    // evidence if its signed R/P/grant authority expired or was withdrawn
+    // while that request was in flight.
+    if let Some((recipient, expected_authorization_sha256)) = recipient_authority {
+        let response_now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs(),
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(PhalaNodeAttestationError {
+                        error: "attestation_unavailable",
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        let current_authorization_sha256 = state
+            .peer_store
+            .current_private_onion_authority_snapshot(&node_id, &recipient, response_now)
+            .and_then(|(_, _, authorization)| {
+                phala_private_onion_authorization_sha256_v1(&authorization).ok()
+            });
+        if response_now < now
+            || current_authorization_sha256 != Some(expected_authorization_sha256)
+        {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(PhalaNodeAttestationError {
+                    error: "attestation_unavailable",
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    let response = PhalaNodeAttestationResponseV1 {
+        contract_version: if recipient_authority.is_some() {
+            PHALA_PRIVATE_RECIPIENT_ATTESTATION_CONTRACT_VERSION_V1.into()
+        } else {
+            PHALA_NODE_ATTESTATION_CONTRACT_VERSION_V1.into()
+        },
+        node_id: hex::encode(node_id),
+        recipient_node_id: recipient_authority.map(|(recipient, _)| hex::encode(recipient)),
+        authorization_sha256: recipient_authority
+            .map(|(_, digest)| hex::encode(digest)),
+        nonce: hex::encode(nonce),
+        expected_report_data,
+        attestation_format: attestation_format.into(),
+        attestation: hex::encode(attestation),
+        verification: PHALA_NODE_ATTESTATION_VERIFICATION_NOTE_V1.into(),
+    };
+    let recipient_binding = recipient_authority
+        .as_ref()
+        .map(|(recipient, digest)| (recipient, digest));
+    if response
+        .validate_for(&node_id, &nonce, recipient_binding)
+        .is_err()
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(PhalaNodeAttestationError {
+                error: "attestation_unavailable",
+            }),
+        )
+            .into_response();
+    }
+    // [PHALA-QUOTE-RESPONSE-OWNERSHIP 2026-10-08 by Codex] Serialization
+    // and delivery remain inside the same two-slot process admission bound.
+    let Ok(bytes) = serde_json::to_vec(&response) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(PhalaNodeAttestationError { error: "attestation_unavailable" })).into_response();
+    };
+    let length = bytes.len();
+    let Ok(body) = delivery_owner.response_body(bytes, attestation_permit) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(PhalaNodeAttestationError { error: "attestation_unavailable" })).into_response();
+    };
+    let mut response = Response::new(body);
+    response.headers_mut().insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/json"));
+    if let Ok(length) = axum::http::HeaderValue::from_str(&length.to_string()) {
+        response.headers_mut().insert(axum::http::header::CONTENT_LENGTH, length);
+    }
+    response
+}
+
+fn parse_phala_attestation_nonce(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let decoded = hex::decode(value).ok()?;
+    let nonce: [u8; 32] = decoded.try_into().ok()?;
+    (nonce.iter().any(|byte| *byte != 0)).then_some(nonce)
+}
+
+// [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex] Recipient IDs
+// are canonical nonzero Ed25519 public keys, never endpoint input.
+fn parse_phala_recipient_node_id(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let decoded: [u8; 32] = hex::decode(value).ok()?.try_into().ok()?;
+    (decoded != [0; 32]).then_some(decoded)
+}
+
+fn phala_private_recipient_pin_matches(
+    policy: &DiscoveryApiPolicy,
+    requested: &[u8; 32],
+) -> bool {
+    policy.phala_private_recipient_node_id.as_ref() == Some(requested)
+}
+
+async fn fetch_dstack_attestation(
+    socket_path: &str,
+    request_body: &[u8],
+    expected_report_data: &str,
+    allow_legacy_v0: bool,
+) -> io::Result<(&'static str, Vec<u8>)> {
+    if socket_path.len() > 4096 || !Path::new(socket_path).is_absolute() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid socket path"));
+    }
+    let v1_response = fetch_dstack_json(socket_path, "/v1/Attest", request_body).await?;
+    if v1_response.status == 200 {
+        return parse_dstack_v1_attestation(&v1_response.body, expected_report_data)
+            .map(|attestation| (PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V1, attestation));
+    }
+    if !allow_legacy_v0 || !is_dstack_v1_mount_missing(&v1_response) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "agent rejected request"));
+    }
+
+    // [PHALA-DSTACK-V0-FALLBACK 2026-10-06 by Codex] Fall back only when the
+    // documented v1-unmounted 404 is observed; never downgrade on timeouts,
+    // malformed responses, method-level errors, or quote-generation failures.
+    let v0_response = fetch_dstack_json(socket_path, "/GetQuote", request_body).await?;
+    if v0_response.status != 200 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "legacy quote request rejected"));
+    }
+    parse_dstack_v0_quote(&v0_response.body, expected_report_data)
+        .map(|opaque_json| (PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V0, opaque_json))
+}
+
+// [PHALA-DSTACK-V0-FALLBACK 2026-10-06 by Codex]
+struct DstackHttpResponse {
+    status: u16,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+async fn fetch_dstack_json(
+    socket_path: &str,
+    path: &str,
+    request_body: &[u8],
+) -> io::Result<DstackHttpResponse> {
+    let mut socket = UnixStream::connect(socket_path).await?;
+    let header = format!(
+        "POST {path} HTTP/1.1\r\nHost: dstack\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        request_body.len()
+    );
+    socket.write_all(header.as_bytes()).await?;
+    socket.write_all(request_body).await?;
+    socket.shutdown().await?;
+
+    let mut response = Vec::new();
+    socket
+        .take((PHALA_NODE_ATTESTATION_MAX_GUEST_HTTP_RESPONSE_BYTES_V1 + 1) as u64)
+        .read_to_end(&mut response)
+        .await?;
+    parse_dstack_http_response(&response)
+}
+
+fn parse_dstack_http_response(response: &[u8]) -> io::Result<DstackHttpResponse> {
+    if response.len() > PHALA_NODE_ATTESTATION_MAX_GUEST_HTTP_RESPONSE_BYTES_V1 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "response too large"));
+    }
+    let separator = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed response"))?;
+    let headers = std::str::from_utf8(&response[..separator])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed headers"))?;
+    let mut lines = headers.split("\r\n");
+    let status_line = lines.next().unwrap_or_default();
+    let mut status_parts = status_line.split_ascii_whitespace();
+    let version = status_parts.next().unwrap_or_default();
+    let status = status_parts
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|_| version == "HTTP/1.1" || version == "HTTP/1.0")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed status line"))?;
+    let mut content_length = None;
+    let mut content_type = None;
+    for line in lines {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed headers"))?;
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("content-encoding")
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported encoding"));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate length"));
+            }
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid length"))?,
+            );
+        } else if name.eq_ignore_ascii_case("content-type") {
+            if content_type.is_some() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate content type"));
+            }
+            content_type = Some(value.trim().to_ascii_lowercase());
+        }
+    }
+    let body = &response[separator + 4..];
+    let json_content_type = content_type
+        .as_deref()
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
+    if content_length != Some(body.len()) || (status == 200 && !json_content_type) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid body framing"));
+    }
+    Ok(DstackHttpResponse {
+        status,
+        content_type,
+        body: body.to_vec(),
+    })
+}
+
+fn parse_dstack_v1_attestation(
+    body: &[u8],
+    expected_report_data: &str,
+) -> io::Result<Vec<u8>> {
+    // [PHALA-UNIQUE-EVIDENCE-JSON 2026-10-07 by Codex] Unknown JSON
+    // members cannot hide ambiguous evidence from downstream consumers.
+    crate::services::memchain::validate_phala_json(body, PHALA_NODE_ATTESTATION_MAX_GUEST_HTTP_RESPONSE_BYTES_V1)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid attestation response"))?;
+    let decoded: DstackAttestBody = serde_json::from_slice(body)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid attestation response"))?;
+    let attestation = hex::decode(decoded.attestation)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid attestation encoding"))?;
+    if attestation.is_empty() || attestation.len() > PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid attestation size"));
+    }
+    // [PHALA-DSTACK-V1-ACI-EVIDENCE 2026-10-06 by Codex] Decode the complete
+    // normative v1 envelope, not just its outer tag, before advertising it.
+    let (report_data, _) = dstack_v1_aci_evidence(&attestation)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid v1 attestation evidence"))?;
+    if hex::encode(report_data) != expected_report_data {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "v1 report data mismatch"));
+    }
+    Ok(attestation)
+}
+
+// [PHALA-DSTACK-V1-ACI-EVIDENCE 2026-10-06 by Codex] dstack v1 is named
+// MessagePack with binary quote/event bytes. aci-verify accepts a different
+// JSON view, so convert only the authenticated schema fields explicitly.
+fn dstack_v1_aci_evidence(attestation: &[u8]) -> Result<(Vec<u8>, serde_json::Value), &'static str> {
+    let mut cursor = std::io::Cursor::new(attestation);
+    let mut decoder = rmp_serde::Deserializer::new(&mut cursor);
+    let envelope = DstackVersionedAttestationEnvelope::deserialize(&mut decoder)
+        .map_err(|_| "invalid dstack v1 messagepack")?;
+    drop(decoder);
+    if cursor.position() != attestation.len() as u64 {
+        return Err("trailing dstack v1 messagepack bytes");
+    }
+    if envelope.version != 1 || envelope.platform.kind != "tdx"
+        || !matches!(envelope.stack.kind.as_str(), "dstack" | "dstack-pod") {
+        return Err("unsupported dstack v1 evidence");
+    }
+
+    let DstackVersionedAttestationPlatformData { quote, event_log } = envelope.platform.data;
+    let DstackVersionedAttestationStackData { report_data, config } = envelope.stack.data;
+    if quote.0.is_empty()
+        || quote.0.len() > PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1
+        || report_data.0.len() != 64
+    {
+        return Err("invalid dstack v1 component data");
+    }
+    let report_data = report_data.0;
+    let event_log = event_log
+        .into_iter()
+        .map(|event| {
+            serde_json::json!({
+                "imr": event.imr,
+                "event_type": event.event_type,
+                "digest": hex::encode(event.digest.0),
+                "event": event.event,
+                "event_payload": hex::encode(event.event_payload.0),
+            })
+        })
+        .collect::<Vec<_>>();
+    let evidence = serde_json::json!({
+        "quote": hex::encode(quote.0),
+        "quote_report_data": hex::encode(&report_data),
+        "event_log": serde_json::to_string(&event_log).map_err(|_| "invalid dstack event log")?,
+        "app_compose": config,
+    });
+    Ok((report_data, evidence))
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct DstackVersionedAttestationEnvelope {
+    version: u64,
+    platform: DstackVersionedAttestationPlatform,
+    stack: DstackVersionedAttestationStack,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct DstackVersionedAttestationPlatform {
+    kind: String,
+    data: DstackVersionedAttestationPlatformData,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct DstackVersionedAttestationPlatformData {
+    quote: DstackByteField,
+    event_log: Vec<DstackVersionedTdxEvent>,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct DstackVersionedTdxEvent {
+    imr: u32,
+    event_type: u32,
+    digest: DstackByteField,
+    event: String,
+    event_payload: DstackByteField,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct DstackVersionedAttestationStack {
+    kind: String,
+    data: DstackVersionedAttestationStackData,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct DstackVersionedAttestationStackData {
+    report_data: DstackByteField,
+    config: String,
+}
+
+// [PHALA-DSTACK-MESSAGEPACK-BYTES 2026-10-06 by Codex] dstack emits binary
+// MessagePack tokens for byte fields, while older/test producers may encode
+// them as integer arrays. Accept both wire forms without adding a dependency.
+struct DstackByteField(Vec<u8>);
+
+#[cfg(test)]
+impl Serialize for DstackByteField {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for DstackByteField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ByteFieldVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ByteFieldVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a MessagePack binary value or byte sequence")
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(value.to_vec())
+            }
+
+            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(value)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut bytes = Vec::new();
+                while let Some(byte) = sequence.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_any(ByteFieldVisitor).map(Self)
+    }
+}
+
+fn is_dstack_v1_mount_missing(response: &DstackHttpResponse) -> bool {
+    if response.status != 404 {
+        return false;
+    }
+    let media_type = response
+        .content_type
+        .as_deref()
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    matches!(media_type, Some("text/plain" | "text/html"))
+        && serde_json::from_slice::<serde_json::Value>(&response.body).is_err()
+}
+
+fn parse_dstack_v0_quote(body: &[u8], expected_report_data: &str) -> io::Result<Vec<u8>> {
+    if body.is_empty() || body.len() > PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "legacy quote response too large"));
+    }
+    // [PHALA-UNIQUE-EVIDENCE-JSON 2026-10-07 by Codex] Preserve legacy
+    // evidence bytes, but reject duplicate members before passing them on.
+    crate::services::memchain::validate_phala_json(body, PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid legacy quote response"))?;
+    let decoded: DstackV0QuoteBody = serde_json::from_slice(body)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid legacy quote response"))?;
+    let report_data = decoded.report_data.strip_prefix("0x").unwrap_or(&decoded.report_data);
+    // [PHALA-DSTACK-V0-HEX-PREFIX 2026-10-06 by Codex] v0 encodes `bytes` as
+    // hex and accepts an optional 0x prefix on input.
+    let quote_hex = decoded.quote.strip_prefix("0x").unwrap_or(&decoded.quote);
+    let quote_bytes = hex::decode(quote_hex)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid legacy quote encoding"))?;
+    if !decoded.event_log.is_array()
+        || quote_bytes.is_empty()
+        || quote_bytes.len() > PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1
+        || !report_data.eq_ignore_ascii_case(expected_report_data)
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid legacy quote evidence"));
+    }
+    // Preserve exact evidence bytes; callers distinguish v0 JSON from v1
+    // MessagePack through the additive `attestation_format` field.
+    Ok(body.to_vec())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1562,6 +2440,11 @@ fn build_discovery_router_state(
             )),
         )
         .route("/api/discovery/status", get(status_handler))
+        .route(
+            "/api/discovery/phala-attestation",
+            get(phala_node_attestation_handler)
+                .layer(middleware::from_fn(no_store_phala_attestation_response)),
+        )
         .route("/api/discovery/summary", get(summary_handler))
         .route("/api/discovery/public-card", get(public_card_handler))
         .route(
@@ -1570,6 +2453,550 @@ fn build_discovery_router_state(
         )
         .layer(DefaultBodyLimit::max(DISCOVERY_REQUEST_BODY_MAX_BYTES))
         .with_state(state)
+}
+
+// [PHALA-ATTESTATION-NO-STORE 2026-10-06 by Codex] Quote responses are bound
+// to a caller nonce and must never be replayed by an HTTP cache.
+async fn no_store_phala_attestation_response(
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store, private"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::PRAGMA,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
+}
+
+// [PHALA-PEER-QUOTE-APPRAISAL 2026-10-06 by Codex] Retrieve and appraise a
+// peer's nonce-bound dstack v1 evidence. Caller supplies only locally pinned
+// trust roots; descriptor-advertised features and response metadata never
+// expand these allowlists.
+// [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] Both discovery
+// owners share this budget, including detached blocking verification children.
+pub(crate) const PHALA_APPRAISAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const PHALA_PCCS_MAX_BODY_BYTES: usize = 1024 * 1024;
+const PHALA_PCCS_MAX_HEADER_BYTES: usize = 32 * 1024;
+static PHALA_APPRAISAL_PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+// [PHALA-APPRAISAL-OBSERVATION-FLOOR 2026-10-07 by Codex] Both the
+// verifier result and its route cache bound descriptor expiry to the original
+// challenge's monotonic age. A wall-clock rollback must not extend that window.
+pub(crate) fn phala_appraisal_effective_time(
+    challenged_at: u64, now: u64, elapsed: std::time::Duration, max_age_secs: u64,
+) -> Option<u64> {
+    if now.checked_sub(challenged_at)? > max_age_secs
+        || elapsed > std::time::Duration::from_secs(max_age_secs)
+    {
+        return None;
+    }
+    Some(now.max(challenged_at.checked_add(elapsed.as_secs())?))
+}
+
+// [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] This process-local
+// result is created only after QVL, nonce, event-log and measurement appraisal.
+// It is not serializable, caller-supplied, or proof of recipient key residency.
+pub(crate) struct VerifiedPhalaPeerAttestation {
+    descriptor_commitment: [u8; 32],
+    challenged_at: u64,
+    verified_at: u64,
+    started: std::time::Instant,
+}
+
+impl VerifiedPhalaPeerAttestation {
+    pub(crate) fn cache_time_for(
+        &self, descriptor: &SignedNodeDescriptor, now: u64, max_age_secs: u64,
+    ) -> Option<(u64, std::time::Instant)> {
+        let commitment = aeronyx_core::protocol::discovery::signed_descriptor_commitment_hash(descriptor).ok()?;
+        // [PHALA-APPRAISAL-OBSERVATION-FLOOR 2026-10-07 by Codex]
+        let effective_now = phala_appraisal_effective_time(self.challenged_at, now, self.started.elapsed(), max_age_secs)?;
+        (commitment == self.descriptor_commitment
+            && self.challenged_at <= self.verified_at && self.verified_at <= now
+            && effective_now == now
+            && descriptor.verify_at(self.challenged_at).is_ok()
+            && descriptor.verify_at(self.verified_at).is_ok()
+            && descriptor.verify_at(effective_now).is_ok()).then_some((self.challenged_at, self.started))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_test(descriptor: &SignedNodeDescriptor, challenged_at: u64, verified_at: u64) -> Self {
+        Self { descriptor_commitment: aeronyx_core::protocol::discovery::signed_descriptor_commitment_hash(descriptor).unwrap(),
+            challenged_at, verified_at, started: std::time::Instant::now() }
+    }
+}
+
+// [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] The QVL SCALE
+// decoder allocates declared byte-vector lengths before reading their bodies.
+// Validate only those framing/allocation bounds first; QVL remains the parser
+// and cryptographic verifier. No untrusted length may allocate beyond its slice.
+pub(crate) fn guard_phala_quote_allocations(quote: &[u8]) -> Result<(), &'static str> {
+    fn data<'a>(bytes: &'a [u8], offset: &mut usize, width: usize) -> Result<&'a [u8], &'static str> {
+        let end = offset.checked_add(width).ok_or("peer_quote_malformed")?;
+        let encoded = bytes.get(*offset..end).ok_or("peer_quote_malformed")?;
+        let length = match width {
+            2 => usize::from(u16::from_le_bytes(encoded.try_into().map_err(|_| "peer_quote_malformed")?)),
+            4 => usize::try_from(u32::from_le_bytes(encoded.try_into().map_err(|_| "peer_quote_malformed")?))
+                .map_err(|_| "peer_quote_malformed")?,
+            _ => return Err("peer_quote_malformed"),
+        };
+        let data_end = end.checked_add(length).ok_or("peer_quote_malformed")?;
+        let body = bytes.get(end..data_end).ok_or("peer_quote_malformed")?;
+        *offset = data_end;
+        Ok(body)
+    }
+    if quote.len() > PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1 || quote.len() < 48 {
+        return Err("peer_quote_malformed");
+    }
+    let version = u16::from_le_bytes([quote[0], quote[1]]);
+    let tee = u32::from_le_bytes(quote[4..8].try_into().map_err(|_| "peer_quote_malformed")?);
+    let mut offset = match (version, tee) {
+        (3, 0) | (4, 0) => 48 + 384,
+        (4, 0x81) => 48 + 584,
+        (5, _) => {
+            let body = quote.get(48..54).ok_or("peer_quote_malformed")?;
+            let kind = u16::from_le_bytes([body[0], body[1]]);
+            let size = match kind { 1 => 384, 2 => 584, 3 => 648, _ => return Err("peer_quote_malformed") };
+            if u32::from_le_bytes(body[2..6].try_into().map_err(|_| "peer_quote_malformed")?) != size as u32 {
+                return Err("peer_quote_malformed");
+            }
+            54 + size
+        }
+        _ => return Err("peer_quote_malformed"),
+    };
+    let auth = data(quote, &mut offset, 4)?;
+    if offset != quote.len() { return Err("peer_quote_malformed"); }
+    let (certification, mut inner_offset) = if version == 3 {
+        (auth, 576)
+    } else {
+        let mut outer_offset = 130; // signature + attestation key + cert type
+        let certification = data(auth, &mut outer_offset, 4)?;
+        if outer_offset != auth.len() { return Err("peer_quote_malformed"); }
+        (certification, 448) // QE report + QE signature
+    };
+    data(certification, &mut inner_offset, 2)?; // QE authentication bytes
+    inner_offset = inner_offset.checked_add(2).ok_or("peer_quote_malformed")?; // inner cert type
+    data(certification, &mut inner_offset, 4)?;
+    if inner_offset != certification.len() { return Err("peer_quote_malformed"); }
+    Ok(())
+}
+
+// [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] Only these official
+// PCCS resources are reachable. No certificate CRL URL, redirect or ambient
+// proxy may choose a destination. Query fields are added after DNS pinning.
+fn phala_pccs_url(
+    target: &super::PinnedPeerHttpTarget, path: &str, query: &[(&str, String)],
+) -> Result<reqwest::Url, &'static str> {
+    if !super::reverse_onion_same_origin(target.url.as_str(), dcap_qvl::PHALA_PCCS_URL)
+        || !matches!(path, "/sgx/certification/v4/pckcert" | "/sgx/certification/v4/pckcrl"
+            | "/sgx/certification/v4/rootcacrl" | "/tdx/certification/v4/tcb"
+            | "/tdx/certification/v4/qe/identity") {
+        return Err("peer_collateral_target_rejected");
+    }
+    let mut url = target.url.clone();
+    url.set_path(path);
+    url.set_query(None);
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query.iter().map(|(name, value)| (*name, value.as_str())));
+    }
+    Ok(url)
+}
+
+async fn fetch_phala_pccs_resource(
+    target: &super::PinnedPeerHttpTarget, path: &str, query: &[(&str, String)],
+) -> Result<(reqwest::header::HeaderMap, Vec<u8>), &'static str> {
+    // [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] The same pinned
+    // client serves every resource, with per-response streaming limits.
+    let url = phala_pccs_url(target, path, query)?;
+    let response = target.client.get(url.clone()).send().await.map_err(|_| "peer_collateral_unavailable")?;
+    if !response.status().is_success() || response.url() != &url {
+        return Err("peer_collateral_unavailable");
+    }
+    if response.content_length().is_some_and(|length| length > PHALA_PCCS_MAX_BODY_BYTES as u64)
+        || response.headers().iter().map(|(name, value)| name.as_str().len().saturating_add(value.as_bytes().len()))
+            .try_fold(0usize, |total, length| total.checked_add(length)).is_none_or(|total| total > PHALA_PCCS_MAX_HEADER_BYTES) {
+        return Err("peer_collateral_oversized");
+    }
+    let headers = response.headers().clone();
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "peer_collateral_unavailable")?;
+        if body.len().saturating_add(chunk.len()) > PHALA_PCCS_MAX_BODY_BYTES { return Err("peer_collateral_oversized"); }
+        body.extend_from_slice(&chunk);
+    }
+    if body.is_empty() { return Err("peer_collateral_malformed"); }
+    Ok((headers, body))
+}
+
+fn phala_pccs_header(headers: &reqwest::header::HeaderMap, name: &str) -> Result<String, &'static str> {
+    // [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] A percent-
+    // encoded certificate header stays bounded before and after decoding.
+    let encoded = headers.get(name).ok_or("peer_collateral_malformed")?;
+    if encoded.as_bytes().len() > PHALA_PCCS_MAX_HEADER_BYTES { return Err("peer_collateral_oversized"); }
+    percent_encoding::percent_decode(encoded.as_bytes()).decode_utf8()
+        .map(|value| value.into_owned()).map_err(|_| "peer_collateral_malformed")
+}
+
+fn phala_pccs_signed_payload(body: &[u8], field: &str) -> Result<(String, Vec<u8>), &'static str> {
+    // [PHALA-INTEL-LEXICAL-PROFILE 2026-10-08 by Codex] Preserve signed
+    // bytes within our restrictive Intel profile. Pinned Rust QVL verifies
+    // these strings directly, unlike Intel C++'s DOM-to-Writer step; do not
+    // generalize whitespace-only extraction to every valid JSON spelling.
+    #[derive(serde::Deserialize)]
+    struct SignedCollateral<'a> {
+        #[serde(rename = "tcbInfo", borrow)]
+        tcb_info: Option<&'a serde_json::value::RawValue>,
+        #[serde(rename = "enclaveIdentity", borrow)]
+        enclave_identity: Option<&'a serde_json::value::RawValue>,
+        signature: String,
+    }
+    if body.len() > PHALA_PCCS_MAX_BODY_BYTES { return Err("peer_collateral_oversized"); }
+    // [PHALA-UNIQUE-EVIDENCE-JSON 2026-10-07 by Codex] RawValue must
+    // preserve signed lexemes, not conceal duplicate members inside them.
+    crate::services::memchain::validate_phala_json(body, PHALA_PCCS_MAX_BODY_BYTES)
+        .map_err(|_| "peer_collateral_malformed")?;
+    // Typed deserialization rejects duplicate known fields, including escaped
+    // aliases. RawValue validates JSON before the whitespace-only pass below.
+    let envelope: SignedCollateral<'_> = serde_json::from_slice(body)
+        .map_err(|_| "peer_collateral_malformed")?;
+    let payload = match (field, envelope.tcb_info, envelope.enclave_identity) {
+        ("tcbInfo", Some(payload), None) | ("enclaveIdentity", None, Some(payload)) => payload.get(),
+        _ => return Err("peer_collateral_malformed"),
+    };
+    if !payload.starts_with('{') || envelope.signature.len() != 128 {
+        return Err("peer_collateral_malformed");
+    }
+    crate::services::memchain::validate_phala_intel_signed_json(payload.as_bytes(), PHALA_PCCS_MAX_BODY_BYTES)?;
+    let signature = hex::decode(envelope.signature).map_err(|_| "peer_collateral_malformed")?;
+    let mut compact = Vec::with_capacity(payload.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for byte in payload.bytes() {
+        if quoted {
+            compact.push(byte);
+            if escaped { escaped = false; }
+            else if byte == b'\\' { escaped = true; }
+            else if byte == b'"' { quoted = false; }
+        } else if byte == b'"' {
+            quoted = true;
+            compact.push(byte);
+        } else if !matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+            compact.push(byte);
+        }
+    }
+    let payload = String::from_utf8(compact).map_err(|_| "peer_collateral_malformed")?;
+    Ok((payload, signature))
+}
+
+// [PHALA-INTEL-LEXICAL-PROFILE 2026-10-08 by Codex] The injected/offline
+// boundary must not bypass the profile enforced by the bounded downloader.
+// Length is only framing; QVL still validates P-256 scalars/keys and trust.
+pub(crate) fn validate_phala_collateral_signed_inputs(collateral: &dcap_qvl::QuoteCollateralV3) -> Result<(), &'static str> {
+    for (payload, signature) in [
+        (&collateral.tcb_info, &collateral.tcb_info_signature),
+        (&collateral.qe_identity, &collateral.qe_identity_signature),
+    ] {
+        crate::services::memchain::validate_phala_intel_signed_json(payload.as_bytes(), PHALA_PCCS_MAX_BODY_BYTES)?;
+        if signature.len() != 64 { return Err("peer_collateral_malformed"); }
+    }
+    Ok(())
+}
+
+pub(crate) async fn fetch_bounded_phala_collateral(quote: &[u8]) -> Result<dcap_qvl::QuoteCollateralV3, &'static str> {
+    // [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] Keep the SDK's
+    // quote metadata/parser and offline verifier, not its unbounded downloader.
+    guard_phala_quote_allocations(quote)?;
+    let mut parsed = dcap_qvl::quote::Quote::parse(quote).map_err(|_| "peer_quote_malformed")?;
+    if parsed.report.as_td10().is_none() { return Err("peer_quote_not_tdx"); }
+    let target = super::resolve_pinned_peer_http_target(
+        reqwest::Url::parse(dcap_qvl::PHALA_PCCS_URL).map_err(|_| "peer_collateral_target_rejected")?,
+        std::time::Duration::from_secs(8),
+    ).await.map_err(|_| "peer_collateral_target_rejected")?;
+    let chain = match parsed.inner_cert_type() {
+        5 => std::str::from_utf8(parsed.inner_cert_data()).map_err(|_| "peer_quote_malformed")?.to_owned(),
+        2 | 3 => {
+            let params = parsed.encrypted_ppid_params().map_err(|_| "peer_quote_malformed")?;
+            let query = [("qeid", hex::encode_upper(parsed.qeid())), ("encrypted_ppid", hex::encode_upper(&params.encrypted_ppid)),
+                ("cpusvn", hex::encode_upper(params.cpusvn)), ("pcesvn", hex::encode_upper(params.pcesvn.to_le_bytes())),
+                ("pceid", hex::encode_upper(params.pceid))];
+            let (headers, leaf) = fetch_phala_pccs_resource(&target, "/sgx/certification/v4/pckcert", &query).await?;
+            if let Some(tcbm) = headers.get("SGX-TCBm") {
+                let tcbm = hex::decode(tcbm.as_bytes()).map_err(|_| "peer_collateral_malformed")?;
+                if tcbm.len() != 18 || tcbm[..16] != params.cpusvn || tcbm[16..] != params.pcesvn.to_le_bytes() {
+                    return Err("peer_collateral_tcb_mismatch");
+                }
+            }
+            let issuer = phala_pccs_header(&headers, "SGX-PCK-Certificate-Issuer-Chain")?;
+            let leaf = String::from_utf8(leaf).map_err(|_| "peer_collateral_malformed")?;
+            format!("{leaf}\n{issuer}")
+        }
+        _ => return Err("peer_quote_malformed"),
+    };
+    // Public Quote helpers extract FMSPC/CA only from type-5 chains. A fetched
+    // chain is metadata input only; the original quote is verified unchanged.
+    let certificate = match &mut parsed.auth_data {
+        dcap_qvl::quote::AuthData::V3(data) => &mut data.certification_data,
+        dcap_qvl::quote::AuthData::V4(data) => &mut data.qe_report_data.certification_data,
+    };
+    certificate.cert_type = 5;
+    certificate.body.data = chain.as_bytes().to_vec();
+    let fmspc = hex::encode_upper(parsed.fmspc().map_err(|_| "peer_quote_malformed")?);
+    let ca = parsed.ca().map_err(|_| "peer_quote_malformed")?;
+    let (headers, pck_crl) = fetch_phala_pccs_resource(&target, "/sgx/certification/v4/pckcrl",
+        &[("ca", ca.to_owned()), ("encoding", "der".to_owned())]).await?;
+    let pck_crl_issuer_chain = phala_pccs_header(&headers, "SGX-PCK-CRL-Issuer-Chain")?;
+    let (headers, tcb) = fetch_phala_pccs_resource(&target, "/tdx/certification/v4/tcb", &[("fmspc", fmspc)]).await?;
+    let tcb_info_issuer_chain = phala_pccs_header(&headers, "SGX-TCB-Info-Issuer-Chain")
+        .or_else(|_| phala_pccs_header(&headers, "TCB-Info-Issuer-Chain"))?;
+    let (tcb_info, tcb_info_signature) = phala_pccs_signed_payload(&tcb, "tcbInfo")?;
+    let (headers, qe) = fetch_phala_pccs_resource(&target, "/tdx/certification/v4/qe/identity", &[("update", "standard".to_owned())]).await?;
+    let qe_identity_issuer_chain = phala_pccs_header(&headers, "SGX-Enclave-Identity-Issuer-Chain")?;
+    let (qe_identity, qe_identity_signature) = phala_pccs_signed_payload(&qe, "enclaveIdentity")?;
+    // No unverified certificate-selected CRL URL fallback, including HTTP.
+    let (_, root) = fetch_phala_pccs_resource(&target, "/sgx/certification/v4/rootcacrl", &[]).await?;
+    let root_ca_crl = hex::decode(&root).map_err(|_| "peer_collateral_malformed")?;
+    let collateral = dcap_qvl::QuoteCollateralV3 { pck_crl_issuer_chain, root_ca_crl, pck_crl,
+        tcb_info_issuer_chain, tcb_info, tcb_info_signature, qe_identity_issuer_chain,
+        qe_identity, qe_identity_signature, pck_certificate_chain: Some(chain) };
+    validate_phala_collateral_signed_inputs(&collateral)?;
+    Ok(collateral)
+}
+
+pub(crate) async fn verify_phala_peer_attestation(
+    descriptor: &SignedNodeDescriptor,
+    trusted_app_ids: &[String],
+    trusted_compose_hashes: &[String],
+) -> Result<VerifiedPhalaPeerAttestation, &'static str> {
+    // [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] A caller may
+    // cancel its waiter, but a blocking QVL child retains this shared permit.
+    with_phala_appraisal_budget(|permit| {
+        verify_phala_peer_attestation_owned(descriptor, trusted_app_ids, trusted_compose_hashes, permit, false)
+    }).await?
+}
+
+// [PHALA-PINNED-RELAY-APPRAISAL 2026-10-07 by Codex] The narrower
+// PeerStore-minted target may name a locally pinned non-public relay. General
+// promotion/peer callers retain the original public-discovery requirement.
+pub(crate) async fn verify_phala_peer_appraisal_target(
+    target: &crate::services::peer_store::PhalaPeerAppraisalTarget,
+    trusted_app_ids: &[String], trusted_compose_hashes: &[String],
+) -> Result<VerifiedPhalaPeerAttestation, &'static str> {
+    // [PHALA-APPRAISAL-EGRESS-PIN 2026-10-07 by Codex] Recheck the
+    // immutable configured origin before any permit, DNS or evidence request.
+    // A descriptor signature does not authorize private-role endpoint rotation.
+    if !target.transport_origin_is_permitted() {
+        return Err("peer_endpoint_rejected");
+    }
+    with_phala_appraisal_budget(|permit| {
+        verify_phala_peer_attestation_owned(target.descriptor(), trusted_app_ids,
+            trusted_compose_hashes, permit, target.permits_private_relay())
+    }).await?
+}
+
+// [PHALA-PINNED-RELAY-APPRAISAL 2026-10-07 by Codex] Private scope only
+// removes public discovery membership, never signatures, role or feature gates.
+fn phala_peer_appraisal_descriptor_eligible(
+    descriptor: &SignedNodeDescriptor, now: u64, pinned_relay: bool,
+) -> bool {
+    descriptor.verify_at(now).is_ok()
+        && (descriptor.descriptor.policy.public_discovery || pinned_relay)
+        && descriptor.descriptor.capabilities.contains(&NodeCapability::ChatRelay)
+        && descriptor.descriptor.advertises_protocol_feature(NodeProtocolFeature::PhalaNodeAttestationV1)
+}
+
+// [PHALA-ACI-BOUNDED-VERIFICATION 2026-10-07 by Codex] Peer discovery,
+// ACI identity and receipt crypto share one process-wide capacity ceiling.
+// The callback moves this permit into any blocking child it starts.
+pub(crate) async fn with_phala_appraisal_budget<T, F: std::future::Future<Output = T>>(
+    appraisal: impl FnOnce(Arc<tokio::sync::OwnedSemaphorePermit>) -> F,
+) -> Result<T, &'static str> {
+    let permits = PHALA_APPRAISAL_PERMITS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)));
+    let permit = Arc::new(Arc::clone(permits).try_acquire_owned().map_err(|_| "peer_appraisal_busy")?);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(PHALA_APPRAISAL_TIMEOUT, appraisal(permit))
+        .await.map_err(|_| "peer_appraisal_timeout")?;
+    // Tokio may poll a ready inner future before observing its timer.
+    if started.elapsed() > PHALA_APPRAISAL_TIMEOUT { return Err("peer_appraisal_timeout"); }
+    Ok(result)
+}
+
+// [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] Keep ownership
+// with the blocking child even if its async waiter times out or is aborted.
+pub(crate) async fn run_phala_appraisal_crypto<T: Send + 'static>(
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    verify: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, &'static str> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify()
+    }).await.map_err(|_| "peer_appraisal_unavailable")
+}
+
+async fn verify_phala_peer_attestation_owned(
+    descriptor: &SignedNodeDescriptor,
+    trusted_app_ids: &[String],
+    trusted_compose_hashes: &[String],
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    pinned_relay: bool,
+) -> Result<VerifiedPhalaPeerAttestation, &'static str> {
+    use aeronyx_core::protocol::discovery::{
+        PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V1, PhalaNodeAttestationResponseV1,
+    };
+
+    // [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] Count DNS,
+    // transport and crypto time from before the challenge, not completion.
+    let started = std::time::Instant::now();
+    let challenged_at = SystemTime::now().duration_since(UNIX_EPOCH)
+        .map_err(|_| "clock_unavailable")?.as_secs();
+    let descriptor_commitment = aeronyx_core::protocol::discovery::signed_descriptor_commitment_hash(descriptor)
+        .map_err(|_| "peer_not_eligible")?;
+    if !phala_peer_appraisal_descriptor_eligible(descriptor, challenged_at, pinned_relay)
+        || trusted_app_ids.is_empty()
+        || trusted_compose_hashes.is_empty()
+    {
+        return Err("peer_not_eligible");
+    }
+    let endpoint = descriptor
+        .descriptor
+        .public_endpoint
+        .as_deref()
+        .ok_or("peer_endpoint_missing")?;
+    if !crate::api::reverse_onion_endpoint_supported(endpoint) {
+        return Err("peer_endpoint_not_https");
+    }
+    let mut url = reqwest::Url::parse(endpoint).map_err(|_| "peer_endpoint_invalid")?;
+    url.set_path("/api/discovery/phala-attestation");
+    url.set_query(None);
+    url.set_fragment(None);
+
+    let mut nonce = [0u8; aeronyx_core::protocol::discovery::PHALA_NODE_ATTESTATION_NONCE_BYTES_V1];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    if nonce == [0; aeronyx_core::protocol::discovery::PHALA_NODE_ATTESTATION_NONCE_BYTES_V1] {
+        return Err("nonce_generation_failed");
+    }
+    // Resolve only the authority/path form accepted by the shared pinned
+    // resolver, then add the fixed nonce query after DNS pinning.
+    let mut target = crate::api::resolve_pinned_peer_http_target(
+        url,
+        std::time::Duration::from_secs(8),
+    )
+    .await
+    .map_err(|_| "peer_endpoint_rejected")?;
+    target
+        .url
+        .query_pairs_mut()
+        .append_pair("nonce", &hex::encode(nonce));
+    let response = target
+        .client
+        .get(target.url)
+        .send()
+        .await
+        .map_err(|_| "peer_transport_failed")?;
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|length| length > (PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1 * 2 + 16_384) as u64)
+    {
+        return Err("peer_attestation_unavailable");
+    }
+    let max_body = PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1 * 2 + 16_384;
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "peer_transport_failed")?;
+        if body.len().saturating_add(chunk.len()) > max_body {
+            return Err("peer_attestation_oversized");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    // [PHALA-UNIQUE-EVIDENCE-JSON 2026-10-07 by Codex] No consumer may
+    // choose different evidence from duplicate or escaped-alias member names.
+    crate::services::memchain::validate_phala_json(&body, max_body)
+        .map_err(|_| "peer_attestation_malformed")?;
+    let evidence: PhalaNodeAttestationResponseV1 =
+        serde_json::from_slice(&body).map_err(|_| "peer_attestation_malformed")?;
+    let node_id = descriptor.node_id();
+    evidence
+        .validate_for(&node_id, &nonce, None)
+        .map_err(|_| "peer_attestation_binding_invalid")?;
+    if evidence.attestation_format != PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V1 {
+        return Err("peer_attestation_format_unsupported");
+    }
+
+    let attestation_bytes = hex::decode(&evidence.attestation)
+        .map_err(|_| "peer_attestation_encoding_invalid")?;
+    let (stack_report_data, aci_evidence) = dstack_v1_aci_evidence(&attestation_bytes)
+        .map_err(|_| "peer_attestation_format_invalid")?;
+    if hex::encode(stack_report_data) != evidence.expected_report_data {
+        return Err("peer_stack_report_data_mismatch");
+    }
+    let quote = aci_verify::quote::quote_bytes(&aci_evidence)
+        .map_err(|_| "peer_quote_malformed")?;
+    let collateral = fetch_bounded_phala_collateral(&quote).await?;
+    let trusted_app_ids = trusted_app_ids.to_vec();
+    let trusted_compose_hashes = trusted_compose_hashes.to_vec();
+    // A dropped JoinHandle does not cancel blocking crypto. Keep its permit
+    // inside the child until it really exits; never monopolize an async worker.
+    run_phala_appraisal_crypto(permit, move || {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "clock_unavailable")?
+            .as_secs();
+        if now < challenged_at || started.elapsed() > PHALA_APPRAISAL_TIMEOUT {
+            return Err("peer_appraisal_timeout");
+        }
+        // [PHALA-INTEL-LEXICAL-PROFILE 2026-10-08 by Codex] Match the
+        // offline ACI boundary immediately before the only verifier path.
+        validate_phala_collateral_signed_inputs(&collateral)?;
+        let verified = dcap_qvl::verify::rustcrypto::verify(&quote, &collateral, now)
+            .map_err(|_| "peer_quote_invalid")?;
+        if verified.status != "UpToDate" {
+            return Err("peer_tcb_not_up_to_date");
+        }
+        let td_report = verified.report.as_td10().ok_or("peer_quote_not_tdx")?;
+        let expected_report_data = aeronyx_core::protocol::phala_node_attestation_report_data_v1(
+            &node_id, &nonce,
+        );
+        // [PHALA-NODE-COMPILE-REPAIR 2026-10-08 by Codex] The official
+        // helper receives the digest and itself enforces the full padded slot.
+        aci_verify::quote::quote_binds_report_data(
+            &aci_evidence, &td_report.report_data, expected_report_data,
+        ).map_err(|_| "peer_quote_report_data_mismatch")?;
+        let event_log = aci_verify::dstack::verify_dstack_event_log(
+            &aci_evidence, Some(&td_report.rt_mr3),
+        ).map_err(|_| "peer_event_log_invalid")?;
+        let compose_hash = aci_verify::dstack::verify_dstack_compose_measurement(
+            &aci_evidence, &event_log,
+        ).map_err(|_| "peer_compose_measurement_invalid")?;
+        let compose_hash = format!("sha256:{compose_hash}");
+        let app_id = aci_verify::dstack::dstack_app_id(&event_log)
+            .map_err(|_| "peer_app_id_missing")?;
+        let app_id = canonical_phala_app_id_pin(&app_id).ok_or("peer_app_id_invalid")?;
+        if !trusted_compose_hashes.iter().any(|allowed| allowed == &compose_hash)
+            || !trusted_app_ids.iter().any(|allowed| allowed == &app_id)
+        {
+            return Err("peer_measurement_untrusted");
+        }
+        let verified_at = SystemTime::now().duration_since(UNIX_EPOCH)
+            .map_err(|_| "clock_unavailable")?.as_secs();
+        if verified_at < now || started.elapsed() > PHALA_APPRAISAL_TIMEOUT {
+            return Err("peer_appraisal_timeout");
+        }
+        Ok(VerifiedPhalaPeerAttestation { descriptor_commitment, challenged_at, verified_at, started })
+    }).await?
+}
+
+// [PHALA-APP-ID-PIN-FORMAT 2026-10-06 by Codex] ACI's dstack helper returns
+// measured app-id bytes; operator pins use its canonical `0x` lowercase-hex
+// representation, never lossy UTF-8 or a display label.
+fn canonical_phala_app_id_pin(app_id: &[u8]) -> Option<String> {
+    (!app_id.is_empty() && app_id.len() <= 64)
+        .then(|| format!("0x{}", hex::encode(app_id)))
 }
 
 #[derive(Clone, Copy)]
@@ -1662,6 +3089,623 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    // [PHALA-PINNED-RELAY-APPRAISAL 2026-10-07 by Codex] Authored only:
+    // private selection scope changes membership, not signature/role checks.
+    #[test]
+    fn phala_private_appraisal_scope_retains_signed_role_and_expiry_gates() {
+        let now = now_secs();
+        let key = IdentityKeyPair::from_bytes(&[185; 32]).unwrap();
+        let mut base = NodeDescriptor::new(key.public_key_bytes(), 1, now - 1, now + 900, "test");
+        base.public_endpoint = Some("https://private-relay.example".into());
+        base.policy.public_discovery = false;
+        base.capabilities = vec![NodeCapability::ChatRelay];
+        let body = base.clone().with_protocol_features([NodeProtocolFeature::PhalaNodeAttestationV1]);
+        let descriptor = SignedNodeDescriptor::sign(body.clone(), &key).unwrap();
+        assert!(!phala_peer_appraisal_descriptor_eligible(&descriptor, now, false));
+        assert!(phala_peer_appraisal_descriptor_eligible(&descriptor, now, true));
+        assert!(!phala_peer_appraisal_descriptor_eligible(&descriptor, now + 901, true));
+        let legacy = SignedNodeDescriptor::sign(base, &key).unwrap();
+        assert!(!phala_peer_appraisal_descriptor_eligible(&legacy, now, true));
+        let mut no_role = body;
+        no_role.capabilities.clear();
+        let no_role = SignedNodeDescriptor::sign(no_role, &key).unwrap();
+        assert!(!phala_peer_appraisal_descriptor_eligible(&no_role, now, true));
+        let mut tampered = descriptor;
+        tampered.descriptor.sequence += 1;
+        assert!(!phala_peer_appraisal_descriptor_eligible(&tampered, now, true));
+    }
+
+    // [PHALA-APPRAISAL-OBSERVATION-FLOOR 2026-10-07 by Codex] Authored
+    // only: deterministic age projections, not cryptographic quote acceptance.
+    #[test]
+    fn phala_appraisal_time_rejects_rollback_expiry_and_projection_overflow() {
+        let started = std::time::Duration::ZERO;
+        assert!(phala_appraisal_effective_time(100, 101, started, 300).unwrap() >= 101);
+        assert!(phala_appraisal_effective_time(100, 99, started, 300).is_none());
+        assert!(phala_appraisal_effective_time(100, 401, started, 300).is_none());
+        let elapsed = std::time::Duration::from_secs(11);
+        assert!(phala_appraisal_effective_time(100, 101, elapsed, 10).is_none());
+        assert!(phala_appraisal_effective_time(u64::MAX - 5, u64::MAX - 4, elapsed, 300).is_none());
+        assert!(phala_appraisal_effective_time(100, 101, elapsed, 300).unwrap() >= 111);
+    }
+
+    // [PHALA-APPRAISAL-OBSERVATION-FLOOR 2026-10-07 by Codex]
+    #[test]
+    fn phala_verified_result_cannot_publish_after_monotonic_descriptor_expiry() {
+        let now = now_secs();
+        let descriptor = signed_routeable_chat_descriptor(1, now + 10, "https://phala-peer.example");
+        let mut result = VerifiedPhalaPeerAttestation::synthetic_for_test(&descriptor, now, now);
+        assert!(result.cache_time_for(&descriptor, now, 300).is_some());
+        assert!(result.cache_time_for(&descriptor, now - 1, 300).is_none());
+        result.started = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(11)).unwrap();
+        assert!(descriptor.verify_at(now + 1).is_ok());
+        assert!(result.cache_time_for(&descriptor, now + 1, 300).is_none());
+        let still_valid = signed_routeable_chat_descriptor(1, now + 300, "https://phala-peer.example");
+        let mut result = VerifiedPhalaPeerAttestation::synthetic_for_test(&still_valid, now, now);
+        result.started = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(11)).unwrap();
+        assert!(still_valid.verify_at(now + 1).is_ok());
+        assert!(result.cache_time_for(&still_valid, now + 1, 300).is_none());
+        assert!(result.cache_time_for(&still_valid, now + 60, 300).is_some());
+    }
+
+    // [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] Synthetic
+    // framing only, never cryptographic acceptance or live TEE evidence.
+    fn framed_phala_quote(version: u16, body_kind: u16) -> (Vec<u8>, Vec<(usize, usize)>) {
+        let size = match body_kind { 1 => 384, 2 => 584, 3 => 648, _ => unreachable!() };
+        let mut quote = vec![0; 48];
+        quote[..2].copy_from_slice(&version.to_le_bytes());
+        quote[4..8].copy_from_slice(&(if body_kind == 1 { 0u32 } else { 0x81u32 }).to_le_bytes());
+        if version == 5 {
+            quote.extend_from_slice(&body_kind.to_le_bytes());
+            quote.extend_from_slice(&(size as u32).to_le_bytes());
+        }
+        quote.resize(quote.len() + size, 0);
+        let auth_length_at = quote.len();
+        let mut inner = vec![0; if version == 3 { 576 } else { 448 }];
+        let qe_length_at = inner.len();
+        inner.extend_from_slice(&0u16.to_le_bytes());
+        inner.extend_from_slice(&5u16.to_le_bytes());
+        let certificate_length_at = inner.len();
+        inner.extend_from_slice(&3u32.to_le_bytes());
+        inner.extend_from_slice(b"pem");
+        let inner_at;
+        let mut lengths = vec![(auth_length_at, 4)];
+        let auth = if version == 3 {
+            inner_at = auth_length_at + 4;
+            inner
+        } else {
+            let mut auth = vec![0; 128];
+            auth.extend_from_slice(&6u16.to_le_bytes());
+            lengths.push((auth_length_at + 4 + auth.len(), 4));
+            auth.extend_from_slice(&(inner.len() as u32).to_le_bytes());
+            inner_at = auth_length_at + 4 + auth.len();
+            auth.extend_from_slice(&inner);
+            auth
+        };
+        lengths.push((inner_at + qe_length_at, 2));
+        lengths.push((inner_at + certificate_length_at, 4));
+        quote.extend_from_slice(&(auth.len() as u32).to_le_bytes());
+        quote.extend_from_slice(&auth);
+        (quote, lengths)
+    }
+
+    #[test]
+    fn phala_quote_guard_bounds_every_sdk_vector_before_allocation() {
+        for (version, kind) in [(3, 1), (4, 1), (4, 2), (5, 1), (5, 2), (5, 3)] {
+            let (quote, lengths) = framed_phala_quote(version, kind);
+            assert!(guard_phala_quote_allocations(&quote).is_ok());
+            assert!(dcap_qvl::quote::Quote::parse(&quote).is_ok());
+            for (at, width) in lengths {
+                let mut corrupted = quote.clone();
+                corrupted[at..at + width].fill(0xff);
+                assert!(guard_phala_quote_allocations(&corrupted).is_err());
+            }
+            for cut in 0..quote.len() {
+                assert!(guard_phala_quote_allocations(&quote[..cut]).is_err());
+            }
+            let mut trailing = quote.clone();
+            trailing.push(0);
+            assert!(guard_phala_quote_allocations(&trailing).is_err());
+            if version == 5 {
+                let mut wrong_size = quote.clone();
+                wrong_size[50..54].fill(0xff);
+                assert!(guard_phala_quote_allocations(&wrong_size).is_err());
+            }
+        }
+        let (mut unsupported, _) = framed_phala_quote(4, 2);
+        unsupported[..2].copy_from_slice(&6u16.to_le_bytes());
+        assert!(guard_phala_quote_allocations(&unsupported).is_err());
+        assert!(guard_phala_quote_allocations(&vec![0; PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1 + 1]).is_err());
+    }
+
+    #[test]
+    fn phala_collateral_target_cannot_follow_certificate_urls() {
+        let mut target = super::super::PinnedPeerHttpTarget {
+            client: reqwest::Client::new(),
+            url: reqwest::Url::parse(dcap_qvl::PHALA_PCCS_URL).unwrap(),
+        };
+        let path = "/tdx/certification/v4/tcb";
+        assert!(phala_pccs_url(&target, "/sgx/certification/v4/rootcacrl", &[]).unwrap().query().is_none());
+        let value = "x&url=http://127.0.0.1/private".to_owned();
+        let url = phala_pccs_url(&target, path, &[("fmspc", value.clone())]).unwrap();
+        assert!(super::super::reverse_onion_same_origin(url.as_str(), dcap_qvl::PHALA_PCCS_URL));
+        assert_eq!(url.path(), path);
+        let pairs = url.query_pairs().collect::<Vec<_>>();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "fmspc");
+        assert_eq!(pairs[0].1, value);
+        for rejected in ["http://127.0.0.1/crl", "//127.0.0.1/crl", "/unknown", "/tdx/certification/v4/tcb/../crl"] {
+            assert!(phala_pccs_url(&target, rejected, &[]).is_err());
+        }
+        for rejected in ["http://pccs.phala.network", "https://pccs.phala.network:444", "https://127.0.0.1"] {
+            target.url = reqwest::Url::parse(rejected).unwrap();
+            assert!(phala_pccs_url(&target, path, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn phala_collateral_fields_are_bounded_and_structured() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("issuer", "line%0Asecond%20line".parse().unwrap());
+        assert_eq!(phala_pccs_header(&headers, "issuer").unwrap(), "line\nsecond line");
+        assert!(phala_pccs_header(&headers, "missing").is_err());
+        headers.insert("issuer", "%ff".parse().unwrap());
+        assert!(phala_pccs_header(&headers, "issuer").is_err());
+        headers.insert("issuer", "a".repeat(PHALA_PCCS_MAX_HEADER_BYTES + 1).parse().unwrap());
+        assert!(phala_pccs_header(&headers, "issuer").is_err());
+        let mut payload = serde_json::json!({"tcbInfo": {"version": 3}, "signature": "ab".repeat(64)});
+        assert_eq!(phala_pccs_signed_payload(&serde_json::to_vec(&payload).unwrap(), "tcbInfo").unwrap().1, vec![0xab; 64]);
+        for invalid in [serde_json::json!(null), serde_json::json!("invalid")] {
+            payload["tcbInfo"] = invalid;
+            assert!(phala_pccs_signed_payload(&serde_json::to_vec(&payload).unwrap(), "tcbInfo").is_err());
+        }
+        payload["tcbInfo"] = serde_json::json!({});
+        for invalid in ["ab".repeat(63), "gg".repeat(64)] {
+            payload["signature"] = invalid.into();
+            assert!(phala_pccs_signed_payload(&serde_json::to_vec(&payload).unwrap(), "tcbInfo").is_err());
+        }
+        assert!(phala_pccs_signed_payload(&vec![b' '; PHALA_PCCS_MAX_BODY_BYTES + 1], "tcbInfo").is_err());
+    }
+
+    // [PHALA-COLLATERAL-SIGNED-BYTES 2026-10-07 by Codex] Authored only:
+    // byte preservation tests, not synthetic claims of valid Intel signatures.
+    #[test]
+    fn phala_collateral_keeps_supported_signed_lexemes_and_only_removes_json_whitespace() {
+        // [PHALA-INTEL-LEXICAL-PROFILE 2026-10-08 by Codex] Literal
+        // backslash-u is not a Unicode escape; supported lexemes stay exact.
+        let raw = r#"{ "z" : "\\u0061/", "space" : " a b ",
+            "slashes" : "\\\" quoted \\\\", "number" : 100,
+            "array" : [ true, null, { "x" : "\t\n" } ] }"#;
+        let expected = r#"{"z":"\\u0061/","space":" a b ","slashes":"\\\" quoted \\\\","number":100,"array":[true,null,{"x":"\t\n"}]}"#;
+        for field in ["tcbInfo", "enclaveIdentity"] {
+            let body = format!("{{\"{field}\":{raw},\"signature\":\"{}\"}}", "ab".repeat(64));
+            let (signed, signature) = phala_pccs_signed_payload(body.as_bytes(), field).unwrap();
+            assert_eq!(signed, expected);
+            assert_eq!(signature, vec![0xab; 64]);
+            // Supported spellings agree for this fixture; this is not proof
+            // that reconstructing arbitrary JSON preserves signed bytes.
+            let reconstructed: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(signed, reconstructed.to_string());
+        }
+    }
+
+    // [PHALA-INTEL-LEXICAL-PROFILE 2026-10-08 by Codex] Authored only:
+    // valid JSON spellings must not reach either verifier through PCCS.
+    #[test]
+    fn phala_collateral_pccs_profile_rejects_unsupported_signed_subtrees() {
+        for raw in [
+            r#"{"x":"\u0008"}"#, r#"{"\u0078":"ok"}"#,
+            r#"{"a":[{"x":"a\/b"}]}"#, r#"{"x":1.00e+02}"#,
+            r#"{"x":-0}"#, r#"{"x":9007199254740992}"#,
+        ] {
+            for field in ["tcbInfo", "enclaveIdentity"] {
+                let body = format!("{{\"{field}\":{raw},\"signature\":\"{}\"}}", "ab".repeat(64));
+                assert!(crate::services::memchain::validate_phala_json(body.as_bytes(), PHALA_PCCS_MAX_BODY_BYTES).is_ok());
+                assert_eq!(phala_pccs_signed_payload(body.as_bytes(), field), Err("peer_collateral_unsupported_form"));
+            }
+        }
+        // Unrelated envelope members do not impose this profile on general
+        // JSON. Duplicate names there are still rejected by the broad guard.
+        let body = format!(r#"{{"tcbInfo":{{}},"extra":"\u0061\/","signature":"{}"}}"#, "ab".repeat(64));
+        assert_eq!(phala_pccs_signed_payload(body.as_bytes(), "tcbInfo").unwrap().0, "{}");
+    }
+
+    #[test]
+    fn phala_collateral_rejects_ambiguous_envelopes_before_qvl() {
+        // [PHALA-COLLATERAL-SIGNED-BYTES 2026-10-07 by Codex] No known
+        // field may select a different signed object through duplicate keys.
+        let signature = "ab".repeat(64);
+        for body in [
+            format!(r#"{{"tcbInfo":{{}},"tcbInfo":{{"version":3}},"signature":"{signature}"}}"#),
+            format!(r#"{{"tcbInfo":{{}},"\u0074cbInfo":{{}},"signature":"{signature}"}}"#),
+            format!(r#"{{"tcbInfo":{{}},"signature":"{signature}","signature":"{signature}"}}"#),
+            format!(r#"{{"tcbInfo":{{}},"enclaveIdentity":{{}},"signature":"{signature}"}}"#),
+            format!(r#"{{"tcbInfo":[],"signature":"{signature}"}}"#),
+            // [PHALA-UNIQUE-EVIDENCE-JSON 2026-10-07 by Codex] RawValue
+            // preserves input, so its nested/unknown members need the guard too.
+            format!(r#"{{"tcbInfo":{{"x":1,"x":2}},"signature":"{signature}"}}"#),
+            format!(r#"{{"tcbInfo":{{}},"unknown":{{"x":1,"\u0078":2}},"signature":"{signature}"}}"#),
+            format!(r#"{{"tcbInfo":{{}},"signature":"{signature}"}} trailing"#),
+        ] {
+            assert!(phala_pccs_signed_payload(body.as_bytes(), "tcbInfo").is_err());
+        }
+        let body = format!(r#"{{"tcbInfo":{{}},"signature":"{signature}"}}"#);
+        for field in ["enclaveIdentity", "unknown"] {
+            assert!(phala_pccs_signed_payload(body.as_bytes(), field).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn phala_appraisal_cancelled_waiter_retains_blocking_child_permit() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(Arc::clone(&permits).try_acquire_owned().unwrap());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(run_phala_appraisal_crypto(permit, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.blocking_recv();
+            Ok::<(), &'static str>(())
+        }));
+        started_rx.await.unwrap();
+        assert!(Arc::clone(&permits).try_acquire_owned().is_err());
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(Arc::clone(&permits).try_acquire_owned().is_err());
+        release_tx.send(()).unwrap();
+        let _recovered = tokio::time::timeout(std::time::Duration::from_secs(2), permits.acquire_owned()).await.unwrap().unwrap();
+    }
+
+    // [PHALA-NODE-ATTESTATION-API 2026-10-06 by Codex] Calibrate the nonce
+    // boundary with accepted, malformed, predictable, and wrong-length inputs.
+    #[test]
+    fn phala_node_attestation_nonce_is_exact_hex_and_nonzero() {
+        assert_eq!(
+            parse_phala_attestation_nonce(&"ab".repeat(32)),
+            Some([0xab; 32])
+        );
+        assert!(parse_phala_attestation_nonce(&"00".repeat(32)).is_none());
+        assert!(parse_phala_attestation_nonce(&"gg".repeat(32)).is_none());
+        assert!(parse_phala_attestation_nonce(&"ab".repeat(31)).is_none());
+    }
+
+    // [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex] Reject zero,
+    // malformed, and wrong-length recipient public identities.
+    #[test]
+    fn phala_recipient_node_id_is_exact_nonzero_hex() {
+        assert_eq!(parse_phala_recipient_node_id(&"ab".repeat(32)), Some([0xab; 32]));
+        assert!(parse_phala_recipient_node_id(&"00".repeat(32)).is_none());
+        assert!(parse_phala_recipient_node_id(&"gg".repeat(32)).is_none());
+        assert!(parse_phala_recipient_node_id(&"ab".repeat(31)).is_none());
+    }
+
+    // [PHALA-QUEUE-RECOVERY-GATE 2026-10-06 by Codex] Calibrate quote
+    // authority against live, recovery-only, and ambiguous queue configs.
+    #[test]
+    fn phala_private_recipient_quote_policy_requires_exact_queue_pin() {
+        let discovery = crate::config::DiscoveryConfig::default();
+        let pinned = "ab".repeat(32);
+        let mut queue = ReverseOnionQueueConfig::default();
+        queue.enabled = true;
+        queue.recipient_node_ids = vec![pinned];
+        let allowed = DiscoveryApiPolicy::from_config(&discovery)
+            .with_phala_private_recipient_queue(&queue);
+        assert_eq!(allowed.phala_private_recipient_node_id, Some([0xab; 32]));
+        assert!(phala_private_recipient_pin_matches(&allowed, &[0xab; 32]));
+        assert!(!phala_private_recipient_pin_matches(&allowed, &[0xcd; 32]));
+
+        queue.recovery_only = true;
+        let recovery = DiscoveryApiPolicy::from_config(&discovery)
+            .with_phala_private_recipient_queue(&queue);
+        assert_eq!(recovery.phala_private_recipient_node_id, None);
+        assert!(!phala_private_recipient_pin_matches(&recovery, &[0xab; 32]));
+
+        queue.recovery_only = false;
+        queue.recipient_node_ids.push("cd".repeat(32));
+        let ambiguous = DiscoveryApiPolicy::from_config(&discovery)
+            .with_phala_private_recipient_queue(&queue);
+        assert_eq!(ambiguous.phala_private_recipient_node_id, None);
+        assert!(!phala_private_recipient_pin_matches(&ambiguous, &[0xab; 32]));
+    }
+
+    // [PHALA-QUOTE-ROUTE-GATE 2026-10-06 by Codex] Exercise the mounted
+    // handler, not just its policy helper: recovery-only must reject before
+    // attempting the configured guest socket.
+    #[tokio::test]
+    async fn phala_recovery_queue_rejects_recipient_quote_before_guest_io() {
+        let identity = IdentityKeyPair::from_bytes(&[0x75; 32]).unwrap();
+        let mut discovery = crate::config::DiscoveryConfig::default();
+        discovery.phala_attestation_socket_path =
+            Some("/var/run/aeronyx/no-such-dstack.sock".into());
+        let mut queue = ReverseOnionQueueConfig::default();
+        queue.enabled = true;
+        queue.recovery_only = true;
+        queue.recipient_node_ids = vec![hex::encode([0x76; 32])];
+        let policy = DiscoveryApiPolicy::from_config(&discovery)
+            .with_phala_private_recipient_queue(&queue);
+        let app = build_discovery_router_with_local_entry(
+            Arc::new(PeerStore::new()),
+            policy,
+            DiscoveryLocalCapabilityStatus::default(),
+            None,
+            identity.public_key_bytes(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/discovery/phala-attestation?nonce={}&recipient_node_id={}",
+                        "77".repeat(32),
+                        hex::encode([0x76; 32]),
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex] Preserve the
+    // existing node-only response shape; recipient binding is additive.
+    #[test]
+    fn phala_attestation_response_keeps_v1_shape_and_names_bound_recipient() {
+        let base = PhalaNodeAttestationResponseV1 {
+            contract_version: PHALA_NODE_ATTESTATION_CONTRACT_VERSION_V1.into(),
+            node_id: "11".repeat(32),
+            recipient_node_id: None,
+            authorization_sha256: None,
+            nonce: "22".repeat(32),
+            expected_report_data: "33".repeat(64),
+            attestation_format: PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V1.into(),
+            attestation: "aa".into(),
+            verification: PHALA_NODE_ATTESTATION_VERIFICATION_NOTE_V1.into(),
+        };
+        let legacy = serde_json::to_value(&base).unwrap();
+        assert_eq!(legacy["contract_version"], "phala_node_attestation.v1");
+        assert!(legacy.get("recipient_node_id").is_none());
+
+        let bound = PhalaNodeAttestationResponseV1 {
+            contract_version: PHALA_PRIVATE_RECIPIENT_ATTESTATION_CONTRACT_VERSION_V1.into(),
+            recipient_node_id: Some("44".repeat(32)),
+            authorization_sha256: Some("55".repeat(32)),
+            ..base
+        };
+        let bound = serde_json::to_value(bound).unwrap();
+        assert_eq!(
+            bound["contract_version"],
+            "phala_private_recipient_attestation.v1",
+        );
+        assert_eq!(bound["recipient_node_id"], "44".repeat(32));
+        assert_eq!(bound["authorization_sha256"], "55".repeat(32));
+    }
+
+    // [PHALA-ATTESTATION-NO-STORE 2026-10-06 by Codex] Authored, not run:
+    // success and upstream-error responses must not be cached for a nonce.
+    #[tokio::test]
+    async fn phala_attestation_response_is_non_cacheable() {
+        let app = Router::new()
+            .route("/quote", get(|| async { StatusCode::OK }))
+            .route("/error", get(|| async { StatusCode::BAD_GATEWAY }))
+            .layer(middleware::from_fn(no_store_phala_attestation_response));
+        for (path, status) in [
+            ("/quote", StatusCode::OK),
+            ("/error", StatusCode::BAD_GATEWAY),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers().get(axum::http::header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store, private"),
+            );
+            assert_eq!(
+                response.headers().get(axum::http::header::PRAGMA)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-cache"),
+            );
+        }
+    }
+
+    #[test]
+    fn dstack_response_parser_rejects_ambiguous_http_framing() {
+        let report_data = vec![0x11; 64];
+        let expected_report_data = hex::encode(&report_data);
+        // [PHALA-DSTACK-MESSAGEPACK-BYTES 2026-10-06 by Codex] Emit actual
+        // MessagePack `bin` tokens for all dstack byte fields, matching the
+        // guest API wire type rather than JSON-like integer arrays.
+        let attestation = rmp_serde::to_vec_named(&DstackVersionedAttestationEnvelope {
+            version: 1,
+            platform: DstackVersionedAttestationPlatform {
+                kind: "tdx".into(),
+                data: DstackVersionedAttestationPlatformData {
+                    quote: DstackByteField(vec![0xaa, 0xbb]),
+                    event_log: vec![DstackVersionedTdxEvent {
+                        imr: 3,
+                        event_type: 134_217_729,
+                        digest: DstackByteField(vec![1, 2]),
+                        event: "app-id".into(),
+                        event_payload: DstackByteField(vec![3, 4]),
+                    }],
+                },
+            },
+            stack: DstackVersionedAttestationStack {
+                kind: "dstack".into(),
+                data: DstackVersionedAttestationStackData {
+                    report_data: DstackByteField(report_data.clone()),
+                    config: "{}".into(),
+                },
+            },
+        })
+        .unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "attestation": hex::encode(&attestation)
+        }))
+        .unwrap();
+        let valid = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(&body).unwrap()
+        );
+        assert_eq!(
+            parse_dstack_http_response(valid.as_bytes()).unwrap().status,
+            200
+        );
+        assert_eq!(
+            parse_dstack_v1_attestation(&body, &expected_report_data).unwrap(),
+            attestation,
+        );
+        // [PHALA-DSTACK-V1-ACI-EVIDENCE 2026-10-06 by Codex] Calibrate the
+        // MessagePack-to-ACI conversion and failure cases without running it.
+        let (decoded_report_data, aci_evidence) = dstack_v1_aci_evidence(&attestation).unwrap();
+        assert_eq!(decoded_report_data, report_data);
+        assert_eq!(aci_evidence["quote"], "aabb");
+        assert_eq!(aci_evidence["quote_report_data"], expected_report_data);
+        assert_eq!(aci_evidence["app_compose"], "{}");
+        let events: Vec<serde_json::Value> = serde_json::from_str(
+            aci_evidence["event_log"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(events[0]["digest"], "0102");
+        assert_eq!(events[0]["event_payload"], "0304");
+        assert_eq!(canonical_phala_app_id_pin(&[0x12, 0xab]), Some("0x12ab".into()));
+        assert_eq!(canonical_phala_app_id_pin(&[]), None);
+        let legacy_byte_sequence = rmp_serde::to_vec(&vec![1_u8, 2]).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<DstackByteField>(&legacy_byte_sequence)
+                .unwrap()
+                .0,
+            vec![1, 2],
+        );
+        assert!(parse_dstack_v1_attestation(&body, &"22".repeat(64)).is_err());
+
+        // [PHALA-DSTACK-V1-FORMAT-CHECK 2026-10-06 by Codex] A v0 SCALE
+        // prefix and a wrong envelope version must not be mislabeled as v1.
+        assert!(parse_dstack_v1_attestation(
+            br#"{"attestation":"00"}"#,
+            &expected_report_data,
+        )
+        .is_err());
+        // [PHALA-NODE-COMPILE-REPAIR 2026-10-08 by Codex] json! accepts
+        // the byte-vector expression, not Rust array-repeat syntax.
+        let wrong_version = rmp_serde::to_vec_named(&serde_json::json!({
+            "version": 2,
+            "platform": { "kind": "tdx", "data": {} },
+            "stack": { "kind": "dstack", "data": { "report_data": vec![17_u8; 64] } }
+        }))
+        .unwrap();
+        let wrong_version = serde_json::to_vec(&serde_json::json!({
+            "attestation": hex::encode(wrong_version)
+        }))
+        .unwrap();
+        assert!(parse_dstack_v1_attestation(&wrong_version, &expected_report_data).is_err());
+        let unsupported_platform = rmp_serde::to_vec_named(&serde_json::json!({
+            "version": 1,
+            "platform": { "kind": "gcp-tdx", "data": {
+                "quote": [0xaa], "event_log": [], "tpm_quote": {}
+            } },
+            "stack": { "kind": "dstack", "data": {
+                "report_data": report_data, "runtime_events": [], "config": "{}"
+            } }
+        })).unwrap();
+        assert!(dstack_v1_aci_evidence(&unsupported_platform).is_err());
+        let mut trailing = attestation.clone();
+        trailing.push(0);
+        assert!(dstack_v1_aci_evidence(&trailing).is_err());
+
+        let duplicate_length = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body.len(),
+            std::str::from_utf8(&body).unwrap()
+        );
+        assert!(parse_dstack_http_response(duplicate_length.as_bytes()).is_err());
+        let chunked = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        assert!(parse_dstack_http_response(chunked).is_err());
+
+        let expanded_body = format!(
+            r#"{{"attestation":"{}"}}"#,
+            "00".repeat(PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1)
+        );
+        let expanded_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            expanded_body.len(), expanded_body
+        );
+        assert!(expanded_response.len() <= PHALA_NODE_ATTESTATION_MAX_GUEST_HTTP_RESPONSE_BYTES_V1);
+        assert!(parse_dstack_http_response(expanded_response.as_bytes()).is_ok());
+
+        let oversized_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            PHALA_NODE_ATTESTATION_MAX_GUEST_HTTP_RESPONSE_BYTES_V1,
+            "x".repeat(PHALA_NODE_ATTESTATION_MAX_GUEST_HTTP_RESPONSE_BYTES_V1)
+        );
+        assert!(parse_dstack_http_response(oversized_response.as_bytes()).is_err());
+    }
+
+    // [PHALA-DSTACK-V0-FALLBACK 2026-10-06 by Codex] Legacy responses are
+    // accepted only with a valid quote shape and exact padded report-data echo.
+    #[test]
+    fn dstack_legacy_quote_requires_exact_report_data_and_mount_missing_404() {
+        let report_data = "ab".repeat(64);
+        let body = format!(
+            r#"{{"quote":"aa","event_log":[],"report_data":"{report_data}"}}"#
+        );
+        assert_eq!(
+            parse_dstack_v0_quote(body.as_bytes(), &report_data).unwrap(),
+            body.as_bytes()
+        );
+        assert!(parse_dstack_v0_quote(body.as_bytes(), &"cd".repeat(64)).is_err());
+        let empty_quote = format!(
+            r#"{{"quote":"0x","event_log":[],"report_data":"{report_data}"}}"#
+        );
+        assert!(parse_dstack_v0_quote(empty_quote.as_bytes(), &report_data).is_err());
+        let oversized_body = format!(
+            "{}{}",
+            body,
+            " ".repeat(PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1 + 1 - body.len())
+        );
+        assert!(parse_dstack_v0_quote(oversized_body.as_bytes(), &report_data).is_err());
+        let prefixed_quote = format!(
+            r#"{{"quote":"0xaa","event_log":[],"report_data":"0x{report_data}"}}"#
+        );
+        assert!(parse_dstack_v0_quote(prefixed_quote.as_bytes(), &report_data).is_ok());
+
+        let missing = DstackHttpResponse {
+            status: 404,
+            content_type: Some("text/plain; charset=utf-8".into()),
+            body: b"not found".to_vec(),
+        };
+        assert!(is_dstack_v1_mount_missing(&missing));
+        let method_error = DstackHttpResponse {
+            status: 404,
+            content_type: Some("application/json".into()),
+            body: br#"{"error":"Service not found: Attest"}"#.to_vec(),
+        };
+        assert!(!is_dstack_v1_mount_missing(&method_error));
+        let other_json_404 = DstackHttpResponse {
+            status: 404,
+            content_type: Some("application/json".into()),
+            body: br#"{"error":"temporary failure"}"#.to_vec(),
+        };
+        assert!(!is_dstack_v1_mount_missing(&other_json_404));
+        let untyped_404 = DstackHttpResponse {
+            status: 404,
+            content_type: None,
+            body: b"not found".to_vec(),
+        };
+        assert!(!is_dstack_v1_mount_missing(&untyped_404));
+    }
 
     fn signed_descriptor() -> aeronyx_core::protocol::SignedNodeDescriptor {
         let kp = IdentityKeyPair::generate();

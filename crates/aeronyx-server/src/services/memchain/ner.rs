@@ -710,6 +710,11 @@ pub struct NerEngine {
     max_labels: usize,
 }
 
+// [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Both legacy loader variants
+// share this fail-closed execution gate.
+#[inline(never)]
+fn local_model_execution_disabled() -> bool { true }
+
 impl NerEngine {
     /// Load GLiNER ONNX model and tokenizer from the given directory.
     ///
@@ -730,6 +735,11 @@ impl NerEngine {
         confidence_threshold: f32,
         max_width: usize,
     ) -> Result<Self, String> {
+        // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Preserve the legacy
+        // signature while refusing local extraction/model execution.
+        if local_model_execution_disabled() {
+            return Err("local entity extraction is disabled; use the attested Phala ACI route".into());
+        }
         let model_dir = model_dir.as_ref();
         let tokenizer_path = model_dir.join(TOKENIZER_FILENAME);
         Self::load_with_tokenizer(model_dir, tokenizer_path, confidence_threshold, max_width)
@@ -746,6 +756,12 @@ impl NerEngine {
         confidence_threshold: f32,
         max_width: usize,
     ) -> Result<Self, String> {
+        // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] No alternate tokenizer
+        // entry point may re-enable local GLiNER inference.
+        if local_model_execution_disabled() {
+            return Err("local entity extraction is disabled; use the attested Phala ACI route".into());
+        }
+
         let model_dir = model_dir.as_ref();
         let tokenizer_path = tokenizer_path.as_ref();
         let confidence_threshold = if confidence_threshold <= 0.0 || confidence_threshold >= 1.0 {
@@ -1696,18 +1712,13 @@ mod tests {
         let result = NerEngine::load("/nonexistent/path", 0.5, 12);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            err.contains("not found"),
-            "Error should mention 'not found': {}",
-            err
-        );
+        assert!(err.contains("disabled"), "unexpected error: {}", err);
     }
 
     #[test]
-    fn custom_tokenizer_path_is_honored_before_runtime_initialization() {
-        // [NER-RUNTIME-INDEPENDENCE 2026-07-30 by Codex] This regression test
-        // remains model-free: model presence advances validation to the
-        // explicit tokenizer path, which must fail before ORT initialization.
+    fn custom_tokenizer_path_cannot_bypass_phala_only_gate() {
+        // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Neither legacy loading
+        // overload may read model files or initialize ORT on a Rust node.
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join(MODEL_FILENAME), b"test-model").unwrap();
         let tokenizer_path = directory.path().join("custom").join("tokenizer.json");
@@ -1715,8 +1726,7 @@ mod tests {
         let error =
             NerEngine::load_with_tokenizer(directory.path(), &tokenizer_path, 0.5, 12).unwrap_err();
 
-        assert!(error.contains(&tokenizer_path.display().to_string()));
-        assert!(error.contains("not found"));
+        assert!(error.contains("disabled"));
     }
 
     /// Standalone word_split for testing without NerEngine instance.
@@ -1737,7 +1747,7 @@ mod tests {
             Ok(e) => Some(e),
             Err(e) => {
                 eprintln!("⏭️ Skipping NER test (model not available): {}", e);
-                eprintln!("   Run `scripts/download_models.sh` to download model files.");
+                eprintln!("   Entity extraction is available only through the attested Phala ACI route.");
                 None
             }
         }

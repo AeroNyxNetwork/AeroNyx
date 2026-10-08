@@ -1,0 +1,148 @@
+# [PHALA-PEER-ATTESTATION-PROFILE 2026-10-06 by Codex]
+# Peer HTTP attestation profile, not a publicly reachable VPN profile. This
+# identity must not also be enabled as a private reverse-onion recipient.
+# The deployment must supply AERONYX_DISCOVERY_PUBLIC_ENDPOINT over HTTPS.
+# [PHALA-STANDALONE-IDENTITY 2026-10-06 by Codex] CMS management is
+# intentionally disabled; start creates a durable local identity under the
+# persistent volume instead of requiring CMS registration metadata.
+
+[network]
+listen_addr = "127.0.0.1:51820"
+
+[vpn]
+# [PHALA-NO-VPN-PROFILE 2026-10-06 by Codex]
+# [PHALA-PRIVATE-RECIPIENT-NO-VPN 2026-10-06 by Codex] Private recipient
+# startup rejects vpn.enabled=true; this shared Phala template stays off.
+enabled = false
+dns_proxy_enabled = false
+
+[server_key]
+key_file = "/var/lib/aeronyx/server_key.json"
+
+[management]
+# [PHALA-PRIVATE-RECIPIENT-EGRESS 2026-10-06 by Codex]
+# CMS and public-IP discovery are independent destinations from the pinned
+# relay and stay disabled for the isolated private-recipient role.
+enabled = false
+cms_url = ""
+
+[memchain]
+# [PHALA-PRIVATE-RECIPIENT-SERVICE-ISOLATION 2026-10-06 by Codex]
+# MemChain APIs/workers stay off for an endpoint-free recipient. The local
+# ChatRelay and Blind Vault durability stores are independently enabled by
+# the private-recipient profile and do not require MemChain mode.
+mode = "off"
+
+# [PHALA-PRIVATE-RECIPIENT-STORES 2026-10-06 by Codex]
+# These stores remain disabled unless the recipient role is explicitly opted
+# in through Phala environment configuration. Model inference stays off.
+[memchain.chat_relay]
+# [PHALA-RELAY-EXPLICIT-OFF 2026-10-06 by Codex] Disabled by default;
+# true turns on bounded blind relay and its signed OnionMiddle capability;
+# explicit false also disables a relay enabled by a mounted TOML override.
+enabled = false
+db_path = "/var/lib/aeronyx/chat-pending.sqlite"
+max_pending_per_wallet = 128
+max_pending_messages_total = 2048
+max_pending_message_bytes_total = 67108864
+max_message_size = 65536
+max_blob_size = 5242880
+max_blobs_per_receiver = 8
+max_pending_blobs_total = 128
+max_pending_blob_bytes_total = 268435456
+
+[blind_vault]
+enabled = false
+public_api_enabled = false
+db_path = "/var/lib/aeronyx/private-terminal-vault.sqlite"
+max_lease_ttl_secs = 604800
+max_object_ttl_secs = 604800
+max_objects_per_lease = 1024
+max_bytes_per_lease = 67108864
+max_live_leases = 128
+max_total_ciphertext_bytes = 2147483648
+min_free_disk_bytes = 1073741824
+
+[discovery]
+enabled = true
+advertise_self = true
+public_discovery = true
+# [PHALA-ONION-RELAY-OPT-IN 2026-10-06 by Codex]
+advertise_onion_middle = false
+public_api_listen_addr = "0.0.0.0:8422"
+# [PHALA-PEER-INGRESS-OPT-IN 2026-10-06 by Codex] The API listens inside the
+# container, but the default Compose template publishes no host port.
+# [PHALA-ATTESTATION-ENDPOINT-GATE 2026-10-06 by Codex] Quote serving needs
+# the HTTPS origin advertised in this identity's signed descriptor. The first
+# Phala render may leave the socket override empty until that origin is known.
+phala_attestation_socket_path = "/var/run/aeronyx/phala-agent.sock"
+# [PHALA-ATTESTATION-FAIL-CLOSED 2026-10-06 by Codex]
+# The Cloud profile requires the v1 guest-agent quote contract; it never
+# downgrades to legacy GetQuote evidence.
+phala_attestation_allow_legacy_v0 = false
+# [PHALA-PRIVATE-SOURCE-ROUTE-GATE 2026-10-06 by Codex] Route trust is a
+# separate operator decision from serving a quote, including fixed private
+# source-pull and recipient-poll relay routes. Defaults remain off until these
+# values are independently verified against the deployed app; relay descriptors
+# must advertise the endpoint through public discovery.
+phala_attested_peers_required = false
+# [PHALA-APP-ID-PIN-FORMAT 2026-10-06 by Codex]
+# Use 0x + lowercase hex of exact RTMR3-measured app-id payload bytes.
+phala_trusted_app_ids = []
+phala_trusted_compose_hashes = []
+phala_peer_attestation_max_age_secs = 900
+# [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] The peer and private
+# recipient Compose roles can opt into this existing outbound trust gate with
+# protected AERONYX_DISCOVERY_PHALA_ATTESTED_PEERS_REQUIRED=true plus JSON
+# AERONYX_DISCOVERY_PHALA_TRUSTED_APP_IDS and
+# AERONYX_DISCOVERY_PHALA_TRUSTED_COMPOSE_HASHES. Optional
+# AERONYX_DISCOVERY_PHALA_PEER_ATTESTATION_MAX_AGE_SECS is decimal 1..=86400.
+# Empty values preserve all four TOML fields. Never copy pins from unverified
+# discovery/quote responses; this does not enable local inference or E2EE.
+peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
+# [PHALA-RECIPIENT-GOSSIP-BOOTSTRAP 2026-10-06 by Codex]
+# Public peer Compose rendering requires AERONYX_DISCOVERY_SEED_ENDPOINTS;
+# Rust validates each origin before gossip and pins HTTPS DNS answers to
+# public addresses while preserving hostname TLS validation. Private
+# recipients use their pinned relay and do not inherit this general seed list.
+# [PHALA-PRIVATE-RECIPIENT-EGRESS 2026-10-06 by Codex] When that role is
+# enabled, Rust also rejects remote bootstrap URLs and other peer-sync pins;
+# local cache/file imports remain local.
+gossip_enabled = true
+seed_endpoints = []
+
+# [PHALA-REVERSE-ONION-RECIPIENT 2026-10-06 by Codex]
+# This is the public peer identity. The optional Compose profile starts a
+# second process/volume for the endpoint-free private recipient identity.
+[reverse_onion.queue]
+# [PHALA-REVERSE-QUEUE-CONFIG 2026-10-06 by Codex]
+# Relay custody is separate from OnionMiddle and remains disabled unless the
+# Phala environment enables OnionMiddle and supplies one recipient ID plus a
+# source allowlist, or explicitly selects recovery-only mode.
+# With one fixed recipient and an active dstack quote socket, discovery can
+# also advertise recipient-bound quote support; independent appraisal remains
+# required.
+# Current descriptor/grant authority must arrive through authenticated gossip.
+# [PHALA-QUEUE-RECOVERY-ENV 2026-10-06 by Codex] Protected env can opt into
+# existing-queue recovery without adding live source or task authority.
+enabled = false
+recovery_only = false
+db_path = "/var/lib/aeronyx/reverse-onion-queue.sqlite"
+recipient_node_ids = []
+relay_descriptor_b64 = ""
+recipient_descriptor_b64 = ""
+recipient_authorization_b64 = ""
+source_node_ids = []
+
+[reverse_onion.recipient]
+enabled = false
+# [PHALA-RECIPIENT-RECOVERY-OVERRIDE 2026-10-06 by Codex]
+# Optional protected env override: AERONYX_REVERSE_ONION_RECOVERY_ONLY.
+# Unset preserves this value; explicit true permits exact journal recovery only.
+recovery_only = false
+# [PHALA-RECIPIENT-BOOTSTRAP-RENDER 2026-10-06 by Codex]
+# The explicit Phala --private-recipient renderer requires these deployment
+# values and accepts only a nonzero 64-hex relay ID plus a public HTTPS origin.
+relay_endpoint = ""
+relay_node_id = ""
+state_db_path = "/var/lib/aeronyx/reverse-onion-recipient.sqlite"

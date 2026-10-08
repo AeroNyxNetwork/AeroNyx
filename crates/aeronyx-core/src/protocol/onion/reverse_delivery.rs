@@ -8,20 +8,344 @@
 //! Existing onion/envelope wire, source-sealed replies and SSRF remain unchanged.
 //! Durable queue CAS, quotas, transport admission and source verification remain
 //! mandatory integration boundaries; these pure types perform no I/O.
+//! [REVERSE-ONION-METADATA-BOUNDARY 2026-10-06 by Codex] This contract does
+//! not provide source anonymity: the adjacent relay learns the authenticated
+//! source-node ID, route ID, recipient, timing/size metadata, and ciphertext.
+//! Source binding prevents the recipient from using its visible route ID to
+//! retrieve another source's signed evidence; payloads remain opaque to relay.
 //! [RECIPIENT-LEASE-AUTHORITY 2026-10-04 by Codex] Recipient lease proof
-//! authenticates relay execution authority, never the hidden source route.
+//! authenticates relay execution authority, never source ownership or the
+//! source's signed route policy.
 //! [SOURCE-EVIDENCE-V1 2026-10-04 by Codex] Additive source-signed read-only
 //! evidence queries and relay-signed bounded parts; no queue/network authority.
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use serde::{Deserialize, Serialize};
 
 use super::is_onion_blob;
+// [REVERSE-ONION-CHECK-FIX 2026-10-06 by Codex]
+use crate::protocol::auth::{signed_message_digest, verify_signed_message, AuthError};
 use crate::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 use crate::protocol::chat::{
     decode_blind_relay_envelope, encode_blind_relay_envelope, BlindRelayEnvelope,
 };
 use crate::protocol::onion_reply::{decode_onion_sealed_response, MAX_ONION_SEALED_RESPONSE_BYTES};
+use crate::protocol::blind_vault::{
+    decode_blind_vault_frame, encode_blind_vault_frame, BlindVaultFrame,
+    BlindVaultPullRequest, BlindVaultPullResponse, MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES,
+};
+use crate::protocol::discovery::{
+    SignedPrivateOnionRecipientAuthorizationV1,
+    MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_BYTES,
+};
+use crate::protocol::onion::OnionRoutePurpose;
+
+/// Stable signature domain for the private source Pull API.
+pub const REVERSE_ONION_SOURCE_PULL_DOMAIN: &str = "AeroNyx-ReverseOnion-SourcePull-v1";
+pub const MAX_REVERSE_ONION_SOURCE_PULL_REQUEST_BYTES: usize = 16 * 1024;
+pub const MAX_REVERSE_ONION_SOURCE_PULL_RESPONSE_BYTES: usize = 7 * 1024 * 1024;
+const REVERSE_ONION_SOURCE_ROUTE_DOMAIN: &[u8] = b"AeroNyx-ReverseOnion-SourceRoute-v1";
+
+/// Exact JSON contract accepted by the authenticated source Pull route.
+/// Fields containing protocol bytes use canonical standard Base64.
+// [REVERSE-ONION-SOURCE-CALLER 2026-10-05 by Codex]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseOnionSourcePullRequestV1 {
+    /// Fixed source Pull API version.
+    pub version: u8,
+    /// Canonical standard Base64 wallet identity.
+    pub wallet_b64: String,
+    /// Canonical standard Base64 nonzero request nonce.
+    pub nonce_b64: String,
+    /// Unix seconds signed by the wallet.
+    pub request_timestamp: u64,
+    /// Exactly one validated Blind Vault Pull item.
+    pub pull: BlindVaultPullRequest,
+    /// Canonical standard Base64 P-signed recipient authorization.
+    pub authorization_b64: String,
+    /// Canonical standard Base64 wallet request signature.
+    pub signature_b64: String,
+}
+
+impl ReverseOnionSourcePullRequestV1 {
+    /// Builds a wallet-signed request whose authorization is resolved from
+    /// the source's verified live discovery cache at admission time.
+    // [REVERSE-ONION-AUTHORITY-GOSSIP 2026-10-05 by Codex]
+    pub fn new_signed_with_live_authority(
+        identity: &IdentityKeyPair,
+        nonce: [u8; 16],
+        request_timestamp: u64,
+        pull: BlindVaultPullRequest,
+    ) -> Result<Self, ReverseOnionError> {
+        let owner = identity.public_key_bytes();
+        reverse_onion_source_route_id(&owner, &nonce, &pull)?;
+        let signature = sign_reverse_onion_source_pull(identity, &nonce, request_timestamp, &pull, &[])?;
+        Ok(Self {
+            version: 1,
+            wallet_b64: STANDARD.encode(owner),
+            nonce_b64: STANDARD.encode(nonce),
+            request_timestamp,
+            pull,
+            authorization_b64: String::new(),
+            signature_b64: STANDARD.encode(signature),
+        })
+    }
+
+    /// Builds the exact source API request using canonical P authorization bytes.
+    pub fn new_signed(
+        identity: &IdentityKeyPair,
+        nonce: [u8; 16],
+        request_timestamp: u64,
+        pull: BlindVaultPullRequest,
+        authorization: &SignedPrivateOnionRecipientAuthorizationV1,
+    ) -> Result<Self, ReverseOnionError> {
+        let owner = identity.public_key_bytes();
+        if !authorization.purpose_hash_matches(OnionRoutePurpose::BlindVaultPull.as_str()) {
+            return Err(ReverseOnionError::Rejected);
+        }
+        authorization.verify_signature().map_err(|_| ReverseOnionError::Rejected)?;
+        reverse_onion_source_route_id(&owner, &nonce, &pull)?;
+        let authorization_bytes = authorization
+            .encode_canonical()
+            .map_err(|_| ReverseOnionError::Rejected)?;
+        let signature = sign_reverse_onion_source_pull(
+            identity, &nonce, request_timestamp, &pull, &authorization_bytes,
+        )?;
+        Ok(Self {
+            version: 1,
+            wallet_b64: STANDARD.encode(owner),
+            nonce_b64: STANDARD.encode(nonce),
+            request_timestamp,
+            pull,
+            authorization_b64: STANDARD.encode(authorization_bytes),
+            signature_b64: STANDARD.encode(signature),
+        })
+    }
+
+    /// Encodes the bounded JSON body accepted by the source API.
+    pub fn encode_json(&self) -> Result<Vec<u8>, ReverseOnionError> {
+        let bytes = serde_json::to_vec(self).map_err(|_| ReverseOnionError::Rejected)?;
+        if bytes.is_empty() || bytes.len() > MAX_REVERSE_ONION_SOURCE_PULL_REQUEST_BYTES {
+            return Err(ReverseOnionError::Rejected);
+        }
+        Ok(bytes)
+    }
+}
+
+/// Exact JSON response returned after source-side Pull verification.
+// [REVERSE-ONION-SOURCE-CALLER 2026-10-05 by Codex]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReverseOnionSourcePullResponseStateV1 {
+    /// Source verification and Pull processing completed.
+    #[serde(rename = "completed")]
+    Completed,
+    /// Durable delivery is unresolved; retry the same owner/nonce/Pull route.
+    #[serde(rename = "pending")]
+    Pending,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseOnionSourcePullResponseV1 {
+    /// Fixed source Pull API version.
+    pub version: u8,
+    /// `pending` carries an empty frame; `completed` carries the sealed result.
+    pub state: ReverseOnionSourcePullResponseStateV1,
+    /// Canonical standard Base64 Blind Vault PullResponse frame.
+    pub response_frame_b64: String,
+}
+
+impl ReverseOnionSourcePullResponseV1 {
+    /// Encodes an accepted-but-unresolved route without implying custody or
+    /// terminal execution completion. The caller retries the same nonce/Pull.
+    // [REVERSE-ONION-SOURCE-PENDING 2026-10-05 by Codex]
+    pub fn pending() -> Self {
+        Self {
+            version: 1,
+            state: ReverseOnionSourcePullResponseStateV1::Pending,
+            response_frame_b64: String::new(),
+        }
+    }
+
+    /// Validates the pending shape before a caller retries its original route.
+    pub fn validate_pending(&self) -> Result<(), ReverseOnionError> {
+        if self.version != 1
+            || self.state != ReverseOnionSourcePullResponseStateV1::Pending
+            || !self.response_frame_b64.is_empty()
+        {
+            return Err(ReverseOnionError::Rejected);
+        }
+        Ok(())
+    }
+
+    /// Encodes a Pull result already verified by the source workflow.
+    // [REVERSE-ONION-SOURCE-CALLER 2026-10-05 by Codex]
+    pub fn completed(response: &BlindVaultPullResponse) -> Result<Self, ReverseOnionError> {
+        let frame = encode_blind_vault_frame(&BlindVaultFrame::PullResponse(response.clone()))
+            .map_err(|_| ReverseOnionError::Rejected)?;
+        if frame.len() as u64 > MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES {
+            return Err(ReverseOnionError::Rejected);
+        }
+        let result = Self {
+            version: 1,
+            state: ReverseOnionSourcePullResponseStateV1::Completed,
+            response_frame_b64: STANDARD.encode(frame),
+        };
+        Ok(result)
+    }
+
+    /// Decodes only a bounded, canonical PullResponse frame.
+    /// This does not verify the replica signature; callers must validate it
+    /// against the pinned descriptor before trusting the page contents.
+    // [REVERSE-ONION-SOURCE-CALLER 2026-10-05 by Codex]
+    pub fn decode_completed(&self) -> Result<BlindVaultPullResponse, ReverseOnionError> {
+        if self.version != 1 || self.state != ReverseOnionSourcePullResponseStateV1::Completed {
+            return Err(ReverseOnionError::Rejected);
+        }
+        let max_encoded = (MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES as usize + 2) / 3 * 4;
+        if self.response_frame_b64.is_empty() || self.response_frame_b64.len() > max_encoded {
+            return Err(ReverseOnionError::Rejected);
+        }
+        let frame = STANDARD.decode(&self.response_frame_b64)
+            .map_err(|_| ReverseOnionError::Rejected)?;
+        if frame.is_empty() || frame.len() as u64 > MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES
+            || STANDARD.encode(&frame) != self.response_frame_b64
+        {
+            return Err(ReverseOnionError::Rejected);
+        }
+        match decode_blind_vault_frame(&frame).map_err(|_| ReverseOnionError::Rejected)? {
+            BlindVaultFrame::PullResponse(response) => Ok(response),
+            _ => Err(ReverseOnionError::Rejected),
+        }
+    }
+
+    /// Encodes the bounded JSON response body.
+    pub fn encode_json(&self) -> Result<Vec<u8>, ReverseOnionError> {
+        let bytes = serde_json::to_vec(self).map_err(|_| ReverseOnionError::Rejected)?;
+        if bytes.is_empty() || bytes.len() > MAX_REVERSE_ONION_SOURCE_PULL_RESPONSE_BYTES {
+            return Err(ReverseOnionError::Rejected);
+        }
+        Ok(bytes)
+    }
+}
+
+/// Canonical bounded Pull frame used by the source request and route binding.
+// [REVERSE-ONION-SOURCE-CALLER 2026-10-05 by Codex]
+pub fn encode_reverse_onion_source_pull(
+    pull: &BlindVaultPullRequest,
+) -> Result<Vec<u8>, ReverseOnionError> {
+    pull.validate().map_err(|_| ReverseOnionError::Rejected)?;
+    if pull.limit != 1 {
+        return Err(ReverseOnionError::Rejected);
+    }
+    encode_blind_vault_frame(&BlindVaultFrame::PullRequest(pull.clone()))
+        .map_err(|_| ReverseOnionError::Rejected)
+}
+
+/// Deterministic source route identity bound to owner, nonce and exact Pull.
+/// The signed request timestamp is deliberately excluded so a fresh signature
+/// can resume or safely refresh this route without creating another delivery.
+// [REVERSE-ONION-SOURCE-RETRY-TIMESTAMP 2026-10-05 by Codex]
+pub fn reverse_onion_source_route_id(
+    owner: &[u8; 32],
+    nonce: &[u8; 16],
+    pull: &BlindVaultPullRequest,
+) -> Result<[u8; 16], ReverseOnionError> {
+    if *owner == [0; 32] || *nonce == [0; 16] {
+        return Err(ReverseOnionError::Rejected);
+    }
+    let frame = encode_reverse_onion_source_pull(pull)?;
+    let mut hash = Sha256::new();
+    hash.update(REVERSE_ONION_SOURCE_ROUTE_DOMAIN);
+    hash.update(owner);
+    hash.update(nonce);
+    hash.update((frame.len() as u64).to_be_bytes());
+    hash.update(frame);
+    let digest = hash.finalize();
+    digest[..16]
+        .try_into()
+        .map_err(|_| ReverseOnionError::Rejected)
+}
+
+/// Digest all request fields, including the exact canonical signed P authority.
+// [REVERSE-ONION-SOURCE-CALLER 2026-10-05 by Codex]
+pub fn reverse_onion_source_pull_digest(
+    version: u8,
+    wallet: &[u8; 32],
+    nonce: &[u8; 16],
+    request_timestamp: u64,
+    pull: &BlindVaultPullRequest,
+    canonical_authorization: &[u8],
+) -> Result<[u8; 32], ReverseOnionError> {
+    if version != 1 || *wallet == [0; 32] || *nonce == [0; 16]
+        || canonical_authorization.len() > MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_BYTES
+    {
+        return Err(ReverseOnionError::Rejected);
+    }
+    if !canonical_authorization.is_empty() {
+        let authorization = SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(
+            canonical_authorization,
+        ).map_err(|_| ReverseOnionError::Rejected)?;
+        if authorization.encode_canonical().map_err(|_| ReverseOnionError::Rejected)?
+            != canonical_authorization
+        {
+            return Err(ReverseOnionError::Rejected);
+        }
+    }
+    let frame = encode_reverse_onion_source_pull(pull)?;
+    let version = [version];
+    let timestamp = request_timestamp.to_be_bytes();
+    Ok(signed_message_digest(
+        REVERSE_ONION_SOURCE_PULL_DOMAIN,
+        &[
+            &version, wallet, nonce, &timestamp, &frame, canonical_authorization,
+        ],
+    ))
+}
+
+/// Verify a fresh source Pull using the shared canonical request contract.
+// [REVERSE-ONION-SOURCE-CALLER 2026-10-05 by Codex]
+pub fn verify_reverse_onion_source_pull(
+    wallet: &[u8; 32],
+    nonce: &[u8; 16],
+    request_timestamp: u64,
+    pull: &BlindVaultPullRequest,
+    canonical_authorization: &[u8],
+    signature: &[u8; 64],
+) -> Result<(), AuthError> {
+    reverse_onion_source_pull_digest(
+        1, wallet, nonce, request_timestamp, pull, canonical_authorization,
+    ).map_err(|_| AuthError::SignatureMismatch)?;
+    let frame = encode_reverse_onion_source_pull(pull).map_err(|_| AuthError::SignatureMismatch)?;
+    let version = [1u8];
+    let timestamp = request_timestamp.to_be_bytes();
+    verify_signed_message(
+        REVERSE_ONION_SOURCE_PULL_DOMAIN,
+        &[&version, wallet, nonce, &timestamp, &frame, canonical_authorization],
+        wallet,
+        signature,
+        request_timestamp,
+    )
+}
+
+/// Create the wallet signature expected by the mounted private source API.
+// [REVERSE-ONION-SOURCE-CALLER 2026-10-05 by Codex]
+pub fn sign_reverse_onion_source_pull(
+    identity: &IdentityKeyPair,
+    nonce: &[u8; 16],
+    request_timestamp: u64,
+    pull: &BlindVaultPullRequest,
+    canonical_authorization: &[u8],
+) -> Result<[u8; 64], ReverseOnionError> {
+    let wallet = identity.public_key_bytes();
+    let digest = reverse_onion_source_pull_digest(
+        1, &wallet, nonce, request_timestamp, pull, canonical_authorization,
+    )?;
+    Ok(identity.sign(&digest))
+}
 
 // [REVERSE-ONION-CONTRACT 2026-10-04 by Codex] Separate additive wire domain;
 // no existing envelope, route discriminant, endpoint policy, or reply changes.
@@ -42,6 +366,10 @@ pub const REVERSE_ONION_ENVELOPE_LIFETIME_SECS: u64 = 600;
 /// Recovery-only window after the immutable execution deadline. This never
 /// authorizes a new delivery, lease, peel, execution, or source reply session.
 pub const REVERSE_ONION_RESULT_RETENTION_SECS: u64 = 300;
+// [REVERSE-ONION-RETENTION-ALIGNMENT 2026-10-05 by Codex] Relay tombstones
+// may outlive result bytes; source route IDs remain reserved through the
+// largest supported relay recovery-retention window.
+pub const MAX_REVERSE_ONION_RECOVERY_RETENTION_SECS: u64 = 86_400;
 /// Outer carrier bound, not an increase to any inner envelope/reply ceiling.
 pub const MAX_REVERSE_ONION_FRAME_BYTES: usize = REVERSE_ONION_HEADER_BYTES
     + REVERSE_ONION_SIGNATURE_BYTES
@@ -50,6 +378,149 @@ pub const MAX_REVERSE_ONION_FRAME_BYTES: usize = REVERSE_ONION_HEADER_BYTES
 /// and signature sizes. Lease/Result use `MAX_REVERSE_ONION_FRAME_BYTES`.
 pub const MAX_REVERSE_ONION_CLAIM_BYTES: usize =
     REVERSE_ONION_HEADER_BYTES + REVERSE_ONION_SIGNATURE_BYTES;
+
+const REVERSE_ONION_NO_WORK_MAGIC: [u8; 4] = *b"AXRA";
+const REVERSE_ONION_NO_WORK_DOMAIN: &[u8] = b"AeroNyx-ReverseOnion-NoWork-v1\0";
+pub const REVERSE_ONION_NO_WORK_LIFETIME_SECS: u64 = 30;
+const REVERSE_ONION_NO_WORK_RECOVERY_SECS: u64 =
+    REVERSE_ONION_ENVELOPE_LIFETIME_SECS + REVERSE_ONION_RESULT_RETENTION_SECS;
+/// Queue marker retention must cover a fresh Claim plus its full recipient
+/// evidence horizon so a lost receipt can be reissued after restart.
+pub const REVERSE_ONION_NO_WORK_MARKER_MIN_RETENTION_SECS: u64 =
+    REVERSE_ONION_CLAIM_LIFETIME_SECS + REVERSE_ONION_NO_WORK_RECOVERY_SECS;
+pub const REVERSE_ONION_NO_WORK_RECEIPT_BYTES: usize = 197;
+
+/// Relay-signed proof that one exact durable Claim had no queued item.
+/// It is not a custody, delivery, or execution acknowledgement.
+// [REVERSE-ONION-SIGNED-NO-WORK 2026-10-06 by Codex]
+pub struct ReverseOnionNoWorkReceiptV1 {
+    relay: [u8; 32],
+    recipient: [u8; 32],
+    claim_id: [u8; 16],
+    claim_commitment: [u8; 32],
+    issued_at: u64,
+    expires_at: u64,
+    signature: [u8; REVERSE_ONION_SIGNATURE_BYTES],
+}
+
+impl ReverseOnionNoWorkReceiptV1 {
+    // [PHALA-RECIPIENT-ADMISSION-CLOCK 2026-10-07 by Codex] Read only
+    // after decode_for_claim authenticates this exact Claim-bound receipt.
+    // The journal may then distinguish forward expiry during SQL wait.
+    pub fn expires_at(&self) -> u64 { self.expires_at }
+
+    /// Create a short-lived receipt for an exact Claim whose no-work state was
+    /// confirmed by the durable relay queue. Reissue is recovery-only.
+    pub fn issue_no_work(
+        claim: &ReverseOnionFrameV1,
+        now: u64,
+        relay_signer: &IdentityKeyPair,
+    ) -> Result<Self, ReverseOnionError> {
+        let relay = relay_signer.public_key_bytes();
+        claim.verify_claim(relay, claim.immediate_recipient(), claim.issued_at())?;
+        let recovery_deadline = claim.expires_at()
+            .checked_add(REVERSE_ONION_NO_WORK_RECOVERY_SECS)
+            .ok_or(ReverseOnionError::Rejected)?;
+        if now < claim.issued_at() || now >= recovery_deadline {
+            return Err(ReverseOnionError::Expired);
+        }
+        let expires_at = now
+            .checked_add(REVERSE_ONION_NO_WORK_LIFETIME_SECS)
+            .ok_or(ReverseOnionError::Rejected)?
+            .min(recovery_deadline);
+        if expires_at <= now {
+            return Err(ReverseOnionError::Expired);
+        }
+        let mut receipt = Self {
+            relay,
+            recipient: claim.immediate_recipient(),
+            claim_id: claim.claim_id(),
+            claim_commitment: claim.commitment(),
+            issued_at: now,
+            expires_at,
+            signature: [0; REVERSE_ONION_SIGNATURE_BYTES],
+        };
+        receipt.signature = relay_signer.sign(&receipt.signing_data());
+        Ok(receipt)
+    }
+
+    /// Canonical fixed-size wire bytes; the response binds to one Claim only.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = self.unsigned_bytes();
+        bytes.extend_from_slice(&self.signature);
+        bytes
+    }
+
+    /// Decode and verify relay identity, recipient, exact Claim and freshness.
+    pub fn decode_for_claim(
+        bytes: &[u8],
+        claim: &ReverseOnionFrameV1,
+        expected_relay: [u8; 32],
+        expected_recipient: [u8; 32],
+        now: u64,
+    ) -> Result<Self, ReverseOnionError> {
+        if bytes.len() != REVERSE_ONION_NO_WORK_RECEIPT_BYTES {
+            return Err(ReverseOnionError::Rejected);
+        }
+        let mut cursor = ReverseOnionCursor(bytes);
+        if cursor.array::<4>()? != REVERSE_ONION_NO_WORK_MAGIC || cursor.array::<1>()? != [1] {
+            return Err(ReverseOnionError::Rejected);
+        }
+        let receipt = Self {
+            relay: cursor.array()?,
+            recipient: cursor.array()?,
+            claim_id: cursor.array()?,
+            claim_commitment: cursor.array()?,
+            issued_at: u64::from_be_bytes(cursor.array()?),
+            expires_at: u64::from_be_bytes(cursor.array()?),
+            signature: cursor.array()?,
+        };
+        if !cursor.0.is_empty() || receipt.encode() != bytes {
+            return Err(ReverseOnionError::Rejected);
+        }
+        claim.verify_claim(expected_relay, expected_recipient, claim.issued_at())?;
+        let recovery_deadline = claim.expires_at()
+            .checked_add(REVERSE_ONION_NO_WORK_RECOVERY_SECS)
+            .ok_or(ReverseOnionError::Rejected)?;
+        if receipt.relay != expected_relay
+            || receipt.recipient != expected_recipient
+            || receipt.claim_id != claim.claim_id()
+            || receipt.claim_commitment != claim.commitment()
+            || receipt.issued_at < claim.issued_at()
+            || receipt.expires_at > recovery_deadline
+            || receipt.expires_at.saturating_sub(receipt.issued_at)
+                > REVERSE_ONION_NO_WORK_LIFETIME_SECS
+            || now < receipt.issued_at
+            || now >= receipt.expires_at
+        {
+            return Err(ReverseOnionError::Rejected);
+        }
+        IdentityPublicKey::from_bytes(&receipt.relay)
+            .and_then(|key| key.verify(&receipt.signing_data(), &receipt.signature))
+            .map_err(|_| ReverseOnionError::Rejected)?;
+        Ok(receipt)
+    }
+
+    fn unsigned_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(REVERSE_ONION_NO_WORK_RECEIPT_BYTES - REVERSE_ONION_SIGNATURE_BYTES);
+        bytes.extend_from_slice(&REVERSE_ONION_NO_WORK_MAGIC);
+        bytes.push(1);
+        bytes.extend_from_slice(&self.relay);
+        bytes.extend_from_slice(&self.recipient);
+        bytes.extend_from_slice(&self.claim_id);
+        bytes.extend_from_slice(&self.claim_commitment);
+        bytes.extend_from_slice(&self.issued_at.to_be_bytes());
+        bytes.extend_from_slice(&self.expires_at.to_be_bytes());
+        bytes
+    }
+
+    fn signing_data(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(REVERSE_ONION_NO_WORK_DOMAIN.len() + REVERSE_ONION_NO_WORK_RECEIPT_BYTES);
+        data.extend_from_slice(REVERSE_ONION_NO_WORK_DOMAIN);
+        data.extend_from_slice(&self.unsigned_bytes());
+        data
+    }
+}
 
 /// Frozen additive frame codes. A result is NOT an execution acknowledgement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +561,9 @@ pub enum ReverseOnionError {
 /// NOT execution or the hidden terminal. Sources must use
 /// `OnionReplySession::prepare_source_sealed` and consuming `open` verification;
 /// no relay can infer the encrypted proof mode from a sealed response.
+// [REVERSE-ONION-IMMUTABLE-FRAME 2026-10-06 by Codex] Frames contain only the
+// signed adjacent-hop ciphertext carrier; cloning does not expose keys/plaintext.
+#[derive(Clone)]
 pub struct ReverseOnionFrameV1 {
     kind: ReverseOnionKindV1,
     relay: [u8; 32],
@@ -433,6 +907,32 @@ impl ReverseOnionFrameV1 {
     /// Kind-specific bound: claim freshness, lease execution, result retention.
     pub fn expires_at(&self) -> u64 {
         self.expires_at
+    }
+
+    /// [PHALA-RECIPIENT-EXPIRY-RACE 2026-10-07 by Codex] The last instant
+    /// before which a recipient may retransmit its exact durable frame. Claim
+    /// recovery outlives fresh admission; Result retry never outlives its grace.
+    /// This bound is not permission to create a Claim or execute a Lease.
+    pub fn recipient_retry_deadline(&self) -> Result<u64, ReverseOnionError> {
+        match self.kind {
+            ReverseOnionKindV1::Claim => self.expires_at
+                .checked_add(REVERSE_ONION_ENVELOPE_LIFETIME_SECS)
+                .and_then(|deadline| deadline.checked_add(REVERSE_ONION_RESULT_RETENTION_SECS))
+                .ok_or(ReverseOnionError::Rejected),
+            ReverseOnionKindV1::Result => Ok(self.expires_at),
+            ReverseOnionKindV1::Lease => Err(ReverseOnionError::Rejected),
+        }
+    }
+
+    /// Authenticate a recipient-owned retry before distinguishing normal expiry
+    /// from malformed bytes or a clock rollback. Parent/journal/origin binding
+    /// remains the caller's responsibility; an expired Claim is recovery only.
+    pub fn verify_recipient_retry(&self, now: u64) -> Result<(), ReverseOnionError> {
+        self.verify_signature()?;
+        let deadline = self.recipient_retry_deadline()?;
+        if now < self.issued_at { return Err(ReverseOnionError::Rejected); }
+        if now >= deadline { return Err(ReverseOnionError::Expired); }
+        Ok(())
     }
 
     /// Recovery bound derived only from an immutable lease execution deadline.
@@ -1093,6 +1593,187 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
 
+    fn source_pull() -> BlindVaultPullRequest {
+        BlindVaultPullRequest {
+            version: 1,
+            lease_id: [31; 32],
+            read_capability: [32; 32],
+            continuation_cursor: Vec::new(),
+            limit: 1,
+        }
+    }
+
+    #[test]
+    fn source_pull_canonical_frame_rejects_multiple_items() {
+        let mut pull = source_pull();
+        assert!(encode_reverse_onion_source_pull(&pull).is_ok());
+        pull.limit = 2;
+        assert!(encode_reverse_onion_source_pull(&pull).is_err());
+    }
+
+    // [REVERSE-ONION-SIGNED-NO-WORK 2026-10-06 by Codex] Authored, not run.
+    #[test]
+    fn no_work_receipt_binds_adjacent_identities_claim_and_short_freshness() {
+        let relay = IdentityKeyPair::from_bytes(&[71; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[72; 32]).unwrap();
+        let claim = ReverseOnionFrameV1::claim(
+            relay.public_key_bytes(), [73; 16], NOW, NOW + 30, &recipient,
+        ).unwrap();
+        let receipt = ReverseOnionNoWorkReceiptV1::issue_no_work(&claim, NOW + 1, &relay).unwrap();
+        let encoded = receipt.encode();
+        assert_eq!(encoded.len(), REVERSE_ONION_NO_WORK_RECEIPT_BYTES);
+        assert!(ReverseOnionNoWorkReceiptV1::decode_for_claim(
+            &encoded, &claim, relay.public_key_bytes(), recipient.public_key_bytes(), NOW + 2,
+        ).is_ok());
+        assert!(ReverseOnionNoWorkReceiptV1::decode_for_claim(
+            &encoded, &claim, [74; 32], recipient.public_key_bytes(), NOW + 2,
+        ).is_err());
+        assert!(ReverseOnionNoWorkReceiptV1::decode_for_claim(
+            &encoded, &claim, relay.public_key_bytes(), [75; 32], NOW + 2,
+        ).is_err());
+        assert!(ReverseOnionNoWorkReceiptV1::decode_for_claim(
+            &encoded, &claim, relay.public_key_bytes(), recipient.public_key_bytes(), NOW + 31,
+        ).is_err());
+        let replayed = ReverseOnionNoWorkReceiptV1::issue_no_work(
+            &claim, NOW + 31, &relay,
+        ).unwrap().encode();
+        assert!(ReverseOnionNoWorkReceiptV1::decode_for_claim(
+            &replayed, &claim, relay.public_key_bytes(), recipient.public_key_bytes(), NOW + 32,
+        ).is_ok());
+        assert!(ReverseOnionNoWorkReceiptV1::issue_no_work(
+            &claim, NOW + 930, &relay,
+        ).is_err());
+        let other_claim = ReverseOnionFrameV1::claim(
+            relay.public_key_bytes(), [76; 16], NOW, NOW + 30, &recipient,
+        ).unwrap();
+        assert!(ReverseOnionNoWorkReceiptV1::decode_for_claim(
+            &encoded, &other_claim, relay.public_key_bytes(), recipient.public_key_bytes(), NOW + 2,
+        ).is_err());
+        let mut tampered = encoded;
+        tampered[70] ^= 1;
+        assert!(ReverseOnionNoWorkReceiptV1::decode_for_claim(
+            &tampered, &claim, relay.public_key_bytes(), recipient.public_key_bytes(), NOW + 2,
+        ).is_err());
+    }
+
+    // [REVERSE-ONION-AUTHORITY-GOSSIP 2026-10-05 by Codex] The live-authority
+    // request signs an empty authority slot; the source resolves the token from
+    // its verified discovery cache only after wallet authentication.
+    #[test]
+    fn source_pull_can_resolve_live_authority_without_caller_token() {
+        let identity = IdentityKeyPair::from_bytes(&[61; 32]).unwrap();
+        // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex] The public
+        // signature verifier uses wall time; frozen NOW belongs only to codec vectors.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let request = ReverseOnionSourcePullRequestV1::new_signed_with_live_authority(
+            &identity, [62; 16], now, source_pull(),
+        ).unwrap();
+        assert!(request.authorization_b64.is_empty());
+        let signature: [u8; 64] = STANDARD.decode(&request.signature_b64).unwrap().try_into().unwrap();
+        verify_reverse_onion_source_pull(
+            &identity.public_key_bytes(), &[62; 16], now, &request.pull, &[], &signature,
+        ).unwrap();
+        assert!(request.encode_json().is_ok());
+    }
+
+    // [REVERSE-ONION-SOURCE-PENDING 2026-10-05 by Codex] A client retry after
+    // HTTP 202 may refresh its signature timestamp, but the same nonce and Pull
+    // must resolve to the same durable route; a new nonce creates a new route.
+    #[test]
+    fn source_pending_retry_preserves_route_identity() {
+        let identity = IdentityKeyPair::from_bytes(&[63; 32]).unwrap();
+        let pull = source_pull();
+        let first = ReverseOnionSourcePullRequestV1::new_signed_with_live_authority(
+            &identity, [64; 16], NOW, pull.clone(),
+        ).unwrap();
+        let retry = ReverseOnionSourcePullRequestV1::new_signed_with_live_authority(
+            &identity, [64; 16], NOW + 1, pull.clone(),
+        ).unwrap();
+        let next = ReverseOnionSourcePullRequestV1::new_signed_with_live_authority(
+            &identity, [65; 16], NOW + 1, pull.clone(),
+        ).unwrap();
+
+        let first_route = reverse_onion_source_route_id(
+            &identity.public_key_bytes(), &[64; 16], &first.pull,
+        ).unwrap();
+        let retry_route = reverse_onion_source_route_id(
+            &identity.public_key_bytes(), &[64; 16], &retry.pull,
+        ).unwrap();
+        let next_route = reverse_onion_source_route_id(
+            &identity.public_key_bytes(), &[65; 16], &next.pull,
+        ).unwrap();
+        assert_eq!(first_route, retry_route);
+        assert_ne!(first.request_timestamp, retry.request_timestamp);
+        assert_ne!(first.signature_b64, retry.signature_b64);
+        assert_ne!(first_route, next_route);
+    }
+
+    // [REVERSE-ONION-SOURCE-PULL-VECTOR 2026-10-06 by Codex] Cross-language
+    // fixture for the exact Pull frame, route ID, digest, and Ed25519 bytes.
+    #[test]
+    fn source_pull_v1_frozen_wire_vector() {
+        let identity = IdentityKeyPair::from_bytes(&[1; 32]).unwrap();
+        let pull = BlindVaultPullRequest {
+            version: 1,
+            lease_id: [31; 32],
+            read_capability: [32; 32],
+            continuation_cursor: Vec::new(),
+            limit: 1,
+        };
+        let owner = identity.public_key_bytes();
+        let nonce = [2; 16];
+        let frame = encode_reverse_onion_source_pull(&pull).unwrap();
+        // [PHALA-PULL-VECTOR-REPAIR 2026-10-08 by Codex] Independently
+        // reconstructed: 7-byte header, u16 LE version, 32-byte lease and
+        // capability, u64 LE empty cursor length, u16 LE limit = 83 bytes.
+        // The prior literal omitted three lease bytes; production encoding,
+        // signed digest and signature remain unchanged.
+        assert_eq!(hex::encode(&frame), "414e425600010701001f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f202020202020202020202020202020202020202020202020202020202020202000000000000000000100");
+        assert_eq!(hex::encode(owner), "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c");
+        assert_eq!(hex::encode(reverse_onion_source_route_id(&owner, &nonce, &pull).unwrap()), "2735e1fb505ae0195b5efdd1298b5ac6");
+        assert_eq!(hex::encode(reverse_onion_source_pull_digest(1, &owner, &nonce, NOW, &pull, &[]).unwrap()), "3c02760db2c0ae2224ab9e6b11c24c92831acc845992262b9e4f3b3511acad31");
+
+        let request = ReverseOnionSourcePullRequestV1::new_signed_with_live_authority(
+            &identity, nonce, NOW, pull,
+        ).unwrap();
+        assert_eq!(request.signature_b64, "in+w6yBVxITkOExTz8MgXSLrzYi5LMDiPS0K1Pp7CEux7LsfrtLGAtu9DMkXIY/VakAHopteatNIJKsFxerHAg==");
+        assert_eq!(
+            String::from_utf8(request.encode_json().unwrap()).unwrap(),
+            "{\"version\":1,\"wallet_b64\":\"iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=\",\"nonce_b64\":\"AgICAgICAgICAgICAgICAg==\",\"request_timestamp\":1800000000,\"pull\":{\"version\":1,\"lease_id\":[31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31,31],\"read_capability\":[32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32],\"continuation_cursor\":[],\"limit\":1},\"authorization_b64\":\"\",\"signature_b64\":\"in+w6yBVxITkOExTz8MgXSLrzYi5LMDiPS0K1Pp7CEux7LsfrtLGAtu9DMkXIY/VakAHopteatNIJKsFxerHAg==\"}"
+        );
+    }
+
+    #[test]
+    fn source_pull_response_codec_is_bounded_canonical_and_typed() {
+        let page = BlindVaultPullResponse::new([51; 32], Vec::new(), Vec::new(), NOW * 1000, [52; 32]);
+        let response = ReverseOnionSourcePullResponseV1::completed(&page).unwrap();
+        assert_eq!(response.decode_completed().unwrap().lease_id, [51; 32]);
+        assert!(response.encode_json().unwrap().len()
+            <= MAX_REVERSE_ONION_SOURCE_PULL_RESPONSE_BYTES);
+
+        let mut wrong_state = serde_json::to_value(response.clone()).unwrap();
+        wrong_state["state"] = serde_json::Value::String("pending".to_owned());
+        let pending = serde_json::from_value::<ReverseOnionSourcePullResponseV1>(wrong_state).unwrap();
+        assert!(pending.validate_pending().is_err());
+        let mut noncanonical = response;
+        noncanonical.response_frame_b64.push('=');
+        assert!(noncanonical.decode_completed().is_err());
+    }
+
+    // [REVERSE-ONION-SOURCE-PENDING 2026-10-05 by Codex] A pending response
+    // round-trips as its own state and can never decode as terminal data.
+    #[test]
+    fn source_pull_pending_codec_has_no_result_frame() {
+        let pending = ReverseOnionSourcePullResponseV1::pending();
+        pending.validate_pending().unwrap();
+        assert!(pending.decode_completed().is_err());
+        let encoded = pending.encode_json().unwrap();
+        assert!(encoded.len() <= MAX_REVERSE_ONION_SOURCE_PULL_RESPONSE_BYTES);
+        let decoded: ReverseOnionSourcePullResponseV1 =
+            serde_json::from_slice(&encoded).unwrap();
+        decoded.validate_pending().unwrap();
+    }
+
     struct Fixture {
         relay: IdentityKeyPair,
         recipient: IdentityKeyPair,
@@ -1239,6 +1920,28 @@ mod tests {
         assert_eq!(source.open(bytes).unwrap().payload.as_slice(), b"result");
         assert!(result.verify_result(&historical, &f.lease, NOW + 600, NOW + 900).is_err());
         assert!(ReverseOnionFrameV1::decode_for_recovery(&result.encode()).is_ok());
+    }
+
+    // [PHALA-RECIPIENT-EXPIRY-RACE 2026-10-07 by Codex] Authored, not run:
+    // retry bounds do not turn old polls into fresh admission or leases into
+    // recipient-originated frames, and invalid signatures never mean expiry.
+    #[test]
+    fn recipient_retry_window_preserves_claim_recovery_without_extending_result_grace() {
+        let f = Fixture::new();
+        assert_eq!(f.claim.recipient_retry_deadline().unwrap(), NOW + 930);
+        assert!(f.claim.verify_recipient_retry(NOW + 30).is_ok());
+        assert!(f.claim.verify_claim(f.relay.public_key_bytes(), f.recipient.public_key_bytes(), NOW + 30).is_err());
+        assert!(f.claim.verify_recipient_retry(NOW + 929).is_ok());
+        assert_eq!(f.claim.verify_recipient_retry(NOW + 930), Err(ReverseOnionError::Expired));
+        assert_eq!(f.claim.verify_recipient_retry(NOW - 1), Err(ReverseOnionError::Rejected));
+        assert_eq!(f.lease.recipient_retry_deadline(), Err(ReverseOnionError::Rejected));
+        let (result, _) = f.result(NOW + 610);
+        assert_eq!(result.recipient_retry_deadline().unwrap(), NOW + 900);
+        assert!(result.verify_recipient_retry(NOW + 899).is_ok());
+        assert_eq!(result.verify_recipient_retry(NOW + 900), Err(ReverseOnionError::Expired));
+        let mut invalid = f.claim.clone();
+        invalid.signature[0] ^= 1;
+        assert_eq!(invalid.verify_recipient_retry(NOW + 930), Err(ReverseOnionError::Rejected));
     }
 
     #[test]

@@ -53,9 +53,10 @@ use super::storage_supernode::{CognitiveTaskRow, StageTaskResult, TaskUsageRecor
 // PrivacyLevel is re-exported from config_supernode via prompts
 use super::prompts::{
     build_code_analysis, build_community_narrative, build_conflict_resolution,
+    build_entity_extraction,
     build_entity_description, build_recall_synthesis, build_session_title, CodeAnalysisInput,
     CommunityNarrativeInput, ConflictResolutionInput, ConflictingEdge, EntityDescriptionInput,
-    RecallSynthesisInput, SessionTitleInput,
+    EntityExtractionInput, RecallSynthesisInput, SessionTitleInput,
 };
 use crate::config_supernode::{PrivacyLevel, WorkerConfig};
 
@@ -104,6 +105,7 @@ pub struct TaskWorker {
     poll_interval: Duration,
     task_timeout: Duration,
     stale_claim_recovery_secs: i64,
+    allow_full_entity_extraction: bool,
 }
 
 impl TaskWorker {
@@ -120,10 +122,34 @@ impl TaskWorker {
             poll_interval: Duration::from_secs(worker_config.poll_interval_secs.max(1)),
             task_timeout: Duration::from_secs(worker_config.task_timeout_secs.max(1)),
             stale_claim_recovery_secs,
+            allow_full_entity_extraction: false,
         }
     }
 
+    // [MEMCHAIN-PHALA-EXTRACTION 2026-10-05 by Codex]
+    #[must_use]
+    pub fn with_full_entity_extraction_allowed(mut self, allowed: bool) -> Self {
+        self.allow_full_entity_extraction = allowed;
+        self
+    }
+
     pub async fn run(self, mut shutdown_rx: broadcast::Receiver<()>) {
+        // [MEMCHAIN-PHALA-E2EE-BOUNDARY 2026-10-06 by Codex] Leave durable
+        // pending tasks untouched until model fields are encrypted end-to-end
+        // to the attested workload and responses are sealed back to the source.
+        if !self.router.has_client_to_tee_e2ee_transport() {
+            warn!(
+                reason = "llm_client_to_tee_e2ee_unavailable",
+                "[TASK_WORKER] Model tasks remain queued; no source-bound E2EE transport"
+            );
+            loop {
+                match shutdown_rx.recv().await {
+                    Ok(_) | Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+            return;
+        }
         info!(
             batch_size = self.batch_size,
             poll_interval_secs = self.poll_interval.as_secs(),
@@ -193,9 +219,18 @@ impl TaskWorker {
             let storage = Arc::clone(&self.storage);
             let router = Arc::clone(&self.router);
             let task_timeout = self.task_timeout;
+            let allow_full_entity_extraction = self.allow_full_entity_extraction;
             let abort_handle = running.spawn(async move {
                 let timed_out =
-                    tokio::time::timeout(task_timeout, Self::process_task(storage, router, task))
+                    tokio::time::timeout(
+                        task_timeout,
+                        Self::process_task(
+                            storage,
+                            router,
+                            task,
+                            allow_full_entity_extraction,
+                        ),
+                    )
                         .await
                         .is_err();
                 (task_id, timed_out)
@@ -295,6 +330,7 @@ impl TaskWorker {
         storage: Arc<MemoryStorage>,
         router: Arc<LlmRouter>,
         task: CognitiveTaskRow,
+        allow_full_entity_extraction: bool,
     ) {
         let start = Instant::now();
         let task_id = task.id;
@@ -333,10 +369,68 @@ impl TaskWorker {
             }
         };
 
-        // [SUPERNODE-DURABLE-WRITEBACK 2026-08-14 by Codex] A staged result is
-        // the durable provider-call boundary. Retries after writeback failure or
-        // process restart reuse it, preventing duplicate inference and billing.
-        let mut reused_staged_result = task.result.is_some();
+        if task_type == CognitiveTaskType::EntityExtraction
+            && (!allow_full_entity_extraction || task.privacy_level != "full")
+        {
+            let _ = storage
+                .reject_task_without_retry(task_id, "llm_full_content_not_authorized")
+                .await;
+            return;
+        }
+        if task_type == CognitiveTaskType::EntityExtraction {
+            let owner_hex = payload["owner"].as_str().unwrap_or("");
+            let valid_owner_hex = owner_hex.len() == 64
+                && owner_hex.bytes().all(|byte| {
+                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                });
+            let owner = hex::decode(owner_hex)
+                .ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+            let session_matches = payload["session_id"].as_str() == task.target_id.as_deref();
+            let conversation_valid = payload["conversation"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty() && text.len() <= 64 * 1024);
+            let owner_matches = match (owner.as_ref(), task.target_id.as_deref()) {
+                (Some(owner), Some(session_id)) => {
+                    storage.session_belongs_to_owner(session_id, owner).await
+                }
+                _ => false,
+            };
+            if !valid_owner_hex || !session_matches || !conversation_valid || !owner_matches {
+                let _ = storage
+                    .reject_task_without_retry(task_id, "llm_entity_extraction_payload_invalid")
+                    .await;
+                return;
+            }
+        }
+
+        // [MEMCHAIN-PHALA-STAGE-RECOVERY 2026-10-05 by Codex] Staged output is
+        // not reusable unless its exact ACI proof can be revalidated. This
+        // worker currently has no such recovery package, so retries clear the
+        // response and perform a fresh attested call; usage history remains.
+        let reused_staged_result = task.result.is_some();
+        // [MEMCHAIN-PHALA-STAGE-RECOVERY 2026-10-05 by Codex] The current
+        // provider does not persist enough original response material to
+        // re-verify a staged result. Discard it and retry through the configured
+        // Phala policy instead of trusting editable usage metadata or writing
+        // back an unverified result. The provider usage audit remains intact.
+        if reused_staged_result {
+            if let Err(error) = storage
+                .discard_unverified_staged_task(
+                    task_id,
+                    "llm_staged_aci_evidence_unverified_recompute",
+                )
+                .await
+            {
+                warn!(
+                    id = task_id,
+                    reason = "staged_result_recovery_failed",
+                    "[TASK_WORKER] Could not reset unverified staged result"
+                );
+                debug!(id = task_id, error = %error, "[TASK_WORKER] Stage recovery detail");
+            }
+            return;
+        }
         let mut result_stored = task.result.clone().unwrap_or_default();
         let mut provider_used = task.provider_used.clone().unwrap_or_default();
         let mut model_used = task.model_used.clone().unwrap_or_default();
@@ -360,17 +454,49 @@ impl TaskWorker {
                 }
             };
 
+            // [PHALA-ACI-REQUEST-BOUNDARY 2026-10-07 by Codex] Generated
+            // prompts are checked too, before routing or any provider IO.
+            if chat_req.require_aci_verified {
+                if let Err(error) = chat_req.validate_aci_bounds() {
+                    let _ = storage.reject_task_without_retry(task_id, error.reason_code()).await;
+                    return;
+                }
+            }
+
             let resp = match router.route(&task_type, &chat_req).await {
                 Ok(r) => r,
                 Err(e) => {
                     let reason = e.reason_code();
                     warn!(id = task_id, reason, "[TASK_WORKER] LLM call failed");
+                    // [PHALA-ACI-REQUEST-BOUNDARY 2026-10-07 by Codex]
+                    // Invalid local input cannot improve through retries and
+                    // must not consume the task's inference retry budget.
+                    if matches!(e, super::llm_provider::LlmError::AciRequestRejected) {
+                        let _ = storage.reject_task_without_retry(task_id, reason).await;
+                        return;
+                    }
                     let _ = storage.fail_task(task_id, reason).await;
                     return;
                 }
             };
 
             latency_ms = start.elapsed().as_millis() as u64;
+            // [MEMCHAIN-PHALA-ACI-IDENTITY 2026-10-05 by Codex]
+            // [MEMCHAIN-PHALA-MEASUREMENT-POLICY 2026-10-05 by Codex]
+            // Recheck the router-owned trust policy at the durable write
+            // boundary, including the exact provider's measurement allowlist.
+            let verified_aci_response = router.response_has_accepted_aci_evidence(&resp);
+            if chat_req.require_aci_verified
+                && !verified_aci_response
+            {
+                // [MEMCHAIN-PHALA-ACI-HEADERS 2026-10-05 by Codex] Keep the
+                // durable staging/writeback boundary fail-closed even for a
+                // future provider adapter that bypasses LlmRouter.
+                let _ = storage
+                    .fail_task(task_id, "llm_aci_response_contract_violation")
+                    .await;
+                return;
+            }
             input_tokens = resp.usage.input_tokens;
             output_tokens = resp.usage.output_tokens;
             provider_used = resp.provider_name.clone();
@@ -378,12 +504,20 @@ impl TaskWorker {
 
             let cleaned = clean_llm_response(&resp.content, &task_type);
             result_stored = truncate_utf8(&cleaned, MAX_RESULT_LEN).to_string();
-            let token_usage_json = serde_json::json!({
+            let mut usage_metadata = serde_json::json!({
                 "input": input_tokens,
                 "output": output_tokens,
                 "cached": resp.usage.cached_tokens,
-            })
-            .to_string();
+            });
+            // [MEMCHAIN-PHALA-ACI-IDENTITY 2026-10-05 by Codex]
+            // Preserve routing hints for audit; they are not verified evidence.
+            if let Some(hints) = &resp.aci_response_hints {
+                usage_metadata["aci_response_hints"] = serde_json::json!(hints);
+            }
+            if let Some(proof) = &resp.aci_verification {
+                usage_metadata["aci_verification"] = serde_json::json!(proof);
+            }
+            let token_usage_json = usage_metadata.to_string();
             let usage = TaskUsageRecord {
                 provider: &provider_used,
                 model: &model_used,
@@ -399,16 +533,16 @@ impl TaskWorker {
             {
                 Ok(StageTaskResult::Stored) => {}
                 Ok(StageTaskResult::AlreadyStored) => {
-                    let Some(staged) = storage.get_task(task_id).await else {
-                        let _ = storage.fail_task(task_id, "task_result_stage_lost").await;
-                        return;
-                    };
-                    let Some(staged_result) = staged.result else {
-                        let _ = storage.fail_task(task_id, "task_result_stage_lost").await;
-                        return;
-                    };
-                    result_stored = staged_result;
-                    reused_staged_result = true;
+                    // [MEMCHAIN-PHALA-RECOVERY-HOLD 2026-10-05 by Codex]
+                    // The competing staged response has not been reverified
+                    // against its exact response bytes; retain it for audit.
+                    let _ = storage
+                        .quarantine_staged_task(
+                            task_id,
+                            "llm_staged_aci_evidence_unverified",
+                        )
+                        .await;
+                    return;
                 }
                 Err(error) => {
                     warn!(
@@ -662,6 +796,21 @@ impl TaskWorker {
                     privacy_level: privacy,
                 })
             }
+
+            CognitiveTaskType::EntityExtraction => {
+                if privacy != PrivacyLevel::Full {
+                    return Err("entity extraction requires explicit full-content consent".into());
+                }
+                let conversation = payload["conversation"]
+                    .as_str()
+                    .filter(|text| !text.is_empty() && text.len() <= 64 * 1024)
+                    .ok_or("missing or oversized extraction conversation")?;
+                build_entity_extraction(&EntityExtractionInput {
+                    session_id: payload["session_id"].as_str().ok_or("missing session_id")?,
+                    conversation,
+                    truncated: payload["truncated"].as_bool().unwrap_or(false),
+                })
+            }
         };
 
         Ok(ChatRequest {
@@ -670,6 +819,9 @@ impl TaskWorker {
             max_tokens: None,
             temperature: None,
             stop: None,
+            // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex] Cognitive task
+            // payloads can contain user memory; never route them to local/non-ACI inference.
+            require_aci_verified: true,
         })
     }
 
@@ -691,6 +843,7 @@ impl TaskWorker {
             CognitiveTaskType::ConflictResolution => "knowledge_edges",
             CognitiveTaskType::CodeAnalysis => "artifacts",
             CognitiveTaskType::EntityDescription => "entities",
+            CognitiveTaskType::EntityExtraction => "sessions",
         };
         if target_table != expected_table {
             return Err(TaskWritebackError::reuse("task_target_table_mismatch"));
@@ -757,23 +910,19 @@ impl TaskWorker {
                 if summary.is_empty() {
                     return Err(TaskWritebackError::recompute("recall_synthesis_empty"));
                 }
-                let conn = storage.conn_lock().await;
-                let affected = conn
-                    .execute(
-                        "UPDATE sessions SET
-                            summary = ?1, key_decisions = ?2, summary_generated = 1
-                         WHERE session_id = ?3",
-                        rusqlite::params![summary, key_decisions, target_id],
-                    )
+                // [MEMCHAIN-PHALA-SUMMARY-WRITEBACK 2026-10-06 by Codex]
+                // The guarded storage transition prevents stale task results from
+                // replacing a summary that another worker already completed.
+                let (owner, persisted_summary) = storage
+                    .complete_session_summary_from_task(target_id, summary, key_decisions)
+                    .await
                     .map_err(|error| {
                         debug!(error = %error, "[TASK_WORKER] Recall writeback detail");
                         TaskWritebackError::reuse("recall_synthesis_writeback_failed")
                     })?;
-                if affected != 1 {
-                    return Err(TaskWritebackError::reuse(
-                        "recall_synthesis_target_not_found",
-                    ));
-                }
+                storage
+                    .fts_index_session(target_id, &owner, &persisted_summary)
+                    .await;
                 debug!(
                     writeback = "recall_synthesis",
                     "[TASK_WORKER] Target updated"
@@ -901,6 +1050,123 @@ impl TaskWorker {
                     "[TASK_WORKER] Target updated"
                 );
             }
+
+            CognitiveTaskType::EntityExtraction => {
+                let parsed = parse_json_result(result);
+                let Some(entity_rows) = parsed["entities"].as_array() else {
+                    return Err(TaskWritebackError::recompute(
+                        "entity_extraction_invalid_result",
+                    ));
+                };
+                if entity_rows.len() > 64 {
+                    return Err(TaskWritebackError::recompute(
+                        "entity_extraction_result_limit",
+                    ));
+                }
+                let mut entities = Vec::with_capacity(entity_rows.len());
+                let mut ids_by_name = HashMap::new();
+                for row in entity_rows {
+                    let (Some(name), Some(kind)) = (
+                        row["name"].as_str(),
+                        row["type"].as_str(),
+                    ) else {
+                        return Err(TaskWritebackError::recompute(
+                            "entity_extraction_invalid_entity",
+                        ));
+                    };
+                    let normalized = name.trim().to_lowercase();
+                    let kind = kind.trim();
+                    if normalized.len() < 2
+                        || normalized.len() > 256
+                        || kind.is_empty()
+                        || kind.len() > 64
+                        || normalized.chars().any(char::is_control)
+                        || kind.chars().any(char::is_control)
+                    {
+                        return Err(TaskWritebackError::recompute(
+                            "entity_extraction_invalid_entity",
+                        ));
+                    }
+                    use sha2::{Digest, Sha256};
+                    let owner_hex = payload["owner"].as_str().unwrap_or("");
+                    if owner_hex.len() != 64
+                        || !owner_hex.bytes().all(|byte| {
+                            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                        })
+                    {
+                        return Err(TaskWritebackError::reuse(
+                            "entity_extraction_owner_invalid",
+                        ));
+                    }
+                    let mut hasher = Sha256::new();
+                    hasher.update(owner_hex.as_bytes());
+                    hasher.update(b":");
+                    hasher.update(normalized.as_bytes());
+                    let entity_id = format!("ent_{}", &hex::encode(hasher.finalize())[..16]);
+                    ids_by_name.insert(normalized, entity_id);
+                    entities.push((name.trim().to_owned(), kind.to_owned()));
+                }
+                let Some(relation_rows) = parsed["relations"].as_array() else {
+                    return Err(TaskWritebackError::recompute(
+                        "entity_extraction_invalid_relations",
+                    ));
+                };
+                if relation_rows.len() > 128 {
+                    return Err(TaskWritebackError::recompute(
+                        "entity_extraction_relation_limit",
+                    ));
+                }
+                let mut relations = Vec::with_capacity(relation_rows.len());
+                for row in relation_rows {
+                    let (Some(source), Some(target), Some(kind)) = (
+                        row["source"].as_str(),
+                        row["target"].as_str(),
+                        row["type"].as_str(),
+                    ) else {
+                        return Err(TaskWritebackError::recompute(
+                            "entity_extraction_invalid_relation",
+                        ));
+                    };
+                    let source = source.trim().to_lowercase();
+                    let target = target.trim().to_lowercase();
+                    let kind = kind.trim().to_ascii_uppercase();
+                    if source == target
+                        || !ids_by_name.contains_key(&source)
+                        || !ids_by_name.contains_key(&target)
+                        || kind.is_empty()
+                        || kind.len() > 64
+                        || !kind.bytes().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+                    {
+                        return Err(TaskWritebackError::recompute(
+                            "entity_extraction_invalid_relation",
+                        ));
+                    }
+                    let fact = row["fact"]
+                        .as_str()
+                        .filter(|fact| fact.len() <= 512)
+                        .unwrap_or("")
+                        .to_owned();
+                    relations.push((source, target, kind, fact));
+                }
+                let owner_hex = payload["owner"].as_str().unwrap_or("");
+                let owner_bytes = hex::decode(owner_hex)
+                    .map_err(|_| TaskWritebackError::reuse("entity_extraction_owner_invalid"))?;
+                let owner: [u8; 32] = owner_bytes
+                    .try_into()
+                    .map_err(|_| TaskWritebackError::reuse("entity_extraction_owner_invalid"))?;
+                if payload["session_id"].as_str() != Some(target_id) {
+                    return Err(TaskWritebackError::reuse(
+                        "entity_extraction_session_mismatch",
+                    ));
+                }
+                storage
+                    .apply_phala_entity_extraction(&owner, target_id, &entities, &relations)
+                    .await
+                    .map_err(|error| {
+                        debug!(error = %error, "[TASK_WORKER] Entity extraction writeback detail");
+                        TaskWritebackError::reuse("entity_extraction_writeback_failed")
+                    })?;
+            }
         }
 
         Ok(())
@@ -936,6 +1202,7 @@ fn clean_llm_response(raw: &str, task_type: &CognitiveTaskType) -> String {
         CognitiveTaskType::RecallSynthesis
             | CognitiveTaskType::ConflictResolution
             | CognitiveTaskType::CodeAnalysis
+            | CognitiveTaskType::EntityExtraction
     ) {
         return trimmed.to_string();
     }
@@ -1060,6 +1327,41 @@ mod tests {
     use super::*;
     use crate::config_supernode::TaskRoutingConfig;
 
+    // [MEMCHAIN-PHALA-ACI1-DIGEST-IDENTITY 2026-10-07 by Codex]
+    fn aci_test_evidence(keyset: char) -> super::super::llm_provider::AciVerificationEvidence {
+        super::super::llm_provider::AciVerificationEvidence {
+            // [PHALA-133171-PROFILE 2026-10-08 by Codex] Source fixture
+            // only; persisted untagged evidence is never newly accepted.
+            wire_profile: super::super::llm_provider::PHALA_ACI_WIRE_PROFILE.into(),
+            key_custody_scope: "identity_kms_operational_measured_code".into(),
+            workload_id: format!("sha256:{}", "c".repeat(64)),
+            keyset_digest: format!("sha256:{}", keyset.to_string().repeat(64)),
+            compose_hash: format!("sha256:{}", "e".repeat(64)),
+            kms_root_public_key: format!("0x02{}", "f".repeat(64)),
+            receipt_id: "test-receipt".into(),
+            upstream_session_id: format!("as_{}", "a".repeat(64)),
+            upstream_session: serde_json::json!({"test_only": true}),
+            upstream_claim_scope: "gateway_assertion".into(),
+            request_body_sha256: format!("sha256:{}", "c".repeat(64)),
+            response_body_sha256: format!("sha256:{}", "d".repeat(64)),
+            // [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex]
+            attestation_report: serde_json::json!({
+                "workload_id": format!("sha256:{}", "c".repeat(64)),
+                "workload_keyset_digest": format!("sha256:{}", keyset.to_string().repeat(64)),
+                "attestation": {"source_provenance": {
+                    "repo_url": "https://example.invalid/phala-gateway",
+                    "repo_commit": "0123456789abcdef0123456789abcdef01234567"
+                }}
+            }),
+            receipt: serde_json::json!({
+                "workload_id": format!("sha256:{}", "c".repeat(64)),
+                "workload_keyset_digest": format!("sha256:{}", keyset.to_string().repeat(64)),
+                "test_only": true
+            }),
+            upstream_verified_required: true,
+        }
+    }
+
     struct PanickingProvider;
 
     struct CountingProvider {
@@ -1085,6 +1387,29 @@ mod tests {
         fn default_model(&self) -> &str {
             "panic-model"
         }
+
+        fn supports_aci_verified(&self) -> bool { true }
+
+        fn has_cryptographic_aci_verifier(&self) -> bool { true }
+
+        // [MEMCHAIN-PHALA-MEASUREMENT-POLICY 2026-10-05 by Codex]
+        fn accepts_aci_compose_hash(&self, hash: &str) -> bool {
+            hash == format!("sha256:{}", "e".repeat(64))
+        }
+        fn accepts_aci_kms_root(&self, root: &str) -> bool {
+            root == format!("0x02{}", "f".repeat(64))
+        }
+        // [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex]
+        fn accepts_aci_source_provenance(
+            &self,
+            compose_hash: &str,
+            provenance: &serde_json::Value,
+        ) -> bool {
+            compose_hash == format!("sha256:{}", "e".repeat(64))
+                && provenance["repo_url"] == "https://example.invalid/phala-gateway"
+                && provenance["repo_commit"]
+                    == "0123456789abcdef0123456789abcdef01234567"
+        }
     }
 
     #[async_trait::async_trait]
@@ -1101,6 +1426,15 @@ mod tests {
                 model_used: "counting-model".to_string(),
                 provider_name: "counting-provider".to_string(),
                 latency_ms: 1,
+                // [MEMCHAIN-PHALA-ACI-PINNED-CONTRACT 2026-10-06 by Codex]
+                // [PHALA-133171-PROFILE 2026-10-08 by Codex] Stable ID.
+                aci_response_hints: Some(super::super::llm_provider::AciResponseHints {
+                    version: "aci/1".into(),
+                    workload_id: format!("sha256:{}", "c".repeat(64)),
+                    keyset_digest: format!("sha256:{}", "a".repeat(64)),
+                    receipt_id: "test-receipt".into(),
+                }),
+                aci_verification: Some(aci_test_evidence('a')),
             })
         }
 
@@ -1110,6 +1444,29 @@ mod tests {
 
         fn default_model(&self) -> &str {
             "counting-model"
+        }
+
+        fn supports_aci_verified(&self) -> bool { true }
+
+        fn has_cryptographic_aci_verifier(&self) -> bool { true }
+
+        // [MEMCHAIN-PHALA-MEASUREMENT-POLICY 2026-10-05 by Codex]
+        fn accepts_aci_compose_hash(&self, hash: &str) -> bool {
+            hash == format!("sha256:{}", "e".repeat(64))
+        }
+        fn accepts_aci_kms_root(&self, root: &str) -> bool {
+            root == format!("0x02{}", "f".repeat(64))
+        }
+        // [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex]
+        fn accepts_aci_source_provenance(
+            &self,
+            compose_hash: &str,
+            provenance: &serde_json::Value,
+        ) -> bool {
+            compose_hash == format!("sha256:{}", "e".repeat(64))
+                && provenance["repo_url"] == "https://example.invalid/phala-gateway"
+                && provenance["repo_commit"]
+                    == "0123456789abcdef0123456789abcdef01234567"
         }
     }
 
@@ -1131,6 +1488,15 @@ mod tests {
                 model_used: "recovering-model".to_string(),
                 provider_name: "recovering-provider".to_string(),
                 latency_ms: 1,
+                // [MEMCHAIN-PHALA-ACI-PINNED-CONTRACT 2026-10-06 by Codex]
+                // [PHALA-133171-PROFILE 2026-10-08 by Codex] Stable ID.
+                aci_response_hints: Some(super::super::llm_provider::AciResponseHints {
+                    version: "aci/1".into(),
+                    workload_id: format!("sha256:{}", "c".repeat(64)),
+                    keyset_digest: format!("sha256:{}", "b".repeat(64)),
+                    receipt_id: "test-receipt".into(),
+                }),
+                aci_verification: Some(aci_test_evidence('b')),
             })
         }
 
@@ -1141,6 +1507,29 @@ mod tests {
         fn default_model(&self) -> &str {
             "recovering-model"
         }
+
+        fn supports_aci_verified(&self) -> bool { true }
+
+        fn has_cryptographic_aci_verifier(&self) -> bool { true }
+
+        // [MEMCHAIN-PHALA-MEASUREMENT-POLICY 2026-10-05 by Codex]
+        fn accepts_aci_compose_hash(&self, hash: &str) -> bool {
+            hash == format!("sha256:{}", "e".repeat(64))
+        }
+        fn accepts_aci_kms_root(&self, root: &str) -> bool {
+            root == format!("0x02{}", "f".repeat(64))
+        }
+        // [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex]
+        fn accepts_aci_source_provenance(
+            &self,
+            compose_hash: &str,
+            provenance: &serde_json::Value,
+        ) -> bool {
+            compose_hash == format!("sha256:{}", "e".repeat(64))
+                && provenance["repo_url"] == "https://example.invalid/phala-gateway"
+                && provenance["repo_commit"]
+                    == "0123456789abcdef0123456789abcdef01234567"
+        }
     }
 
     #[async_trait::async_trait]
@@ -1148,6 +1537,10 @@ mod tests {
         async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
             std::future::pending().await
         }
+
+        fn supports_aci_verified(&self) -> bool { true }
+
+        fn has_cryptographic_aci_verifier(&self) -> bool { true }
 
         fn name(&self) -> &str {
             "pending-provider"
@@ -1168,6 +1561,33 @@ mod tests {
             )],
             TaskRoutingConfig::default(),
         ))
+    }
+
+    // [PHALA-ACI-REQUEST-BOUNDARY 2026-10-07 by Codex] Authored only:
+    // exercise the real claimed-task handler and durable terminal transition,
+    // not the startup-disabled batch loop or a replacement error classifier.
+    #[tokio::test]
+    async fn oversized_generated_prompt_is_rejected_without_provider_or_retry() {
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let payload = serde_json::json!({"entity_names": ["x".repeat(1024 * 1024)]}).to_string();
+        let id = storage.insert_cognitive_task(
+            "session_title", 1, &payload, None, None, None, "structured", 2,
+        ).await.unwrap().unwrap();
+        let provider = Arc::new(CountingProvider { calls: AtomicUsize::new(0) });
+        let erased: Arc<dyn LlmProvider> = provider.clone();
+        let router = Arc::new(LlmRouter::new(vec![(
+            "counting".into(), "https://example.invalid".into(), "model".into(), erased,
+        )], TaskRoutingConfig::default()));
+        let task = storage.claim_pending_tasks(1).await.pop().unwrap();
+        assert_eq!(task.id, id);
+        TaskWorker::process_task(Arc::clone(&storage), router, task, false).await;
+        let rejected = storage.get_task(id).await.unwrap();
+        assert_eq!(rejected.status, "failed");
+        assert_eq!(rejected.retry_count, 0);
+        assert_eq!(rejected.error_message.as_deref(), Some("llm_aci_request_rejected"));
+        assert!(rejected.result.is_none());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(storage.claim_pending_tasks(1).await.is_empty());
     }
 
     #[test]
@@ -1444,7 +1864,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writeback_retry_reuses_staged_result_without_rebilling() {
+    // [MEMCHAIN-PHALA-RECOVERY-HOLD 2026-10-05 by Codex] Authored, not executed.
+    async fn writeback_retry_discards_staged_result_then_recomputes() {
         let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
         let task_id = storage
             .insert_cognitive_task(
@@ -1497,6 +1918,20 @@ mod tests {
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert_eq!(storage.get_usage_stats(0, 0).await.total_calls, 1);
 
+        worker.process_batch().await;
+        let recovered = storage.get_task(task_id).await.unwrap();
+        assert_eq!(recovered.status, "pending");
+        assert_eq!(recovered.retry_count, 1);
+        assert_eq!(
+            recovered.error_message.as_deref(),
+            Some("llm_staged_aci_evidence_unverified_recompute")
+        );
+        assert!(recovered.result.is_none());
+        assert!(recovered.provider_used.is_none());
+        assert!(recovered.token_usage.is_none());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.get_usage_stats(0, 0).await.total_calls, 1);
+
         {
             let conn = storage.conn_lock().await;
             conn.execute(
@@ -1506,23 +1941,11 @@ mod tests {
             )
             .unwrap();
         }
-
         worker.process_batch().await;
         let completed = storage.get_task(task_id).await.unwrap();
         assert_eq!(completed.status, "completed");
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(storage.get_usage_stats(0, 0).await.total_calls, 1);
-
-        let title: String = {
-            let conn = storage.conn_lock().await;
-            conn.query_row(
-                "SELECT title FROM sessions WHERE session_id = ?1",
-                rusqlite::params!["session-retry"],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
-        assert_eq!(title, "Durable session title");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(storage.get_usage_stats(0, 0).await.total_calls, 2);
     }
 
     #[tokio::test]

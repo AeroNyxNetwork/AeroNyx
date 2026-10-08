@@ -93,4 +93,18 @@ impl Server {
         .await
         .unwrap_or(false)
     }
+
+    /// Observes read-only terminal storage health without imposing the public
+    /// mutation issuer or capacity-admission policy.
+    // [PRIVATE-ONION-PULL-READINESS 2026-10-05 by Codex]
+    pub(super) async fn observe_blind_vault_terminal_readiness(
+        blind_vault: Option<Arc<BlindVaultService>>,
+    ) -> bool {
+        let Some(blind_vault) = blind_vault else {
+            return false;
+        };
+        tokio::task::spawn_blocking(move || blind_vault.private_terminal_readiness().is_ok())
+            .await
+            .unwrap_or(false)
+    }
 }

@@ -363,7 +363,10 @@ impl Server {
         let memchain = &self.config.memchain;
         let strict_gate_enabled = memchain.commitment_witness_startup_required
             || memchain.commitment_coordinator_lease_required;
-        if !memchain.commitment_coordinator_enabled
+        // [PHALA-PRIVATE-RECIPIENT-EGRESS 2026-10-06 by Codex] The endpoint-
+        // free worker must not preflight independent witness destinations.
+        if self.config.reverse_onion.recipient.enabled
+            || !memchain.commitment_coordinator_enabled
             || !strict_gate_enabled
             || !self.config.discovery.enabled
             || !self.config.discovery.advertise_self
@@ -423,7 +426,11 @@ impl Server {
         peer_store: &PeerStore,
         control_http_client: &reqwest::Client,
     ) -> Result<()> {
-        if !self.config.memchain.commitment_coordinator_enabled {
+        // [PHALA-PRIVATE-RECIPIENT-EGRESS 2026-10-06 by Codex] Startup
+        // witness polling is a separate peer egress path from discovery gossip.
+        if self.config.reverse_onion.recipient.enabled
+            || !self.config.memchain.commitment_coordinator_enabled
+        {
             return Ok(());
         }
 
@@ -574,7 +581,11 @@ impl Server {
         peer_store: &PeerStore,
         control_http_client: &reqwest::Client,
     ) -> Result<Option<[u8; 32]>> {
-        if !self.config.memchain.commitment_coordinator_lease_required {
+        // [PHALA-PRIVATE-RECIPIENT-EGRESS 2026-10-06 by Codex] Keep startup
+        // lease acquisition within the recipient's pinned-relay-only boundary.
+        if self.config.reverse_onion.recipient.enabled
+            || !self.config.memchain.commitment_coordinator_lease_required
+        {
             return Ok(None);
         }
         let witness_node_ids = self.config.memchain.commitment_witness_node_id_bytes();
@@ -635,7 +646,11 @@ impl Server {
         instance_id: Option<[u8; 32]>,
         control_http_client: Arc<reqwest::Client>,
     ) -> Option<JoinHandle<()>> {
-        if !self.config.memchain.commitment_coordinator_lease_required {
+        // [PHALA-PRIVATE-RECIPIENT-EGRESS 2026-10-06 by Codex] A private
+        // recipient has no independent coordinator/witness relationship.
+        if self.config.reverse_onion.recipient.enabled
+            || !self.config.memchain.commitment_coordinator_lease_required
+        {
             return None;
         }
         let instance_id = instance_id?;
@@ -782,7 +797,11 @@ impl Server {
         mut commitment_tip_rx: mpsc::Receiver<u64>,
         sync_http_client: Arc<reqwest::Client>,
     ) -> Option<JoinHandle<()>> {
-        if !self.config.memchain.commitment_coordinator_enabled {
+        // [PHALA-PRIVATE-RECIPIENT-EGRESS 2026-10-06 by Codex] A private
+        // recipient has no independent coordinator/witness relationship.
+        if self.config.reverse_onion.recipient.enabled
+            || !self.config.memchain.commitment_coordinator_enabled
+        {
             return None;
         }
 
@@ -1150,7 +1169,11 @@ impl Server {
         mut block_announce_rx: mpsc::Receiver<u64>,
         sync_http_client: Arc<reqwest::Client>,
     ) -> Result<Option<JoinHandle<()>>> {
-        if !self.config.memchain.commitment_sync_enabled {
+        // [PHALA-PRIVATE-RECIPIENT-EGRESS 2026-10-06 by Codex] Do not let a
+        // direct runtime caller bypass the private role's no-peer-sync policy.
+        if self.config.reverse_onion.recipient.enabled
+            || !self.config.memchain.commitment_sync_enabled
+        {
             return Ok(None);
         }
         let Some(coordinator_node_id) = self.config.memchain.commitment_sync_coordinator_node_id()

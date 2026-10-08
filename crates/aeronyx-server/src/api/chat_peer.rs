@@ -607,21 +607,24 @@ use crate::services::chat_relay::{
     BlindRelayRouteAdmission, ChatRelayError, ChatRelayInboundFailureReason,
 };
 use crate::services::chat_relay_mailbox::AnonymousMailboxCustodyRepository;
-use crate::services::peer_store::PeerStore;
+use crate::services::peer_store::{PeerStore, PrivateOnionQueueIdentityPins};
 use crate::services::{
     BlindVaultPutFailureClass, BlindVaultServiceError, ChatRelayService, Session, SessionManager,
     SharedBlindVaultService,
 };
 use crate::services::reverse_onion_queue::{
-    ReverseOnionQueueAdmission, ReverseOnionQueueItem,
+    ReverseOnionQueueAdmission, ReverseOnionQueueItem, ReverseOnionQueueStoredItem,
 };
 use crate::services::reverse_onion_queue_db::{ReverseOnionQueueDb, ReverseOnionQueueDbError};
 
 mod outbound_transport;
 use outbound_transport::{
-    blind_peer_relay_url, blind_relay_response_observed_at, forward_blind_relay_with_retry,
-    prepare_blind_relay_forward_request,
+    blind_relay_response_observed_at,
+    forward_blind_relay_with_resolved_target, prepare_blind_relay_forward_request,
+    resolve_blind_peer_relay_target,
 };
+#[cfg(test)]
+use outbound_transport::{blind_peer_relay_url, forward_blind_relay_with_retry};
 pub(crate) use outbound_transport::{
     blind_relay_delivery_receipt_is_valid, prepare_exact_peer_blind_relay_http_request,
     prepare_peer_blind_relay_http_request_with, prepare_peer_chat_relay_request_v1,
@@ -755,6 +758,19 @@ const BLIND_RELAY_MAX_ENVELOPE_AGE_SECS: u64 = 10 * 60;
 /// Small clock-skew allowance for peers whose clocks run slightly ahead.
 const BLIND_RELAY_MAX_FUTURE_SKEW_SECS: u64 = 120;
 
+// [REVERSE-PIN-ENCODING 2026-10-05 by Codex] Encoding failure is not an
+// identity: two failed encodings must never compare as the same authority.
+// Signature, freshness, and route validation remain mandatory at callers.
+pub(crate) fn same_signed_descriptor(
+    current: &SignedNodeDescriptor,
+    expected: &SignedNodeDescriptor,
+) -> bool {
+    matches!(
+        (current.encode_canonical(), expected.encode_canonical()),
+        (Ok(current), Ok(expected)) if current == expected
+    )
+}
+
 /// Trusted, source-local admission for the one supported private hop shape
 /// S -> local relay R -> configured private recipient P.
 ///
@@ -765,15 +781,30 @@ const BLIND_RELAY_MAX_FUTURE_SKEW_SECS: u64 = 120;
 #[derive(Clone)]
 pub(crate) struct PrivateBlindRelayAdmission {
     local_relay_node_id: [u8; 32],
-    relay_descriptor: SignedNodeDescriptor,
-    recipient_descriptor: SignedNodeDescriptor,
-    authorization: SignedPrivateOnionRecipientAuthorizationV1,
+    recipient_node_id: [u8; 32],
+    // [PHALA-REVERSE-AUTHORITY-BOOTSTRAP 2026-10-06 by Codex] Optional
+    // signed startup seeds are not authority. Live requests always resolve
+    // the exact current R/P/grant tuple from PeerStore.
+    relay_descriptor_seed: Option<SignedNodeDescriptor>,
+    recipient_descriptor_seed: Option<SignedNodeDescriptor>,
+    authorization_seed: Option<SignedPrivateOnionRecipientAuthorizationV1>,
     purpose: OnionRoutePurpose,
     allowed_sources: Arc<[[u8; 32]]>,
     queue: Arc<ReverseOnionQueueDb>,
     queue_admission: Arc<Semaphore>,
+    // [PHALA-QUEUE-RESPONSE-DRAIN 2026-10-08 by Codex] Ingress and HTTP
+    // reclaim the same response-held slots, including after a cancelled drain.
+    queue_responses: Arc<super::ReverseOnionResponseRegistry>,
+    queue_stopped: Arc<std::sync::atomic::AtomicBool>,
+    queue_max_in_flight: u32,
     authority_commitment: [u8; 32],
     route_cap_secs: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PrivateBlindRelayQueueAuthoritySnapshot {
+    valid_until: u64,
+    commitment: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -796,26 +827,38 @@ impl PrivateBlindRelayAdmission {
         route_cap_secs: u64,
         now: u64,
     ) -> Result<Self, PrivateBlindRelayAdmissionError> {
-        if local_relay_node_id == [0; 32]
-            || relay_descriptor.node_id() != local_relay_node_id
-            || recipient_descriptor.node_id() == [0; 32]
-            || recipient_descriptor.node_id() == local_relay_node_id
+        // [PHALA-QUEUE-IDENTITY-PINS 2026-10-08 by Codex] A signed seed
+        // cannot bypass the same bounded identity policy used by cold start.
+        let pins = PrivateOnionQueueIdentityPins::new(
+            local_relay_node_id, recipient_descriptor.node_id(), allowed_sources,
+        ).map_err(|_| PrivateBlindRelayAdmissionError::Rejected)?;
+        if relay_descriptor.node_id() != pins.relay()
             || recipient_descriptor.descriptor.public_endpoint.is_some()
-            || allowed_sources.is_empty()
-            || queue_max_in_flight == 0
-            || route_cap_secs == 0
+            || recipient_descriptor.descriptor.policy.public_discovery
+            // [REVERSE-QUEUE-DRAIN 2026-10-05 by Codex] Direct internal
+            // construction must obey the same bound as config before the
+            // usize permit count is retained as the u32 drain count.
+            || !(1..=64).contains(&queue_max_in_flight)
+            || !(1..=aeronyx_core::protocol::discovery::MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_LIFETIME_SECS_V1)
+                .contains(&route_cap_secs)
+            || now == 0
             || purpose != OnionRoutePurpose::BlindVaultPull
         {
             return Err(PrivateBlindRelayAdmissionError::Rejected);
         }
-        if relay_descriptor.verify_at(now).is_err()
-            || recipient_descriptor.verify_at(now).is_err()
+        // [REVERSE-ONION-AUTHORITY-RENEWAL 2026-10-05 by Codex] The configured
+        // token seeds role identity at startup; expiration cannot disable
+        // startup, while only a current token can pass per-enqueue admission.
+        let authority_issued_at = authorization.issued_at();
+        if relay_descriptor.verify_signature().is_err()
+            || recipient_descriptor.verify_signature().is_err()
+            || authority_issued_at > now
             || authorization
                 .verify_at(
                     &relay_descriptor,
                     &recipient_descriptor,
                     purpose.as_str(),
-                    now,
+                    authority_issued_at,
                 )
                 .is_err()
         {
@@ -840,17 +883,14 @@ impl PrivateBlindRelayAdmission {
                 .map_err(|_| PrivateBlindRelayAdmissionError::Rejected)?,
         );
         let authority_commitment: [u8; 32] = authority_hasher.finalize().into();
-        for source in &allowed_sources {
-            if *source == [0; 32]
-                || *source == local_relay_node_id
-                || *source == recipient_descriptor.node_id()
-                || VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+        for source in pins.sources() {
+            if VerifiedOnionRoute::from_signed_private_recipient_descriptors(
                     *source,
                     &relay_descriptor,
                     &recipient_descriptor,
                     &authorization,
                     purpose,
-                    now,
+                    authority_issued_at,
                 )
                 .is_err()
             {
@@ -859,48 +899,72 @@ impl PrivateBlindRelayAdmission {
         }
         Ok(Self {
             local_relay_node_id,
-            relay_descriptor,
-            recipient_descriptor,
-            authorization,
+            recipient_node_id: recipient_descriptor.node_id(),
+            relay_descriptor_seed: Some(relay_descriptor),
+            recipient_descriptor_seed: Some(recipient_descriptor),
+            authorization_seed: Some(authorization),
             purpose,
-            allowed_sources: allowed_sources.into(),
+            allowed_sources: pins.into_sources().into(),
             queue,
             queue_admission: Arc::new(Semaphore::new(queue_max_in_flight)),
+            queue_responses: Arc::new(super::ReverseOnionResponseRegistry::new(queue_max_in_flight)),
+            queue_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            queue_max_in_flight: queue_max_in_flight as u32,
             authority_commitment,
             route_cap_secs,
         })
     }
 
+    // [PHALA-REVERSE-AUTHORITY-BOOTSTRAP 2026-10-06 by Codex] A live queue
+    // may start from durable identity pins alone. It remains inert until
+    // authenticated discovery supplies current signed descriptors and P's
+    // exact-purpose grant; no config identity is treated as a signature.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_pinned_identity_only(
+        local_relay_node_id: [u8; 32],
+        recipient_node_id: [u8; 32],
+        purpose: OnionRoutePurpose,
+        allowed_sources: Vec<[u8; 32]>,
+        queue: Arc<ReverseOnionQueueDb>,
+        queue_max_in_flight: usize,
+        route_cap_secs: u64,
+    ) -> Result<Self, PrivateBlindRelayAdmissionError> {
+        // [PHALA-QUEUE-IDENTITY-PINS 2026-10-08 by Codex] No signature
+        // path or identity-only path may widen the rollout's operator policy.
+        let pins = PrivateOnionQueueIdentityPins::new(
+            local_relay_node_id, recipient_node_id, allowed_sources,
+        ).map_err(|_| PrivateBlindRelayAdmissionError::Rejected)?;
+        if !(1..=64).contains(&queue_max_in_flight)
+            || !(1..=aeronyx_core::protocol::discovery::MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_LIFETIME_SECS_V1)
+                .contains(&route_cap_secs)
+            || purpose != OnionRoutePurpose::BlindVaultPull
+        {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        Ok(Self {
+            local_relay_node_id,
+            recipient_node_id,
+            relay_descriptor_seed: None,
+            recipient_descriptor_seed: None,
+            authorization_seed: None,
+            purpose,
+            allowed_sources: pins.into_sources().into(),
+            queue,
+            queue_admission: Arc::new(Semaphore::new(queue_max_in_flight)),
+            queue_responses: Arc::new(super::ReverseOnionResponseRegistry::new(queue_max_in_flight)),
+            queue_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            queue_max_in_flight: queue_max_in_flight as u32,
+            authority_commitment: [0; 32],
+            route_cap_secs,
+        })
+    }
+
     pub(crate) fn recipient_node_id(&self) -> [u8; 32] {
-        self.recipient_descriptor.node_id()
+        self.recipient_node_id
     }
 
     pub(crate) fn source_allowed(&self, source: [u8; 32]) -> bool {
         self.allowed_sources.iter().any(|allowed| *allowed == source)
-    }
-
-    pub(crate) fn route_deadline(
-        &self,
-        envelope_timestamp: u64,
-        now: u64,
-    ) -> Result<u64, PrivateBlindRelayAdmissionError> {
-        let freshness = envelope_timestamp
-            .checked_add(BLIND_RELAY_MAX_ENVELOPE_AGE_SECS)
-            .ok_or(PrivateBlindRelayAdmissionError::Rejected)?;
-        let local_cap = envelope_timestamp
-            .checked_add(self.route_cap_secs)
-            .ok_or(PrivateBlindRelayAdmissionError::Rejected)?;
-        let deadline = self
-            .authorization
-            .expires_at()
-            .min(self.relay_descriptor.descriptor.expires_at)
-            .min(self.recipient_descriptor.descriptor.expires_at)
-            .min(freshness)
-            .min(local_cap);
-        if envelope_timestamp >= deadline || deadline <= now {
-            return Err(PrivateBlindRelayAdmissionError::Rejected);
-        }
-        Ok(deadline)
     }
 
     pub(crate) fn queue(&self) -> &Arc<ReverseOnionQueueDb> {
@@ -908,10 +972,61 @@ impl PrivateBlindRelayAdmission {
     }
 
     pub(crate) fn try_queue_permit(&self) -> Result<OwnedSemaphorePermit, PrivateBlindRelayAdmissionError> {
-        self.queue_admission
+        self.queue_responses.expire();
+        // [REVERSE-QUEUE-DRAIN 2026-10-05 by Codex] Cloned router capabilities
+        // share this stop bit and cannot start DB work after the drain boundary.
+        if self.queue_stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        let permit = self.queue_admission
             .clone()
             .try_acquire_owned()
-            .map_err(|_| PrivateBlindRelayAdmissionError::Rejected)
+            .map_err(|_| PrivateBlindRelayAdmissionError::Rejected)?;
+        if self.queue_stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        Ok(permit)
+    }
+
+    // [REVERSE-ONION-SHARED-ADMISSION 2026-10-05 by Codex] The relay ingress
+    // and reverse-onion polling API share one DB-work ceiling and drain owner.
+    pub(crate) fn queue_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.queue_admission)
+    }
+
+    // [PHALA-QUEUE-RESPONSE-DRAIN 2026-10-08 by Codex] Live API binding
+    // must share this registry as well as the semaphore and stop bit.
+    pub(crate) fn queue_response_registry(&self) -> Arc<super::ReverseOnionResponseRegistry> {
+        Arc::clone(&self.queue_responses)
+    }
+
+    // [PHALA-QUEUE-LIFECYCLE-OWNER 2026-10-07 by Codex] The mounted poll
+    // API and ciphertext ingress must close the same intake gate, not merely
+    // share a permit pool that becomes available again after a drain returns.
+    pub(crate) fn queue_stop_signal(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.queue_stopped)
+    }
+
+    pub(crate) fn queue_capacity(&self) -> usize {
+        self.queue_max_in_flight as usize
+    }
+
+    pub(crate) fn request_stop(&self) {
+        self.queue_stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    // [REVERSE-QUEUE-DRAIN-FENCE 2026-10-06 by Codex] A permit can outlive
+    // the intake check; repeat this inside the durable write authorization.
+    fn ensure_queue_active(&self) -> Result<(), PrivateBlindRelayAdmissionError> {
+        if self.queue_stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn shutdown_and_drain(&self) {
+        self.request_stop();
+        self.queue_responses.drain(Arc::clone(&self.queue_admission), self.queue_max_in_flight).await;
     }
 
     pub(crate) fn local_relay_node_id(&self) -> [u8; 32] {
@@ -925,6 +1040,224 @@ impl PrivateBlindRelayAdmission {
     pub(crate) fn purpose(&self) -> OnionRoutePurpose {
         self.purpose
     }
+
+    // [PRIVATE-RECIPIENT-FRESH-AUTH 2026-10-04 by Codex] A signed admission
+    // is a startup capability, not a permanent exemption from descriptor
+    // rotation/revocation. New durable effects must bind to the exact current
+    // PeerStore descriptors and the still-valid P authorization at enqueue
+    // time. Existing durable rows are recovered by the queue tuple before
+    // this gate and therefore are not stranded by a later rotation.
+    pub(crate) fn validate_current_enqueue(
+        &self,
+        peer_store: &PeerStore,
+        source: [u8; 32],
+        envelope_timestamp: u64,
+        now: u64,
+    ) -> Result<u64, PrivateBlindRelayAdmissionError> {
+        self.validate_current_enqueue_authority(peer_store, source, envelope_timestamp, now, None)
+            .map(|(deadline, _)| deadline)
+    }
+
+    // [REVERSE-ONION-AUTHORITY-RENEWAL 2026-10-05 by Codex]
+    pub(crate) fn validate_current_enqueue_authority(
+        &self,
+        peer_store: &PeerStore,
+        source: [u8; 32],
+        envelope_timestamp: u64,
+        now: u64,
+        supplied_authorization: Option<&SignedPrivateOnionRecipientAuthorizationV1>,
+    ) -> Result<(u64, [u8; 32]), PrivateBlindRelayAdmissionError> {
+        let _authority_snapshot = peer_store.private_onion_authority_read_guard();
+        self.validate_current_enqueue_authority_under_guard(
+            peer_store,
+            source,
+            envelope_timestamp,
+            now,
+            supplied_authorization,
+        )
+    }
+
+    // [REVERSE-ONION-SOURCE-AUTHORITY-SNAPSHOT 2026-10-05 by Codex]
+    // The durable queue transaction already owns this authority epoch.
+    pub(crate) fn validate_current_enqueue_authority_under_guard(
+        &self,
+        peer_store: &PeerStore,
+        source: [u8; 32],
+        envelope_timestamp: u64,
+        now: u64,
+        supplied_authorization: Option<&SignedPrivateOnionRecipientAuthorizationV1>,
+    ) -> Result<(u64, [u8; 32]), PrivateBlindRelayAdmissionError> {
+        self.ensure_queue_active()?;
+        if !self.source_allowed(source) || now == 0 {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        let (relay, recipient, authorization) = peer_store
+            .current_private_onion_authority_snapshot_under_guard(
+                &self.local_relay_node_id,
+                &self.recipient_node_id,
+                now,
+            )
+            .ok_or(PrivateBlindRelayAdmissionError::Rejected)?;
+        if relay.node_id() != self.local_relay_node_id
+            || recipient.node_id() != self.recipient_node_id
+        {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        if self.relay_descriptor_seed.as_ref().is_some_and(|seed| seed.node_id() != relay.node_id())
+            || self.recipient_descriptor_seed.as_ref().is_some_and(|seed| seed.node_id() != recipient.node_id())
+            || self.authorization_seed.as_ref().is_some_and(|seed| {
+                seed.relay_node_id() != authorization.relay_node_id()
+                    || seed.recipient_node_id() != authorization.recipient_node_id()
+                    || seed.canonical_purpose() != authorization.canonical_purpose()
+            })
+        {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        // [REVERSE-ONION-DISCOVERY-BOOTSTRAP 2026-10-05 by Codex] Historical
+        // configuration pins identity only. Enforce the current signed role
+        // contract here on every new queue effect after descriptor rotation.
+        if !crate::server::reverse_onion_current_pull_roles_valid(&relay, &recipient) {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        // The request header is transport evidence only; it cannot mint or
+        // renew queue authority. Resolve the grant from the bounded,
+        // descriptor-bound PeerStore cache for every admission. A supplied
+        // copy is accepted only when byte-identical to that current grant.
+        if supplied_authorization.is_some_and(|supplied| supplied != &authorization)
+            || authorization.relay_node_id() != self.local_relay_node_id
+            || authorization.recipient_node_id() != self.recipient_node_id
+            || authorization
+                .verify_at(&relay, &recipient, self.purpose.as_str(), now)
+                .is_err()
+            || VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                source,
+                &relay,
+                &recipient,
+                &authorization,
+                self.purpose,
+                now,
+            )
+            .is_err()
+        {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        let freshness = envelope_timestamp
+            .checked_add(BLIND_RELAY_MAX_ENVELOPE_AGE_SECS)
+            .ok_or(PrivateBlindRelayAdmissionError::Rejected)?;
+        let local_cap = envelope_timestamp
+            .checked_add(self.route_cap_secs)
+            .ok_or(PrivateBlindRelayAdmissionError::Rejected)?;
+        let deadline = authorization
+            .expires_at()
+            .min(relay.descriptor.expires_at)
+            .min(recipient.descriptor.expires_at)
+            .min(freshness)
+            .min(local_cap);
+        if envelope_timestamp >= deadline || deadline <= now {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        let mut authority_hasher = Sha256::new();
+        authority_hasher.update(b"AeroNyx-PrivateBlindRelay-Admission-v1");
+        authority_hasher.update(self.purpose.as_str().as_bytes());
+        authority_hasher.update(relay.encode_canonical().map_err(|_| PrivateBlindRelayAdmissionError::Rejected)?);
+        authority_hasher.update(recipient.encode_canonical().map_err(|_| PrivateBlindRelayAdmissionError::Rejected)?);
+        authority_hasher.update(authorization.encode_canonical().map_err(|_| PrivateBlindRelayAdmissionError::Rejected)?);
+        Ok((deadline, authority_hasher.finalize().into()))
+    }
+
+    // [REVERSE-ONION-LIVE-CLAIM-AUTH 2026-10-05 by Codex] A queued row may
+    // receive a new Lease only while its R/P/grant authority snapshot is
+    // current and the row's own immutable source/route commitment remains
+    // within that grant horizon. Existing Claim->Lease replay bypasses this
+    // gate in the queue state machine, preserving recovery after rotation.
+    pub(crate) fn validate_pending_lease_authority(
+        &self,
+        item: &ReverseOnionQueueStoredItem,
+        authority: PrivateBlindRelayQueueAuthoritySnapshot,
+        now: u64,
+    ) -> Result<(), PrivateBlindRelayAdmissionError> {
+        self.ensure_queue_active()?;
+        let source = item.source_node_id().ok_or(PrivateBlindRelayAdmissionError::Rejected)?;
+        if !self.source_allowed(source)
+            || item.immediate_recipient() != self.recipient_node_id()
+            || now >= authority.valid_until
+            || item.route_deadline() > authority.valid_until
+        {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        let mut route_body_hasher = Sha256::new();
+        route_body_hasher.update(b"AeroNyx-PrivateBlindRelay-RouteBody-v1");
+        route_body_hasher.update(authority.commitment);
+        route_body_hasher.update(item.route_id());
+        route_body_hasher.update(item.request_commitment());
+        route_body_hasher.update(item.envelope());
+        let current_route_body_commitment: [u8; 32] = route_body_hasher.finalize().into();
+        if current_route_body_commitment != item.route_body_commitment() {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        Ok(())
+    }
+
+    // [REVERSE-ONION-LIVE-CLAIM-AUTH 2026-10-05 by Codex] Compute expensive
+    // signature/descriptor validation once per authenticated poll; row scans
+    // then compare bounded commitments instead of repeating crypto per item.
+    // The queue DB caller holds PeerStore's authority read guard through commit.
+    pub(crate) fn current_queue_authority_snapshot(
+        &self,
+        peer_store: &PeerStore,
+        now: u64,
+    ) -> Result<PrivateBlindRelayQueueAuthoritySnapshot, PrivateBlindRelayAdmissionError> {
+        // [PHALA-QUEUE-AUTHORITY-HORIZON 2026-10-07 by Codex] This snapshot
+        // describes the shared R/P/grant epoch, not a synthetic envelope.
+        // Envelope freshness is already captured in each durable row's
+        // immutable route deadline and must not shorten that row at poll time.
+        self.ensure_queue_active()?;
+        if now == 0 {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        let (relay, recipient, authorization) = peer_store
+            .current_private_onion_authority_snapshot_under_guard(
+                &self.local_relay_node_id,
+                &self.recipient_node_id,
+                now,
+            )
+            .ok_or(PrivateBlindRelayAdmissionError::Rejected)?;
+        if relay.node_id() != self.local_relay_node_id
+            || recipient.node_id() != self.recipient_node_id
+            || !crate::server::reverse_onion_current_pull_roles_valid(&relay, &recipient)
+            || authorization.relay_node_id() != self.local_relay_node_id
+            || authorization.recipient_node_id() != self.recipient_node_id
+            || authorization
+                .verify_at(&relay, &recipient, self.purpose.as_str(), now)
+                .is_err()
+        {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        let mut authority_hasher = Sha256::new();
+        authority_hasher.update(b"AeroNyx-PrivateBlindRelay-Admission-v1");
+        authority_hasher.update(self.purpose.as_str().as_bytes());
+        authority_hasher.update(
+            relay.encode_canonical()
+                .map_err(|_| PrivateBlindRelayAdmissionError::Rejected)?,
+        );
+        authority_hasher.update(
+            recipient.encode_canonical()
+                .map_err(|_| PrivateBlindRelayAdmissionError::Rejected)?,
+        );
+        authority_hasher.update(
+            authorization.encode_canonical()
+                .map_err(|_| PrivateBlindRelayAdmissionError::Rejected)?,
+        );
+        let valid_until = authorization
+            .expires_at()
+            .min(relay.descriptor.expires_at)
+            .min(recipient.descriptor.expires_at);
+        if valid_until <= now {
+            return Err(PrivateBlindRelayAdmissionError::Rejected);
+        }
+        let commitment = authority_hasher.finalize().into();
+        Ok(PrivateBlindRelayQueueAuthoritySnapshot { valid_until, commitment })
+    }
 }
 // ============================================
 // State / Request / Response Types
@@ -937,6 +1270,8 @@ struct ChatPeerState {
     /// terminal frames. Absence is fail-closed and never falls back to chat.
     blind_vault: Option<SharedBlindVaultService>,
     anonymous_mailbox: Option<Arc<dyn AnonymousMailboxCustodyRepository>>,
+    // [REVERSE-ONION-TEST-FIXTURE 2026-10-06 by Codex] Legacy relay fixtures
+    // deliberately leave this opt-in capability absent.
     private_recipient_admission: Option<Arc<PrivateBlindRelayAdmission>>,
     sessions: Arc<SessionManager>,
     udp: Arc<UdpTransport>,
@@ -995,6 +1330,41 @@ impl PeerRelayRequestGate {
         now: Instant,
     ) -> AuthenticatedPeerRelayReplayStart {
         self.admission.begin_replay(request_commitment, now)
+    }
+}
+
+/// [PEER-RELAY-SHARED-RUNTIME 2026-10-04 by Codex] The node, VPN, and
+/// authenticated ticket surfaces may expose the same relay capability, but
+/// they must not multiply parser, replay, abuse, or in-flight budgets merely
+/// because the router is mounted more than once.
+#[derive(Clone)]
+pub(crate) struct PeerRelaySharedRuntime {
+    request_gate: Arc<PeerRelayRequestGate>,
+    blind_relay_in_flight: Arc<AtomicUsize>,
+    blind_relay_replay_registry: Arc<dyn BlindRelayReplayRegistry>,
+    blind_relay_abuse_guard: Arc<dyn BlindRelayAbusePolicy>,
+}
+
+impl PeerRelaySharedRuntime {
+    pub(crate) fn new(chat_relay: Option<Arc<ChatRelayService>>) -> Arc<Self> {
+        let requests_per_minute = chat_relay
+            .as_ref()
+            .map(|relay| relay.config().peer_relay_requests_per_minute)
+            .unwrap_or(DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE);
+        let authenticated_requests_per_minute = chat_relay
+            .as_ref()
+            .map(|relay| relay.config().peer_relay_authenticated_requests_per_minute)
+            .unwrap_or(DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE);
+        Arc::new(Self {
+            request_gate: Arc::new(PeerRelayRequestGate::new(
+                requests_per_minute,
+                authenticated_requests_per_minute,
+                chat_relay,
+            )),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        })
     }
 }
 
@@ -1076,6 +1446,18 @@ impl BlindRelayRouteLease {
             },
             recovered,
         }
+    }
+
+    // [PHALA-QUEUE-EFFECT-ADMISSION 2026-10-08 by Codex] Capacity failure
+    // precedes the effect fence. Fresh zero-write work stays releasable, while
+    // a recovered Armed lease is never downgraded. The caller moves this exact
+    // permit into its cancellation-surviving enqueue worker.
+    fn arm_private_queue_effect(
+        &mut self, admission: &PrivateBlindRelayAdmission, now: u64,
+    ) -> Result<OwnedSemaphorePermit, BlindRelayError> {
+        let permit = admission.try_queue_permit().map_err(|_| BlindRelayError::Backpressure)?;
+        self.arm_effect(now)?;
+        Ok(permit)
     }
 
     fn arm_effect(&mut self, now: u64) -> Result<(), BlindRelayError> {
@@ -1751,6 +2133,12 @@ enum BlindRelayError {
     #[error("blind relay verification capacity exhausted")]
     Backpressure,
 
+    // [REVERSE-ONION-AUTH-HEADER 2026-10-06 by Codex] Malformed optional
+    // private-route authorization is a client envelope error, not a peer
+    // signature failure.
+    #[error("invalid blind relay envelope")]
+    InvalidEnvelope,
+
     #[error("invalid previous hop public key")]
     InvalidPreviousHop,
 
@@ -1838,6 +2226,7 @@ impl BlindRelayError {
         match self {
             Self::InvalidPreviousHop
             | Self::InvalidSignature
+            | Self::InvalidEnvelope
             | Self::EnvelopeTooLarge
             | Self::TtlExhausted
             | Self::TimestampExpired
@@ -1865,6 +2254,7 @@ impl BlindRelayError {
             Self::Backpressure => "backpressure",
             Self::InvalidPreviousHop => "invalid_previous_hop",
             Self::InvalidSignature => "invalid_signature",
+            Self::InvalidEnvelope => "invalid_envelope",
             Self::EnvelopeTooLarge => "envelope_too_large",
             Self::TtlExhausted => "ttl_exhausted",
             Self::TimestampExpired => "timestamp_expired",
@@ -1961,6 +2351,8 @@ use blind_relay::map_terminal_chat_preparation_error;
 use blind_relay::map_terminal_reply_failure;
 use blind_relay::peer_blind_relay_handler;
 use blind_relay::peer_blind_relay_request_gate;
+// [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex]
+use blind_relay::private_terminal_purpose_allowed;
 use blind_relay::prepare_onion_terminal_payload;
 use blind_relay::process_authenticated_peer_blind_relay;
 use blind_relay::process_onion_blind_relay;
@@ -2073,19 +2465,39 @@ pub(crate) fn build_chat_peer_router_with_private_recipient_admission(
     anonymous_mailbox: Option<Arc<dyn AnonymousMailboxCustodyRepository>>,
     private_recipient_admission: Option<Arc<PrivateBlindRelayAdmission>>,
 ) -> Router {
-    let peer_relay_requests_per_minute = chat_relay
-        .as_ref()
-        .map(|relay| relay.config().peer_relay_requests_per_minute)
-        .unwrap_or(DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE);
-    let authenticated_peer_relay_requests_per_minute = chat_relay
-        .as_ref()
-        .map(|relay| relay.config().peer_relay_authenticated_requests_per_minute)
-        .unwrap_or(DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE);
-    let peer_relay_gate = Arc::new(PeerRelayRequestGate::new(
-        peer_relay_requests_per_minute,
-        authenticated_peer_relay_requests_per_minute,
-        chat_relay.clone(),
-    ));
+    build_chat_peer_router_with_private_recipient_admission_and_runtime(
+        chat_relay,
+        sessions,
+        udp,
+        peer_store,
+        node_identity,
+        http_client,
+        blind_vault,
+        anonymous_mailbox,
+        private_recipient_admission,
+        None,
+    )
+}
+
+// [PEER-RELAY-SHARED-RUNTIME 2026-10-04 by Codex] Internal startup callers
+// pass one shared budget/replay domain to every mounted peer surface. The
+// additive public(crate) builder above keeps existing embedded callers
+// default-off and preserves its old construction semantics.
+pub(crate) fn build_chat_peer_router_with_private_recipient_admission_and_runtime(
+    chat_relay: Option<Arc<ChatRelayService>>,
+    sessions: Arc<SessionManager>,
+    udp: Arc<UdpTransport>,
+    peer_store: Arc<PeerStore>,
+    node_identity: Arc<IdentityKeyPair>,
+    http_client: Arc<reqwest::Client>,
+    blind_vault: Option<SharedBlindVaultService>,
+    anonymous_mailbox: Option<Arc<dyn AnonymousMailboxCustodyRepository>>,
+    private_recipient_admission: Option<Arc<PrivateBlindRelayAdmission>>,
+    shared_runtime: Option<Arc<PeerRelaySharedRuntime>>,
+) -> Router {
+    let shared_runtime = shared_runtime.unwrap_or_else(|| {
+        PeerRelaySharedRuntime::new(chat_relay.clone())
+    });
     let state = ChatPeerState {
         chat_relay,
         blind_vault,
@@ -2096,16 +2508,16 @@ pub(crate) fn build_chat_peer_router_with_private_recipient_admission(
         peer_store,
         node_identity,
         http_client,
-        blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-        blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
-        blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        blind_relay_in_flight: Arc::clone(&shared_runtime.blind_relay_in_flight),
+        blind_relay_replay_registry: Arc::clone(&shared_runtime.blind_relay_replay_registry),
+        blind_relay_abuse_guard: Arc::clone(&shared_runtime.blind_relay_abuse_guard),
     };
     let peer_relay_router = Router::new()
         .route("/api/chat/peer/relay", post(peer_relay_handler))
         .route("/api/chat/peer/relay-v2", post(peer_relay_v2_handler))
         .route("/api/chat/peer/relay-v3", post(peer_relay_v3_handler))
         .route_layer(middleware::from_fn_with_state(
-            peer_relay_gate,
+            Arc::clone(&shared_runtime.request_gate),
             peer_relay_request_gate,
         ))
         .layer(DefaultBodyLimit::max(PEER_CHAT_REQUEST_BODY_MAX_BYTES));
@@ -2263,7 +2675,50 @@ impl PreparedOnionTerminalPayload {
 // ============================================
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    // [REVERSE-PIN-ENCODING 2026-10-05 by Codex] Authored, not executed.
+    #[test]
+    fn descriptor_pin_equality_rejects_encoding_failure() {
+        let identity = IdentityKeyPair::from_bytes(&[41; 32]).unwrap();
+        let valid = signed_peer_descriptor_for(
+            &identity, "https://8.8.8.8".to_owned(), 1_800_000_000,
+            1_800_000_600, vec![NodeCapability::ChatRelay],
+        );
+        assert!(same_signed_descriptor(&valid, &valid));
+        let mut oversized = valid.clone();
+        oversized.descriptor.software_version = "x".repeat(1024 * 1024);
+        assert!(oversized.encode_canonical().is_err());
+        assert!(!same_signed_descriptor(&oversized, &oversized));
+        assert!(!same_signed_descriptor(&valid, &oversized));
+        assert!(!same_signed_descriptor(&oversized, &valid));
+    }
+
+    #[test]
+    fn peer_surfaces_share_one_relay_runtime_budget_domain() {
+        // [PEER-RELAY-SHARED-RUNTIME 2026-10-04 by Codex] Node/VPN/ticket
+        // router construction must retain one process-wide admission, replay,
+        // abuse, and blind in-flight domain rather than clone independent
+        // limits for each listener.
+        let runtime = PeerRelaySharedRuntime::new(None);
+        let clone = Arc::clone(&runtime);
+        assert!(Arc::ptr_eq(
+            &runtime.request_gate,
+            &clone.request_gate
+        ));
+        assert!(Arc::ptr_eq(
+            &runtime.blind_relay_in_flight,
+            &clone.blind_relay_in_flight
+        ));
+        assert!(Arc::ptr_eq(
+            &runtime.blind_relay_replay_registry,
+            &clone.blind_relay_replay_registry
+        ));
+        assert!(Arc::ptr_eq(
+            &runtime.blind_relay_abuse_guard,
+            &clone.blind_relay_abuse_guard
+        ));
+    }
+
     mod blind_relay;
     mod direct_relay;
     mod other;
@@ -2299,6 +2754,70 @@ mod tests {
     use crate::api::PEER_ACK_RESPONSE_MAX_BYTES;
     use crate::config::{BlindVaultConfig, ChatRelayConfig};
     use crate::services::{BlindVaultLeaseProvisionOutcome, BlindVaultService};
+
+    // [PHALA-QUEUE-AUTHORITY-HORIZON 2026-10-07 by Codex] Authored, not run:
+    // the current grant horizon must not be clipped to a synthetic envelope's
+    // ten-minute freshness window when a valid queued route used allowed skew.
+    #[test]
+    fn current_queue_authority_horizon_uses_signed_route_expiry() {
+        let relay = IdentityKeyPair::from_bytes(&[0xC1; 32]).unwrap();
+        let recipient = IdentityKeyPair::from_bytes(&[0xC2; 32]).unwrap();
+        let source = IdentityKeyPair::from_bytes(&[0xC3; 32]).unwrap();
+        let now = now_secs();
+        let purpose = OnionRoutePurpose::BlindVaultPull;
+
+        let mut relay_body = NodeDescriptor::new(
+            relay.public_key_bytes(), 1, now.saturating_sub(1), now + 7_200, "test",
+        )
+        .with_x25519_kem(relay.x25519_public_key_bytes())
+        .with_protocol_features(purpose.required_path_protocol_features().iter().copied());
+        relay_body.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
+        relay_body.public_endpoint = Some("https://8.8.8.8".to_owned());
+        let mut recipient_body = NodeDescriptor::new(
+            recipient.public_key_bytes(), 1, now.saturating_sub(1), now + 7_200, "test",
+        )
+        .with_x25519_kem(recipient.x25519_public_key_bytes())
+        .with_protocol_features(
+            purpose.required_terminal_protocol_features().iter().copied(),
+        );
+        recipient_body.capabilities = vec![NodeCapability::BlindVaultReplica];
+        recipient_body.policy.public_discovery = false;
+        let relay_descriptor = SignedNodeDescriptor::sign(relay_body, &relay).unwrap();
+        let recipient_descriptor = SignedNodeDescriptor::sign(recipient_body, &recipient).unwrap();
+        let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &relay_descriptor, &recipient_descriptor, purpose.as_str(), now, now + 3_600,
+            &recipient,
+        ).unwrap();
+        let limits = crate::services::reverse_onion_queue::ReverseOnionQueueLimits::new(
+            4, 2 * 1024 * 1024, 4, 300, 600,
+        ).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("phala-queue-authority-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp")
+            .unwrap();
+        let config = crate::services::reverse_onion_queue_db::ReverseOnionQueueDbConfig::new(
+            directory.path().join("queue.sqlite"), 16 * 1024 * 1024, limits,
+        ).unwrap();
+        let queue = Arc::new(ReverseOnionQueueDb::open(config, now).unwrap());
+        let admission = PrivateBlindRelayAdmission::new(
+            relay.public_key_bytes(), relay_descriptor.clone(), recipient_descriptor.clone(),
+            authorization.clone(), purpose,
+            vec![source.public_key_bytes()], queue, 1, 7_200, now,
+        ).unwrap();
+        let peers = PeerStore::new();
+        peers.upsert_verified_from_source(relay_descriptor, now, "test_pin").unwrap();
+        peers.upsert_verified_from_source(recipient_descriptor, now, "test_pin").unwrap();
+        peers.pin_private_onion_route_identities(
+            relay.public_key_bytes(), recipient.public_key_bytes(),
+        ).unwrap();
+        peers.import_private_onion_authorization(
+            authorization.clone(), relay.public_key_bytes(), now,
+        ).unwrap();
+
+        let _epoch = peers.private_onion_authority_read_guard();
+        let snapshot = admission.current_queue_authority_snapshot(&peers, now).unwrap();
+        assert_eq!(snapshot.valid_until, authorization.expires_at());
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -2344,6 +2863,8 @@ mod tests {
             NodeCapability::BlindVaultReplica,
         ];
         recipient_body.public_endpoint = None;
+        // [PHALA-PRIVATE-DISCOVERY-ISOLATION 2026-10-06 by Codex]
+        recipient_body.policy.public_discovery = false;
         let relay_descriptor = SignedNodeDescriptor::sign(relay_body, relay.as_ref()).unwrap();
         let recipient_descriptor = SignedNodeDescriptor::sign(recipient_body, &recipient).unwrap();
         let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
@@ -2578,6 +3099,8 @@ mod tests {
             NodeCapability::BlindVaultReplica,
         ];
         recipient_body.public_endpoint = None;
+        // [PHALA-PRIVATE-DISCOVERY-ISOLATION 2026-10-06 by Codex]
+        recipient_body.policy.public_discovery = false;
         let relay_descriptor = SignedNodeDescriptor::sign(relay_body, relay.as_ref()).unwrap();
         let recipient_descriptor = SignedNodeDescriptor::sign(recipient_body, &recipient).unwrap();
         let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
@@ -2662,6 +3185,15 @@ mod tests {
             onward_descriptor_hint: None,
         };
         let request_commitment = blind_relay_authenticated_request_commitment(&request).unwrap();
+        let current_authority = Arc::new(PeerStore::new());
+        current_authority.upsert_verified_from_source(relay_descriptor.clone(), now, "test_pin").unwrap();
+        current_authority.upsert_verified_from_source(recipient_descriptor.clone(), now, "test_pin").unwrap();
+        current_authority.pin_private_onion_route_identities(
+            relay.public_key_bytes(), recipient.public_key_bytes(),
+        ).unwrap();
+        current_authority.import_private_onion_authorization(
+            authorization.clone(), relay.public_key_bytes(), now,
+        ).unwrap();
         let state = ChatPeerState {
             chat_relay: Some(Arc::clone(&relay_service)),
             blind_vault: None,
@@ -2669,7 +3201,7 @@ mod tests {
             private_recipient_admission: Some(Arc::clone(&admission)),
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
-            peer_store: Arc::new(PeerStore::new()),
+            peer_store: Arc::clone(&current_authority),
             node_identity: Arc::clone(&relay),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -2749,7 +3281,7 @@ mod tests {
             chat_relay: Some(Arc::clone(&restarted_relay)),
             blind_vault: None,
             anonymous_mailbox: None,
-            private_recipient_admission: Some(admission_reopened),
+            private_recipient_admission: Some(Arc::clone(&admission_reopened)),
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::new(PeerStore::new()),
@@ -2823,6 +3355,14 @@ mod tests {
         )
         .is_err());
 
+        // [REVERSE-QUEUE-DRAIN-FENCE 2026-10-06 by Codex] A request may own
+        // its bounded permit when shutdown begins, but must fail the final
+        // authorization check before mutating the durable queue.
+        let admitted_permit = admission_reopened.try_queue_permit().unwrap();
+        admission_reopened.request_stop();
+        assert!(admission_reopened.ensure_queue_active().is_err());
+        drop(admitted_permit);
+
         drop(restarted_relay);
         let _ = std::fs::remove_file(relay_path);
     }
@@ -2895,15 +3435,48 @@ mod tests {
         Arc<BlindVaultService>,
         BlindVaultPutRequest,
     ) {
+        temp_blind_vault_with_put_for_role(node_identity, now_ms, [0x61; 32], [0x63; 32], true)
+    }
+
+    // [PHALA-CONNECTED-REVERSE-LOOP 2026-10-07 by Codex] Provision real
+    // signed admission and ciphertext under an endpoint-free Pull-only role.
+    // This helper returns no fake router response or preverified source page.
+    pub(crate) fn reverse_onion_private_pull_vault(
+        node_identity: &IdentityKeyPair, now_ms: u64,
+    ) -> (tempfile::TempDir, Arc<BlindVaultService>, BlindVaultPutRequest) {
+        let (directory, service, put) = temp_blind_vault_with_put_for_role(
+            node_identity, now_ms, [7; 32], [8; 32], true,
+        );
+        service.put(&put, now_ms).expect("store synthetic client ciphertext");
+        // [PHALA-CONNECTED-FIXTURE-ADMISSION 2026-10-08 by Codex] Seed
+        // through signed public provisioning, then reopen the same ciphertext
+        // store with admission closed. Never bypass the production gate.
+        drop(service);
+        let service = Arc::new(BlindVaultService::new(BlindVaultConfig {
+            enabled: true,
+            public_api_enabled: false,
+            db_path: directory.path().join("blind-vault.db").display().to_string(),
+            ..BlindVaultConfig::default()
+        }, node_identity.clone()).expect("private read-only vault"));
+        (directory, service, put)
+    }
+
+    // [PHALA-CONNECTED-REVERSE-LOOP 2026-10-07 by Codex] Preserve the
+    // existing public fixture while sharing the actual provisioning pipeline.
+    fn temp_blind_vault_with_put_for_role(
+        node_identity: &IdentityKeyPair, now_ms: u64, lease_id: [u8; 32],
+        read_capability: [u8; 32], public_api_enabled: bool,
+    ) -> (tempfile::TempDir, Arc<BlindVaultService>, BlindVaultPutRequest) {
         // [BLIND-VAULT-ONION-DISPATCH 2026-08-10 by Codex] Use the production
         // admission and mutation pipeline in relay tests. Bypassing lease
         // provisioning would miss signature, quota, expiry, and authority
         // regressions at the protocol boundary this feature is meant to join.
-        let directory = tempfile::tempdir().expect("blind vault temp directory");
+        let directory = tempfile::Builder::new().prefix("blind-vault-peer-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").expect("blind vault temp directory");
         let issuer = IdentityKeyPair::generate();
         let config = BlindVaultConfig {
             enabled: true,
-            public_api_enabled: true,
+            public_api_enabled,
             admission_issuer_public_keys: vec![hex::encode(issuer.public_key_bytes())],
             db_path: directory
                 .path()
@@ -2917,13 +3490,12 @@ mod tests {
         );
         let write_key = IdentityKeyPair::generate();
         let admin_key = IdentityKeyPair::generate();
-        let lease_id = [0x61; 32];
         let mut lease = BlindVaultLeaseCreateRequest::new(
             lease_id,
             [0x62; 16],
             write_key.public_key_bytes(),
             admin_key.public_key_bytes(),
-            Sha256::digest([0x63; 32]).into(),
+            Sha256::digest(read_capability).into(),
             now_ms + 24 * 60 * 60 * 1_000,
         );
         lease.sign(&admin_key).expect("sign anonymous lease");
@@ -3066,6 +3638,8 @@ mod tests {
         );
         recipient_body.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica];
         recipient_body.public_endpoint = None;
+        // [PHALA-PRIVATE-DISCOVERY-ISOLATION 2026-10-06 by Codex]
+        recipient_body.policy.public_discovery = false;
         let relay_descriptor = SignedNodeDescriptor::sign(relay_body, &relay).unwrap();
         let recipient_descriptor = SignedNodeDescriptor::sign(recipient_body, &recipient).unwrap();
         let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(

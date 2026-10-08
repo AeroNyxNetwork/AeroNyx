@@ -675,6 +675,16 @@ fn unix_now_secs() -> u64 {
 // Session
 // ============================================
 
+// [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Cursor state is scoped to one
+// authenticated transport session. Restart recovery starts a fresh full scan.
+const SEALED_SYNC_PENDING_TTL: Duration = Duration::from_secs(180);
+const MAX_SEALED_SYNC_OWNERS_PER_SESSION: usize = 8;
+
+struct PendingSealedSyncPage {
+    after_record_id: Option<[u8; 32]>,
+    requested_at: std::time::Instant,
+}
+
 /// A single authenticated client session.
 pub struct Session {
     /// Unique identifier assigned at handshake time.
@@ -727,6 +737,9 @@ pub struct Session {
     admission_evictions: Mutex<Vec<SessionTermination>>,
     /// In-tunnel ICMP keepalive state for RTT measurement.
     keepalive: Mutex<KeepaliveState>,
+    /// One outstanding sealed-memory page per owner; discarded with the
+    /// authenticated peer session and expired if a response never arrives.
+    sealed_sync_pending: Mutex<HashMap<[u8; 32], PendingSealedSyncPage>>,
     // ── v1.0.0-Membership ────────────────────────────────────────────────
     /// Cached lowercase hex of `client_public_key.to_bytes()`.
     ///
@@ -770,6 +783,7 @@ impl Session {
             stats: SessionStats::default(),
             admission_evictions: Mutex::new(Vec::new()),
             keepalive: Mutex::new(KeepaliveState::default()),
+            sealed_sync_pending: Mutex::new(HashMap::new()),
             wallet_hex,
         }
     }
@@ -800,6 +814,90 @@ impl Session {
     /// or encrypted tunnel keepalive ACK.
     pub fn mark_client_activity(&self) {
         self.client_activity.store(std::time::Instant::now());
+    }
+
+    // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Reserve one bounded sync page
+    // before writing it; an expired request may be retried from the same cursor.
+    pub(crate) fn reserve_sealed_sync_page(
+        &self,
+        owner: [u8; 32],
+        after_record_id: Option<[u8; 32]>,
+    ) -> bool {
+        let now = std::time::Instant::now();
+        let mut pending = self.sealed_sync_pending.lock();
+        pending.retain(|_, request| now.duration_since(request.requested_at) < SEALED_SYNC_PENDING_TTL);
+        if pending.contains_key(&owner) || pending.len() >= MAX_SEALED_SYNC_OWNERS_PER_SESSION {
+            return false;
+        }
+        pending.insert(
+            owner,
+            PendingSealedSyncPage {
+                after_record_id,
+                requested_at: now,
+            },
+        );
+        true
+    }
+
+    pub(crate) fn sealed_sync_page_matches(
+        &self,
+        owner: &[u8; 32],
+        after_record_id: Option<[u8; 32]>,
+    ) -> bool {
+        self.sealed_sync_pending
+            .lock()
+            .get(owner)
+            .is_some_and(|request| {
+                request.after_record_id == after_record_id
+                    && request.requested_at.elapsed() < SEALED_SYNC_PENDING_TTL
+            })
+    }
+
+    // A cursor advances only after the complete page has been verified and
+    // stored. `None` next removes the owner from the active scan.
+    pub(crate) fn advance_sealed_sync_page(
+        &self,
+        owner: &[u8; 32],
+        after_record_id: Option<[u8; 32]>,
+        next_cursor: Option<[u8; 32]>,
+    ) -> bool {
+        let mut pending = self.sealed_sync_pending.lock();
+        let Some(request) = pending.get(owner) else {
+            return false;
+        };
+        if request.after_record_id != after_record_id
+            || request.requested_at.elapsed() >= SEALED_SYNC_PENDING_TTL
+            || next_cursor.is_some_and(|next| after_record_id.is_some_and(|after| next <= after))
+        {
+            pending.remove(owner);
+            return false;
+        }
+        if let Some(next) = next_cursor {
+            pending.insert(
+                *owner,
+                PendingSealedSyncPage {
+                    after_record_id: Some(next),
+                    requested_at: std::time::Instant::now(),
+                },
+            );
+        } else {
+            pending.remove(owner);
+        }
+        true
+    }
+
+    pub(crate) fn abandon_sealed_sync_page(
+        &self,
+        owner: &[u8; 32],
+        after_record_id: Option<[u8; 32]>,
+    ) {
+        let mut pending = self.sealed_sync_pending.lock();
+        if pending
+            .get(owner)
+            .is_some_and(|request| request.after_record_id == after_record_id)
+        {
+            pending.remove(owner);
+        }
     }
 
     /// Returns the time elapsed since the most recent activity.
@@ -1800,6 +1898,30 @@ mod tests {
     fn test_session_creation() {
         let session = create_test_session();
         assert!(session.is_established());
+    }
+
+    // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] A peer cannot advance a page
+    // unless it echoes the currently outstanding owner/cursor request.
+    #[test]
+    fn sealed_sync_cursor_is_monotonic_and_session_scoped() {
+        let session = create_test_session();
+        let owner = [0x31; 32];
+        let first = [0x42; 32];
+        let second = [0x53; 32];
+
+        assert!(session.reserve_sealed_sync_page(owner, None));
+        assert!(!session.reserve_sealed_sync_page(owner, None));
+        assert!(session.sealed_sync_page_matches(&owner, None));
+        assert!(!session.sealed_sync_page_matches(&owner, Some(first)));
+
+        assert!(session.advance_sealed_sync_page(&owner, None, Some(first)));
+        assert!(session.sealed_sync_page_matches(&owner, Some(first)));
+        assert!(!session.advance_sealed_sync_page(&owner, Some(first), Some(first)));
+        assert!(session.reserve_sealed_sync_page(owner, None));
+        assert!(session.advance_sealed_sync_page(&owner, None, Some(first)));
+        assert!(session.advance_sealed_sync_page(&owner, Some(first), Some(second)));
+        assert!(session.advance_sealed_sync_page(&owner, Some(second), None));
+        assert!(!session.sealed_sync_page_matches(&owner, None));
     }
 
     #[test]

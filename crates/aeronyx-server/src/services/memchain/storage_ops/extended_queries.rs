@@ -113,15 +113,36 @@ impl MemoryStorage {
         records
     }
 
-    pub async fn get_records_needing_embedding(&self, limit: usize) -> Vec<MemoryRecord> {
+    // [MEMCHAIN-PHALA-EMBEDDING-OWNER-SCOPE 2026-10-06 by Codex]
+    pub async fn get_records_needing_embedding(
+        &self,
+        owner: &[u8; 32],
+        model: &str,
+        limit: usize,
+    ) -> Vec<MemoryRecord> {
         let conn = self.conn.lock().await;
+        let (minimum_content_bytes, maximum_content_bytes) = if self.record_key.is_some() {
+            // ChaCha20-Poly1305 storage adds a 12-byte nonce and 16-byte tag.
+            (29, 16 * 1024 + 28)
+        } else {
+            (1, 16 * 1024)
+        };
         self.query_rows(
             &conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,signature,access_count,
                     positive_feedback,negative_feedback,conflict_with
-             FROM records WHERE embedding IS NULL AND status = 0 LIMIT ?1",
-            params![limit as i64],
+             FROM records WHERE owner = ?1 AND status = 0 AND blind = 0
+               AND length(encrypted_content) BETWEEN ?3 AND ?4
+               AND (embedding IS NULL OR embedding_model != ?2)
+             ORDER BY timestamp ASC LIMIT ?5",
+            params![
+                owner.as_slice(),
+                model,
+                minimum_content_bytes,
+                maximum_content_bytes,
+                limit as i64
+            ],
         )
     }
 

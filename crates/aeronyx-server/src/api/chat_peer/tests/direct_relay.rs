@@ -855,6 +855,7 @@ async fn advertised_failure_receipt_omission_penalizes_exact_next_hop_surface() 
         .unwrap();
     peer_store.record_route_forward_success(&next_hop_node_id, now);
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -965,6 +966,7 @@ async fn invalid_failure_receipt_penalizes_immediate_next_hop_protocol() {
         .unwrap();
     peer_store.record_route_forward_success(&next_hop_node_id, now);
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,

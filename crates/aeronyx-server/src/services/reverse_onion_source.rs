@@ -10,9 +10,13 @@
 //! Only trusted route construction may supply the latter before dispatch.
 //! A deadline parameter is a runtime admission assertion, not a signature.
 //!
-//! Prepared->Armed commits before dispatch bytes escape. Opening commits before
-//! restoring a one-use key. Crashed Opening is never reopened. Authenticated
-//! cached pages are readable without reopening a reply session. Disk rollback
+//! Prepared->Armed commits before dispatch bytes escape. An uncertain Armed
+//! row may only replay identical bytes to the original relay within its
+//! original authorization/deadline; it cannot select a new route. Opening
+//! commits before restoring a reply key. Crashed Opening retains its exact Result and sealed
+//! session for local-only recovery; it never sends or dispatches again.
+//! Authenticated cached pages are readable without reopening a reply session.
+//! Disk rollback
 //! by a hostile same-euid actor is NOT prevented without an external anchor.
 //! Evidence is bounded, not eternal: identifiers are protected through their
 //! admitted freshness horizon, not forever after all tombstones are deleted.
@@ -23,6 +27,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aeronyx_core::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::blind_vault::{
@@ -43,7 +48,8 @@ use aeronyx_core::protocol::discovery::{
 };
 use aeronyx_core::protocol::onion::{is_onion_blob, VerifiedOnionForwardExpectation, reverse_delivery::{
     ReverseOnionFrameV1, MAX_REVERSE_ONION_FRAME_BYTES,
-    REVERSE_ONION_ENVELOPE_LIFETIME_SECS, REVERSE_ONION_RESULT_RETENTION_SECS,
+    MAX_REVERSE_ONION_RECOVERY_RETENTION_SECS, REVERSE_ONION_ENVELOPE_LIFETIME_SECS,
+    REVERSE_ONION_RESULT_RETENTION_SECS,
 }};
 use aeronyx_core::protocol::onion_reply::decode_onion_reply_request;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
@@ -57,7 +63,7 @@ use crate::api::chat_peer::{
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
-use std::os::unix::{fs::{FileExt, MetadataExt, OpenOptionsExt}, io::AsRawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 const MAX_ENTRIES: usize = 1024;
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -225,6 +231,28 @@ impl SourceRouteAuthority {
         authorization
             .verify_at(&relay, &recipient, purpose, now)
             .map_err(|_| SourceJournalError::Rejected)
+    }
+
+    // [REVERSE-SOURCE-HISTORIC-AUTH 2026-10-05 by Codex] Expose only the
+    // signed public policy stored with a durable row, never its POST or payload.
+    pub(crate) fn signed_parts(
+        &self,
+    ) -> Result<(
+        SignedNodeDescriptor,
+        SignedNodeDescriptor,
+        SignedPrivateOnionRecipientAuthorizationV1,
+    )> {
+        self.validate_shape()?;
+        Ok((
+            SignedNodeDescriptor::decode_canonical(&self.relay_descriptor)
+                .map_err(|_| SourceJournalError::Corrupt)?,
+            SignedNodeDescriptor::decode_canonical(&self.recipient_descriptor)
+                .map_err(|_| SourceJournalError::Corrupt)?,
+            SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(
+                &self.authorization,
+            )
+            .map_err(|_| SourceJournalError::Corrupt)?,
+        ))
     }
 }
 
@@ -436,12 +464,22 @@ impl SourcePreparedPull {
         Ok(())
     }
 
-    fn retention(&self) -> Result<u64> {
+    fn legacy_retention(&self) -> Result<u64> {
         let retained_envelope_expiry = self.expected.timestamp
             .checked_add(REVERSE_ONION_ENVELOPE_LIFETIME_SECS).ok_or(SourceJournalError::Rejected)?;
         let result_grace = self.deadline.checked_add(REVERSE_ONION_RESULT_RETENTION_SECS)
             .ok_or(SourceJournalError::Rejected)?;
         Ok(self.original_expiry.max(retained_envelope_expiry).max(result_grace))
+    }
+
+    fn retention(&self) -> Result<u64> {
+        // [REVERSE-ONION-RETENTION-ALIGNMENT 2026-10-05 by Codex] Source route
+        // identity outlives every allowed relay tombstone, even when the
+        // configured relay recovery window is longer than result retention.
+        let relay_replay_horizon = self.deadline
+            .checked_add(MAX_REVERSE_ONION_RECOVERY_RETENTION_SECS)
+            .ok_or(SourceJournalError::Rejected)?;
+        Ok(self.legacy_retention()?.max(relay_replay_horizon))
     }
 
     fn same(&self, other: &Self) -> bool {
@@ -462,12 +500,29 @@ impl SourcePreparedPull {
             && self.deadline == other.deadline && self.original_expiry == other.original_expiry
             && self.dispatch == other.dispatch && self.terminal.as_slice() == other.terminal.as_slice()
     }
+
+    // [REVERSE-SOURCE-PREPARED-ROTATION 2026-10-05 by Codex] The authenticated
+    // route ID binds owner, nonce and exact Pull. Before any POST, fresh
+    // current descriptors/grants may replace this snapshot for the same peers.
+    fn same_prepared_request(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.target == other.target
+            && self.authority.purpose == other.authority.purpose
+            && self.expected.relay == other.expected.relay
+            && self.expected.recipient == other.expected.recipient
+            && self.expected.route == other.expected.route
+            && self.expected.ttl == other.expected.ttl
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum SourcePhase {
-    Prepared = 1, Armed = 2, DispatchAmbiguous = 3, ResultReady = 4,
+    Prepared = 1, Armed = 2,
+    // [PHALA-SOURCE-POST-OBSERVATION 2026-10-07 by Codex] A POST outcome
+    // was observed but execution is unresolved. A verified custody ACK uses
+    // this same evidence-only state; its existing numeric value is unchanged.
+    DispatchAmbiguous = 3, ResultReady = 4,
     Opening = 5, Verified = 6, Rejected = 7, OpenAmbiguous = 8,
 }
 
@@ -482,24 +537,47 @@ impl SourcePhase {
     }
     fn permits(self, next: Self) -> bool {
         matches!((self, next),
-            (Self::Prepared, Self::Armed) | (Self::Armed, Self::DispatchAmbiguous)
+            (Self::Prepared, Self::Armed)
+            // [REVERSE-SOURCE-ZERO-SEND 2026-10-05 by Codex] Only the live
+            // caller that proves transport was never invoked may restore this
+            // row. A crash leaves Armed and recovery conservatively ambiguous.
+            | (Self::Armed, Self::Prepared)
+            | (Self::Armed, Self::DispatchAmbiguous)
             | (Self::Armed | Self::DispatchAmbiguous, Self::ResultReady)
             | (Self::ResultReady, Self::Opening)
             | (Self::Opening, Self::Verified | Self::Rejected | Self::OpenAmbiguous))
     }
 }
 
-/// Exact bytes returned ONLY by the successful first Prepared->Armed CAS.
-/// No Clone/Debug; runtime must not duplicate or reconstruct this authority.
-pub(crate) struct SourceDispatch { pub(crate) exact_bytes: Vec<u8> }
+/// Exact durable bytes and deadline returned only by a Prepared->Armed CAS.
+/// No Clone/Debug; runtime must not reconstruct this authority.
+pub(crate) struct SourceDispatch {
+    pub(crate) exact_bytes: Vec<u8>,
+    pub(crate) deadline: u64,
+    // [PHALA-SOURCE-OBSERVATION-FLOOR 2026-10-07 by Codex] The actual
+    // SQL admission sample follows these exact bytes to post-commit preflight.
+    pub(crate) observed_at: u64,
+}
+
+// [REVERSE-SOURCE-SAME-RELAY-RECOVERY 2026-10-05 by Codex] Bounded durable
+// material for replaying only the exact armed request to its original relay.
+// The runtime must revalidate the pinned authority and route deadline first.
+pub(crate) struct SourceRecoveryDispatch {
+    pub(crate) exact_bytes: Zeroizing<Vec<u8>>,
+    pub(crate) authorization_bytes: Zeroizing<Vec<u8>>,
+    pub(crate) deadline: u64,
+    pub(crate) request_commitment: [u8; 32],
+    // [PHALA-SOURCE-OBSERVATION-FLOOR 2026-10-07 by Codex] Volatile
+    // checked read time, not a new persisted timestamp or replay authority.
+    pub(crate) observed_at: u64,
+}
 pub(crate) struct SourceRecoveryPage {
     pub(crate) items: Vec<([u8; 16], SourcePhase)>,
     pub(crate) next_after: Option<[u8; 16]>,
 }
 
-/// Immutable restart/query metadata. It deliberately omits dispatch and
-/// terminal bytes; after Armed, recovery may only issue read-only evidence
-/// queries and must not obtain a second effectful request body.
+/// Immutable restart/query metadata. It omits dispatch and terminal bytes;
+/// exact dispatch recovery is exposed separately with stricter checks.
 pub(crate) struct SourceRecoveryMetadata {
     route: [u8; 16],
     phase: SourcePhase,
@@ -512,6 +590,8 @@ pub(crate) struct SourceRecoveryMetadata {
     relay_descriptor_commitment: [u8; 32],
     recipient_descriptor_commitment: [u8; 32],
     deadline: u64,
+    // [REVERSE-ONION-SOURCE-PENDING 2026-10-05 by Codex]
+    result_deadline: u64,
     retain_until: u64,
 }
 
@@ -531,6 +611,7 @@ impl SourceRecoveryMetadata {
         self.recipient_descriptor_commitment
     }
     pub(crate) fn deadline(&self) -> u64 { self.deadline }
+    pub(crate) fn result_deadline(&self) -> u64 { self.result_deadline }
     pub(crate) fn retain_until(&self) -> u64 { self.retain_until }
 }
 
@@ -594,7 +675,8 @@ impl Record {
     fn validate(&self) -> Result<()> {
         self.plan.validate().map_err(|_| SourceJournalError::Corrupt)?;
         if self.reserved != Self::reservation(&self.plan)? || self.generation == 0
-            || self.retain_until != self.plan.retention()?
+            || (self.retain_until < self.plan.legacy_retention()?
+                && self.retain_until < self.plan.retention()?)
         { return Err(SourceJournalError::Corrupt); }
         let has_evidence = !self.result.is_empty();
         let needs_evidence = matches!(self.phase, SourcePhase::ResultReady | SourcePhase::Opening
@@ -700,6 +782,15 @@ struct Inner { connection: Connection, poisoned: bool }
 /// Exclusive private repository; not an OS hard quota or anti-rollback anchor.
 pub(crate) struct ReverseOnionSourceJournal {
     inner: Mutex<Inner>, identity: Arc<IdentityKeyPair>, limits: SourceJournalLimits,
+    // [PHALA-SOURCE-JOURNAL-LANE 2026-10-07 by Codex] Every runtime DB
+    // operation shares this lane, including ambiguity/result completion writes.
+    // Synchronous audited methods keep their existing fail-fast mutex behavior.
+    blocking_lane: Arc<tokio::sync::Semaphore>,
+    // [PHALA-SOURCE-JOURNAL-FAULT 2026-10-07 by Codex] Shared live-owner
+    // intake/fault signals, never persisted. Completion DB work ignores the
+    // intake flag so shutdown still drains accepted writes and reply opening.
+    intake_stopped: Arc<AtomicBool>,
+    failure: tokio::sync::watch::Sender<bool>,
     #[cfg(unix)] _inode_lock: File,
     #[cfg(unix)] _parent: File,
     #[cfg(unix)] db_path: std::path::PathBuf,
@@ -710,8 +801,57 @@ pub(crate) struct ReverseOnionSourceJournal {
 }
 
 impl ReverseOnionSourceJournal {
+    // [PHALA-SOURCE-JOURNAL-FAULT 2026-10-07 by Codex] A runtime adopts
+    // these exact signals; a blocking DB fault cannot outlive a cancelled
+    // async waiter without closing the API and notifying its supervisor.
+    pub(crate) fn intake_stop_flag(&self) -> Arc<AtomicBool> { Arc::clone(&self.intake_stopped) }
+
+    pub(crate) fn failure_signal(&self) -> tokio::sync::watch::Sender<bool> { self.failure.clone() }
+
+    fn report_failure(&self) {
+        self.intake_stopped.store(true, Ordering::SeqCst);
+        self.failure.send_replace(true);
+    }
+
+    // [PHALA-SOURCE-JOURNAL-LANE 2026-10-07 by Codex] Runtime callers are
+    // bounded by source admission permits. Acquire asynchronously, then retain
+    // the owned lane permit through blocking work and its durability fence.
+    // Never close this lane on stop: accepted completion writes must drain.
+    pub(crate) fn blocking_operation_lane(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.blocking_lane)
+    }
+
+    // [PHALA-SOURCE-JOURNAL-LANE 2026-10-07 by Codex] Reuse the existing
+    // post-commit fault path for runtime ownership regression source only.
+    #[cfg(test)]
+    pub(crate) fn fail_next_commit_fence(&self) {
+        self.commits_until_fence_error.store(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    // [REVERSE-ROLE-RECOVERY 2026-10-05 by Codex] Evidence-only startup
+    // requires existing history and never initializes an empty replacement.
+    pub(crate) fn open_existing(path: &Path, identity: Arc<IdentityKeyPair>,
+        limits: SourceJournalLimits, now: u64) -> Result<Self> {
+        // [PHALA-EXISTING-CUSTODY-OPEN 2026-10-07 by Codex]
+        #[cfg(unix)]
+        { Self::open_inner(path, identity, limits, now, true) }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, identity, limits, now);
+            Err(SourceJournalError::Rejected)
+        }
+    }
+
     #[cfg(unix)]
     pub(crate) fn open(path: &Path, identity: Arc<IdentityKeyPair>, limits: SourceJournalLimits, now: u64) -> Result<Self> {
+        Self::open_inner(path, identity, limits, now, false)
+    }
+
+    // [PHALA-EXISTING-CUSTODY-OPEN 2026-10-07 by Codex] Recovery shares the
+    // authenticated row audit but cannot reserve a new empty primary.
+    #[cfg(unix)]
+    fn open_inner(path: &Path, identity: Arc<IdentityKeyPair>, limits: SourceJournalLimits,
+        now: u64, existing_only: bool) -> Result<Self> {
         use super::chat_relay_mailbox::{prepare_private_sqlite_target, verify_private_file};
         if limits.max_entries == 0 || limits.max_entries > MAX_ENTRIES
             || limits.max_bytes == 0 || limits.max_bytes > MAX_BYTES || path == Path::new(":memory:")
@@ -722,33 +862,41 @@ impl ReverseOnionSourceJournal {
         // their aggregate are admitted. This preflight has no write effects.
         let physical_limit = source_physical_limit(&limits)?;
         preflight_source_files(path, physical_limit)?;
-        let target = prepare_private_sqlite_target(path).map_err(|_| SourceJournalError::Unavailable)?;
+        let (target, existing_inode) = if existing_only {
+            let (target, inode) = super::chat_relay_mailbox::open_existing_private_sqlite_target(path)
+                .map_err(|_| SourceJournalError::Rejected)?;
+            (target, Some(inode))
+        } else {
+            (prepare_private_sqlite_target(path).map_err(|_| SourceJournalError::Unavailable)?, None)
+        };
         verify_private_file(&target.resolved_path, true).map_err(|_| SourceJournalError::Rejected)?;
-        let inode = std::fs::OpenOptions::new().read(true).write(true)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK)
-            .open(&target.resolved_path).map_err(|_| SourceJournalError::Unavailable)?;
+        let inode = if let Some(inode) = existing_inode { inode } else {
+            std::fs::OpenOptions::new().read(true).write(true)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK)
+                .open(&target.resolved_path).map_err(|_| SourceJournalError::Unavailable)?
+        };
         let metadata = inode.metadata().map_err(|_| SourceJournalError::Unavailable)?;
+        if existing_only && metadata.len() == 0 { return Err(SourceJournalError::Rejected); }
         // SAFETY: geteuid takes no pointers; inode stays owned for journal lifetime.
         if !metadata.is_file() || metadata.uid() != unsafe { nix::libc::geteuid() }
             || metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o600
         { return Err(SourceJournalError::Rejected); }
         if metadata.len() > physical_limit { return Err(SourceJournalError::Capacity); }
-        // SAFETY: valid owned fd; advisory cooperation, not hostile same-euid defense.
-        if unsafe { nix::libc::flock(inode.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) } != 0 {
-            return Err(SourceJournalError::Busy);
-        }
+        // [PHALA-SQLITE-INODE-LOCK 2026-10-08 by Codex]
+        super::chat_relay_mailbox::lock_private_sqlite_inode(&inode).map_err(|error| match error {
+            super::chat_relay_mailbox::AnonymousMailboxStoreError::Busy => SourceJournalError::Busy,
+            _ => SourceJournalError::Unavailable,
+        })?;
         // [REVERSE-ONION-SOURCE-JOURNAL 2026-10-04 by Codex] An existing
         // nonempty DB must declare this owner before writable SQLite recovery
         // or journal-mode changes. SQLite header offsets are its documented
         // file ABI; full schema/integrity checks still follow recovery. A crash
         // during unacknowledged first initialization may require operator care.
         if metadata.len() != 0 {
-            let mut header = [0u8; 100];
-            inode.read_exact_at(&mut header, 0).map_err(|_| SourceJournalError::Corrupt)?;
-            if &header[..16] != b"SQLite format 3\0"
-                || header[60..64] != 1u32.to_be_bytes()
-                || header[68..72] != (APPLICATION_ID as u32).to_be_bytes()
-            { return Err(SourceJournalError::Corrupt); }
+            // [PHALA-OWNED-RECOVERY-SCHEMA 2026-10-07 by Codex] Preserve
+            // the existing source header contract through the shared gate.
+            super::chat_relay_mailbox::verify_private_sqlite_header(&inode, APPLICATION_ID as u32, &[1])
+                .map_err(|_| SourceJournalError::Corrupt)?;
         }
         audit_source_sidecars(&target.resolved_path, physical_limit, metadata.len())?;
         let parent_metadata = target.parent.metadata().map_err(|_| SourceJournalError::Unavailable)?;
@@ -767,6 +915,9 @@ impl ReverseOnionSourceJournal {
         if integrity != "ok" { return Err(SourceJournalError::Corrupt); }
         initialize_schema(&mut connection, identity.public_key_bytes(), now)?;
         let journal = Self { inner: Mutex::new(Inner { connection, poisoned: false }), identity, limits,
+            blocking_lane: Arc::new(tokio::sync::Semaphore::new(1)),
+            intake_stopped: Arc::new(AtomicBool::new(false)),
+            failure: tokio::sync::watch::channel(false).0,
             _inode_lock: inode, _parent: target.parent,
             db_path: target.resolved_path, physical_limit,
             inode_identity: (metadata.dev(), metadata.ino()),
@@ -780,14 +931,11 @@ impl ReverseOnionSourceJournal {
                 // admission; current execution/recovery freshness is checked
                 // separately by the phase and retention deadlines.
                 row.plan.validate_at(row.plan.expected.timestamp)?;
-                let next = match row.phase {
-                    SourcePhase::Armed => Some(SourcePhase::DispatchAmbiguous),
-                    SourcePhase::Opening => Some(SourcePhase::OpenAmbiguous), _ => None,
-                };
-                if let Some(next) = next {
-                    if next == SourcePhase::OpenAmbiguous { row.restart.zeroize(); }
-                    journal.replace(tx, &mut row, next)?;
-                }
+                journal.extend_retention(tx, &mut row)?;
+                // [REVERSE-SOURCE-ARMED-RECOVERY 2026-10-05 by Codex] Keep
+                // Armed distinct from a transport-observed ambiguity. After a
+                // crash, the runtime may replay exact bytes to the same R;
+                // explicit DispatchAmbiguous remains evidence-only.
             }
             Ok(())
         }))?;
@@ -801,7 +949,18 @@ impl ReverseOnionSourceJournal {
 
     /// Exact retries compare immutable admitted claims, not randomized AEAD bytes.
     pub(crate) fn prepare(&self, plan: SourcePreparedPull, session: BlindVaultOnionPullSession, now: u64) -> Result<SourcePhase> {
-        plan.validate()?; plan.fresh(now)?;
+        // [PHALA-SOURCE-ADMISSION-CLOCK 2026-10-07 by Codex] The scalar
+        // compatibility path includes restart sealing and SQL wait in its clock.
+        let started = std::time::Instant::now();
+        self.prepare_at(plan, session, || elapsed_now(now, started))
+    }
+
+    // [PHALA-SOURCE-ADMISSION-CLOCK 2026-10-07 by Codex] Freshness is an
+    // audited transaction condition, not a pre-sealing snapshot. The runtime
+    // retains its signed-authority read guard through this entire operation.
+    pub(crate) fn prepare_at(&self, plan: SourcePreparedPull, session: BlindVaultOnionPullSession,
+        refresh_now: impl FnOnce() -> Result<u64>) -> Result<SourcePhase> {
+        plan.validate()?;
         if plan.source != self.identity.public_key_bytes() { return Err(SourceJournalError::Rejected); }
         let restart = Zeroizing::new(session.seal_restart(&self.identity, plan.expected.route, plan.target, &plan.terminal)
             .map_err(|_| SourceJournalError::Rejected)?);
@@ -809,11 +968,41 @@ impl ReverseOnionSourceJournal {
         let retain_until = plan.retention()?;
         let row = Record { plan, restart, reserved, retain_until, generation: 1, phase: SourcePhase::Prepared,
             claim: vec![], lease: vec![], result: vec![], verified: Zeroizing::new(vec![]) };
-        self.with_inner(|inner| self.transaction(inner, now, |tx| {
+        self.with_inner(|inner| self.transaction_at(inner, refresh_now, |tx, now| {
+            row.plan.fresh(now)?;
             if let Some(existing) = self.load(tx, row.plan.expected.route)? {
-                if !existing.plan.same(&row.plan) { return Err(SourceJournalError::Conflict); }
-                return Ok(existing.phase);
+                if existing.plan.same(&row.plan) {
+                    return Ok(existing.phase);
+                }
+                if existing.phase != SourcePhase::Prepared
+                    || !existing.plan.same_prepared_request(&row.plan)
+                    || existing.reserved != row.reserved
+                {
+                    return Err(SourceJournalError::Conflict);
+                }
+                // [REVERSE-SOURCE-PREPARED-ROTATION 2026-10-05 by Codex]
+                // Prepared proves no relay POST escaped. Replace only that
+                // zero-send snapshot, preserving route identity and extending
+                // retention monotonically. Armed and later remain immutable.
+                let mut replacement = row;
+                replacement.generation = existing.generation.checked_add(1)
+                    .ok_or(SourceJournalError::Corrupt)?;
+                replacement.retain_until = replacement.retain_until.max(existing.retain_until);
+                let sealed = self.seal(&replacement)?;
+                one(tx.execute(
+                    "UPDATE source_jobs SET generation=?1,retain_until=?2,sealed=?3
+                     WHERE route=?4 AND phase=?5 AND generation=?6 AND reserved=?7 AND retain_until=?8",
+                    params![sql(replacement.generation)?, sql(replacement.retain_until)?, sealed,
+                        replacement.plan.expected.route.as_slice(), SourcePhase::Prepared as u8,
+                        sql(existing.generation)?, sql(existing.reserved)?, sql(existing.retain_until)?],
+                ).map_err(unavailable)?)?;
+                return Ok(SourcePhase::Prepared);
             }
+            // [PHALA-SOURCE-RETENTION-ADMISSION 2026-10-08 by Codex] New
+            // routes reclaim authenticated expired custody in this same
+            // transaction. Existing routes above retain exact retry semantics;
+            // a failed insertion/quota fence rolls the reclamation back too.
+            self.cleanup_expired(tx, PAGE_LIMIT, now)?;
             let sealed = self.seal(&row)?;
             one(tx.execute("INSERT INTO source_jobs VALUES(?1,?2,?3,?4,?5,?6)", params![
                 row.plan.expected.route.as_slice(), row.phase as u8, sql(row.generation)?,
@@ -822,16 +1011,56 @@ impl ReverseOnionSourceJournal {
         }))
     }
 
-    pub(crate) fn arm(&self, route: [u8; 16], now: u64) -> Result<SourceDispatch> {
+    /// Looks up an authenticated durable route without creating or changing a row.
+    // [REVERSE-SOURCE-ROUTE-LOOKUP 2026-10-05 by Codex]
+    pub(crate) fn lookup_phase(&self, route: [u8; 16], now: u64) -> Result<Option<SourcePhase>> {
         self.with_inner(|inner| self.transaction(inner, now, |tx| {
+            self.load(tx, route).map(|row| row.map(|row| row.phase))
+        }))
+    }
+
+    pub(crate) fn arm(&self, route: [u8; 16], now: u64) -> Result<SourceDispatch> {
+        // [PHALA-SOURCE-ADMISSION-CLOCK 2026-10-07 by Codex] Preparing
+        // and arming are separate durable barriers with separate checked times.
+        let started = std::time::Instant::now();
+        self.arm_at(route, || elapsed_now(now, started))
+    }
+
+    // [PHALA-SOURCE-ADMISSION-CLOCK 2026-10-07 by Codex] A plan that was
+    // live at Prepared may expire or be stopped before this SQL transaction.
+    pub(crate) fn arm_at(&self, route: [u8; 16], refresh_now: impl FnOnce() -> Result<u64>) -> Result<SourceDispatch> {
+        self.with_inner(|inner| self.transaction_at(inner, refresh_now, |tx, now| {
             let mut row = self.load(tx, route)?.ok_or(SourceJournalError::Rejected)?;
             if row.phase != SourcePhase::Prepared { return Err(SourceJournalError::Ambiguous); }
             row.plan.fresh(now)?;
             self.replace(tx, &mut row, SourcePhase::Armed)?;
-            Ok(SourceDispatch { exact_bytes: row.plan.dispatch })
+            Ok(SourceDispatch {
+                exact_bytes: row.plan.dispatch,
+                deadline: row.plan.deadline,
+                observed_at: now,
+            })
         }))
     }
 
+    /// Restores a one-shot row only while its live owner proves no transport
+    /// call began. If the process dies after arming, recovery may replay only
+    /// the exact request to R while the original deadline remains live.
+    // [REVERSE-SOURCE-ZERO-SEND 2026-10-05 by Codex]
+    pub(crate) fn restore_prepared_after_no_send(&self, route: [u8; 16], now: u64) -> Result<()> {
+        self.with_inner(|inner| self.transaction(inner, now, |tx| {
+            let mut row = self.load(tx, route)?.ok_or(SourceJournalError::Rejected)?;
+            if row.phase != SourcePhase::Armed || !row.claim.is_empty()
+                || !row.lease.is_empty() || !row.result.is_empty()
+            {
+                return Err(SourceJournalError::Conflict);
+            }
+            self.replace(tx, &mut row, SourcePhase::Prepared)
+        }))
+    }
+
+    // [PHALA-SOURCE-POST-OBSERVATION 2026-10-07 by Codex] Also records a
+    // verified custody observation, which is not proof of completed execution.
+    // Persist before evidence polling so live/restart resume cannot resend it.
     pub(crate) fn mark_dispatch_ambiguous(&self, route: [u8; 16], now: u64) -> Result<()> {
         self.with_inner(|inner| self.transaction(inner, now, |tx| {
             let mut row = self.load(tx, route)?.ok_or(SourceJournalError::Rejected)?;
@@ -843,7 +1072,19 @@ impl ReverseOnionSourceJournal {
     /// No caller-supplied 'verified' bit: re-check the complete adjacent chain.
     pub(crate) fn record_result(&self, route: [u8; 16], claim: &ReverseOnionFrameV1,
         lease: &ReverseOnionFrameV1, result: &ReverseOnionFrameV1, now: u64) -> Result<()> {
-        self.with_inner(|inner| self.transaction(inner, now, |tx| {
+        // [PHALA-JOURNAL-RESULT-CLOCK 2026-10-07 by Codex] Compatibility
+        // callers advance one anchor across transaction wait as well.
+        let started = std::time::Instant::now();
+        self.record_result_at(route, claim, lease, result, || elapsed_now(now, started))
+    }
+
+    // [PHALA-JOURNAL-RESULT-CLOCK 2026-10-07 by Codex] Runtime clocks are
+    // sampled after SQLite acquisition and bounded integrity work, not before
+    // waiting. Exact stored results still only acknowledge identical retries.
+    pub(crate) fn record_result_at(&self, route: [u8; 16], claim: &ReverseOnionFrameV1,
+        lease: &ReverseOnionFrameV1, result: &ReverseOnionFrameV1,
+        refresh_now: impl FnOnce() -> Result<u64>) -> Result<()> {
+        self.with_inner(|inner| self.transaction_at(inner, refresh_now, |tx, now| {
             let mut row = self.load(tx, route)?.ok_or(SourceJournalError::Rejected)?;
             let claim_bytes = claim.encode(); let lease_bytes = lease.encode(); let result_bytes = result.encode();
             if claim_bytes.len() > MAX_CLAIM_BYTES || lease_bytes.len() > MAX_LEASE_BYTES
@@ -863,15 +1104,42 @@ impl ReverseOnionSourceJournal {
     }
 
     /// Owns the mutex across both durable transitions and synchronous crypto.
-    /// No async await or recursively acquired lock. Panic poisons the mutex;
-    /// restart retires Opening without ever restoring its reply key again.
+    /// No async await or recursively acquired lock. Panic poisons the mutex.
+    /// A restarted Opening may repeat this local pure operation from its sealed
+    /// session because no plaintext returns before Verified is durable.
+    // [PHALA-SOURCE-OPEN-CLOCK 2026-10-07 by Codex] Scalar time remains
+    // a synthetic-fixture API only; production must provide a live sampler.
+    #[cfg(test)]
     pub(crate) fn open_result(&self, route: [u8; 16], now: u64) -> Result<BlindVaultPullResponse> {
+        let started = std::time::Instant::now();
+        self.open_result_at(route, now, || elapsed_now(now, started))
+    }
+
+    // [PHALA-SOURCE-OPEN-CLOCK 2026-10-07 by Codex] Production supplies
+    // a live local sample inside each audited transaction, both before session
+    // restoration and after crypto. A fault leaves ResultReady/Opening durable;
+    // it cannot publish plaintext or restore effectful dispatch authority.
+    pub(crate) fn open_result_at(&self, route: [u8; 16], now: u64,
+        mut refresh_now: impl FnMut() -> Result<u64>) -> Result<BlindVaultPullResponse> {
+        let opening_started = std::time::Instant::now();
+        let mut observed_floor = now;
         self.with_inner(|inner| {
-            let mut row = self.transaction(inner, now, |tx| {
+            let mut row = self.transaction_at(inner,
+                || result_observed_now(&mut observed_floor, &mut refresh_now), |tx, checked_at| {
+                // Keep expiry advancement separate from the raw sample that
+                // transaction_at compares with the durable journal clock.
+                let checked_at = checked_at.max(elapsed_now(now, opening_started)?);
                 let mut row = self.load(tx, route)?.ok_or(SourceJournalError::Rejected)?;
-                if row.phase != SourcePhase::ResultReady { return Err(SourceJournalError::Ambiguous); }
-                row.evidence(Some(now))?;
-                self.replace(tx, &mut row, SourcePhase::Opening)?;
+                if !matches!(row.phase, SourcePhase::ResultReady | SourcePhase::Opening) {
+                    return Err(SourceJournalError::Ambiguous);
+                }
+                if checked_at >= row.retain_until { return Err(SourceJournalError::Expired); }
+                row.evidence(Some(checked_at))?;
+                // [SOURCE-OPEN-RECOVERY 2026-10-05 by Codex] Only the
+                // ResultReady transition is new; Opening repeats local crypto.
+                if row.phase == SourcePhase::ResultReady {
+                    self.replace(tx, &mut row, SourcePhase::Opening)?;
+                }
                 Ok(row)
             })?;
             // Only this post-commit point may restore the session. Neither load
@@ -888,21 +1156,52 @@ impl ReverseOnionSourceJournal {
                         .map_err(|_| SourceJournalError::Corrupt)?);
                     if row.verified.len() > MAX_PAGE_BYTES { return Err(SourceJournalError::Corrupt); }
                     let page = row.cached_page()?;
-                    self.transaction(inner, now, |tx| self.replace(tx, &mut row, SourcePhase::Verified))?;
+                    // [REVERSE-ONION-SOURCE-OPEN-DEADLINE 2026-10-05 by Codex]
+                    // Decryption may cross the bounded result-retention edge;
+                    // revalidate before making plaintext externally readable.
+                    self.transaction_at(inner,
+                        || result_observed_now(&mut observed_floor, &mut refresh_now), |tx, verified_at| {
+                        let verified_at = verified_at.max(elapsed_now(now, opening_started)?);
+                        if verified_at >= row.retain_until {
+                            return Err(SourceJournalError::Expired);
+                        }
+                        row.evidence(Some(verified_at))?;
+                        self.replace(tx, &mut row, SourcePhase::Verified)
+                    })?;
                     Ok(page)
                 }
                 Err(_) => {
-                    self.transaction(inner, now, |tx| self.replace(tx, &mut row, SourcePhase::Rejected))?;
+                    self.transaction_at(inner,
+                        || result_observed_now(&mut observed_floor, &mut refresh_now), |tx, _| {
+                        self.replace(tx, &mut row, SourcePhase::Rejected)
+                    })?;
                     Err(SourceJournalError::ReplyRejected)
                 }
             }
         })
     }
 
+    // [REVERSE-ONION-SOURCE-READ-DEADLINE 2026-10-05 by Codex] Cached
+    // plaintext is returned only after lock-time retention validation.
+    // [PHALA-SOURCE-OPEN-CLOCK 2026-10-07 by Codex] No scalar-time
+    // cache reader is compiled into production.
+    #[cfg(test)]
     pub(crate) fn read_verified(&self, route: [u8; 16], now: u64) -> Result<BlindVaultPullResponse> {
-        self.with_inner(|inner| self.transaction(inner, now, |tx| {
+        let started = std::time::Instant::now();
+        self.read_verified_at(route, now, || elapsed_now(now, started))
+    }
+
+    // [PHALA-SOURCE-OPEN-CLOCK 2026-10-07 by Codex] Cached results use
+    // the same post-lock live-clock fence as newly opened results.
+    pub(crate) fn read_verified_at(&self, route: [u8; 16], now: u64,
+        mut refresh_now: impl FnMut() -> Result<u64>) -> Result<BlindVaultPullResponse> {
+        let started = std::time::Instant::now();
+        let mut observed_floor = now;
+        self.with_inner(|inner| self.transaction_at(inner,
+            || result_observed_now(&mut observed_floor, &mut refresh_now), |tx, checked_at| {
+            let checked_at = checked_at.max(elapsed_now(now, started)?);
             let row = self.load(tx, route)?.ok_or(SourceJournalError::Rejected)?;
-            if now >= row.retain_until { return Err(SourceJournalError::Expired); }
+            if checked_at >= row.retain_until { return Err(SourceJournalError::Expired); }
             if row.phase != SourcePhase::Verified { return Err(SourceJournalError::Rejected); }
             row.cached_page()
         }))
@@ -953,6 +1252,9 @@ impl ReverseOnionSourceJournal {
                     relay_descriptor_commitment: row.plan.relay_descriptor_commitment,
                     recipient_descriptor_commitment: row.plan.recipient_descriptor_commitment,
                     deadline: row.plan.deadline,
+                    result_deadline: row.plan.deadline
+                        .checked_add(REVERSE_ONION_RESULT_RETENTION_SECS)
+                        .ok_or(SourceJournalError::Corrupt)?,
                     retain_until: row.retain_until,
                 });
             }
@@ -961,58 +1263,154 @@ impl ReverseOnionSourceJournal {
         }))
     }
 
+    /// Returns the original signed public authority only for a retained armed
+    /// or transport-ambiguous route. The row's historical timestamp anchors
+    /// authorization; this method cannot authorize a new route.
+    // [REVERSE-SOURCE-HISTORIC-AUTH 2026-10-05 by Codex]
+    pub(crate) fn recover_route_authority(
+        &self,
+        route: [u8; 16],
+        now: u64,
+    ) -> Result<SourceRouteAuthority> {
+        self.with_inner(|inner| self.transaction(inner, now, |tx| {
+            let row = self.load(tx, route)?.ok_or(SourceJournalError::Rejected)?;
+            if now >= row.retain_until
+                || !matches!(row.phase, SourcePhase::Armed | SourcePhase::DispatchAmbiguous)
+            {
+                return Err(SourceJournalError::Rejected);
+            }
+            row.plan.validate_at(row.plan.expected.timestamp)?;
+            Ok(SourceRouteAuthority {
+                relay_descriptor: row.plan.authority.relay_descriptor.clone(),
+                recipient_descriptor: row.plan.authority.recipient_descriptor.clone(),
+                authorization: row.plan.authority.authorization.clone(),
+                purpose: row.plan.authority.purpose.clone(),
+            })
+        }))
+    }
+
+    /// Returns the exact original request only while it remains admissible at
+    /// the pinned relay. This cannot change route, body, authority, or deadline.
+    // [REVERSE-SOURCE-SAME-RELAY-RECOVERY 2026-10-05 by Codex]
+    pub(crate) fn recover_dispatch(
+        &self,
+        route: [u8; 16],
+        now: u64,
+    ) -> Result<SourceRecoveryDispatch> {
+        // [PHALA-SOURCE-OBSERVATION-FLOOR 2026-10-07 by Codex] Keep
+        // existing callers while refreshing after SQL ownership/audit waits.
+        let started = std::time::Instant::now();
+        self.recover_dispatch_at(route, || elapsed_now(now, started))
+    }
+
+    pub(crate) fn recover_dispatch_at(
+        &self, route: [u8; 16], refresh_now: impl FnOnce() -> Result<u64>,
+    ) -> Result<SourceRecoveryDispatch> {
+        self.with_inner(|inner| self.transaction_at(inner, refresh_now, |tx, now| {
+            let row = self.load(tx, route)?.ok_or(SourceJournalError::Rejected)?;
+            if now >= row.retain_until
+                || now >= row.plan.deadline
+                || row.phase != SourcePhase::Armed
+            {
+                return Err(SourceJournalError::Rejected);
+            }
+            row.plan.validate_at(now)?;
+            Ok(SourceRecoveryDispatch {
+                exact_bytes: Zeroizing::new(row.plan.dispatch.clone()),
+                authorization_bytes: row.plan.authority.authorization.clone(),
+                deadline: row.plan.deadline,
+                request_commitment: row.plan.request_commitment,
+                observed_at: now,
+            })
+        }))
+    }
+
     pub(crate) fn cleanup(&self, limit: usize, now: u64) -> Result<usize> {
         if limit == 0 || limit > PAGE_LIMIT { return Err(SourceJournalError::Rejected); }
-        self.with_inner(|inner| self.transaction(inner, now, |tx| {
-            let mut removed = 0;
-            // Scan at most the fixed row ceiling in SQLite, but decrypt only
-            // this cleanup batch, not every unrelated live result/large page.
-            let selected = {
-                let mut statement = tx.prepare("SELECT CASE WHEN typeof(route)='blob' AND length(route)=16 THEN route ELSE NULL END FROM source_jobs WHERE retain_until<=?1 ORDER BY route LIMIT ?2").map_err(unavailable)?;
-                let rows = statement.query_map(params![sql(now)?, limit as i64], |r| r.get::<_, Option<Vec<u8>>>(0)).map_err(unavailable)?;
-                let mut selected: Vec<[u8; 16]> = Vec::new();
-                for row in rows {
-                    selected.push(row.map_err(|_| SourceJournalError::Corrupt)?.ok_or(SourceJournalError::Corrupt)?
-                        .try_into().map_err(|_| SourceJournalError::Corrupt)?);
-                }
-                selected
-            };
-            for id in selected {
-                let row = self.load(tx, id)?.ok_or(SourceJournalError::Corrupt)?;
-                if now >= row.retain_until {
-                    one(tx.execute("DELETE FROM source_jobs WHERE route=?1 AND generation=?2 AND retain_until<=?3",
-                        params![id.as_slice(), sql(row.generation)?, sql(now)?]).map_err(unavailable)?)?;
-                    removed += 1;
-                    if removed == limit { break; }
-                }
+        self.with_inner(|inner| self.transaction(inner, now, |tx| self.cleanup_expired(tx, limit, now)))
+    }
+
+    // [PHALA-SOURCE-RETENTION-ADMISSION 2026-10-08 by Codex] Both explicit
+    // retention cleanup and production fresh admission use the sealed row's
+    // authenticated horizon, never untrusted SQL expiry columns alone.
+    fn cleanup_expired(&self, tx: &Transaction<'_>, limit: usize, now: u64) -> Result<usize> {
+        let mut removed = 0;
+        // Scan at most the fixed row ceiling in SQLite, but decrypt only
+        // this cleanup batch, not every unrelated live result/large page.
+        let selected = {
+            let mut statement = tx.prepare("SELECT CASE WHEN typeof(route)='blob' AND length(route)=16 THEN route ELSE NULL END FROM source_jobs WHERE retain_until<=?1 ORDER BY route LIMIT ?2").map_err(unavailable)?;
+            let rows = statement.query_map(params![sql(now)?, limit as i64], |r| r.get::<_, Option<Vec<u8>>>(0)).map_err(unavailable)?;
+            let mut selected: Vec<[u8; 16]> = Vec::new();
+            for row in rows {
+                selected.push(row.map_err(|_| SourceJournalError::Corrupt)?.ok_or(SourceJournalError::Corrupt)?
+                    .try_into().map_err(|_| SourceJournalError::Corrupt)?);
             }
-            Ok(removed)
-        }))
+            selected
+        };
+        for id in selected {
+            let row = self.load(tx, id)?.ok_or(SourceJournalError::Corrupt)?;
+            if now >= row.retain_until {
+                one(tx.execute("DELETE FROM source_jobs WHERE route=?1 AND generation=?2 AND retain_until<=?3",
+                    params![id.as_slice(), sql(row.generation)?, sql(now)?]).map_err(unavailable)?)?;
+                removed += 1;
+                if removed == limit { break; }
+            }
+        }
+        Ok(removed)
     }
 
     fn with_inner<T>(&self, action: impl FnOnce(&mut Inner) -> Result<T>) -> Result<T> {
         let mut inner = match self.inner.try_lock() {
             Ok(inner) => inner, Err(TryLockError::WouldBlock) => return Err(SourceJournalError::Busy),
-            Err(TryLockError::Poisoned(_)) => return Err(SourceJournalError::Unavailable),
+            Err(TryLockError::Poisoned(_)) => {
+                self.report_failure();
+                return Err(SourceJournalError::Unavailable);
+            }
         };
-        if inner.poisoned { return Err(SourceJournalError::Unavailable); }
-        let result = action(&mut inner);
+        if inner.poisoned {
+            self.report_failure();
+            return Err(SourceJournalError::Unavailable);
+        }
+        // [PHALA-SOURCE-JOURNAL-FAULT 2026-10-07 by Codex] Publish even
+        // when the async JoinHandle was already dropped. Resume unwinding with
+        // the mutex held so its original poisoning semantics remain intact.
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(&mut inner))) {
+            Ok(result) => result,
+            Err(unwind) => {
+                self.report_failure();
+                std::panic::resume_unwind(unwind)
+            }
+        };
         if matches!(&result, Err(SourceJournalError::Corrupt | SourceJournalError::Unavailable | SourceJournalError::ClockRollback)) {
             inner.poisoned = true;
+            self.report_failure();
         }
         result
     }
 
     fn transaction<T>(&self, inner: &mut Inner, now: u64, action: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        self.transaction_at(inner, || Ok(now), |tx, _| action(tx))
+    }
+
+    // [REVERSE-ONION-SOURCE-LOCK-TIME 2026-10-05 by Codex] Freshness-sensitive
+    // source reads sample time only after SQLite transaction acquisition and
+    // bounded journal integrity work, before applying or publishing a result.
+    fn transaction_at<T>(
+        &self,
+        inner: &mut Inner,
+        refresh_now: impl FnOnce() -> Result<u64>,
+        action: impl FnOnce(&Transaction<'_>, u64) -> Result<T>,
+    ) -> Result<T> {
         let tx = inner.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
         let outcome = (|| {
             let (source, clock): (Vec<u8>, i64) = tx.query_row(
                 "SELECT source,clock FROM source_meta WHERE singleton=1 AND typeof(source)='blob' AND length(source)=32 AND typeof(clock)='integer'",
                 [], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|_| SourceJournalError::Corrupt)?;
             if source.as_slice() != self.identity.public_key_bytes().as_slice() || clock < 0 { return Err(SourceJournalError::Corrupt); }
-            if sql(now)? < clock { return Err(SourceJournalError::ClockRollback); }
             self.audit_bounds(&tx)?;
-            let value = action(&tx)?;
+            let now = refresh_now()?;
+            if sql(now)? < clock { return Err(SourceJournalError::ClockRollback); }
+            let value = action(&tx, now)?;
             self.audit_bounds(&tx)?;
             one(tx.execute("UPDATE source_meta SET clock=?1 WHERE singleton=1 AND clock=?2", params![sql(now)?, clock]).map_err(unavailable)?)?;
             Ok(value)
@@ -1098,6 +1496,26 @@ impl ReverseOnionSourceJournal {
     fn seal(&self, row: &Record) -> Result<Vec<u8>> {
         row.validate()?;
         seal_blind_vault_source_pull_journal(&self.identity, &row.encode()?).map_err(|_| SourceJournalError::Corrupt)
+    }
+
+    // [REVERSE-ONION-RETENTION-MIGRATION 2026-10-05 by Codex] Extend existing
+    // sealed rows atomically while still accepting the previous retention
+    // formula. A crash rolls the SQL transaction back without losing evidence.
+    fn extend_retention(&self, tx: &Transaction<'_>, row: &mut Record) -> Result<()> {
+        let retain_until = row.plan.retention()?;
+        if row.retain_until >= retain_until { return Ok(()); }
+        let previous_generation = row.generation;
+        let previous_retention = row.retain_until;
+        row.retain_until = retain_until;
+        row.generation = previous_generation.checked_add(1).ok_or(SourceJournalError::Corrupt)?;
+        let sealed = self.seal(row)?;
+        one(tx.execute(
+            "UPDATE source_jobs SET generation=?1,retain_until=?2,sealed=?3
+             WHERE route=?4 AND phase=?5 AND generation=?6 AND reserved=?7 AND retain_until=?8",
+            params![sql(row.generation)?, sql(row.retain_until)?, sealed,
+                row.plan.expected.route.as_slice(), row.phase as u8,
+                sql(previous_generation)?, sql(row.reserved)?, sql(previous_retention)?],
+        ).map_err(unavailable)?)
     }
 
     fn replace(&self, tx: &Transaction<'_>, row: &mut Record, next: SourcePhase) -> Result<()> {
@@ -1241,6 +1659,17 @@ fn initialize_schema(connection: &mut Connection, source: [u8; 32], now: u64) ->
             params![name, expected.len() as i64], |r| r.get(0)).map_err(|_| SourceJournalError::Corrupt)?;
         if actual != expected { return Err(SourceJournalError::Corrupt); }
     }
+    // [PHALA-JOURNAL-OPEN-OWNER 2026-10-08 by Codex] Match the normal
+    // transaction's owner/clock gate before initialization can commit. A
+    // schema-shaped primary alone never establishes this source's custody.
+    let (stored_source, clock): (Vec<u8>, i64) = tx.query_row(
+        "SELECT source,clock FROM source_meta WHERE singleton=1 AND typeof(source)='blob' AND length(source)=32 AND typeof(clock)='integer'",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|_| SourceJournalError::Corrupt)?;
+    if stored_source.as_slice() != source.as_slice() || clock < 0 {
+        return Err(SourceJournalError::Corrupt);
+    }
+    if sql(now)? < clock { return Err(SourceJournalError::ClockRollback); }
     tx.commit().map_err(unavailable)
 }
 
@@ -1288,6 +1717,24 @@ impl<'a> Cursor<'a> {
 fn hash(bytes: &[u8]) -> [u8; 32] { Sha256::digest(bytes).into() }
 fn valid_key(bytes: [u8; 32]) -> Result<()> {
     IdentityPublicKey::from_bytes(&bytes).map(|_| ()).map_err(|_| SourceJournalError::Rejected)
+}
+// [REVERSE-ONION-SOURCE-LOCK-TIME 2026-10-05 by Codex] Advance a trusted
+// receive-time anchor monotonically across blocking journal/crypto work.
+fn elapsed_now(anchor: u64, started: std::time::Instant) -> Result<u64> {
+    anchor.checked_add(started.elapsed().as_secs()).ok_or(SourceJournalError::Rejected)
+}
+
+// [PHALA-SOURCE-OPEN-CLOCK 2026-10-07 by Codex] Check raw observations
+// before applying the independent monotonic expiry bound in the action.
+// transaction_at must also compare this RAW sample with its durable clock;
+// max() before that comparison could hide rollback while waiting for SQL.
+// Remote timestamps are not accepted as the anchor or sampler.
+fn result_observed_now(floor: &mut u64,
+    refresh_now: &mut impl FnMut() -> Result<u64>) -> Result<u64> {
+    let sample = refresh_now()?;
+    if sample < *floor { return Err(SourceJournalError::ClockRollback); }
+    *floor = sample;
+    Ok(sample)
 }
 fn sql(n: u64) -> Result<i64> { i64::try_from(n).map_err(|_| SourceJournalError::Rejected) }
 fn rejected<T>(_: T) -> SourceJournalError { SourceJournalError::Rejected }
@@ -1343,6 +1790,14 @@ pub(crate) mod tests {
         fn descriptor(identity: &IdentityKeyPair) -> SignedNodeDescriptor {
             Self::descriptor_at(identity, NOW)
         }
+        // [PHALA-PRIVATE-DISCOVERY-ISOLATION 2026-10-06 by Codex] Keep test
+        // role construction aligned with the signed private-recipient policy.
+        fn private_descriptor_at(identity: &IdentityKeyPair, now: u64) -> SignedNodeDescriptor {
+            let mut descriptor = Self::descriptor_at(identity, now).descriptor;
+            descriptor.public_endpoint = None;
+            descriptor.policy.public_discovery = false;
+            SignedNodeDescriptor::sign(descriptor, identity).unwrap()
+        }
         pub(crate) fn new() -> Self {
             Self::new_with_route(11)
         }
@@ -1357,8 +1812,27 @@ pub(crate) mod tests {
                 .saturating_sub(120);
             Self::new_with_route_at(11, now)
         }
+        // [PHALA-SOURCE-RETENTION-ADMISSION 2026-10-08 by Codex] Synthetic
+        // historical custody for the real runtime's fresh admission boundary.
+        pub(crate) fn for_retention_admission(route_byte: u8, now: u64) -> Self {
+            Self::new_with_route_at(route_byte, now)
+        }
         fn new_with_route_at(route_byte: u8, now: u64) -> Self {
+            Self::new_with_route_at_and_kem(route_byte, now, None)
+        }
+        // [PHALA-CONNECTED-REVERSE-LOOP 2026-10-07 by Codex] Both local
+        // routers use this process's ephemeral KEM manager. Signing identities
+        // remain distinct; this fixture is not independent-host key custody.
+        pub(crate) fn new_for_connected_loop() -> Self {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap().as_secs();
+            Self::new_with_route_at_and_kem(71, now,
+                Some(crate::services::onion_keys::current_public_key()))
+        }
+        fn new_with_route_at_and_kem(route_byte: u8, now: u64, kem: Option<[u8; 32]>) -> Self {
             let directory = tempfile::Builder::new().prefix("r1-source-pull-test-")
+                // [PHALA-JOURNAL-FIXTURE-REPAIR 2026-10-08 by Codex]
+                .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
                 .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
             let source = Arc::new(IdentityKeyPair::from_bytes(&[41; 32]).unwrap());
             let relay = IdentityKeyPair::from_bytes(&[42; 32]).unwrap();
@@ -1369,7 +1843,18 @@ pub(crate) mod tests {
                     read_capability: [8; 32], continuation_cursor: vec![], limit: 1 }).unwrap();
             let terminal = Zeroizing::new(request);
             let snapshot = Zeroizing::new(session.seal_restart(&source, route, recipient.public_key_bytes(), &terminal).unwrap());
-            let descriptors = [Self::descriptor_at(&relay, now), Self::descriptor_at(&recipient, now)];
+            let mut descriptors = [
+                Self::descriptor_at(&relay, now),
+                Self::private_descriptor_at(&recipient, now),
+            ];
+            if let Some(kem) = kem {
+                descriptors[0] = SignedNodeDescriptor::sign(
+                    descriptors[0].descriptor.clone().with_x25519_kem(kem), &relay,
+                ).unwrap();
+                descriptors[1] = SignedNodeDescriptor::sign(
+                    descriptors[1].descriptor.clone().with_x25519_kem(kem), &recipient,
+                ).unwrap();
+            }
             let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
                 &descriptors[0], &descriptors[1], OnionRoutePurpose::BlindVaultPull.as_str(),
                 now, now + 9_000, &recipient,
@@ -1382,16 +1867,25 @@ pub(crate) mod tests {
                 DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptors[0]).unwrap().hash();
             let recipient_descriptor_commitment =
                 DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptors[1]).unwrap().hash();
-            let verified_route = VerifiedOnionRoute::from_signed_descriptors(
-                source.public_key_bytes(), descriptors.iter(), OnionRoutePurpose::BlindVaultPull, now,
+            // [PHALA-CONNECTED-REVERSE-LOOP 2026-10-07 by Codex] A private
+            // endpoint-free P must use the grant-bound private route builder;
+            // the generic public builder correctly rejects this descriptor.
+            let verified_route = VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                source.public_key_bytes(), &descriptors[0], &descriptors[1],
+                &authorization, OnionRoutePurpose::BlindVaultPull, now,
             ).unwrap();
             let (envelope, expectation) = verified_route.build_envelope_with_forward_expectation(
                 &terminal, route, now, &source,
             ).unwrap();
             let expectation = expectation.unwrap();
             // R's secret is used ONLY after source construction to emulate R.
-            let (relay_secret, _) = relay.to_x25519();
-            let peeled = open_onion_layer(&envelope.encrypted_blob, &relay_secret).unwrap();
+            let peeled = if kem.is_some() {
+                crate::services::onion_keys::peel_secrets(now).iter()
+                    .find_map(|secret| open_onion_layer(&envelope.encrypted_blob, secret).ok()).unwrap()
+            } else {
+                let (relay_secret, _) = relay.to_x25519();
+                open_onion_layer(&envelope.encrypted_blob, &relay_secret).unwrap()
+            };
             let retained = BlindRelayEnvelope { route_id: route, next_hop: recipient.public_key_bytes(), ttl: 1,
                 timestamp: now, encrypted_blob: peeled.inner, signature: [0; 64] }.sign_with(&relay);
             let claim = ReverseOnionFrameV1::claim(relay.public_key_bytes(), [12; 16], now, now + 30, &recipient).unwrap();
@@ -1404,6 +1898,29 @@ pub(crate) mod tests {
         fn path(&self) -> std::path::PathBuf { self.directory.path().join("source.sqlite") }
         pub(crate) fn source_identity(&self) -> Arc<IdentityKeyPair> {
             Arc::clone(&self.source)
+        }
+        // [PHALA-SOURCE-HTTP-BOUNDARY 2026-10-07 by Codex] Test-only actual
+        // core wire constructor, matching this fixture's provisioned vault.
+        pub(crate) fn source_api_request(&self, nonce: [u8; 16], at: u64)
+            -> aeronyx_core::protocol::onion::reverse_delivery::ReverseOnionSourcePullRequestV1 {
+            aeronyx_core::protocol::onion::reverse_delivery::ReverseOnionSourcePullRequestV1::new_signed(
+                &self.source, nonce, at,
+                BlindVaultPullRequest { version: BLIND_VAULT_PROTOCOL_VERSION, lease_id: [7; 32],
+                    read_capability: [8; 32], continuation_cursor: Vec::new(), limit: 1 },
+                &self.policy_parts().2,
+            ).unwrap()
+        }
+        // [PHALA-SOURCE-POST-OBSERVATION 2026-10-07 by Codex] Synthetic
+        // relay identity for actual transport-boundary ACK regression cases.
+        pub(crate) fn relay_identity(&self) -> Arc<IdentityKeyPair> {
+            // [PHALA-SOURCE-FIXTURE-OWNERSHIP 2026-10-07 by Codex] The
+            // fixture owns a key pair, not an Arc; share an owned test copy.
+            Arc::new(self.relay.clone())
+        }
+        // [PHALA-CONNECTED-REVERSE-LOOP 2026-10-07 by Codex] Only the test
+        // recipient owns this synthetic identity; production code is untouched.
+        pub(crate) fn recipient_identity(&self) -> Arc<IdentityKeyPair> {
+            Arc::new(self.recipient.clone())
         }
         pub(crate) fn now(&self) -> u64 { self.now }
         pub(crate) fn outbound_bytes(&self) -> Vec<u8> {
@@ -1420,12 +1937,35 @@ pub(crate) mod tests {
             SignedPrivateOnionRecipientAuthorizationV1,
         ) {
             (
-                self.authority.relay_descriptor.clone(),
-                self.authority.recipient_descriptor.clone(),
-                self.authority.authorization.clone(),
+                SignedNodeDescriptor::decode_canonical(&self.authority.relay_descriptor).unwrap(),
+                SignedNodeDescriptor::decode_canonical(&self.authority.recipient_descriptor).unwrap(),
+                SignedPrivateOnionRecipientAuthorizationV1::decode_canonical(
+                    &self.authority.authorization,
+                ).unwrap(),
             )
         }
         pub(crate) fn route(&self) -> [u8; 16] { self.retained.route_id }
+        // [PHALA-ROTATED-CUSTODY-RECOVERY 2026-10-08 by Codex] Test-only
+        // real signed replacement, not an identity-only rotation surrogate.
+        pub(crate) fn renewed_policy_parts(&self, at: u64) -> (
+            SignedNodeDescriptor, SignedNodeDescriptor,
+            SignedPrivateOnionRecipientAuthorizationV1,
+        ) {
+            let (relay, recipient, _) = self.policy_parts();
+            let mut relay_body = relay.descriptor;
+            relay_body.sequence += 1;
+            relay_body.issued_at = at;
+            let relay = SignedNodeDescriptor::sign(relay_body, &self.relay).unwrap();
+            let mut recipient_body = recipient.descriptor;
+            recipient_body.sequence += 1;
+            recipient_body.issued_at = at;
+            let recipient = SignedNodeDescriptor::sign(recipient_body, &self.recipient).unwrap();
+            let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+                &relay, &recipient, OnionRoutePurpose::BlindVaultPull.as_str(),
+                at, at + 600, &self.recipient,
+            ).unwrap();
+            (relay, recipient, authorization)
+        }
         fn expected(&self) -> ExpectedRetainedEnvelope {
             ExpectedRetainedEnvelope::from_verified_forward_expectation(&self.expectation).unwrap()
         }
@@ -1442,18 +1982,108 @@ pub(crate) mod tests {
                     purpose: self.authority.purpose.clone(),
                 }, self.now + 600, self.terminal.to_vec()).unwrap()
         }
+        fn randomized_plan_for_same_pull(
+            &self,
+        ) -> (SourcePreparedPull, BlindVaultOnionPullSession) {
+            let route_id = self.route();
+            let refreshed_at = self.now + 1;
+            let relay_descriptor = Self::descriptor_at(&self.relay, refreshed_at);
+            let recipient_descriptor = Self::private_descriptor_at(&self.recipient, refreshed_at);
+            let authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+                &relay_descriptor,
+                &recipient_descriptor,
+                OnionRoutePurpose::BlindVaultPull.as_str(),
+                refreshed_at,
+                refreshed_at + 9_000,
+                &self.recipient,
+            ).unwrap();
+            let authority = SourceRouteAuthority::from_signed(
+                &relay_descriptor,
+                &recipient_descriptor,
+                &authorization,
+                OnionRoutePurpose::BlindVaultPull.as_str(),
+            ).unwrap();
+            let pull = BlindVaultPullRequest {
+                version: BLIND_VAULT_PROTOCOL_VERSION,
+                lease_id: [7; 32],
+                read_capability: [8; 32],
+                continuation_cursor: Vec::new(),
+                limit: 1,
+            };
+            let (terminal, session) = BlindVaultOnionPullSession::prepare(
+                route_id,
+                self.recipient.public_key_bytes(),
+                pull,
+            ).unwrap();
+            let route = VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+                self.source.public_key_bytes(),
+                &relay_descriptor,
+                &recipient_descriptor,
+                &authorization,
+                OnionRoutePurpose::BlindVaultPull,
+                refreshed_at,
+            ).unwrap();
+            let (envelope, expectation) = route.build_envelope_with_forward_expectation(
+                &terminal, route_id, refreshed_at, &self.source,
+            ).unwrap();
+            let expected = ExpectedRetainedEnvelope::from_verified_forward_expectation(
+                &expectation.unwrap(),
+            ).unwrap();
+            let request = PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: self.source.public_key_bytes(),
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            };
+            let request_commitment =
+                blind_relay_authenticated_request_commitment(&request).unwrap();
+            let plan = SourcePreparedPull::from_runtime_admission(
+                &self.source,
+                request,
+                expected,
+                self.recipient.public_key_bytes(),
+                DirectoryDescriptorCommitmentV1::from_signed_descriptor(&recipient_descriptor).unwrap().hash(),
+                DirectoryDescriptorCommitmentV1::from_signed_descriptor(&relay_descriptor).unwrap().hash(),
+                DirectoryDescriptorCommitmentV1::from_signed_descriptor(&recipient_descriptor).unwrap().hash(),
+                request_commitment,
+                authority,
+                refreshed_at + 600,
+                terminal,
+            ).unwrap();
+            (plan, session)
+        }
         fn session(&self) -> BlindVaultOnionPullSession {
             // Fixture construction only. Production restore lives inside Opening.
             BlindVaultOnionPullSession::restore_restart(&self.source, &self.snapshot,
                 self.route(), self.recipient.public_key_bytes(), &self.terminal).unwrap()
         }
+        // [PHALA-SOURCE-JOURNAL-LANE 2026-10-07 by Codex] Synthetic,
+        // authenticated material for the actual runtime admission boundary.
+        pub(crate) fn runtime_admission_parts(&self) -> (
+            PeerBlindRelayRequest, ExpectedRetainedEnvelope, BlindVaultOnionPullSession, Vec<u8>,
+        ) {
+            (self.outbound.clone(), self.expected(), self.session(), self.terminal.to_vec())
+        }
         pub(crate) fn open(&self, now: u64) -> ReverseOnionSourceJournal {
             self.open_limits(now, 8, RESERVED_PER_JOB * 8).unwrap()
+        }
+        // [PHALA-SOURCE-RETURNED-FAULT 2026-10-07 by Codex] Exercise
+        // production quota rollback through the actual API/lifecycle owner.
+        pub(crate) fn open_one_slot(&self, now: u64) -> ReverseOnionSourceJournal {
+            self.open_limits(now, 1, RESERVED_PER_JOB).unwrap()
+        }
+        // [PHALA-ACTUAL-RECIPIENT-WORKER 2026-10-07 by Codex] Connected
+        // restart assertions must use the existing-only authenticated opener.
+        pub(crate) fn open_existing(&self, now: u64) -> ReverseOnionSourceJournal {
+            ReverseOnionSourceJournal::open_existing(&self.path(), self.source.clone(),
+                SourceJournalLimits { max_entries: 8, max_bytes: RESERVED_PER_JOB * 8 }, now).unwrap()
         }
         fn open_limits(&self, now: u64, max_entries: usize, max_bytes: u64) -> Result<ReverseOnionSourceJournal> {
             ReverseOnionSourceJournal::open(&self.path(), self.source.clone(), SourceJournalLimits { max_entries, max_bytes }, now)
         }
-        fn prepare(&self, journal: &ReverseOnionSourceJournal, now: u64) {
+        // [REVERSE-ONION-SOURCE-TEST-SHARING 2026-10-06 by Codex]
+        // Runtime recovery fixtures use the same authenticated journal setup.
+        pub(crate) fn prepare(&self, journal: &ReverseOnionSourceJournal, now: u64) {
             assert_eq!(journal.prepare(self.plan(), self.session(), now).unwrap(), SourcePhase::Prepared);
         }
         fn response(&self, lease: &ReverseOnionFrameV1, lease_id: [u8; 32], maximum: bool) -> ReverseOnionFrameV1 {
@@ -1476,6 +2106,14 @@ pub(crate) mod tests {
         pub(crate) fn ready_with_maximum(&self, journal: &ReverseOnionSourceJournal) -> ReverseOnionFrameV1 {
             self.ready_with_maximum_inner(journal, true)
         }
+        // [SOURCE-OPEN-RECOVERY 2026-10-05 by Codex] Model a crash after the
+        // durable Opening transition and before the local result is committed.
+        pub(crate) fn mark_opening(&self, journal: &ReverseOnionSourceJournal) {
+            journal.with_inner(|inner| journal.transaction(inner, self.now + 3, |tx| {
+                let mut row = journal.load(tx, self.route())?.ok_or(SourceJournalError::Rejected)?;
+                journal.replace(tx, &mut row, SourcePhase::Opening)
+            })).unwrap();
+        }
         fn ready_with_maximum_inner(
             &self,
             journal: &ReverseOnionSourceJournal,
@@ -1496,8 +2134,90 @@ pub(crate) mod tests {
         }
     }
 
+    // [PHALA-SOURCE-OBSERVATION-FLOOR 2026-10-07 by Codex] Authored,
+    // not run: dispatch material reports the checked SQL time, not its caller's
+    // earlier sample. Clock faults poison the live owner, while forward expiry
+    // is only a rejected replay; neither changes Armed's exact durable bytes.
     #[test]
-    fn prepared_restart_arms_exact_bytes_once_and_uncertain_send_never_rearms() {
+    fn dispatch_clock_floor_survives_sql_admission_and_existing_only_restart() {
+        for rollback in [false, true] {
+            let f = Fixture::new();
+            let journal = f.open(NOW);
+            f.prepare(&journal, NOW);
+            let armed = journal.arm_at(f.route(), || Ok(NOW + 1)).unwrap();
+            assert_eq!(armed.observed_at, NOW + 1);
+            assert_eq!(armed.exact_bytes, f.outbound_bytes());
+            let recovered = journal.recover_dispatch_at(f.route(), || Ok(NOW + 2)).unwrap();
+            assert_eq!(recovered.observed_at, NOW + 2);
+            assert_eq!(recovered.exact_bytes.as_slice(), armed.exact_bytes.as_slice());
+            assert_eq!(recovered.deadline, armed.deadline);
+            let rejected_at = if rollback { NOW + 1 } else { armed.deadline };
+            assert_eq!(journal.recover_dispatch_at(f.route(), || Ok(rejected_at)).err(),
+                Some(if rollback { SourceJournalError::ClockRollback } else { SourceJournalError::Rejected }));
+            assert_eq!(journal.intake_stop_flag().load(Ordering::SeqCst), rollback);
+            assert_eq!(*journal.failure_signal().borrow(), rollback);
+            drop(journal);
+            let reopened_at = (NOW + 3).max(rejected_at + 1);
+            let reopened = f.open_existing(reopened_at);
+            assert_eq!(reopened.lookup_phase(f.route(), reopened_at).unwrap(), Some(SourcePhase::Armed));
+            // Row decoding/audit authenticates the same original payload even
+            // when live replay has expired; no replacement request is created.
+            let row = reopened.with_inner(|inner| reopened.transaction(inner, reopened_at, |tx| {
+                reopened.load(tx, f.route())?.ok_or(SourceJournalError::Rejected)
+            })).unwrap();
+            assert_eq!(row.plan.dispatch, armed.exact_bytes);
+        }
+    }
+
+    // [PHALA-EXISTING-CUSTODY-OPEN 2026-10-07 by Codex] Authored, not run.
+    #[test]
+    fn recovery_open_never_bootstraps_missing_or_empty_source_history() {
+        let f = Fixture::new();
+        let reopen = |path: &Path, now| ReverseOnionSourceJournal::open_existing(
+            path, f.source.clone(), SourceJournalLimits { max_entries: 8, max_bytes: RESERVED_PER_JOB * 8 }, now);
+        let nested = f.path().parent().unwrap().join("missing/source.sqlite");
+        assert!(reopen(&nested, NOW).is_err());
+        assert!(!nested.parent().unwrap().exists());
+        assert!(reopen(&f.path(), NOW).is_err());
+        assert!(!f.path().exists());
+        let empty = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .open(f.path()).unwrap();
+        drop(empty);
+        assert!(reopen(&f.path(), NOW).is_err());
+        assert_eq!(std::fs::metadata(f.path()).unwrap().len(), 0);
+        std::fs::remove_file(f.path()).unwrap();
+        let journal = f.open(NOW);
+        f.prepare(&journal, NOW);
+        let exact = journal.arm(f.route(), NOW + 1).unwrap().exact_bytes;
+        drop(journal);
+        let journal = reopen(&f.path(), NOW + 2).unwrap();
+        assert_eq!(journal.recover(None, 1, NOW + 2).unwrap().items,
+            vec![(f.route(), SourcePhase::Armed)]);
+        assert_eq!(journal.recover_dispatch(f.route(), NOW + 2).unwrap().exact_bytes.as_slice(), exact.as_slice());
+    }
+
+    // [PHALA-OWNED-RECOVERY-SCHEMA 2026-10-07 by Codex] Authored, not run.
+    #[test]
+    fn source_header_gate_preserves_unowned_sqlite_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let connection = Connection::open(f.path()).unwrap();
+        connection.execute_batch("CREATE TABLE foreign_state(value BLOB);").unwrap();
+        connection.pragma_update(None, "application_id", APPLICATION_ID).unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        drop(connection);
+        std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::read(f.path()).unwrap();
+        assert_eq!(f.open_limits(NOW, 8, RESERVED_PER_JOB * 8).err(), Some(SourceJournalError::Corrupt));
+        assert_eq!(std::fs::read(f.path()).unwrap(), before);
+        assert_eq!(ReverseOnionSourceJournal::open_existing(&f.path(), f.source.clone(),
+            SourceJournalLimits { max_entries: 8, max_bytes: RESERVED_PER_JOB * 8 }, NOW).err(),
+            Some(SourceJournalError::Corrupt));
+        assert_eq!(std::fs::read(f.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn prepared_restart_arms_exact_bytes_and_preserves_unattempted_arm_for_recovery() {
         let f = Fixture::new();
         let journal = f.open(NOW); f.prepare(&journal, NOW);
         let exact = serde_json::to_vec(&f.outbound).unwrap();
@@ -1507,11 +2227,90 @@ pub(crate) mod tests {
         assert_eq!(journal.arm(f.route(), NOW + 1).err(), Some(SourceJournalError::Ambiguous));
         drop(journal);
         let journal = f.open(NOW + 2);
-        assert_eq!(journal.recover(None, 1, NOW + 2).unwrap().items, vec![(f.route(), SourcePhase::DispatchAmbiguous)]);
+        assert_eq!(journal.recover(None, 1, NOW + 2).unwrap().items, vec![(f.route(), SourcePhase::Armed)]);
         assert_eq!(journal.arm(f.route(), NOW + 2).err(), Some(SourceJournalError::Ambiguous));
         let result = f.response(&f.lease, [7; 32], false);
         journal.record_result(f.route(), &f.claim, &f.lease, &result, NOW + 2).unwrap();
         assert_eq!(journal.open_result(f.route(), NOW + 2).unwrap().lease_id, [7; 32]);
+    }
+
+    // [REVERSE-SOURCE-SAME-RELAY-RECOVERY 2026-10-05 by Codex] Authored,
+    // not executed: restart recovery yields only the exact persisted request
+    // and authority, and refuses replay after the immutable route deadline.
+    #[test]
+    fn armed_recovery_returns_only_exact_dispatch_under_original_deadline() {
+        let f = Fixture::new();
+        let journal = f.open(NOW);
+        f.prepare(&journal, NOW);
+        let exact = journal.arm(f.route(), NOW + 1).unwrap().exact_bytes;
+        drop(journal);
+
+        let journal = f.open(NOW + 2);
+        let recovered = journal.recover_dispatch(f.route(), NOW + 2).unwrap();
+        assert_eq!(recovered.exact_bytes.as_slice(), exact.as_slice());
+        assert_eq!(
+            recovered.authorization_bytes.as_slice(),
+            f.authority.authorization.as_slice(),
+        );
+        // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex] Recovery
+        // preserves the admitted cap, not the time at which recovery runs.
+        assert_eq!(recovered.deadline, f.plan().deadline);
+        assert_eq!(
+            journal.recover_dispatch(f.route(), recovered.deadline).err(),
+            Some(SourceJournalError::Rejected),
+        );
+    }
+
+    // [REVERSE-SOURCE-ZERO-SEND 2026-10-05 by Codex] Authored, not executed:
+    // only a live owner that has not entered transport may roll Armed back.
+    #[test]
+    fn known_zero_send_restores_exact_prepared_frame_but_ambiguous_does_not() {
+        let f = Fixture::new();
+        let journal = f.open(NOW);
+        f.prepare(&journal, NOW);
+        let first = journal.arm(f.route(), NOW + 1).unwrap().exact_bytes;
+        journal.restore_prepared_after_no_send(f.route(), NOW + 2).unwrap();
+        assert_eq!(
+            journal.lookup_phase(f.route(), NOW + 2).unwrap(),
+            Some(SourcePhase::Prepared),
+        );
+        assert_eq!(journal.arm(f.route(), NOW + 3).unwrap().exact_bytes, first);
+        journal.mark_dispatch_ambiguous(f.route(), NOW + 4).unwrap();
+        assert_eq!(
+            journal.restore_prepared_after_no_send(f.route(), NOW + 4).err(),
+            Some(SourceJournalError::Conflict),
+        );
+
+        let other = Fixture::new();
+        let journal = other.open(NOW);
+        other.prepare(&journal, NOW);
+        journal.arm(other.route(), NOW + 1).unwrap();
+        journal.mark_dispatch_ambiguous(other.route(), NOW + 2).unwrap();
+        assert_eq!(
+            journal.restore_prepared_after_no_send(other.route(), NOW + 3).err(),
+            Some(SourceJournalError::Conflict),
+        );
+    }
+
+    // [REVERSE-SOURCE-PREPARED-ROTATION 2026-10-05 by Codex] Authored,
+    // unexecuted: fresh descriptors/grants replace only proven zero-send work.
+    #[test]
+    fn prepared_retry_replaces_dispatch_but_armed_route_is_immutable() {
+        let f = Fixture::new();
+        let journal = f.open(NOW);
+        f.prepare(&journal, NOW);
+        let original = journal.arm(f.route(), NOW + 1).unwrap().exact_bytes;
+        journal.restore_prepared_after_no_send(f.route(), NOW + 2).unwrap();
+
+        let (retry, session) = f.randomized_plan_for_same_pull();
+        assert_ne!(retry.recipient_descriptor_commitment, f.recipient_descriptor_commitment);
+        assert_ne!(retry.authority.authorization.as_slice(), f.authority.authorization.as_slice());
+        assert_eq!(journal.prepare(retry, session, NOW + 3).unwrap(), SourcePhase::Prepared);
+        let refreshed = journal.arm(f.route(), NOW + 4).unwrap().exact_bytes;
+        assert_ne!(refreshed, original);
+
+        let (another_retry, session) = f.randomized_plan_for_same_pull();
+        assert_eq!(journal.prepare(another_retry, session, NOW + 5).err(), Some(SourceJournalError::Conflict));
     }
 
     // [REVERSE-ONION-SOURCE-JOURNAL-V2 2026-10-04 by Codex] Recovery exposes
@@ -1535,7 +2334,33 @@ pub(crate) mod tests {
         assert_eq!(item.body_commitment(), hash(&serde_json::to_vec(&f.outbound).unwrap()));
         assert_ne!(item.request_commitment(), [0; 32]);
         assert!(item.deadline() <= item.retain_until());
+        assert!(item.retain_until() >= item.deadline()
+            + MAX_REVERSE_ONION_RECOVERY_RETENTION_SECS);
         assert!(page.next_after.is_none());
+    }
+
+    // [REVERSE-ONION-RETENTION-MIGRATION 2026-10-05 by Codex] Authored,
+    // unexecuted: old sealed rows remain readable and are extended on reopen.
+    #[test]
+    fn startup_extends_legacy_source_route_retention() {
+        let f = Fixture::new();
+        let journal = f.open(NOW);
+        f.prepare(&journal, NOW);
+        journal.with_inner(|inner| journal.transaction(inner, NOW + 1, |tx| {
+            let mut row = journal.load(tx, f.route())?.ok_or(SourceJournalError::Corrupt)?;
+            row.retain_until = row.plan.legacy_retention()?;
+            let sealed = journal.seal(&row)?;
+            one(tx.execute(
+                "UPDATE source_jobs SET retain_until=?1,sealed=?2 WHERE route=?3",
+                params![sql(row.retain_until)?, sealed, f.route().as_slice()],
+            ).map_err(unavailable)?)
+        })).unwrap();
+        drop(journal);
+
+        let reopened = f.open(NOW + 2);
+        let page = reopened.recover_metadata(None, 1, NOW + 2).unwrap();
+        assert!(page.items[0].retain_until() >= page.items[0].deadline()
+            + MAX_REVERSE_ONION_RECOVERY_RETENTION_SECS);
     }
 
     #[test]
@@ -1543,11 +2368,72 @@ pub(crate) mod tests {
         let f = Fixture::new();
         let journal = f.open(NOW);
         f.prepare(&journal, NOW);
+        assert_eq!(
+            journal.recover_route_authority(f.route(), NOW + 1).err(),
+            Some(SourceJournalError::Rejected),
+            "Prepared rows are never eligible for network recovery",
+        );
         journal.arm(f.route(), NOW + 1).unwrap();
-        let page = journal.recover_metadata(None, 1, NOW + 601).unwrap();
-        assert_eq!(page.items[0].phase(), SourcePhase::Armed);
-        assert!(page.items[0].deadline() < NOW + 601);
-        assert!(page.items[0].retain_until() > NOW + 601);
+        journal.mark_dispatch_ambiguous(f.route(), NOW + 2).unwrap();
+        // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex] The
+        // signed grant outlives execution but expires within custody retention.
+        let expired_authority_at = NOW + 9_000;
+        let authority = journal.recover_route_authority(f.route(), expired_authority_at).unwrap();
+        let (relay, recipient, authorization) = authority.signed_parts().unwrap();
+        assert_eq!(relay.node_id(), f.relay.public_key_bytes());
+        assert_eq!(recipient.node_id(), f.recipient.public_key_bytes());
+        assert_eq!(authorization.relay_node_id(), f.relay.public_key_bytes());
+        assert!(authorization
+            .verify_at(
+                &relay,
+                &recipient,
+                OnionRoutePurpose::BlindVaultPull.as_str(),
+                expired_authority_at,
+            )
+            .is_err());
+        let page = journal.recover_metadata(None, 1, expired_authority_at).unwrap();
+        assert_eq!(page.items[0].phase(), SourcePhase::DispatchAmbiguous);
+        assert!(page.items[0].deadline() < expired_authority_at);
+        assert!(page.items[0].retain_until() > expired_authority_at);
+    }
+
+    // [PHALA-ROTATED-CUSTODY-RECOVERY 2026-10-08 by Codex] Authored,
+    // not run: reopening must authenticate the original route's full bundle,
+    // even when another valid bundle has the same R/P identities and origin.
+    #[test]
+    fn restarted_custody_retains_exact_historical_authority_after_renewal() {
+        for ambiguous in [false, true] {
+            let f = Fixture::new();
+            let journal = f.open(NOW);
+            f.prepare(&journal, NOW);
+            journal.arm(f.route(), NOW + 1).unwrap();
+            if ambiguous {
+                journal.mark_dispatch_ambiguous(f.route(), NOW + 2).unwrap();
+            }
+            let (old_relay, old_recipient, old_grant) = f.policy_parts();
+            let (new_relay, new_recipient, new_grant) = f.renewed_policy_parts(NOW + 3);
+            assert_eq!(new_relay.node_id(), old_relay.node_id());
+            assert_eq!(new_recipient.node_id(), old_recipient.node_id());
+            assert_ne!(new_relay.encode_canonical().unwrap(), old_relay.encode_canonical().unwrap());
+            assert_ne!(new_recipient.encode_canonical().unwrap(), old_recipient.encode_canonical().unwrap());
+            new_grant.verify_at(&new_relay, &new_recipient,
+                OnionRoutePurpose::BlindVaultPull.as_str(), NOW + 3).unwrap();
+            assert!(old_grant.verify_at(&new_relay, &new_recipient,
+                OnionRoutePurpose::BlindVaultPull.as_str(), NOW + 3).is_err());
+            drop(journal);
+
+            let reopened = f.open_existing(NOW + 4);
+            let restored = reopened.recover_route_authority(f.route(), NOW + 4).unwrap();
+            let (relay, recipient, grant) = restored.signed_parts().unwrap();
+            assert_eq!(relay.encode_canonical().unwrap(), old_relay.encode_canonical().unwrap());
+            assert_eq!(recipient.encode_canonical().unwrap(), old_recipient.encode_canonical().unwrap());
+            assert_eq!(grant.encode_canonical().unwrap(), old_grant.encode_canonical().unwrap());
+            assert_ne!(grant.encode_canonical().unwrap(), new_grant.encode_canonical().unwrap());
+            let metadata = reopened.recover_metadata(None, 1, NOW + 4).unwrap();
+            assert_eq!(metadata.items.len(), 1);
+            assert_eq!(metadata.items[0].relay_descriptor_commitment(), f.relay_descriptor_commitment);
+            assert_eq!(metadata.items[0].recipient_descriptor_commitment(), f.recipient_descriptor_commitment);
+        }
     }
 
     #[test]
@@ -1761,8 +2647,9 @@ pub(crate) mod tests {
 
     #[test]
     fn result_ready_restart_verifies_and_reads_authenticated_cache_without_reopen() {
-        let f = Fixture::new(); let journal = f.open(NOW); let result = f.ready(&journal);
-        journal.record_result(f.route(), &f.claim, &f.lease, &result, NOW + 3).unwrap();
+        let f = Fixture::new(); let journal = f.open(NOW); f.ready(&journal);
+        // [REVERSE-ONION-SOURCE-RESULT-RESTART 2026-10-06 by Codex]
+        // Fixture::ready already arms and durably records its exact result.
         drop(journal);
         let journal = f.open(NOW + 4);
         assert_eq!(journal.open_result(f.route(), NOW + 4).unwrap().lease_id, [7; 32]);
@@ -1771,23 +2658,170 @@ pub(crate) mod tests {
         let journal = f.open(NOW + 5);
         assert_eq!(journal.read_verified(f.route(), NOW + 5).unwrap().lease_id, [7; 32]);
         assert_eq!(journal.open_result(f.route(), NOW + 5).err(), Some(SourceJournalError::Ambiguous));
+        // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex] Cache
+        // expiry follows authenticated custody retention, not result grace.
+        assert_eq!(journal.read_verified(f.route(), f.plan().retention().unwrap()).err(), Some(SourceJournalError::Expired));
+    }
+
+    // [REVERSE-ONION-SOURCE-LOCK-TIME 2026-10-05 by Codex] Deterministic
+    // monotonic advancement supports lock/crypto freshness without wall-clock rollback.
+    #[test]
+    fn elapsed_now_advances_the_receive_anchor() {
+        let started = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(elapsed_now(NOW, started).unwrap() >= NOW + 3);
+    }
+
+    // [PHALA-SOURCE-OPEN-CLOCK 2026-10-07 by Codex] Authored, not run:
+    // calibrate the newer raw floor against a rollback still above entry time.
+    #[test]
+    fn result_live_clock_fault_preserves_the_last_durable_open_phase() {
+        for after_opening in [false, true] {
+            for unavailable in [false, true] {
+                let f = Fixture::new();
+                let journal = f.open(NOW);
+                f.ready(&journal);
+                let before = journal.inner.lock().unwrap().connection.query_row(
+                    "SELECT phase,generation,sealed,clock FROM source_jobs CROSS JOIN source_meta WHERE route=?1 AND singleton=1",
+                    params![f.route().as_slice()], |row| Ok((row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?)),
+                ).unwrap();
+                let mut calls = 0;
+                let error = journal.open_result_at(f.route(), NOW + 4, || {
+                    calls += 1;
+                    assert!(journal.inner.try_lock().is_err());
+                    if after_opening && calls == 1 { return Ok(NOW + 20); }
+                    if unavailable { Err(SourceJournalError::Unavailable) }
+                    else { Ok(if after_opening { NOW + 10 } else { NOW + 3 }) }
+                }).err();
+                assert_eq!(calls, if after_opening { 2 } else { 1 });
+                assert_eq!(error, Some(if unavailable { SourceJournalError::Unavailable }
+                    else { SourceJournalError::ClockRollback }));
+                let after = journal.inner.lock().unwrap().connection.query_row(
+                    "SELECT phase,generation,sealed,clock FROM source_jobs CROSS JOIN source_meta WHERE route=?1 AND singleton=1",
+                    params![f.route().as_slice()], |row| Ok((row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?)),
+                ).unwrap();
+                if after_opening {
+                    assert_eq!(after.0, SourcePhase::Opening as i64);
+                    assert_eq!(after.1, before.1 + 1);
+                    assert_eq!(after.3, (NOW + 20) as i64);
+                } else { assert_eq!(after, before); }
+                assert!(*journal.failure_signal().borrow());
+                assert_eq!(journal.read_verified(f.route(), NOW + 21).err(), Some(SourceJournalError::Unavailable));
+                drop(journal);
+                let reopened = f.open_existing(NOW + 21);
+                assert_eq!(reopened.lookup_phase(f.route(), NOW + 21).unwrap(),
+                    Some(if after_opening { SourcePhase::Opening } else { SourcePhase::ResultReady }));
+                assert_eq!(reopened.arm(f.route(), NOW + 21).err(), Some(SourceJournalError::Ambiguous));
+                assert_eq!(reopened.open_result_at(f.route(), NOW + 21, || Ok(NOW + 21)).unwrap().lease_id, [7; 32]);
+                assert_eq!(reopened.read_verified_at(f.route(), NOW + 22, || Ok(NOW + 22)).unwrap().lease_id, [7; 32]);
+            }
+        }
+    }
+
+    // [PHALA-SOURCE-OPEN-CLOCK 2026-10-07 by Codex] Authored, not run:
+    // the raw sample, not an expiry projection, must reach the durable floor.
+    #[test]
+    fn result_live_sample_is_not_clamped_before_the_durable_clock_check() {
+        let f = Fixture::new();
+        let journal = f.open(NOW);
+        f.ready(&journal);
+        journal.lookup_phase(f.route(), NOW + 20).unwrap();
+        let started = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(30)).unwrap();
+        let mut floor = NOW + 4;
+        let raw = result_observed_now(&mut floor, &mut || Ok(NOW + 10)).unwrap();
+        assert_eq!(raw, NOW + 10);
+        // The former pre-check max shape would conceal this durable rollback.
+        assert!(raw.max(elapsed_now(NOW + 4, started).unwrap()) >= NOW + 20);
+        assert_eq!(journal.open_result_at(f.route(), NOW + 4, || Ok(raw)).err(),
+            Some(SourceJournalError::ClockRollback));
+        drop(journal);
+        let reopened = f.open_existing(NOW + 21);
+        assert_eq!(reopened.lookup_phase(f.route(), NOW + 21).unwrap(), Some(SourcePhase::ResultReady));
+    }
+
+    // [PHALA-SOURCE-OPEN-CLOCK 2026-10-07 by Codex] Authored, not run:
+    // a forward jump expires output without poisoning or changing its phase.
+    #[test]
+    fn result_live_clock_forward_expiry_is_not_a_retry_or_owner_fault() {
+        for after_opening in [false, true] {
+            let f = Fixture::new();
+            let journal = f.open(NOW);
+            f.ready(&journal);
+            let until = journal.recover_metadata(None, 1, NOW + 3).unwrap().items[0].retain_until();
+            let mut calls = 0;
+            assert_eq!(journal.open_result_at(f.route(), NOW + 4, || {
+                calls += 1;
+                Ok(if after_opening && calls == 1 { NOW + 4 } else { until })
+            }).err(), Some(SourceJournalError::Expired));
+            assert_eq!(calls, if after_opening { 2 } else { 1 });
+            assert!(!*journal.failure_signal().borrow());
+            assert_eq!(journal.lookup_phase(f.route(), NOW + 5).unwrap(),
+                Some(if after_opening { SourcePhase::Opening } else { SourcePhase::ResultReady }));
+        }
+    }
+
+    // [PHALA-SOURCE-OPEN-CLOCK 2026-10-07 by Codex] Authored, not run:
+    // cached plaintext cannot escape a failed post-lock local observation.
+    #[test]
+    fn verified_cache_live_clock_failure_preserves_authenticated_cached_bytes() {
+        for unavailable in [false, true] {
+            let f = Fixture::new();
+            let journal = f.open(NOW);
+            f.ready(&journal);
+            journal.open_result(f.route(), NOW + 4).unwrap();
+            let snapshot = || journal.inner.lock().unwrap().connection.query_row(
+                "SELECT phase,generation,sealed,clock FROM source_jobs CROSS JOIN source_meta WHERE route=?1 AND singleton=1",
+                params![f.route().as_slice()], |row| Ok((row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?)),
+            ).unwrap();
+            let before = snapshot();
+            assert_eq!(journal.read_verified_at(f.route(), NOW + 5, || {
+                assert!(journal.inner.try_lock().is_err());
+                if unavailable { Err(SourceJournalError::Unavailable) } else { Ok(NOW + 4) }
+            }).err(), Some(if unavailable { SourceJournalError::Unavailable }
+                else { SourceJournalError::ClockRollback }));
+            assert_eq!(snapshot(), before);
+            assert!(*journal.failure_signal().borrow());
+            drop(journal);
+            let reopened = f.open_existing(NOW + 6);
+            assert_eq!(reopened.lookup_phase(f.route(), NOW + 6).unwrap(), Some(SourcePhase::Verified));
+            assert_eq!(reopened.read_verified_at(f.route(), NOW + 6, || Ok(NOW + 6)).unwrap().lease_id, [7; 32]);
+            assert_eq!(reopened.arm(f.route(), NOW + 6).err(), Some(SourceJournalError::Ambiguous));
+        }
+    }
+
+    // [PHALA-SOURCE-OPEN-CLOCK 2026-10-07 by Codex] Authored, not run:
+    // expiry at the cache fence is ordinary retention enforcement, not fault.
+    #[test]
+    fn verified_cache_forward_expiry_does_not_publish_or_poison() {
+        let f = Fixture::new();
+        let journal = f.open(NOW);
+        f.ready(&journal);
+        journal.open_result(f.route(), NOW + 4).unwrap();
+        let until = journal.recover_metadata(None, 1, NOW + 5).unwrap().items[0].retain_until();
+        assert_eq!(journal.read_verified_at(f.route(), NOW + 6, || Ok(until)).err(),
+            Some(SourceJournalError::Expired));
+        assert!(!*journal.failure_signal().borrow());
+        assert_eq!(journal.lookup_phase(f.route(), NOW + 7).unwrap(), Some(SourcePhase::Verified));
     }
 
     #[test]
-    fn crash_after_opening_commit_never_restores_session_again() {
-        let f = Fixture::new(); let journal = f.open(NOW); let result = f.ready(&journal);
+    fn crash_after_opening_commit_recovers_only_the_local_open() {
+        let f = Fixture::new(); let journal = f.open(NOW); f.ready(&journal);
         journal.with_inner(|inner| journal.transaction(inner, NOW + 3, |tx| {
             let mut row = journal.load(tx, f.route())?.unwrap();
             journal.replace(tx, &mut row, SourcePhase::Opening)
         })).unwrap();
         drop(journal);
         let journal = f.open(NOW + 4);
-        assert_eq!(journal.recover(None, 64, NOW + 4).unwrap().items, vec![(f.route(), SourcePhase::OpenAmbiguous)]);
-        journal.record_result(f.route(), &f.claim, &f.lease, &result, NOW + 4).unwrap();
+        assert_eq!(journal.recover(None, 64, NOW + 4).unwrap().items, vec![(f.route(), SourcePhase::Opening)]);
+        assert_eq!(journal.open_result(f.route(), NOW + 4).unwrap().lease_id, [7; 32]);
+        assert_eq!(journal.recover(None, 64, NOW + 4).unwrap().items, vec![(f.route(), SourcePhase::Verified)]);
         assert_eq!(journal.open_result(f.route(), NOW + 4).err(), Some(SourceJournalError::Ambiguous));
-        journal.with_inner(|inner| journal.transaction(inner, NOW + 4, |tx| {
-            assert!(journal.load(tx, f.route())?.unwrap().restart.is_empty()); Ok(())
-        })).unwrap();
+        assert_eq!(journal.read_verified(f.route(), NOW + 4).unwrap().lease_id, [7; 32]);
     }
 
     #[test]
@@ -1801,6 +2835,107 @@ pub(crate) mod tests {
         let journal = f.open(NOW + 3);
         assert_eq!(journal.recover(None, 1, NOW + 3).unwrap().items, vec![(f.route(), SourcePhase::Rejected)]);
         assert_eq!(journal.open_result(f.route(), NOW + 3).err(), Some(SourceJournalError::Ambiguous));
+    }
+
+    // [PHALA-JOURNAL-RESULT-CLOCK 2026-10-07 by Codex] Authored, not run:
+    // inject expiry/failure only after transaction acquisition and audits.
+    // [PHALA-SOURCE-ADMISSION-CLOCK 2026-10-07 by Codex] Authored, not
+    // run: the post-sealing callback is under SQL ownership and rejects before
+    // reserving a route or advancing the durable clock.
+    #[test]
+    fn prepare_post_lock_expiry_or_clock_failure_creates_no_source_route() {
+        for fault in [false, true] {
+            let f = Fixture::new();
+            let journal = f.open(NOW);
+            let snapshot = || journal.inner.lock().unwrap().connection.query_row(
+                "SELECT clock,(SELECT COUNT(*) FROM source_jobs) FROM source_meta WHERE singleton=1",
+                [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            ).unwrap();
+            let before = snapshot();
+            let mut calls = 0;
+            let result = journal.prepare_at(f.plan(), f.session(), || {
+                calls += 1;
+                assert!(journal.inner.try_lock().is_err(), "clock must run under journal lock");
+                if fault { Err(SourceJournalError::Unavailable) } else { Ok(NOW + 600) }
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(result.err(), Some(if fault { SourceJournalError::Unavailable }
+                else { SourceJournalError::Expired }));
+            assert_eq!(snapshot(), before);
+            assert_eq!(*journal.failure_signal().borrow(), fault);
+            drop(journal);
+            let reopened = f.open(NOW + 1);
+            assert_eq!(reopened.lookup_phase(f.route(), NOW + 1).unwrap(), None);
+        }
+    }
+
+    // [PHALA-SOURCE-ADMISSION-CLOCK 2026-10-07 by Codex] Authored, not
+    // run: neither late arming nor a post-Prepared clock fault can rewrite
+    // the exact encrypted zero-send plan, its generation, or its clock.
+    #[test]
+    fn arm_post_lock_expiry_or_clock_failure_preserves_exact_prepared_route() {
+        for fault in [false, true] {
+            let f = Fixture::new();
+            let journal = f.open(NOW);
+            f.prepare(&journal, NOW);
+            let snapshot = || journal.inner.lock().unwrap().connection.query_row(
+                "SELECT phase,generation,sealed,clock FROM source_jobs CROSS JOIN source_meta WHERE route=?1 AND singleton=1",
+                params![f.route().as_slice()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?)),
+            ).unwrap();
+            let before = snapshot();
+            let mut calls = 0;
+            let result = journal.arm_at(f.route(), || {
+                calls += 1;
+                assert!(journal.inner.try_lock().is_err(), "clock must run under journal lock");
+                if fault { Err(SourceJournalError::Unavailable) } else { Ok(NOW + 600) }
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(result.err(), Some(if fault { SourceJournalError::Unavailable }
+                else { SourceJournalError::Expired }));
+            assert_eq!(snapshot(), before);
+            assert_eq!(*journal.failure_signal().borrow(), fault);
+            drop(journal);
+            let reopened = f.open(NOW + 601);
+            assert_eq!(reopened.lookup_phase(f.route(), NOW + 601).unwrap(), Some(SourcePhase::Prepared));
+            assert_eq!(reopened.arm(f.route(), NOW + 601).err(), Some(SourceJournalError::Expired));
+        }
+    }
+
+    #[test]
+    fn result_post_lock_clock_rejects_without_replacing_source_evidence() {
+        for fault in [false, true] {
+            let f = Fixture::new();
+            let journal = f.open(NOW);
+            f.prepare(&journal, NOW);
+            journal.arm(f.route(), NOW + 1).unwrap();
+            let result = f.response(&f.lease, [7; 32], false);
+            let snapshot = || {
+                journal.inner.lock().unwrap().connection.query_row(
+                    "SELECT phase,generation,sealed,clock FROM source_jobs CROSS JOIN source_meta WHERE route=?1 AND singleton=1",
+                    params![f.route().as_slice()],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?)),
+                ).unwrap()
+            };
+            let before = snapshot();
+            let outcome = journal.record_result_at(f.route(), &f.claim, &f.lease, &result, || {
+                assert!(journal.inner.try_lock().is_err(), "clock must run under journal lock");
+                if fault { Err(SourceJournalError::Unavailable) }
+                else { Ok(result.expires_at()) }
+            });
+            assert_eq!(outcome.err(), Some(if fault { SourceJournalError::Unavailable }
+                else { SourceJournalError::Rejected }));
+            assert_eq!(snapshot(), before, "rejection must preserve exact encrypted custody and clock");
+            assert_eq!(journal.intake_stop_flag().load(std::sync::atomic::Ordering::Acquire), fault);
+            assert_eq!(*journal.failure_signal().borrow(), fault);
+            drop(journal);
+            let reopened = f.open(NOW + 4);
+            assert_eq!(reopened.recover(None, 64, NOW + 4).unwrap().items,
+                vec![(f.route(), SourcePhase::Armed)]);
+            assert_eq!(reopened.open_result(f.route(), NOW + 4).err(), Some(SourceJournalError::Ambiguous));
+        }
     }
 
     #[test]
@@ -1828,10 +2963,25 @@ pub(crate) mod tests {
         let f = Fixture::new(); let journal = f.open_limits(NOW, 1, RESERVED_PER_JOB).unwrap();
         f.prepare(&journal, NOW); f.prepare(&journal, NOW + 1);
         let mut changed = f.plan(); changed.descriptor = [15; 32];
-        assert_eq!(journal.prepare(changed, f.session(), NOW + 1).err(), Some(SourceJournalError::Conflict));
+        // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex] An
+        // inconsistent commitment is rejected before existing-row comparison.
+        assert_eq!(journal.prepare(changed, f.session(), NOW + 1).err(), Some(SourceJournalError::Rejected));
         let other = Fixture::new_with_route(15);
         assert_eq!(journal.prepare(other.plan(), other.session(), NOW + 1).err(), Some(SourceJournalError::Capacity));
+        // [PHALA-SOURCE-JOURNAL-FAULT 2026-10-07 by Codex] Quota and
+        // conflicting input are not poisoned-owner shutdown triggers.
+        assert!(!journal.intake_stop_flag().load(Ordering::SeqCst));
+        assert!(!*journal.failure_signal().borrow());
         assert_eq!(journal.recover(None, 1, NOW + 1).unwrap().items.len(), 1);
+        // [PHALA-SOURCE-RETURNED-FAULT 2026-10-07 by Codex] A rejected
+        // over-quota insert rolls back; it cannot strand the accepted slot or
+        // prevent its exact retry and durable Armed transition.
+        f.prepare(&journal, NOW + 1);
+        journal.arm(f.route(), NOW + 1).unwrap();
+        assert_eq!(journal.recover(None, 1, NOW + 1).unwrap().items,
+            vec![(f.route(), SourcePhase::Armed)]);
+        assert!(!journal.intake_stop_flag().load(Ordering::SeqCst));
+        assert!(!*journal.failure_signal().borrow());
         drop(journal);
         assert_eq!(f.open_limits(NOW + 2, 1, RESERVED_PER_JOB - 1).err(), Some(SourceJournalError::Capacity));
     }
@@ -1844,7 +2994,17 @@ pub(crate) mod tests {
         journal.record_result(f.route(), &f.claim, &f.lease, &result, NOW + 2).unwrap();
         let page = journal.open_result(f.route(), NOW + 2).unwrap();
         assert_eq!(page.objects.len(), 1);
-        journal.with_inner(|inner| journal.transaction(inner, NOW + 2, |tx| {
+        // [PHALA-SOURCE-CAPACITY-CLOCK-FIXTURE 2026-10-08 by Codex]
+        // Maximum-page decryption advances the durable observation clock on
+        // slower hosts; the subsequent accounting/restart checks must not
+        // replay its earlier timestamp.
+        let observed_at = journal.with_inner(|inner| {
+            let clock: i64 = inner.connection.query_row(
+                "SELECT clock FROM source_meta WHERE singleton=1", [], |row| row.get(0),
+            ).map_err(unavailable)?;
+            u64::try_from(clock).map_err(|_| SourceJournalError::Corrupt)
+        }).unwrap();
+        journal.with_inner(|inner| journal.transaction(inner, observed_at, |tx| {
             let row = journal.load(tx, f.route())?.unwrap();
             let actual = row.encode()?.len() + SEALED_OVERHEAD + ROW_ACCOUNTING_BYTES;
             assert!(actual as u64 <= row.reserved);
@@ -1852,8 +3012,9 @@ pub(crate) mod tests {
             Ok(())
         })).unwrap();
         drop(journal);
-        let journal = f.open_limits(NOW + 3, 1, RESERVED_PER_JOB).unwrap();
-        assert_eq!(journal.read_verified(f.route(), NOW + 3).unwrap().objects.len(), 1);
+        let restarted_at = observed_at.checked_add(1).unwrap();
+        let journal = f.open_limits(restarted_at, 1, RESERVED_PER_JOB).unwrap();
+        assert_eq!(journal.read_verified(f.route(), restarted_at).unwrap().objects.len(), 1);
     }
 
     #[test]
@@ -1920,12 +3081,122 @@ pub(crate) mod tests {
     #[test]
     fn bounded_cleanup_keeps_evidence_until_horizon_and_rejects_stale_prepare() {
         let f = Fixture::new(); let journal = f.open(NOW); f.prepare(&journal, NOW);
-        assert_eq!(journal.cleanup(1, NOW + 899).unwrap(), 0);
-        assert_eq!(journal.cleanup(1, NOW + 900).unwrap(), 1);
-        assert_eq!(journal.prepare(f.plan(), f.session(), NOW + 900).err(), Some(SourceJournalError::Expired));
-        assert_eq!(journal.recover(None, 1, NOW + 900).unwrap().items.len(), 0);
-        assert_eq!(journal.recover(None, 65, NOW + 900).err(), Some(SourceJournalError::Rejected));
+        // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex] Exercise
+        // the sealed route horizon, including the relay recovery allowance.
+        let until = f.plan().retention().unwrap();
+        assert_eq!(journal.cleanup(1, until - 1).unwrap(), 0);
+        assert_eq!(journal.cleanup(1, until).unwrap(), 1);
+        // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex] At this
+        // later horizon the signed grant has also expired: reject before quota.
+        assert_eq!(journal.prepare(f.plan(), f.session(), until).err(), Some(SourceJournalError::Rejected));
+        assert_eq!(journal.recover(None, 1, until).unwrap().items.len(), 0);
+        assert_eq!(journal.recover(None, 65, until).err(), Some(SourceJournalError::Rejected));
         // This does not promise permanent route-id exclusion after deletion.
+    }
+
+    // [PHALA-SOURCE-RETENTION-ADMISSION 2026-10-08 by Codex] Authored,
+    // not run: fresh production admission recycles only authenticated expired
+    // custody, never an execution deadline or an unexpired quota reservation.
+    #[test]
+    fn fresh_prepare_reclaims_retained_capacity_only_at_authenticated_horizon() {
+        for phase in [SourcePhase::Prepared, SourcePhase::Armed, SourcePhase::Verified] {
+            let old = Fixture::new();
+            let journal = old.open_one_slot(NOW);
+            if phase == SourcePhase::Verified {
+                old.ready(&journal);
+                journal.open_result(old.route(), NOW + 3).unwrap();
+            } else {
+                old.prepare(&journal, NOW);
+                if phase == SourcePhase::Armed { journal.arm(old.route(), NOW + 1).unwrap(); }
+            }
+            // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex]
+            let until = old.plan().retention().unwrap();
+            let fresh = Fixture::new_with_route_at(15, until - 1);
+            assert_eq!(journal.prepare(fresh.plan(), fresh.session(), until - 1).err(),
+                Some(SourceJournalError::Capacity));
+            assert_eq!(journal.lookup_phase(old.route(), until - 1).unwrap(), Some(phase));
+            assert_eq!(journal.prepare(fresh.plan(), fresh.session(), until).unwrap(),
+                SourcePhase::Prepared);
+            assert_eq!(journal.lookup_phase(old.route(), until).unwrap(), None);
+            journal.arm(fresh.route(), until).unwrap();
+            assert!(!*journal.failure_signal().borrow());
+            drop(journal);
+            let reopened = old.open_existing(until);
+            assert_eq!(reopened.lookup_phase(old.route(), until).unwrap(), None);
+            assert_eq!(reopened.lookup_phase(fresh.route(), until).unwrap(), Some(SourcePhase::Armed));
+        }
+    }
+
+    // [PHALA-SOURCE-RETENTION-ADMISSION 2026-10-08 by Codex] An insert
+    // failure after cleanup must roll back both effects, not consume custody.
+    #[test]
+    fn fresh_prepare_insert_failure_rolls_back_expired_custody_reclamation() {
+        let old = Fixture::new(); let journal = old.open_one_slot(NOW);
+        old.prepare(&journal, NOW); journal.arm(old.route(), NOW + 1).unwrap();
+        journal.with_inner(|inner| {
+            inner.connection.execute_batch("CREATE TRIGGER fail_fresh_source_insert
+                BEFORE INSERT ON source_jobs BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;")
+                .map_err(unavailable)
+        }).unwrap();
+        // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex] The
+        // injected failure must occur after a genuinely eligible deletion.
+        let until = old.plan().retention().unwrap();
+        let fresh = Fixture::new_with_route_at(15, until);
+        assert_eq!(journal.prepare(fresh.plan(), fresh.session(), until).err(),
+            Some(SourceJournalError::Unavailable));
+        drop(journal);
+        let connection = Connection::open(old.path()).unwrap();
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM source_jobs", [],
+            |r| r.get::<_, i64>(0)).unwrap(), 1);
+        connection.execute_batch("DROP TRIGGER fail_fresh_source_insert;").unwrap();
+        drop(connection);
+        let reopened = old.open_existing(until);
+        assert_eq!(reopened.lookup_phase(old.route(), until).unwrap(), Some(SourcePhase::Armed));
+        assert_eq!(reopened.lookup_phase(fresh.route(), until).unwrap(), None);
+    }
+
+    // [PHALA-SOURCE-RETENTION-ADMISSION 2026-10-08 by Codex] Forging
+    // SQL expiry cannot erase a live sealed row to admit a new task.
+    #[test]
+    fn fresh_prepare_rejects_forged_retention_without_erasing_custody() {
+        let old = Fixture::new(); let journal = old.open_one_slot(NOW);
+        old.prepare(&journal, NOW); journal.arm(old.route(), NOW + 1).unwrap();
+        journal.with_inner(|inner| {
+            inner.connection.execute("UPDATE source_jobs SET retain_until=?1",
+                params![(NOW + 899) as i64]).map_err(unavailable)?;
+            Ok(())
+        }).unwrap();
+        let fresh = Fixture::new_with_route_at(15, NOW + 899);
+        assert_eq!(journal.prepare(fresh.plan(), fresh.session(), NOW + 899).err(),
+            Some(SourceJournalError::Corrupt));
+        drop(journal);
+        let connection = Connection::open(old.path()).unwrap();
+        let routes: Vec<Vec<u8>> = connection.prepare("SELECT route FROM source_jobs").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().map(|row| row.unwrap()).collect();
+        assert_eq!(routes, vec![old.route().to_vec()]);
+    }
+
+    // [PHALA-SOURCE-RETENTION-ADMISSION 2026-10-08 by Codex] One fresh
+    // admission decrypts/removes at most PAGE_LIMIT historical rows.
+    #[test]
+    fn fresh_prepare_retention_reclamation_is_bounded() {
+        let old = Fixture::new_with_route(1);
+        let journal = old.open_limits(NOW, PAGE_LIMIT + 2,
+            RESERVED_PER_JOB * (PAGE_LIMIT as u64 + 2)).unwrap();
+        for route_byte in 1..=(PAGE_LIMIT + 1) as u8 {
+            let historical = Fixture::new_with_route(route_byte);
+            historical.prepare(&journal, NOW);
+            journal.arm(historical.route(), NOW).unwrap();
+        }
+        // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex]
+        let until = old.plan().retention().unwrap();
+        let fresh = Fixture::new_with_route_at(100, until);
+        fresh.prepare(&journal, until);
+        assert_eq!(journal.lookup_phase([1; 16], until).unwrap(), None);
+        assert_eq!(journal.lookup_phase([(PAGE_LIMIT + 1) as u8; 16], until).unwrap(),
+            Some(SourcePhase::Armed));
+        assert_eq!(journal.cleanup(PAGE_LIMIT, until).unwrap(), 1);
+        assert_eq!(journal.lookup_phase(fresh.route(), until).unwrap(), Some(SourcePhase::Prepared));
     }
 
     #[test]
@@ -1943,7 +3214,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn uncertain_arm_commit_returns_no_dispatch_and_restart_is_ambiguous() {
+    fn uncertain_arm_commit_returns_no_dispatch_and_restart_preserves_exact_arm() {
         use std::sync::atomic::Ordering;
         let f = Fixture::new(); let journal = f.open(NOW); f.prepare(&journal, NOW);
         journal.commits_until_fence_error.store(1, Ordering::SeqCst);
@@ -1951,25 +3222,51 @@ pub(crate) mod tests {
         assert_eq!(journal.arm(f.route(), NOW + 1).err(), Some(SourceJournalError::Unavailable));
         drop(journal);
         let journal = f.open(NOW + 2);
-        assert_eq!(journal.recover(None, 1, NOW + 2).unwrap().items[0].1, SourcePhase::DispatchAmbiguous);
+        assert_eq!(journal.recover(None, 1, NOW + 2).unwrap().items[0].1, SourcePhase::Armed);
         assert_eq!(journal.arm(f.route(), NOW + 2).err(), Some(SourceJournalError::Ambiguous));
     }
 
+    // [PHALA-SOURCE-JOURNAL-FAULT 2026-10-07 by Codex] Authored, not run:
+    // unwinding an owned DB action publishes before any later mutex access.
     #[test]
-    fn uncertainty_at_opening_or_final_commit_never_grants_second_open() {
+    fn journal_unwind_publishes_failure_without_waiting_for_another_call() {
+        let f = Fixture::new();
+        let journal = f.open(NOW);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            journal.with_inner::<()>(|_| panic!("synthetic DB action unwind"))
+        }));
+        assert!(unwind.is_err());
+        assert!(journal.intake_stop_flag().load(Ordering::SeqCst));
+        assert!(*journal.failure_signal().borrow());
+        assert_eq!(journal.recover(None, 1, NOW).err(), Some(SourceJournalError::Unavailable));
+    }
+
+    #[test]
+    fn uncertainty_at_opening_or_final_commit_recovers_without_redispatch() {
         use std::sync::atomic::Ordering;
         for failure_commit in [1, 2] {
             let f = Fixture::new(); let journal = f.open(NOW); f.ready(&journal);
             journal.commits_until_fence_error.store(failure_commit, Ordering::SeqCst);
             assert_eq!(journal.open_result(f.route(), NOW + 3).err(), Some(SourceJournalError::Unavailable));
+            // [PHALA-SOURCE-JOURNAL-FAULT 2026-10-07 by Codex] The failed
+            // publication closes intake and records a sticky fault before the
+            // caller sees its error, at either result-opening commit boundary.
+            assert!(journal.intake_stop_flag().load(Ordering::SeqCst));
+            assert!(*journal.failure_signal().borrow());
             drop(journal);
             let journal = f.open(NOW + 4);
+            assert!(!journal.intake_stop_flag().load(Ordering::SeqCst));
+            assert!(!*journal.failure_signal().borrow());
             let phase = journal.recover(None, 1, NOW + 4).unwrap().items[0].1;
-            assert_eq!(phase, if failure_commit == 1 { SourcePhase::OpenAmbiguous } else { SourcePhase::Verified });
-            assert_eq!(journal.open_result(f.route(), NOW + 4).err(), Some(SourceJournalError::Ambiguous));
-            if phase == SourcePhase::Verified {
-                assert_eq!(journal.read_verified(f.route(), NOW + 4).unwrap().lease_id, [7; 32]);
+            // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex] A
+            // post-commit fence failure cannot undo the committed SQL phase.
+            assert_eq!(phase, if failure_commit == 1 { SourcePhase::Opening } else { SourcePhase::Verified });
+            if failure_commit == 1 {
+                assert_eq!(journal.open_result(f.route(), NOW + 4).unwrap().lease_id, [7; 32]);
+            } else {
+                assert_eq!(journal.open_result(f.route(), NOW + 4).err(), Some(SourceJournalError::Ambiguous));
             }
+            assert_eq!(journal.read_verified(f.route(), NOW + 4).unwrap().lease_id, [7; 32]);
         }
     }
 
@@ -1984,8 +3281,10 @@ pub(crate) mod tests {
         assert_eq!(page.items[0].0, second.route());
         let page = journal.recover(page.next_after, 1, NOW).unwrap();
         assert_eq!(page.items[0].0, third.route()); assert!(page.next_after.is_none());
-        assert_eq!(journal.cleanup(1, NOW + 900).unwrap(), 1);
-        assert_eq!(journal.recover(None, 64, NOW + 900).unwrap().items.len(), 2);
+        // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex]
+        let until = first.plan().retention().unwrap();
+        assert_eq!(journal.cleanup(1, until).unwrap(), 1);
+        assert_eq!(journal.recover(None, 64, until).unwrap().items.len(), 2);
     }
 
     // [REVERSE-ONION-TYPED-EXPECTATION 2026-10-04 by Codex] Authored only.
@@ -2006,7 +3305,8 @@ pub(crate) mod tests {
         journal.with_inner(|inner| journal.transaction(inner, NOW, |tx| {
             let row = journal.load(tx, f.route())?.unwrap();
             let encoded = row.encode()?;
-            assert_eq!(&encoded[..6], b"AXSJ\x00\x01");
+            // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex]
+            assert_eq!(&encoded[..6], b"AXSJ\x00\x02");
             let restored = Record::decode(&encoded)?;
             assert!(restored.plan.same(&typed_plan));
             assert!(restored.plan.expected.matches(&f.retained));
@@ -2103,7 +3403,30 @@ pub(crate) mod tests {
         assert_eq!(journal.recover(None, 1, NOW + 1).err(), Some(SourceJournalError::Unavailable));
         drop(journal);
         let journal = f.open(NOW + 2);
-        assert_eq!(journal.recover(None, 1, NOW + 2).unwrap().items[0].1, SourcePhase::DispatchAmbiguous);
+        assert_eq!(journal.recover(None, 1, NOW + 2).unwrap().items[0].1, SourcePhase::Armed);
+    }
+
+    // [PHALA-SOURCE-POST-OBSERVATION 2026-10-07 by Codex] Authored, not run:
+    // observation survives reopen, retains historical authority, and cannot
+    // restore Prepared/Armed or publish exact dispatch bytes for another POST.
+    #[test]
+    fn observed_dispatch_is_evidence_only_after_restart() {
+        let f = Fixture::new();
+        let journal = f.open(NOW);
+        f.prepare(&journal, NOW);
+        journal.arm(f.route(), NOW + 1).unwrap();
+        journal.mark_dispatch_ambiguous(f.route(), NOW + 2).unwrap();
+        journal.mark_dispatch_ambiguous(f.route(), NOW + 3).unwrap();
+        drop(journal);
+        let journal = f.open(NOW + 4);
+        assert_eq!(journal.lookup_phase(f.route(), NOW + 4).unwrap(), Some(SourcePhase::DispatchAmbiguous));
+        assert_eq!(journal.recover_dispatch(f.route(), NOW + 4).err(), Some(SourceJournalError::Rejected));
+        assert_eq!(journal.restore_prepared_after_no_send(f.route(), NOW + 4).err(), Some(SourceJournalError::Conflict));
+        assert_eq!(journal.arm(f.route(), NOW + 4).err(), Some(SourceJournalError::Ambiguous));
+        assert!(journal.recover_route_authority(f.route(), NOW + 4).is_ok());
+        let result = f.response(&f.lease, [7; 32], false);
+        journal.record_result(f.route(), &f.claim, &f.lease, &result, NOW + 4).unwrap();
+        assert_eq!(journal.open_result(f.route(), NOW + 4).unwrap().lease_id, [7; 32]);
     }
 
     #[test]

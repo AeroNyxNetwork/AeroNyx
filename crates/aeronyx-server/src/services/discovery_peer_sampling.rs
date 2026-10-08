@@ -46,6 +46,7 @@ fn rank(domain: &[u8], round_nonce: &[u8; 32], node_id: &[u8; 32]) -> [u8; 32] {
 /// DNS hostname, not an operator/AS proof. A short sample stays short instead
 /// of filling it with collocated peers. The nonce must be fresh and private per
 /// round; no identity, endpoint, or rank is emitted to diagnostics.
+// [PHALA-ATTESTED-DNS-GOSSIP 2026-10-06 by Codex]
 pub(crate) fn sample_public_gossip_peers<F>(
     peer_store: &PeerStore,
     now: u64,
@@ -56,6 +57,33 @@ pub(crate) fn sample_public_gossip_peers<F>(
 ) -> Vec<SampledGossipPeer>
 where
     F: Fn(&str) -> Option<String>,
+{
+    sample_public_gossip_peers_with_policy(
+        peer_store,
+        now,
+        round_nonce,
+        limit,
+        excluded_node_ids,
+        canonical_safe_endpoint,
+        |_| true,
+    )
+}
+
+// [PHALA-ATTESTED-DNS-GOSSIP 2026-10-06 by Codex] Keep endpoint-collision
+// accounting over every safe claim, but rank only peers that satisfy the
+// caller's operation-specific authority gate.
+pub(crate) fn sample_public_gossip_peers_with_policy<F, G>(
+    peer_store: &PeerStore,
+    now: u64,
+    round_nonce: [u8; 32],
+    limit: usize,
+    excluded_node_ids: &[[u8; 32]],
+    canonical_safe_endpoint: F,
+    eligible: G,
+) -> Vec<SampledGossipPeer>
+where
+    F: Fn(&str) -> Option<String>,
+    G: Fn(&SignedNodeDescriptor) -> bool,
 {
     if limit == 0 {
         return Vec::new();
@@ -86,7 +114,7 @@ where
         *canonical_claims
             .entry(canonical_endpoint.clone())
             .or_default() += 1;
-        if !excluded_node_ids.contains(node_id) {
+        if !excluded_node_ids.contains(node_id) && eligible(&descriptor) {
             candidates.push(SampledGossipPeer {
                 descriptor,
                 canonical_endpoint,

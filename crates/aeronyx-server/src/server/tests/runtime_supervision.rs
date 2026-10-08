@@ -6,6 +6,178 @@
 // runtime behavior.
 
 use super::*;
+// [PHALA-NODE-COMPILE-REPAIR 2026-10-08 by Codex] Explicit shutdown fixture imports.
+use std::sync::atomic::Ordering;
+use tokio::sync::broadcast;
+
+// [PHALA-QUOTE-RESPONSE-OWNERSHIP 2026-10-08 by Codex] Authored only:
+// actual supervisor shutdown/abort fences late quote-response handoff.
+#[tokio::test]
+async fn phala_quote_delivery_supervision_stops_its_owner() {
+    use super::super::api_runtime::run_phala_attestation_delivery_cleanup;
+    for abort in [false, true] {
+        let owner = crate::api::discovery::DiscoveryApiPolicy::default().phala_attestation_delivery_owner();
+        let worker_owner = Arc::clone(&owner);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
+        let (tx, rx) = broadcast::channel(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            run_phala_attestation_delivery_cleanup(worker_owner, worker_stopped, rx).await;
+        });
+        started_rx.await.unwrap();
+        if abort {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            tx.send(()).unwrap();
+            task.await.unwrap();
+        }
+        assert!(owner.is_stopped());
+        assert!(!crate::api::discovery::DiscoveryApiPolicy::default().phala_attestation_delivery_owner().is_stopped());
+    }
+}
+
+// [PHALA-PROMOTION-CANCEL-OWNERSHIP 2026-10-08 by Codex] Authored,
+// not run: the production supervisor wrapper cancels work that has really
+// started, rather than only noticing shutdown after the round completes.
+#[tokio::test]
+async fn promotion_shutdown_interrupts_an_in_progress_round() {
+    use super::super::api_runtime::run_permissionless_promotion_round_until_shutdown;
+    use std::sync::atomic::Ordering;
+    let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+    let stopped = Arc::new(AtomicBool::new(false));
+    let parent_stopped = Arc::clone(&stopped);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+    let parent = tokio::spawn(async move {
+        run_permissionless_promotion_round_until_shutdown(&mut shutdown_rx, &parent_stopped, async move {
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(alive_tx);
+        }).await
+    });
+    tokio::time::timeout(Duration::from_secs(1), started_rx).await.unwrap().unwrap();
+    stopped.store(true, Ordering::SeqCst);
+    shutdown_tx.send(()).unwrap();
+    assert!(!tokio::time::timeout(Duration::from_secs(1), parent).await.unwrap().unwrap());
+    assert!(alive_rx.await.is_err(), "round future must be dropped before wrapper returns");
+}
+
+// [PHALA-PROMOTION-CANCEL-OWNERSHIP 2026-10-08 by Codex] Authored
+// only: queued shutdown, a closed shutdown channel and an already-set process
+// flag all deny before polling work; normal completion remains permitted.
+#[tokio::test]
+async fn promotion_shutdown_wins_ready_work_without_polling_it() {
+    use super::super::api_runtime::run_permissionless_promotion_round_until_shutdown;
+    use std::sync::atomic::Ordering;
+    let (tx, mut rx) = broadcast::channel(1);
+    let stopped = AtomicBool::new(false);
+    let polled = AtomicBool::new(false);
+    tx.send(()).unwrap();
+    assert!(!run_permissionless_promotion_round_until_shutdown(&mut rx, &stopped, async {
+        polled.store(true, Ordering::SeqCst);
+    }).await);
+    assert!(!polled.load(Ordering::SeqCst));
+    stopped.store(true, Ordering::SeqCst);
+    assert!(!run_permissionless_promotion_round_until_shutdown(&mut rx, &stopped, async {
+        polled.store(true, Ordering::SeqCst);
+    }).await);
+    assert!(!polled.load(Ordering::SeqCst));
+    stopped.store(false, Ordering::SeqCst);
+    assert!(run_permissionless_promotion_round_until_shutdown(&mut rx, &stopped, async {
+        polled.store(true, Ordering::SeqCst);
+    }).await);
+    assert!(polled.load(Ordering::SeqCst));
+    polled.store(false, Ordering::SeqCst);
+    drop(tx);
+    assert!(!run_permissionless_promotion_round_until_shutdown(&mut rx, &stopped, async {
+        polled.store(true, Ordering::SeqCst);
+    }).await);
+    assert!(!polled.load(Ordering::SeqCst));
+}
+
+// [PHALA-APPRAISAL-TASK-OWNERSHIP 2026-10-07 by Codex] Authored, not
+// executed: use the real startup registry to cancel a live parent and prove
+// its owned child is cancelled too. No evidence, DNS or HTTP is involved.
+#[tokio::test]
+async fn phala_appraisal_parent_abort_stops_child_and_publication_gate() {
+    use super::super::discovery_gossip_runtime::PhalaAppraisalTaskOwner;
+    use std::sync::atomic::Ordering;
+    let (owner_ready_tx, owner_ready_rx) = tokio::sync::oneshot::channel();
+    let (child_started_tx, child_started_rx) = tokio::sync::oneshot::channel();
+    let (child_alive_tx, child_alive_rx) = tokio::sync::oneshot::channel::<()>();
+    let parent = tokio::spawn(async move {
+        let mut owner = PhalaAppraisalTaskOwner::new();
+        assert!(owner.start(async move {
+            child_started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(child_alive_tx);
+        }));
+        owner_ready_tx.send(owner.stop_signal()).unwrap();
+        std::future::pending::<()>().await;
+        drop(owner);
+    });
+    let mut registry = RuntimeTaskRegistry::default();
+    registry.push(("test-phala-appraisal-parent", parent));
+    let stopped = tokio::time::timeout(Duration::from_secs(1), owner_ready_rx).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), child_started_rx).await.unwrap().unwrap();
+    assert!(!stopped.load(Ordering::SeqCst));
+    drop(registry);
+    assert!(tokio::time::timeout(Duration::from_secs(1), child_alive_rx).await.unwrap().is_err(),
+        "dropping a parent must not detach its live appraisal child");
+    assert!(stopped.load(Ordering::SeqCst));
+}
+
+// [PHALA-APPRAISAL-TASK-OWNERSHIP 2026-10-07 by Codex] Authored only:
+// completed work frees the one-child slot; stop is sticky and normal shutdown
+// confirms async cancellation without claiming to preempt blocking crypto.
+#[tokio::test]
+async fn phala_appraisal_owner_reuses_completed_slot_but_never_stopped_slot() {
+    use super::super::discovery_gossip_runtime::PhalaAppraisalTaskOwner;
+    use std::sync::atomic::Ordering;
+    let mut owner = PhalaAppraisalTaskOwner::new();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    assert!(owner.start(async move { let _ = release_rx.await; }));
+    assert!(!owner.can_start());
+    let polled = Arc::new(AtomicBool::new(false));
+    let rejected_poll = Arc::clone(&polled);
+    assert!(!owner.start(async move { rejected_poll.store(true, Ordering::SeqCst); }));
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !owner.can_start() { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+    assert!(owner.start(async move {
+        std::future::pending::<()>().await;
+        drop(alive_tx);
+    }));
+    let stopped = owner.stop_signal();
+    tokio::time::timeout(Duration::from_secs(1), owner.stop_and_join()).await.unwrap();
+    assert!(stopped.load(Ordering::SeqCst));
+    assert!(alive_rx.await.is_err());
+    assert!(!owner.can_start());
+    let stopped_poll = Arc::clone(&polled);
+    assert!(!owner.start(async move { stopped_poll.store(true, Ordering::SeqCst); }));
+    tokio::task::yield_now().await;
+    assert!(!polled.load(Ordering::SeqCst));
+}
+
+// [REVERSE-ONION-WORKER-SUPERVISION 2026-10-05 by Codex] Authored, not run:
+// worker termination enters the same sanitized failure type used by required
+// listener and data-plane supervision.
+#[test]
+fn reverse_onion_worker_exit_is_bucketed_as_critical_failure() {
+    assert_eq!(
+        super::super::runtime_supervision::reverse_onion_recipient_worker_exited(),
+        CriticalRuntimeFailure {
+            task: "reverse-onion-recipient",
+            reason: "required recipient worker exited unexpectedly".to_string(),
+        },
+    );
+}
 
 #[tokio::test]
 async fn required_api_listener_bind_fails_closed_on_address_conflict() {
@@ -295,6 +467,10 @@ async fn runtime_task_registry_hands_tasks_to_bounded_shutdown() {
     registry.push(("test-runtime-task", task));
 
     let tasks = registry.take_for_shutdown();
+    // [PHALA-RETAINED-UNWIND-DRAIN 2026-10-07 by Codex] The retained
+    // outer owner can safely take twice/drop after handing off exact handles.
+    assert!(registry.take_for_shutdown().is_empty());
+    drop(registry);
     assert!(!abort_handle.is_finished());
     release_tx.send(()).unwrap();
     let reports = Server::shutdown_runtime_tasks(tasks).await;
@@ -537,8 +713,12 @@ async fn wait_for_shutdown_accepts_programmatic_shutdown() {
     ));
     let (_failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
     let waiting_server = Arc::clone(&server);
-    let waiter =
-        tokio::spawn(async move { waiting_server.wait_for_shutdown(&mut failure_rx).await });
+    // [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex] Synthetic
+    // listener keeps programmatic tests independent of process-wide signals.
+    let waiter = tokio::spawn(async move {
+        let mut signals = super::super::runtime_supervision::ProcessShutdownSignals::from_waiter(std::future::pending());
+        waiting_server.wait_for_shutdown(&mut failure_rx, &mut signals).await
+    });
 
     tokio::task::yield_now().await;
     server.shutdown();
@@ -550,6 +730,89 @@ async fn wait_for_shutdown_accepts_programmatic_shutdown() {
     assert!(outcome.is_none());
 }
 
+// [PHALA-ORDERED-RUN-STOP 2026-10-08 by Codex] Authored, not run:
+// queue-only, source-only and recipient-only operator stops wake the actual
+// supervisor without broadcasting dependency shutdown or publishing READY.
+#[tokio::test]
+async fn reverse_programmatic_stop_is_sticky_and_keeps_dependencies_alive() {
+    use super::super::runtime_supervision::{ProcessShutdownSignals, PreReadyRuntimeDecision};
+    for role in 0..3 {
+        let mut config = ServerConfig::default();
+        match role {
+            0 => config.reverse_onion.queue.enabled = true,
+            1 => config.reverse_onion.source.enabled = true,
+            _ => config.reverse_onion.recipient.enabled = true,
+        }
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let mut dependency_stop = server.shutdown_tx.subscribe();
+        let (_failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+        let mut signals = ProcessShutdownSignals::from_waiter(std::future::pending());
+        {
+            let waiter = server.wait_for_shutdown(&mut failure_rx, &mut signals);
+            tokio::pin!(waiter);
+            assert!(futures::poll!(waiter.as_mut()).is_pending());
+        }
+        {
+            let readiness_stop = server.reverse_run_stop.cancelled();
+            tokio::pin!(readiness_stop);
+            assert!(futures::poll!(readiness_stop.as_mut()).is_pending());
+            server.shutdown();
+            assert!(futures::poll!(readiness_stop.as_mut()).is_ready());
+        }
+        for _ in 0..2 {
+            assert!(server.wait_for_shutdown(&mut failure_rx, &mut signals).await.is_none());
+            assert!(!server.shutdown.load(Ordering::Acquire));
+            assert!(matches!(dependency_stop.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+            assert_eq!(server.reverse_run_stop.before_ready(PreReadyRuntimeDecision::Ready),
+                PreReadyRuntimeDecision::Stopped);
+        }
+        if let Some(source) = &server.reverse_source { assert!(source.request_admission().is_stopped()); }
+        if let Some(recipient) = &server.reverse_recipient { assert!(recipient.is_cancelled()); }
+        let failure = CriticalRuntimeFailure { task: "synthetic-required", reason: "failed".into() };
+        assert_eq!(server.reverse_run_stop.before_ready(PreReadyRuntimeDecision::Failed(failure.clone())),
+            PreReadyRuntimeDecision::Failed(failure.clone()));
+        _failure_tx.send(failure.clone()).await.unwrap();
+        assert_eq!(server.wait_for_shutdown(&mut failure_rx, &mut signals).await, Some(failure));
+        server.publish_dependency_shutdown();
+        assert!(server.shutdown.load(Ordering::Acquire));
+        assert!(dependency_stop.try_recv().is_ok());
+    }
+}
+
+// [PHALA-ORDERED-RUN-STOP 2026-10-08 by Codex] Authored, not run:
+// a queue-only operator stop before first poll returns without signals,
+// runtime ownership or creation of the configured database.
+#[tokio::test]
+async fn reverse_stop_before_run_does_not_start_a_queue_owner() {
+    let directory = tempfile::Builder::new().prefix("phala-run-prestopped-")
+        .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+    let path = directory.path().join("queue.sqlite");
+    let mut config = ServerConfig::default();
+    config.memchain.mode = crate::config::MemChainMode::Off;
+    config.memchain.chat_relay.enabled = true;
+    config.discovery.enabled = true;
+    config.discovery.gossip_enabled = true;
+    config.discovery.advertise_onion_middle = true;
+    config.discovery.public_api_listen_addr = Some("127.0.0.1:8422".parse().unwrap());
+    config.discovery.public_endpoint = Some("https://relay.example.net".into());
+    config.reverse_onion.queue.enabled = true;
+    config.reverse_onion.queue.db_path = path.display().to_string();
+    config.reverse_onion.queue.recipient_node_ids = vec![hex::encode(
+        IdentityKeyPair::from_bytes(&[0x68; 32]).unwrap().public_key_bytes(),
+    )];
+    config.reverse_onion.queue.source_node_ids = vec![hex::encode(
+        IdentityKeyPair::from_bytes(&[0x69; 32]).unwrap().public_key_bytes(),
+    )];
+    let server = Server::new(config, IdentityKeyPair::from_bytes(&[0x67; 32]).unwrap(), None);
+    server.config.validate().unwrap();
+    server.shutdown();
+    server.run().await.unwrap();
+    assert!(!server.reverse_run_started.load(Ordering::Acquire));
+    assert!(!server.shutdown.load(Ordering::Acquire));
+    assert!(!path.exists());
+}
+
 #[tokio::test]
 async fn wait_for_shutdown_rejects_silent_required_task_group_loss() {
     // [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] Losing every
@@ -558,10 +821,12 @@ async fn wait_for_shutdown_rejects_silent_required_task_group_loss() {
     let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
     let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
     drop(failure_tx);
+    // [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex]
+    let mut signals = super::super::runtime_supervision::ProcessShutdownSignals::from_waiter(std::future::pending());
 
     let failure = tokio::time::timeout(
         Duration::from_secs(1),
-        server.wait_for_shutdown(&mut failure_rx),
+        server.wait_for_shutdown(&mut failure_rx, &mut signals),
     )
     .await
     .unwrap()
@@ -573,6 +838,61 @@ async fn wait_for_shutdown_rejects_silent_required_task_group_loss() {
             reason: "critical runtime supervisor channel closed unexpectedly".to_string(),
         }
     );
+}
+
+// [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex] Authored, not run:
+// a stop received during startup is sticky, suppresses READY, and does not
+// publish global stop ahead of the existing reverse-owner drain boundary.
+#[tokio::test]
+async fn startup_shutdown_signal_survives_ready_checks_and_cancelled_waiters() {
+    use super::super::runtime_supervision::{ProcessShutdownSignals, PreReadyRuntimeDecision};
+    let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+    let (_failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+    let installed = Arc::new(AtomicBool::new(false));
+    let registration = Arc::clone(&installed);
+    let mut signals = ProcessShutdownSignals::from_waiter(async move {
+        registration.store(true, Ordering::Release);
+        signal_rx.await.unwrap()
+    });
+    assert!(installed.load(Ordering::Acquire));
+    assert_eq!(signals.before_ready(PreReadyRuntimeDecision::Ready), PreReadyRuntimeDecision::Ready);
+    {
+        let waiter = server.wait_for_shutdown(&mut failure_rx, &mut signals);
+        tokio::pin!(waiter);
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+    }
+    signal_tx.send(None).unwrap();
+    for _ in 0..2 {
+        assert_eq!(signals.before_ready(PreReadyRuntimeDecision::Ready), PreReadyRuntimeDecision::Stopped);
+        assert!(!server.shutdown.load(Ordering::Acquire));
+        assert!(server.wait_for_shutdown(&mut failure_rx, &mut signals).await.is_none());
+    }
+}
+
+// [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex] Authored, not run:
+// a failed signal stream is not a normal stop, and a known runtime failure
+// is not masked by either an ordinary stop or a second listener failure.
+#[tokio::test]
+async fn startup_signal_failure_keeps_required_failure_precedence() {
+    use super::super::runtime_supervision::{ProcessShutdownSignals, PreReadyRuntimeDecision};
+    let failure = Server::shutdown_signal_failure("SIGTERM", "signal stream closed unexpectedly");
+    let required = CriticalRuntimeFailure { task: "test-required", reason: "failed".to_string() };
+    for event in [None, Some(failure.clone())] {
+        let mut signals = ProcessShutdownSignals::from_waiter(std::future::ready(event.clone()));
+        assert_eq!(signals.before_ready(PreReadyRuntimeDecision::Failed(required.clone())),
+            PreReadyRuntimeDecision::Failed(required.clone()));
+        let expected = match event {
+            Some(failure) => PreReadyRuntimeDecision::Failed(failure),
+            None => PreReadyRuntimeDecision::Stopped,
+        };
+        assert_eq!(signals.before_ready(PreReadyRuntimeDecision::Ready), expected);
+    }
+    let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+    let (_failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+    let mut signals = ProcessShutdownSignals::from_waiter(std::future::ready(Some(failure.clone())));
+    assert_eq!(server.wait_for_shutdown(&mut failure_rx, &mut signals).await, Some(failure));
+    assert!(!server.shutdown.load(Ordering::Acquire));
 }
 
 #[tokio::test]

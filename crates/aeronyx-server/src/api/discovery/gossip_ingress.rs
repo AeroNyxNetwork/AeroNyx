@@ -267,7 +267,10 @@ pub(super) async fn gossip_handler(
         return persist_or_discard_endpoint_attestation(&state, attestation_frame, now).await;
     }
 
-    if !state.policy.message_allowed(&message) {
+    if !state
+        .policy
+        .message_allowed(&message, state.local_node_id.is_some())
+    {
         state.peer_store.record_policy_rejected(
             now,
             format!(
@@ -311,7 +314,8 @@ pub(super) async fn gossip_handler(
         NodeDiscoveryMessage::SnapshotResponse { .. }
         | NodeDiscoveryMessage::DescriptorAnnounce { .. }
         | NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. }
-        | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. } => None,
+        | NodeDiscoveryMessage::EndpointEvidenceAttestationV1 { .. }
+        | NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 { .. } => None,
     };
 
     (StatusCode::OK, Json(GossipResponse { applied, response })).into_response()
@@ -369,6 +373,38 @@ pub(super) fn apply_gossip_message(
     message: &NodeDiscoveryMessage,
     now: u64,
 ) -> (StatusCode, PeerStoreImportReport) {
+    if let NodeDiscoveryMessage::PrivateOnionRecipientAuthorizationV1 {
+        authorization,
+        relay_descriptor,
+        recipient_descriptor,
+    } = message {
+        let Some(local_node) = state.local_node_id else {
+            return (StatusCode::SERVICE_UNAVAILABLE, PeerStoreImportReport::empty());
+        };
+        return match state.peer_store.import_private_onion_authorization_bundle(
+            authorization.clone(),
+            relay_descriptor.clone(),
+            recipient_descriptor.clone(),
+            local_node,
+            now,
+        ) {
+            Ok(inserted) => (StatusCode::OK, PeerStoreImportReport {
+                inserted: usize::from(inserted),
+                unchanged: usize::from(!inserted),
+                ..PeerStoreImportReport::empty()
+            }),
+            // [REVERSE-ONION-STALE-SEED 2026-10-05 by Codex] The sender must
+            // refresh the signed descriptor pair before retrying its grant.
+            Err(crate::services::peer_store::PeerStoreError::StaleSequence { .. }) => (
+                StatusCode::CONFLICT,
+                PeerStoreImportReport { rejected: 1, ..PeerStoreImportReport::empty() },
+            ),
+            Err(_) => (StatusCode::UNPROCESSABLE_ENTITY, PeerStoreImportReport {
+                rejected: 1,
+                ..PeerStoreImportReport::empty()
+            }),
+        };
+    }
     let NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 {
         producer,
         block_hash,

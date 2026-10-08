@@ -375,6 +375,17 @@ impl fmt::Debug for PrivateAtomicRecoveryFile {
 }
 
 fn open_or_create_private_directory(path: &Path) -> Result<File, PrivateRecoveryIoError> {
+    open_or_create_private_directory_with(path, &HostParentDirectoryDurability)
+}
+
+// [REPLICA-VOLUME-DURABILITY 2026-10-08 by Codex] Keep each opened parent
+// pinned until the final volume is known. Synchronizing the container's
+// unrelated read-only root is neither required nor a durability proof for
+// entries created inside the writable recovery volume.
+fn open_or_create_private_directory_with(
+    path: &Path,
+    durability: &impl ParentDirectoryDurability,
+) -> Result<File, PrivateRecoveryIoError> {
     let components = private_directory_components(path)?;
     let anchor = if path.is_absolute() { "/" } else { "." };
     let mut directory = OpenOptions::new()
@@ -386,8 +397,12 @@ fn open_or_create_private_directory(path: &Path) -> Result<File, PrivateRecovery
     // create every component relative to a previously opened directory FD.
     // This closes the parent-symlink and path-swap window left by recursive
     // path creation while retaining support for absolute and relative paths.
+    let mut ancestry = Vec::with_capacity(components.len());
     for component in components {
-        directory = open_or_create_directory_at(&directory, &component)?;
+        let child = open_or_create_directory_at(&directory, &component)?;
+        let child_device = child.metadata()?.dev();
+        ancestry.push((directory, child_device));
+        directory = child;
     }
 
     let metadata = directory.metadata()?;
@@ -397,11 +412,29 @@ fn open_or_create_private_directory(path: &Path) -> Result<File, PrivateRecovery
     if !metadata.is_dir() || metadata.uid() != effective_user_id() {
         return Err(PrivateRecoveryIoError::UnsafePath);
     }
+    sync_recovery_ancestry(&ancestry, metadata.dev(), durability)?;
     directory.set_permissions(fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
     if directory.metadata()?.permissions().mode() & 0o077 != 0 {
         return Err(PrivateRecoveryIoError::UnsafePath);
     }
     Ok(directory)
+}
+
+// [REPLICA-VOLUME-DURABILITY 2026-10-08 by Codex] Retry synchronization even
+// for preexisting entries after an ambiguous mkdir/fsync failure. Stop at the
+// nearest mount boundary; the platform, not this store, owns that mount entry.
+fn sync_recovery_ancestry(
+    ancestry: &[(File, u64)],
+    final_device: u64,
+    durability: &impl ParentDirectoryDurability,
+) -> Result<(), PrivateRecoveryIoError> {
+    for (parent, child_device) in ancestry.iter().rev() {
+        if *child_device != final_device || parent.metadata()?.dev() != final_device {
+            break;
+        }
+        durability.sync_parent(parent)?;
+    }
+    Ok(())
 }
 
 trait ParentDirectoryDurability {
@@ -437,14 +470,6 @@ fn open_or_create_directory_at(
     parent: &File,
     name: &OsStr,
 ) -> Result<File, PrivateRecoveryIoError> {
-    open_or_create_directory_at_with(parent, name, &HostParentDirectoryDurability)
-}
-
-fn open_or_create_directory_at_with(
-    parent: &File,
-    name: &OsStr,
-    durability: &impl ParentDirectoryDurability,
-) -> Result<File, PrivateRecoveryIoError> {
     let directory = match open_directory_at(parent, name) {
         Ok(directory) => Ok(directory),
         Err(PrivateRecoveryIoError::Filesystem(error)) if error.kind() == ErrorKind::NotFound => {
@@ -464,11 +489,9 @@ fn open_or_create_directory_at_with(
         Err(error) => Err(error),
     }?;
 
-    // [BLIND-VAULT-RECOVERY-IO 2026-08-31 by Codex] A synced child does not
-    // make its directory entry durable. Synchronize the pinned parent even
-    // for an existing/raced entry so a retry cannot bypass an ambiguous prior
-    // mkdir fsync failure.
-    durability.sync_parent(parent)?;
+    // [REPLICA-VOLUME-DURABILITY 2026-10-08 by Codex] The caller retains
+    // this parent and confirms its entry only after identifying the final
+    // filesystem. No state/lock file is opened before that confirmation.
     Ok(directory)
 }
 
@@ -886,22 +909,76 @@ mod tests {
             .expect("open canonical temporary root");
 
         let first_attempt = RecordingParentDirectoryDurability::failing();
+        let directory = open_or_create_directory_at(&parent, OsStr::new("recovery"))
+            .expect("create recovery directory without opening state");
+        let device = directory.metadata().expect("recovery metadata").dev();
+        let ancestry = [(parent.try_clone().expect("pin parent"), device)];
         assert!(matches!(
-            open_or_create_directory_at_with(
-                &parent,
-                OsStr::new("recovery"),
-                &first_attempt,
-            ),
+            sync_recovery_ancestry(&ancestry, device, &first_attempt),
             Err(PrivateRecoveryIoError::Filesystem(error))
                 if error.kind() == ErrorKind::Other
         ));
         assert_eq!(first_attempt.calls.get(), 1);
 
         let retry = RecordingParentDirectoryDurability::succeeding();
-        let directory = open_or_create_directory_at_with(&parent, OsStr::new("recovery"), &retry)
+        let directory = open_or_create_directory_at(&parent, OsStr::new("recovery"))
             .expect("retry existing recovery directory");
+        sync_recovery_ancestry(&ancestry, device, &retry).expect("retry parent synchronization");
         assert_eq!(retry.calls.get(), 1);
         assert!(directory.metadata().expect("recovery metadata").is_dir());
+    }
+
+    // [REPLICA-VOLUME-DURABILITY 2026-10-08 by Codex] A failing outer
+    // filesystem must not poison a mounted writable store, but an error
+    // inside the final filesystem must still reject activation.
+    #[test]
+    fn final_volume_ancestry_stops_before_unrelated_mount_parent() {
+        let root = tempfile::tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+        let parent = File::open(fs::canonicalize(root.path()).unwrap()).unwrap();
+        let device = parent.metadata().unwrap().dev();
+        let other_device = device.checked_add(1).expect("fixture device increment");
+        let outside = RecordingParentDirectoryDurability::failing();
+        let boundary = [(parent.try_clone().unwrap(), other_device)];
+        sync_recovery_ancestry(&boundary, device, &outside).unwrap();
+        assert_eq!(outside.calls.get(), 0);
+
+        let inside = [(parent.try_clone().unwrap(), device)];
+        assert!(sync_recovery_ancestry(&inside, device, &outside).is_err());
+        assert_eq!(outside.calls.get(), 1);
+
+        let success = RecordingParentDirectoryDurability::succeeding();
+        let ancestry = [
+            (parent.try_clone().unwrap(), device),
+            (parent.try_clone().unwrap(), other_device),
+            (parent, device),
+        ];
+        sync_recovery_ancestry(&ancestry, device, &success).unwrap();
+        assert_eq!(success.calls.get(), 1, "do not resume above nearest boundary");
+    }
+
+    #[test]
+    fn final_volume_walk_retries_existing_entries_before_state_open() {
+        // [REPLICA-VOLUME-DURABILITY 2026-10-08 by Codex] The real FD walk
+        // creates ancestry, fails durability, and retries it without ever
+        // opening a lock/state file or relaxing ownership and mode checks.
+        let root = tempfile::tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+        let path = fs::canonicalize(root.path()).unwrap().join("nested/recovery");
+        let failure = RecordingParentDirectoryDurability::failing();
+        assert!(open_or_create_private_directory_with(&path, &failure).is_err());
+        assert_eq!(failure.calls.get(), 1);
+        assert!(!path.join(LOCK_FILE_NAME).exists());
+        assert!(!path.join(STATE_FILE_NAME).exists());
+
+        let success = RecordingParentDirectoryDurability::succeeding();
+        let directory = open_or_create_private_directory_with(&path, &success).unwrap();
+        assert!(success.calls.get() >= 2, "both nested entries require durability");
+        assert_eq!(directory.metadata().unwrap().permissions().mode() & 0o777, 0o700);
+        drop(directory);
+        let store = PrivateAtomicRecoveryFile::open(&path).unwrap();
+        store.replace(b"synthetic opaque generation", 64).unwrap();
+        drop(store);
+        let reopened = PrivateAtomicRecoveryFile::open(&path).unwrap();
+        assert_eq!(reopened.read(64).unwrap().unwrap(), b"synthetic opaque generation");
     }
 
     #[test]

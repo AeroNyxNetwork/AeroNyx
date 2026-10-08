@@ -394,7 +394,23 @@ pub use codec::{Codec, ProtocolCodec};
 pub use discovery::{
     decode_discovery_message, encode_discovery_message, NodeBootstrapSnapshot, NodeCapability,
     NodeCapacity, NodeDescriptor, NodeDiscoveryMessage, NodePolicy, NodeProtocolFeature,
+    // [PHALA-ATTESTATION-RESPONSE-CONTRACT 2026-10-06 by Codex]
+    PhalaNodeAttestationResponseV1,
     SignedNodeDescriptor, NODE_BOOTSTRAP_SNAPSHOT_SCHEMA_VERSION, NODE_DESCRIPTOR_SCHEMA_VERSION,
+    // [PHALA-NODE-REPORT-DATA 2026-10-06 by Codex]
+    phala_node_attestation_report_data_v1, PHALA_NODE_ATTESTATION_NONCE_BYTES_V1,
+    PHALA_NODE_ATTESTATION_REPORT_DATA_BYTES_V1,
+    PHALA_NODE_ATTESTATION_CONTRACT_VERSION_V1,
+    PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V0,
+    PHALA_NODE_ATTESTATION_FORMAT_DSTACK_V1,
+    PHALA_NODE_ATTESTATION_MAX_EVIDENCE_BYTES_V1,
+    PHALA_NODE_ATTESTATION_VERIFICATION_NOTE_V1,
+    // [PHALA-RECIPIENT-ATTESTATION-BINDING 2026-10-06 by Codex]
+    phala_private_onion_authorization_sha256_v1,
+    phala_private_recipient_attestation_report_data_v1,
+    PHALA_PRIVATE_RECIPIENT_ATTESTATION_CONTRACT_VERSION_V1,
+    // [REVERSE-ONION-AUTHORIZATION-EXPORT 2026-10-06 by Codex]
+    SignedPrivateOnionRecipientAuthorizationV1,
 };
 pub use discovery_endpoint_attestation::{
     discovery_endpoint_evidence_commitment_v1, DiscoveryEndpointAttestationError,

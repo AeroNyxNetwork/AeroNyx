@@ -8,8 +8,12 @@
 //! into real **onion routing**: the source wraps the payload in one encrypted
 //! layer per hop, and each relay peels exactly one layer. A relay learns only
 //! the *immediate* next hop — never the original source, the final destination,
-//! or the payload. This guarantees that no single honest-but-curious relay can
-//! link source and destination together.
+//! or the payload when it is not directly adjacent to both endpoints. A relay
+//! on a short route can observe its authenticated previous hop and the next
+//! hop revealed by its layer; in particular, the private S -> R -> P custody
+//! route lets R correlate S and P. This protocol is ciphertext delivery, not
+//! source anonymity or protection from traffic analysis.
+// [ONION-PRIVACY-BOUNDARY 2026-10-06 by Codex]
 //!
 //! ## Relationship to the transport
 //! The original onion layer restructures the opaque
@@ -112,7 +116,8 @@
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use sha2::Sha256;
+// [ONION-DIGEST-TRAIT 2026-10-06 by Codex]
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroize;
@@ -200,21 +205,25 @@ const BLIND_VAULT_DELETE_FEATURES: [NodeProtocolFeature; 4] = [
 
 /// [BLIND-VAULT-LARGE-PULL-NEGOTIATION 2026-08-30 by Codex]
 /// Generic reply support plus the path-wide large recovery carrier.
-const BLIND_VAULT_PULL_FEATURES: [NodeProtocolFeature; 5] = [
+const BLIND_VAULT_PULL_FEATURES: [NodeProtocolFeature; 6] = [
     NodeProtocolFeature::OnionReplyV1,
     NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
     NodeProtocolFeature::BlindRelaySuccessReceiptV1,
     NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
     NodeProtocolFeature::OnionBlindVaultLargePullV1,
+    NodeProtocolFeature::PrivateOnionBlindVaultPullTerminalV1,
 ];
 
 /// Reply contract for blind-issued lease admission.
-const BLIND_VAULT_LEASE_ADMISSION_FEATURES: [NodeProtocolFeature; 5] = [
+// [PRIVATE-ONION-ADMISSION-ROLE 2026-10-05 by Codex] A private P terminal
+// explicitly opts into the fixed admission request/reply contract.
+const BLIND_VAULT_LEASE_ADMISSION_FEATURES: [NodeProtocolFeature; 6] = [
     NodeProtocolFeature::OnionReplyV1,
     NodeProtocolFeature::OnionBlindLeaseAdmissionV1,
     NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
     NodeProtocolFeature::BlindRelaySuccessReceiptV1,
     NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+    NodeProtocolFeature::PrivateOnionBlindVaultAdmissionTerminalV1,
 ];
 
 /// Reply contract for receipt-capable immutable writes.
@@ -386,10 +395,13 @@ impl OnionRoutePurpose {
         match self {
             Self::MessageRelay => None,
             Self::AnonymousMailboxV1 => Some(NodeCapability::ChatRelay),
+            // [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex] Pull terminals
+            // prove this operation with their signed, purpose-specific feature
+            // set. Requiring the public replica role would force a private
+            // recipient to advertise unrelated public storage admission.
+            Self::BlindVaultPull | Self::BlindVaultLeaseAdmission => None,
             Self::BlindVaultPut
-            | Self::BlindVaultPull
             | Self::BlindVaultDelete
-            | Self::BlindVaultLeaseAdmission
             | Self::BlindVaultPutReceipt
             | Self::BlindVaultLeaseRetire
             | Self::BlindVaultLeaseRenewal
@@ -524,6 +536,9 @@ pub enum OnionRoutePlanError {
     /// with an ordinary reachable terminal role.
     #[error("private onion recipient has a public endpoint")]
     PrivateRecipientHasPublicEndpoint,
+    /// A private terminal must opt out of public discovery in its signed policy.
+    #[error("private onion recipient is marked publicly discoverable")]
+    PrivateRecipientPubliclyDiscoverable,
     /// Only explicit mailbox or fixed-class Pull private roles are admitted.
     #[error("private onion recipient route requires an explicit supported purpose")]
     PrivateRecipientPurposeRequired,
@@ -577,6 +592,7 @@ impl OnionRoutePlanError {
             Self::MissingPublicEndpoint { .. } => "missing_public_endpoint",
             Self::MissingPrivateRecipientAuthorization => "missing_private_recipient_authorization",
             Self::PrivateRecipientHasPublicEndpoint => "private_recipient_public_endpoint",
+            Self::PrivateRecipientPubliclyDiscoverable => "private_recipient_public_discovery",
             Self::PrivateRecipientPurposeRequired => "private_recipient_purpose_required",
             Self::SourceIdentityMismatch => "source_identity_mismatch",
             Self::OutsideValidityWindow => "outside_validity_window",
@@ -596,6 +612,7 @@ impl OnionRoutePlanError {
             | Self::MissingPublicEndpoint { .. }
             | Self::MissingPrivateRecipientAuthorization
             | Self::PrivateRecipientHasPublicEndpoint
+            | Self::PrivateRecipientPubliclyDiscoverable
             | Self::PrivateRecipientPurposeRequired
             | Self::OutsideValidityWindow => OnionRouteFailureDisposition::RefreshRoute,
             Self::TooManyHops { .. } | Self::DuplicateNode { .. } | Self::SourceIncluded { .. } => {
@@ -785,18 +802,21 @@ impl VerifiedOnionRoute {
                 });
             }
         }
-        if !recipient
-            .descriptor
-            .capabilities
-            .contains(&NodeCapability::ChatRelay)
+        if purpose != OnionRoutePurpose::BlindVaultPull
+            && !recipient
+                .descriptor
+                .capabilities
+                .contains(&NodeCapability::ChatRelay)
         {
             return Err(OnionRoutePlanError::MissingCapability {
                 hop_number: 2,
                 capability: NodeCapability::ChatRelay,
             });
         }
-        // Pull requires BlindVaultReplica in addition to the base ChatRelay.
-        // For mailbox this is the already-required ChatRelay role.
+        // [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex] Pull's explicit
+        // purpose-specific terminal feature is its operation capability; it
+        // must not imply public BlindVault replica admission. Other BlindVault
+        // purposes retain their existing specialized role.
         if let Some(capability) = purpose.specialized_terminal_capability() {
             if !recipient.descriptor.capabilities.contains(&capability) {
                 return Err(OnionRoutePlanError::MissingCapability { hop_number: 2, capability });
@@ -828,6 +848,12 @@ impl VerifiedOnionRoute {
         }
         if recipient.descriptor.public_endpoint.is_some() {
             return Err(OnionRoutePlanError::PrivateRecipientHasPublicEndpoint);
+        }
+        // [PHALA-PRIVATE-DISCOVERY-ISOLATION 2026-10-06 by Codex] Endpoint
+        // omission alone is not a private-role declaration; require the
+        // signed policy to exclude this terminal from public discovery.
+        if recipient.descriptor.policy.public_discovery {
+            return Err(OnionRoutePlanError::PrivateRecipientPubliclyDiscoverable);
         }
         authorization
             .verify_at(relay, recipient, purpose.as_str(), now)
@@ -1488,16 +1514,25 @@ mod tests {
         );
         assert_eq!(
             OnionRoutePurpose::BlindVaultPull.specialized_terminal_capability(),
-            Some(NodeCapability::BlindVaultReplica)
+            None
         );
+        assert!(OnionRoutePurpose::BlindVaultPull
+            .required_terminal_protocol_features()
+            .contains(&NodeProtocolFeature::PrivateOnionBlindVaultPullTerminalV1));
         assert_eq!(
             OnionRoutePurpose::BlindVaultDelete.specialized_terminal_capability(),
             Some(NodeCapability::BlindVaultReplica)
         );
         assert_eq!(
             OnionRoutePurpose::BlindVaultLeaseAdmission.specialized_terminal_capability(),
-            Some(NodeCapability::BlindVaultReplica)
+            // [PHALA-CORE-CONTRACT-REGRESSION 2026-10-08 by Codex]
+            // Private admission is declared by its signed operation feature,
+            // not an unrelated public replica capability.
+            None
         );
+        assert!(OnionRoutePurpose::BlindVaultLeaseAdmission
+            .required_terminal_protocol_features()
+            .contains(&NodeProtocolFeature::PrivateOnionBlindVaultAdmissionTerminalV1));
         assert_eq!(
             OnionRoutePurpose::BlindVaultPutReceipt.specialized_terminal_capability(),
             Some(NodeCapability::BlindVaultReplica)
@@ -1580,12 +1615,13 @@ mod tests {
         )
         .with_x25519_kem(identity.x25519_public_key_bytes());
         descriptor.public_endpoint = endpoint.map(str::to_owned);
+        descriptor.policy.public_discovery = endpoint.is_some();
         descriptor.capabilities = capabilities;
         descriptor = descriptor.with_protocol_features(features.iter().copied());
         SignedNodeDescriptor::sign(descriptor, identity).unwrap()
     }
 
-    // [PRIVATE-BLIND-VAULT-PULL 2026-10-04 by Codex] Authored, unexecuted.
+    // [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex] Authored, unexecuted.
     #[test]
     fn private_pull_builder_enforces_each_role_feature_and_public_boundary() {
         let source = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap();
@@ -1621,13 +1657,27 @@ mod tests {
             assert!(matches!(build(&missing, &p, OnionRoutePurpose::BlindVaultPull),
                 Err(OnionRoutePlanError::MissingProtocolFeature { hop_number: 1, feature }) if feature == removed));
         }
-        for removed in [NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica] {
-            let caps = [NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica].into_iter()
-                .filter(|c| *c != removed).collect();
-            let missing = private_route_descriptor(&recipient, None, caps, &BLIND_VAULT_PULL_FEATURES);
-            assert!(matches!(build(&r, &missing, OnionRoutePurpose::BlindVaultPull),
-                Err(OnionRoutePlanError::MissingCapability { hop_number: 2, capability }) if capability == removed));
-        }
+        // [PHALA-CORE-CONTRACT-REGRESSION 2026-10-08 by Codex] Pull keeps
+        // ChatRelay but does not require public replica admission. A changed
+        // descriptor needs its own grant; the previous commitment must reject.
+        let private_terminal = private_route_descriptor(&recipient, None,
+            vec![NodeCapability::ChatRelay], &BLIND_VAULT_PULL_FEATURES);
+        assert!(matches!(build(&r, &private_terminal, OnionRoutePurpose::BlindVaultPull),
+            Err(OnionRoutePlanError::MissingPrivateRecipientAuthorization)));
+        let private_grant = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &r, &private_terminal, "blind_vault_pull", 1_700_000_100,
+            1_700_001_000, &recipient,
+        ).unwrap();
+        assert!(VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+            source.public_key_bytes(), &r, &private_terminal, &private_grant,
+            OnionRoutePurpose::BlindVaultPull, 1_700_000_500,
+        ).is_ok());
+        let missing_chat_role = private_route_descriptor(&recipient, None,
+            vec![], &BLIND_VAULT_PULL_FEATURES);
+        assert!(SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &r, &missing_chat_role, "blind_vault_pull", 1_700_000_100,
+            1_700_001_000, &recipient,
+        ).is_err());
         for removed in ONION_FORWARD_HOP_REQUIRED_CAPABILITIES {
             let caps = ONION_FORWARD_HOP_REQUIRED_CAPABILITIES.into_iter().filter(|c| *c != removed).collect();
             let missing = private_route_descriptor(&relay, Some("relay.example:443"), caps, &BLIND_VAULT_LARGE_PULL_PATH_FEATURES);
@@ -1642,6 +1692,22 @@ mod tests {
             vec![NodeCapability::ChatRelay, NodeCapability::BlindVaultReplica], &BLIND_VAULT_PULL_FEATURES);
         assert!(matches!(build(&r, &public_p, OnionRoutePurpose::BlindVaultPull),
             Err(OnionRoutePlanError::PrivateRecipientHasPublicEndpoint)));
+
+        // [PHALA-PRIVATE-DISCOVERY-ISOLATION 2026-10-06 by Codex] A signed,
+        // endpoint-free descriptor that still opts into public discovery is
+        // not an acceptable private recipient.
+        let mut public_policy = private_route_descriptor(&recipient, None,
+            vec![NodeCapability::ChatRelay], &BLIND_VAULT_PULL_FEATURES).descriptor;
+        public_policy.policy.public_discovery = true;
+        let public_policy = SignedNodeDescriptor::sign(public_policy, &recipient).unwrap();
+        let public_policy_grant = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+            &r, &public_policy, "blind_vault_pull", 1_700_000_100,
+            1_700_001_000, &recipient,
+        ).unwrap();
+        assert!(matches!(VerifiedOnionRoute::from_signed_private_recipient_descriptors(
+            source.public_key_bytes(), &r, &public_policy, &public_policy_grant,
+            OnionRoutePurpose::BlindVaultPull, 1_700_000_500,
+        ), Err(OnionRoutePlanError::PrivateRecipientPubliclyDiscoverable)));
     }
 
     #[test]
@@ -2055,6 +2121,8 @@ mod tests {
         );
         let mut same_recipient_body = same_relay.descriptor.clone();
         same_recipient_body.public_endpoint = None;
+        // [PHALA-PRIVATE-DISCOVERY-ISOLATION 2026-10-06 by Codex]
+        same_recipient_body.policy.public_discovery = false;
         same_recipient_body = same_recipient_body.with_protocol_features(ANONYMOUS_MAILBOX_FEATURES);
         let same_recipient = SignedNodeDescriptor::sign(same_recipient_body, &same).unwrap();
         let same_authorization = SignedPrivateOnionRecipientAuthorizationV1::new_signed(

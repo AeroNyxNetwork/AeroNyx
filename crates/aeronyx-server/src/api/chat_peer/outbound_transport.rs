@@ -21,9 +21,24 @@ use super::super::chat_peer_retry::{
 };
 use super::super::chat_peer_transport::{BlindRelayTransport, ReqwestBlindRelayTransport};
 use super::*;
-use crate::api::{canonical_peer_http_url, peer_endpoint_is_public_ip};
+use crate::api::{
+    canonical_peer_http_url, peer_endpoint_is_public_ip,
+    resolve_pinned_peer_http_target, reverse_onion_endpoint_supported,
+};
+#[cfg(test)]
+use crate::api::peer_endpoint_is_loopback_ip;
 use bytes::Bytes;
 use tokio::time::sleep;
+
+#[cfg(test)]
+fn is_test_loopback_peer_endpoint(endpoint: &str) -> bool {
+    peer_endpoint_is_loopback_ip(endpoint)
+}
+
+#[cfg(not(test))]
+fn is_test_loopback_peer_endpoint(_endpoint: &str) -> bool {
+    false
+}
 
 /// Privacy-safe local failure while preparing an outbound direct request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +171,13 @@ pub(crate) struct PreparedPeerBlindRelayHttpRequest {
 pub(super) struct PreparedBlindRelayForwardRequest {
     request: Arc<PeerBlindRelayRequest>,
     http: PreparedPeerBlindRelayHttpRequest,
+}
+
+// [PHALA-ONION-DNS-PIN 2026-10-06 by Codex] Retain the exact resolver-pinned
+// client and signed-host URL from zero-send preflight through every retry.
+pub(super) struct BlindRelayPeerTarget {
+    url: String,
+    client: Arc<reqwest::Client>,
 }
 
 impl PreparedPeerBlindRelayHttpRequest {
@@ -468,6 +490,7 @@ struct BlindRelayForwardComponents<'a> {
     observer: &'a dyn BlindRelayForwardObserver,
 }
 
+#[cfg(test)]
 pub(super) async fn forward_blind_relay_with_retry(
     state: &ChatPeerState,
     url: &str,
@@ -479,6 +502,63 @@ pub(super) async fn forward_blind_relay_with_retry(
     let observer = PeerStoreBlindRelayForwardObserver::new(state.peer_store.as_ref());
     forward_blind_relay_with_components(
         url,
+        descriptor,
+        request,
+        now,
+        BlindRelayForwardComponents {
+            retry_policy: Arc::new(BlindRelayRetryDomain::default()),
+            response_policy: Arc::new(BlindRelayResponseDomain),
+            transport: &transport,
+            observer: &observer,
+        },
+    )
+    .await
+}
+
+// [PHALA-ONION-DNS-PIN 2026-10-06 by Codex] DNS resolution is completed
+// before the caller arms its durable external-effect boundary. DNS names are
+// accepted only by the reverse-onion HTTPS policy; IP-literal compatibility
+// keeps using the existing process client without a resolver lookup.
+pub(super) async fn resolve_blind_peer_relay_target(
+    state: &ChatPeerState,
+    endpoint: &str,
+) -> Option<BlindRelayPeerTarget> {
+    let url = blind_peer_relay_url(endpoint)?;
+    if peer_endpoint_is_public_ip(endpoint)
+        || is_test_loopback_peer_endpoint(endpoint)
+    {
+        return Some(BlindRelayPeerTarget {
+            url,
+            client: Arc::clone(&state.http_client),
+        });
+    }
+    if !reverse_onion_endpoint_supported(endpoint) {
+        return None;
+    }
+    let parsed = canonical_peer_http_url(endpoint, "/api/chat/peer/blind-relay").ok()?;
+    let pinned = resolve_pinned_peer_http_target(
+        parsed,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .ok()?;
+    Some(BlindRelayPeerTarget {
+        url: pinned.url.to_string(),
+        client: Arc::new(pinned.client),
+    })
+}
+
+pub(super) async fn forward_blind_relay_with_resolved_target(
+    state: &ChatPeerState,
+    target: &BlindRelayPeerTarget,
+    descriptor: &SignedNodeDescriptor,
+    request: PreparedBlindRelayForwardRequest,
+    now: u64,
+) -> Result<BlindRelayForwardOutcome, BlindRelayError> {
+    let transport = ReqwestBlindRelayTransport::new(Arc::clone(&target.client));
+    let observer = PeerStoreBlindRelayForwardObserver::new(state.peer_store.as_ref());
+    forward_blind_relay_with_components(
+        &target.url,
         descriptor,
         request,
         now,
@@ -738,18 +818,45 @@ fn log_invalid_blind_relay_response(
 }
 
 pub(super) fn blind_peer_relay_url(endpoint: &str) -> Option<String> {
-    // [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] A next-hop descriptor is
-    // permissionless input. Its signature cannot authorize localhost, private
-    // networks, metadata services, DNS rebinding, or URL-controlled paths.
-    if !peer_endpoint_is_public_ip(endpoint) {
-        #[cfg(not(test))]
+    // [PHALA-ONION-DNS-PIN 2026-10-06 by Codex] IP literals preserve the
+    // legacy transport policy. DNS is admitted only as public HTTPS; the
+    // async caller must resolve and pin the complete public answer set before
+    // it arms the durable relay effect. A descriptor signature alone is not
+    // authorization to access private or metadata networks.
+    let permitted = peer_endpoint_is_public_ip(endpoint)
+        || is_test_loopback_peer_endpoint(endpoint)
+        || reverse_onion_endpoint_supported(endpoint);
+    if !permitted {
         return None;
-        #[cfg(test)]
-        if !crate::api::peer_endpoint_is_loopback_ip(endpoint) {
-            return None;
-        }
     }
     canonical_peer_http_url(endpoint, "/api/chat/peer/blind-relay")
         .ok()
         .map(|url| url.to_string())
+}
+
+#[cfg(test)]
+mod phala_onion_endpoint_tests {
+    use super::blind_peer_relay_url;
+
+    // [PHALA-ONION-DNS-PIN 2026-10-06 by Codex] Authored, not run: DNS is
+    // permitted only for HTTPS onion hops; legacy public IP literals remain.
+    #[test]
+    fn onion_forward_target_accepts_public_https_dns_without_widening_http() {
+        assert_eq!(
+            blind_peer_relay_url("https://relay.phala.ai:443").as_deref(),
+            Some("https://relay.phala.ai/api/chat/peer/blind-relay"),
+        );
+        assert_eq!(
+            blind_peer_relay_url("8.8.8.8:8422").as_deref(),
+            Some("http://8.8.8.8:8422/api/chat/peer/blind-relay"),
+        );
+        for endpoint in [
+            "http://relay.phala.example:8422",
+            "https://localhost",
+            "https://relay.internal",
+            "https://10.0.0.1:8422",
+        ] {
+            assert!(blind_peer_relay_url(endpoint).is_none(), "{endpoint}");
+        }
+    }
 }

@@ -48,12 +48,13 @@
 //! Last Modified: v1.3.0-SourceIndex - Explicit v3/v4 index migration.
 
 use aeronyx_core::crypto::keys::IdentityPublicKey;
+use aeronyx_core::protocol::discovery::MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_LIFETIME_SECS_V1;
 use aeronyx_core::protocol::onion::reverse_delivery::{
     MAX_REVERSE_ONION_CLAIM_BYTES, MAX_REVERSE_ONION_ENVELOPE_BYTES,
-    MAX_REVERSE_ONION_FRAME_BYTES,
+    MAX_REVERSE_ONION_FRAME_BYTES, MAX_REVERSE_ONION_RECOVERY_RETENTION_SECS,
+    REVERSE_ONION_RESULT_RETENTION_SECS,
 };
 use parking_lot::Mutex;
-use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use thiserror::Error;
 
@@ -104,6 +105,10 @@ pub(crate) enum ReverseOnionQueueError {
     AlreadyComplete,
     #[error("reverse onion queue storage is unavailable")]
     Unavailable,
+    // [REVERSE-ONION-RESULT-CLOCK 2026-10-05 by Codex] Transient trusted-time
+    // failure must fail closed without poisoning durable queue state.
+    #[error("reverse onion queue clock is unavailable")]
+    ClockUnavailable,
     #[error("reverse onion queue contains corrupt state")]
     Corrupt,
     #[error("reverse onion queue requires explicit schema migration")]
@@ -142,6 +147,7 @@ impl ReverseOnionQueueLimits {
             || max_items_per_recipient > i64::MAX as u64
             || lease_max_secs == 0
             || recovery_retention_secs == 0
+            || recovery_retention_secs > MAX_REVERSE_ONION_RECOVERY_RETENTION_SECS
             || max_bytes < (MAX_CLAIM_BYTES + MAX_LEASE_BYTES + MAX_RESULT_BYTES) as u64
         {
             return Err(ReverseOnionQueueError::Rejected);
@@ -162,7 +168,9 @@ impl ReverseOnionQueueLimits {
         mut self,
         route_max_secs: u64,
     ) -> Result<Self, ReverseOnionQueueError> {
-        if route_max_secs == 0 {
+        if route_max_secs == 0
+            || route_max_secs > MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_LIFETIME_SECS_V1
+        {
             return Err(ReverseOnionQueueError::Rejected);
         }
         self.route_max_secs = route_max_secs;
@@ -344,6 +352,10 @@ pub(crate) struct ReverseOnionQueueSourceSnapshot {
     request_commitment: [u8; COMMITMENT_BYTES],
     immediate_recipient: [u8; COMMITMENT_BYTES],
     route_deadline: u64,
+    // [PHALA-SOURCE-EVIDENCE-CLOCK 2026-10-07 by Codex] Internal read-time
+    // bounds survive DB fencing and signing waits; neither changes the wire.
+    observed_at: u64,
+    available_until: u64,
     claim_frame: Option<Vec<u8>>,
     lease_frame: Option<Vec<u8>>,
     result_frame: Option<Vec<u8>>,
@@ -355,6 +367,8 @@ impl ReverseOnionQueueSourceSnapshot {
     pub(crate) fn request_commitment(&self) -> [u8; COMMITMENT_BYTES] { self.request_commitment }
     pub(crate) fn immediate_recipient(&self) -> [u8; COMMITMENT_BYTES] { self.immediate_recipient }
     pub(crate) fn route_deadline(&self) -> u64 { self.route_deadline }
+    pub(crate) fn observed_at(&self) -> u64 { self.observed_at }
+    pub(crate) fn available_until(&self) -> u64 { self.available_until }
     pub(crate) fn claim_frame(&self) -> Option<&[u8]> { self.claim_frame.as_deref() }
     pub(crate) fn lease_frame(&self) -> Option<&[u8]> { self.lease_frame.as_deref() }
     pub(crate) fn result_frame(&self) -> Option<&[u8]> { self.result_frame.as_deref() }
@@ -466,11 +480,34 @@ impl SqliteReverseOnionQueue {
         Self { limits }
     }
 
+    // [PHALA-CLAIM-EXECUTION-CAP 2026-10-08 by Codex] The selected row's
+    // authenticated route horizon and this owner's immutable execution cap
+    // both constrain a fresh Lease; Claim freshness is not its lifetime.
+    pub(crate) fn maximum_execution_deadline(
+        &self, route_deadline: u64, now: u64,
+    ) -> Result<u64, ReverseOnionQueueError> {
+        validate_now(now)?;
+        let deadline = now.checked_add(self.limits.lease_max_secs)
+            .ok_or(ReverseOnionQueueError::Rejected)?.min(route_deadline);
+        if deadline <= now { return Err(ReverseOnionQueueError::Rejected); }
+        Ok(deadline)
+    }
+
+    // [REVERSE-ONION-ROUTE-CAP 2026-10-06 by Codex] Keep signed-route
+    // freshness independent from the immutable execution lease duration.
+    pub(crate) fn with_route_max_secs(
+        mut self,
+        route_max_secs: u64,
+    ) -> Result<Self, ReverseOnionQueueError> {
+        self.limits = self.limits.with_route_max_secs(route_max_secs)?;
+        Ok(self)
+    }
+
     pub(crate) fn initialize(
         &self,
         connection: &Mutex<Connection>,
     ) -> Result<(), ReverseOnionQueueError> {
-        self.initialize_inner(connection, None)
+        self.initialize_inner(connection, None, true)
     }
 
     pub(crate) fn initialize_at(
@@ -479,20 +516,33 @@ impl SqliteReverseOnionQueue {
         trusted_now: u64,
     ) -> Result<(), ReverseOnionQueueError> {
         validate_now(trusted_now)?;
-        self.initialize_inner(connection, Some(trusted_now))
+        self.initialize_inner(connection, Some(trusted_now), true)
+    }
+
+    // [PHALA-OWNED-RECOVERY-SCHEMA 2026-10-07 by Codex] A nonempty file
+    // without our durable ownership metadata is not existing custody. Owned
+    // legacy schemas still use the same trusted-time migration and row audit.
+    pub(crate) fn initialize_existing_at(
+        &self,
+        connection: &Mutex<Connection>,
+        trusted_now: u64,
+    ) -> Result<(), ReverseOnionQueueError> {
+        validate_now(trusted_now)?;
+        self.initialize_inner(connection, Some(trusted_now), false)
     }
 
     fn initialize_inner(
         &self,
         connection: &Mutex<Connection>,
         trusted_now: Option<u64>,
+        allow_create: bool,
     ) -> Result<(), ReverseOnionQueueError> {
         let mut connection = connection.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let has_objects = has_application_objects(&tx)?;
         let meta_object = named_object_type(&tx, META_TABLE)?;
         if meta_object.is_none() {
-            if has_objects {
+            if has_objects || !allow_create {
                 return Err(ReverseOnionQueueError::MigrationRequired);
             }
             create_meta_schema(&tx)?;
@@ -570,6 +620,19 @@ impl SqliteReverseOnionQueue {
         validate_meta_schema(&tx)?;
         validate_schema(&tx)?;
         validate_no_work_schema(&tx)?;
+        validate_all_rows(&tx, &self.limits)?;
+        validate_all_no_work_rows(&tx, &self.limits)?;
+        // [PHALA-QUEUE-CAPACITY-OPEN 2026-10-08 by Codex] Audit the whole
+        // custody budget, including future frames, before committing migration.
+        // An observed rollback must roll back schema and retention changes too.
+        validate_stored_quotas(&tx, &self.limits)?;
+        if let Some(now) = trusted_now {
+            advance_clock(&tx, sqlite_integer(now)?)?;
+        }
+        extend_recovery_horizons(&tx, &self.limits, trusted_now)?;
+        if let Some(now) = trusted_now {
+            cleanup_expired(&tx, sqlite_integer(now)?)?;
+        }
         validate_all_rows(&tx, &self.limits)?;
         validate_all_no_work_rows(&tx, &self.limits)?;
         tx.commit()?;
@@ -653,6 +716,10 @@ impl SqliteReverseOnionQueue {
     /// Recipient-authenticated poll and atomic Lease issue. The closure must
     /// call the core `ReverseOnionFrameV1::lease`; its exact bytes, lease
     /// commitment, and deadlines are committed before the method returns.
+    // [REVERSE-ONION-LIVE-CLAIM-AUTH 2026-10-05 by Codex] The unchecked
+    // wrapper exists only for queue state-machine unit fixtures; runtime code
+    // must use `issue_lease_authorized`.
+    #[cfg(test)]
     pub(crate) fn issue_lease<V, F>(
         &self,
         connection: &Mutex<Connection>,
@@ -666,6 +733,33 @@ impl SqliteReverseOnionQueue {
     ) -> Result<ReverseOnionQueueIssue, ReverseOnionQueueError>
     where
         V: Fn(&[u8]) -> Result<[u8; COMMITMENT_BYTES], ReverseOnionQueueError>,
+        F: FnOnce(&ReverseOnionQueueStoredItem, &[u8])
+            -> Result<ReverseOnionQueueLeaseMaterial, ReverseOnionQueueError>,
+    {
+        self.issue_lease_authorized(
+            connection, recipient, claim_id, claim_commitment, claim_frame, now,
+            verify_claim, |_| Ok(()), build_lease,
+        )
+    }
+
+    // [REVERSE-ONION-LIVE-CLAIM-AUTH 2026-10-05 by Codex] Production lease
+    // issuance checks the selected durable row against its current authority
+    // inside this same transaction, before signing or persisting a Lease.
+    pub(crate) fn issue_lease_authorized<V, A, F>(
+        &self,
+        connection: &Mutex<Connection>,
+        recipient: [u8; COMMITMENT_BYTES],
+        claim_id: [u8; ID_BYTES],
+        claim_commitment: [u8; COMMITMENT_BYTES],
+        claim_frame: Vec<u8>,
+        now: u64,
+        verify_claim: V,
+        authorize_item: A,
+        build_lease: F,
+    ) -> Result<ReverseOnionQueueIssue, ReverseOnionQueueError>
+    where
+        V: Fn(&[u8]) -> Result<[u8; COMMITMENT_BYTES], ReverseOnionQueueError>,
+        A: Fn(&ReverseOnionQueueStoredItem) -> Result<(), ReverseOnionQueueError>,
         F: FnOnce(&ReverseOnionQueueStoredItem, &[u8])
             -> Result<ReverseOnionQueueLeaseMaterial, ReverseOnionQueueError>,
     {
@@ -709,8 +803,13 @@ impl SqliteReverseOnionQueue {
                 return Err(ReverseOnionQueueError::Conflict);
             }
             let issue = match existing.state {
-                ARMED => ReverseOnionQueueIssue::Existing(issued_lease_from_row(&existing)?),
-                RESULT => ReverseOnionQueueIssue::Result(result_from_row(&existing)?),
+                ARMED if lease_execution_deadline(&existing)? > now => {
+                    ReverseOnionQueueIssue::Existing(issued_lease_from_row(&existing)?)
+                }
+                RESULT if lease_result_deadline(&existing)? > now => {
+                    ReverseOnionQueueIssue::Result(result_from_row(&existing)?)
+                }
+                ARMED | RESULT => ReverseOnionQueueIssue::Ambiguous,
                 LEASED | TOMBSTONE => ReverseOnionQueueIssue::Ambiguous,
                 PENDING => return Err(ReverseOnionQueueError::Corrupt),
                 _ => return Err(ReverseOnionQueueError::Corrupt),
@@ -718,11 +817,13 @@ impl SqliteReverseOnionQueue {
             tx.commit()?;
             return Ok(issue);
         }
-        let Some(row) = select_pending(&tx, &recipient)? else {
-            let verified = verify_claim(&claim_frame)?;
-            if verified != claim_commitment || is_zero(&verified) {
-                return Err(ReverseOnionQueueError::Rejected);
-            }
+        let verified = verify_claim(&claim_frame)?;
+        if verified != claim_commitment || is_zero(&verified) {
+            return Err(ReverseOnionQueueError::Rejected);
+        }
+        let Some((row, stored)) = select_pending_authorized(
+            &tx, &recipient, now, self.limits.max_items, &authorize_item,
+        )? else {
             insert_no_work_marker(
                 &tx,
                 &self.limits,
@@ -735,43 +836,29 @@ impl SqliteReverseOnionQueue {
             tx.commit()?;
             return Ok(ReverseOnionQueueIssue::NoWork);
         };
-        validate_row(&row)?;
-        if row.route_deadline <= now {
-            let verified = verify_claim(&claim_frame)?;
-            if verified != claim_commitment || is_zero(&verified) {
-                return Err(ReverseOnionQueueError::Rejected);
-            }
-            insert_no_work_marker(
-                &tx,
-                &self.limits,
-                &recipient,
-                &claim_id,
-                &claim_commitment,
-                &claim_frame,
-                now,
-            )?;
-            tx.commit()?;
-            return Ok(ReverseOnionQueueIssue::NoWork);
-        }
-        let verified = verify_claim(&claim_frame)?;
-        if verified != claim_commitment || is_zero(&verified) {
-            return Err(ReverseOnionQueueError::Rejected);
-        }
-        let stored = stored_item_from_row(&row)?;
+        // [PHALA-QUEUE-CAPACITY-OPEN 2026-10-08 by Codex] Existing exact
+        // replay above stays available; fresh execution needs reserved budget.
+        validate_stored_quotas(&tx, &self.limits)?;
         let material = build_lease(&stored, &claim_frame)?;
         let execution_deadline = sqlite_integer(material.execution_deadline)?;
-        let retained_until = sqlite_integer(material.replay_evidence_deadline)?;
-        let execution_limit = now_u64
-            .checked_add(self.limits.lease_max_secs)
-            .ok_or(ReverseOnionQueueError::Rejected)?;
-        let mandatory_retention = now_u64
+        // [PHALA-LEASE-RETENTION-REPAIR 2026-10-08 by Codex] Match the
+        // existing startup migration contract: reserve the entire trusted
+        // route horizon, even when its immutable execution lease ends earlier.
+        let tombstone_deadline = u64::try_from(row.route_deadline)
+            .map_err(|_| ReverseOnionQueueError::Corrupt)?
             .checked_add(self.limits.recovery_retention_secs)
             .ok_or(ReverseOnionQueueError::Rejected)?;
+        let retained_until = sqlite_integer(
+            material.replay_evidence_deadline.max(tombstone_deadline),
+        )?
+        // [PHALA-LEASE-RETENTION-REPAIR 2026-10-08 by Codex] Issuing an
+        // earlier execution lease must not truncate the route's existing
+        // tombstone/replay reservation or make our own row fail its audit.
+        .max(row.retained_until);
+        let execution_limit = self.maximum_execution_deadline(stored.route_deadline(), now_u64)?;
         if execution_deadline <= now
-            || retained_until < execution_deadline
             || execution_deadline > row.route_deadline
             || material.execution_deadline > execution_limit
-            || material.replay_evidence_deadline < mandatory_retention
             || material.replay_evidence_deadline < material.execution_deadline
         {
             return Err(ReverseOnionQueueError::Rejected);
@@ -842,7 +929,12 @@ impl SqliteReverseOnionQueue {
             {
                 return Err(ReverseOnionQueueError::Conflict);
             }
-            if row.state != ARMED || row.retained_until <= sqlite_integer(now)? {
+            if row.state != ARMED
+                || row.retained_until <= sqlite_integer(now)?
+                // [PHALA-LEASE-RETENTION-REPAIR 2026-10-08 by Codex]
+                // This is Result recovery context, never permission to execute.
+                || lease_result_deadline(&row)? <= sqlite_integer(now)?
+            {
                 None
             } else {
                 Some(issued_lease_from_row(&row)?)
@@ -867,16 +959,39 @@ impl SqliteReverseOnionQueue {
         route_id: [u8; ID_BYTES],
         now: u64,
     ) -> Result<ReverseOnionQueueResultContext, ReverseOnionQueueError> {
-        validate_now(now)?;
+        self.lookup_result_context_at(
+            connection,
+            recipient,
+            claim_id,
+            lease_id,
+            route_id,
+            || Ok(now),
+        )
+    }
+
+    // [REVERSE-ONION-RESULT-CLOCK 2026-10-05 by Codex] Refresh after queue
+    // locks, SQLite acquisition, and bounded integrity scans.
+    pub(crate) fn lookup_result_context_at(
+        &self,
+        connection: &Mutex<Connection>,
+        recipient: [u8; COMMITMENT_BYTES],
+        claim_id: [u8; ID_BYTES],
+        lease_id: [u8; ID_BYTES],
+        route_id: [u8; ID_BYTES],
+        refresh_now: impl FnOnce() -> Result<u64, ReverseOnionQueueError>,
+    ) -> Result<ReverseOnionQueueResultContext, ReverseOnionQueueError> {
         if is_zero(&recipient) || is_zero(&claim_id) || is_zero(&lease_id) || is_zero(&route_id) {
             return Err(ReverseOnionQueueError::Rejected);
         }
-        let now = sqlite_integer(now)?;
         let mut connection = connection.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        advance_clock(&tx, now)?;
         validate_all_no_work_rows(&tx, &self.limits)?;
-        let outcome = if let Some(row) = load_by_claim_id(&tx, &claim_id)? {
+        let row = load_by_claim_id(&tx, &claim_id)?;
+        let now = refresh_now()?;
+        validate_now(now)?;
+        let now = sqlite_integer(now)?;
+        advance_clock(&tx, now)?;
+        let outcome = if let Some(row) = row {
             let identity_matches = row.immediate_recipient.as_slice() == recipient.as_slice()
                 && row.route_id.as_slice() == route_id.as_slice()
                 && row.lease_id.as_deref() == Some(lease_id.as_slice());
@@ -885,13 +1000,13 @@ impl SqliteReverseOnionQueue {
             } else {
                 validate_row(&row)?;
                 if row.state == ARMED {
-                    if row.retained_until <= now {
+                    if row.retained_until <= now || lease_result_deadline(&row)? <= now {
                         ReverseOnionQueueResultContext::Ambiguous
                     } else {
                         ReverseOnionQueueResultContext::Armed(issued_lease_from_row(&row)?)
                     }
                 } else if row.state == RESULT {
-                    if row.retained_until <= now {
+                    if row.retained_until <= now || lease_result_deadline(&row)? <= now {
                         ReverseOnionQueueResultContext::NoWork
                     } else {
                         ReverseOnionQueueResultContext::Result(result_from_row(&row)?)
@@ -921,14 +1036,29 @@ impl SqliteReverseOnionQueue {
             &[u8],
         ) -> Result<[u8; COMMITMENT_BYTES], ReverseOnionQueueError>,
     ) -> Result<ReverseOnionQueueCompletion, ReverseOnionQueueError> {
-        validate_now(now)?;
+        self.complete_at(connection, lease, result_frame, || Ok(now),
+            |stored, bytes, _| verify_result(stored, bytes))
+    }
+
+    // [REVERSE-ONION-RESULT-CLOCK 2026-10-05 by Codex] The immutable lease
+    // and bounded result grace use time sampled after bounded DB validation.
+    pub(crate) fn complete_at(
+        &self,
+        connection: &Mutex<Connection>,
+        lease: &ReverseOnionQueueIssuedLease,
+        result_frame: &[u8],
+        refresh_now: impl FnOnce() -> Result<u64, ReverseOnionQueueError>,
+        verify_result: impl FnOnce(
+            &ReverseOnionQueueStoredResultContext,
+            &[u8],
+            u64,
+        ) -> Result<[u8; COMMITMENT_BYTES], ReverseOnionQueueError>,
+    ) -> Result<ReverseOnionQueueCompletion, ReverseOnionQueueError> {
         if result_frame.is_empty() || result_frame.len() > MAX_RESULT_BYTES {
             return Err(ReverseOnionQueueError::Rejected);
         }
-        let now = sqlite_integer(now)?;
         let mut connection = connection.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        advance_clock(&tx, now)?;
         validate_all_rows(&tx, &self.limits)?;
         validate_all_no_work_rows(&tx, &self.limits)?;
         let row = load_row(&tx, &lease.queue_key)?.ok_or(ReverseOnionQueueError::LeaseLost)?;
@@ -939,8 +1069,12 @@ impl SqliteReverseOnionQueue {
         {
             return Err(ReverseOnionQueueError::LeaseLost);
         }
+        let now = refresh_now()?;
+        validate_now(now)?;
+        let now = sqlite_integer(now)?;
+        advance_clock(&tx, now)?;
         if row.state == RESULT {
-            if row.retained_until <= now {
+            if lease_result_deadline(&row)? <= now {
                 // [REVERSE-ONION-QUEUE-DURABLE-ERROR-FENCE 2026-10-04 by Codex]
                 // The authenticated retained row has been observed as expired;
                 // commit only the clock and publish NoWork after the DB wrapper
@@ -959,7 +1093,7 @@ impl SqliteReverseOnionQueue {
         if row.state != ARMED {
             return Err(ReverseOnionQueueError::LeaseLost);
         }
-        if row.retained_until <= now {
+        if row.retained_until <= now || lease_result_deadline(&row)? <= now {
             // [REVERSE-ONION-QUEUE-DURABLE-ERROR-FENCE 2026-10-04 by Codex]
             // Preserve the trusted expiry observation without mutating the
             // still-armed row; the DB wrapper fences before returning Ambiguous.
@@ -969,6 +1103,7 @@ impl SqliteReverseOnionQueue {
         let result_commitment = verify_result(
             &ReverseOnionQueueStoredResultContext::from_row(&row)?,
             result_frame,
+            u64::try_from(now).map_err(|_| ReverseOnionQueueError::Rejected)?,
         )?;
         if is_zero(&result_commitment) {
             return Err(ReverseOnionQueueError::Rejected);
@@ -1019,7 +1154,10 @@ impl SqliteReverseOnionQueue {
             {
                 return Err(ReverseOnionQueueError::Conflict);
             }
-            if row.state != RESULT || row.retained_until <= sqlite_integer(now)? {
+            if row.state != RESULT
+                || row.retained_until <= sqlite_integer(now)?
+                || lease_result_deadline(&row)? <= sqlite_integer(now)?
+            {
                 None
             } else {
                 Some(result_from_row(&row)?)
@@ -1041,14 +1179,25 @@ impl SqliteReverseOnionQueue {
         request_commitment: [u8; COMMITMENT_BYTES],
         now: u64,
     ) -> Result<Option<ReverseOnionQueueSourceSnapshot>, ReverseOnionQueueError> {
-        validate_now(now)?;
+        self.lookup_source_at(connection, source_node_id, route_id, request_commitment, || Ok(now))
+    }
+
+    // [PHALA-SOURCE-EVIDENCE-CLOCK 2026-10-07 by Codex] Sample after the
+    // connection lock and SQL reads, including any SQLite busy wait.
+    pub(crate) fn lookup_source_at(
+        &self,
+        connection: &Mutex<Connection>,
+        source_node_id: [u8; COMMITMENT_BYTES],
+        route_id: [u8; ID_BYTES],
+        request_commitment: [u8; COMMITMENT_BYTES],
+        refresh_now: impl FnOnce() -> Result<u64, ReverseOnionQueueError>,
+    ) -> Result<Option<ReverseOnionQueueSourceSnapshot>, ReverseOnionQueueError> {
         if !valid_source_node_id(&source_node_id)
             || is_zero(&route_id)
             || is_zero(&request_commitment)
         {
             return Err(ReverseOnionQueueError::Rejected);
         }
-        let now = sqlite_integer(now)?;
         let mut connection = connection.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let clock_high_water: i64 = tx
@@ -1058,18 +1207,24 @@ impl SqliteReverseOnionQueue {
                 |row| row.get(0),
             )
             .map_err(|_| ReverseOnionQueueError::Corrupt)?;
+        let row = load_by_source_route(&tx, &source_node_id, &route_id, &request_commitment)?;
+        if let Some(row) = &row {
+            validate_row(row)?;
+        }
+        let observed_at = refresh_now()?;
+        validate_now(observed_at)?;
+        let now = sqlite_integer(observed_at)?;
         if clock_high_water < 0 || now < clock_high_water {
             return Err(ReverseOnionQueueError::Rejected);
         }
-        let row = load_by_source_route(&tx, &source_node_id, &route_id, &request_commitment)?;
         let snapshot = if let Some(row) = row {
-            validate_row(&row)?;
-            let expired = match row.state {
-                PENDING => row.route_deadline <= now,
-                LEASED | ARMED | RESULT | TOMBSTONE => row.retained_until <= now,
-                _ => true,
+            let available_until = match row.state {
+                PENDING => row.route_deadline,
+                LEASED | TOMBSTONE => row.retained_until,
+                ARMED | RESULT => row.retained_until.min(lease_result_deadline(&row)?),
+                _ => return Err(ReverseOnionQueueError::Corrupt),
             };
-            if expired {
+            if available_until <= now {
                 None
             } else {
                 Some(ReverseOnionQueueSourceSnapshot {
@@ -1085,6 +1240,9 @@ impl SqliteReverseOnionQueue {
                     immediate_recipient: row.immediate_recipient.as_slice().try_into()
                         .map_err(|_| ReverseOnionQueueError::Corrupt)?,
                     route_deadline: u64::try_from(row.route_deadline)
+                        .map_err(|_| ReverseOnionQueueError::Corrupt)?,
+                    observed_at,
+                    available_until: u64::try_from(available_until)
                         .map_err(|_| ReverseOnionQueueError::Corrupt)?,
                     claim_frame: row.claim_frame,
                     lease_frame: row.lease_frame,
@@ -1235,44 +1393,13 @@ fn insert_no_work_marker(
         .and_then(|value| value.checked_add(limits.recovery_retention_secs))
         .ok_or(ReverseOnionQueueError::Rejected)
         .and_then(sqlite_integer)?;
-    let (main_count, main_bytes): (i64, i64) = connection.query_row(
-        &format!(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(envelope)
-                + COALESCE(LENGTH(claim_frame), 0)
-                + COALESCE(LENGTH(lease_frame), 0)
-                + COALESCE(LENGTH(result_frame), 0)), 0)
-             FROM {TABLE}"
-        ),
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let (marker_count, marker_bytes): (i64, i64) = connection.query_row(
-        &format!(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(claim_frame) + 80), 0)
-             FROM {NO_WORK_TABLE}"
-        ),
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let count = main_count
-        .checked_add(marker_count)
-        .ok_or(ReverseOnionQueueError::Corrupt)?;
-    let bytes = main_bytes
-        .checked_add(marker_bytes)
-        .ok_or(ReverseOnionQueueError::Corrupt)?;
-    let count = u64::try_from(count).map_err(|_| ReverseOnionQueueError::Corrupt)?;
-    let bytes = u64::try_from(bytes).map_err(|_| ReverseOnionQueueError::Corrupt)?;
     let incoming = u64::try_from(claim_frame.len())
         .ok()
         .and_then(|value| value.checked_add(80))
         .ok_or(ReverseOnionQueueError::Rejected)?;
-    if count >= limits.max_items
-        || bytes
-            .checked_add(incoming)
-            .is_none_or(|value| value > limits.max_bytes)
-    {
-        return Err(ReverseOnionQueueError::Capacity);
-    }
+    // [PHALA-QUEUE-CAPACITY-OPEN 2026-10-08 by Codex] Empty polls share
+    // every admission quota, not just the global row and current-byte counts.
+    enforce_quotas(connection, limits, recipient, incoming)?;
     connection.execute(
         &format!(
             "INSERT INTO {NO_WORK_TABLE}
@@ -1463,15 +1590,55 @@ fn load_by_source_route(
     load_row(connection, &key)
 }
 
-fn select_pending(connection: &Connection, recipient: &[u8; COMMITMENT_BYTES]) -> Result<Option<StoredRow>, ReverseOnionQueueError> {
-    let key_shape: Option<(String, Option<i64>)> = connection.query_row(&format!("SELECT typeof(queue_key), length(queue_key) FROM {TABLE} WHERE immediate_recipient = ?1 AND state = ?2 ORDER BY route_deadline ASC, queue_key ASC LIMIT 1"), params![recipient.as_slice(), PENDING], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
-    if let Some((class, length)) = key_shape {
-        if class != "blob" || length != Some(COMMITMENT_BYTES as i64) { return Err(ReverseOnionQueueError::Corrupt); }
+fn select_pending_authorized<A>(
+    connection: &Connection,
+    recipient: &[u8; COMMITMENT_BYTES],
+    now: i64,
+    max_items: u64,
+    authorize_item: &A,
+) -> Result<Option<(StoredRow, ReverseOnionQueueStoredItem)>, ReverseOnionQueueError>
+where
+    A: Fn(&ReverseOnionQueueStoredItem) -> Result<(), ReverseOnionQueueError>,
+{
+    // [REVERSE-ONION-LIVE-CLAIM-AUTH 2026-10-05 by Codex] Scan only the
+    // configured durable-row bound, preserving expiry order while skipping
+    // rows whose authority has rotated or expired. This prevents one stale
+    // pending item from starving every currently authorized source.
+    let limit = i64::try_from(max_items).map_err(|_| ReverseOnionQueueError::Corrupt)?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT queue_key FROM {TABLE}
+         WHERE immediate_recipient = ?1 AND state = ?2
+         ORDER BY route_deadline ASC, queue_key ASC LIMIT ?3"
+    ))?;
+    let keys = statement
+        .query_map(params![recipient.as_slice(), PENDING, limit], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for key in keys {
+        let key: [u8; COMMITMENT_BYTES] = key
+            .as_slice()
+            .try_into()
+            .map_err(|_| ReverseOnionQueueError::Corrupt)?;
+        let row = load_row(connection, &key)?.ok_or(ReverseOnionQueueError::Corrupt)?;
+        validate_row(&row)?;
+        if row.state != PENDING
+            || row.immediate_recipient.as_slice() != recipient.as_slice()
+        {
+            return Err(ReverseOnionQueueError::Corrupt);
+        }
+        if row.route_deadline <= now {
+            continue;
+        }
+        let stored = stored_item_from_row(&row)?;
+        match authorize_item(&stored) {
+            Ok(()) => return Ok(Some((row, stored))),
+            Err(ReverseOnionQueueError::Rejected) => continue,
+            Err(error) => return Err(error),
+        }
     }
-    let key: Option<Vec<u8>> = connection.query_row(&format!("SELECT queue_key FROM {TABLE} WHERE immediate_recipient = ?1 AND state = ?2 ORDER BY route_deadline ASC, queue_key ASC LIMIT 1"), params![recipient.as_slice(), PENDING], |row| row.get(0)).optional()?;
-    let Some(key) = key else { return Ok(None); };
-    let key: [u8; COMMITMENT_BYTES] = key.try_into().map_err(|_| ReverseOnionQueueError::Corrupt)?;
-    load_row(connection, &key)
+    Ok(None)
 }
 
 fn stored_item_from_row(row: &StoredRow) -> Result<ReverseOnionQueueStoredItem, ReverseOnionQueueError> {
@@ -1622,16 +1789,155 @@ fn cleanup_expired(connection: &Connection, now: i64) -> Result<u64, ReverseOnio
     let mut removed = u64::try_from(connection.execute(&format!("DELETE FROM {TABLE} WHERE state = ?1 AND route_deadline <= ?2"), params![PENDING, now])?).map_err(|_| ReverseOnionQueueError::Corrupt)?;
     removed = removed.saturating_add(u64::try_from(connection.execute(&format!("DELETE FROM {TABLE} WHERE state IN (?1, ?2) AND retained_until <= ?3"), params![RESULT, TOMBSTONE, now])?).map_err(|_| ReverseOnionQueueError::Corrupt)?);
     removed = removed.saturating_add(u64::try_from(connection.execute(&format!("DELETE FROM {NO_WORK_TABLE} WHERE retained_until <= ?1"), params![now])?).map_err(|_| ReverseOnionQueueError::Corrupt)?);
-    connection.execute(&format!("UPDATE {TABLE} SET state = ?1, envelope = zeroblob(0), claim_frame = NULL, lease_frame = NULL WHERE state = ?2 AND retained_until <= ?3"), params![TOMBSTONE, ARMED, now])?;
+    let result_cutoff = now.saturating_sub(
+        i64::try_from(REVERSE_ONION_RESULT_RETENTION_SECS)
+            .map_err(|_| ReverseOnionQueueError::Corrupt)?,
+    );
+    connection.execute(&format!(
+        "UPDATE {TABLE} SET state = ?1, envelope = zeroblob(0), claim_frame = NULL,
+            lease_frame = NULL, result_frame = NULL, result_commitment = NULL,
+            completed_at = NULL
+         WHERE state IN (?2, ?3) AND execution_deadline <= ?4"
+    ), params![TOMBSTONE, ARMED, RESULT, result_cutoff])?;
     Ok(removed)
 }
 
-fn enforce_quotas(connection: &Connection, limits: &ReverseOnionQueueLimits, recipient: &[u8; COMMITMENT_BYTES], incoming: u64) -> Result<(), ReverseOnionQueueError> {
-    let (main_count, main_bytes): (i64, i64) = connection.query_row(&format!("SELECT COUNT(*), COALESCE(SUM(LENGTH(envelope) + COALESCE(LENGTH(claim_frame), 0) + COALESCE(LENGTH(lease_frame), 0) + COALESCE(LENGTH(result_frame), 0)), 0) FROM {TABLE}"), [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+fn lease_execution_deadline(row: &StoredRow) -> Result<i64, ReverseOnionQueueError> {
+    row.execution_deadline.ok_or(ReverseOnionQueueError::Corrupt)
+}
+
+fn lease_result_deadline(row: &StoredRow) -> Result<i64, ReverseOnionQueueError> {
+    lease_execution_deadline(row)?
+        .checked_add(i64::try_from(REVERSE_ONION_RESULT_RETENTION_SECS)
+            .map_err(|_| ReverseOnionQueueError::Corrupt)?)
+        .ok_or(ReverseOnionQueueError::Corrupt)
+}
+
+// [REVERSE-ONION-RETENTION-MIGRATION 2026-10-05 by Codex] Existing durable
+// leases and live NoWork markers inherit the current bounded replay horizon
+// before startup exposes recovery. Expired evidence is never revived.
+fn extend_recovery_horizons(
+    connection: &Connection,
+    limits: &ReverseOnionQueueLimits,
+    trusted_now: Option<u64>,
+) -> Result<(), ReverseOnionQueueError> {
+    let clock_high_water: i64 = connection.query_row(
+        &format!("SELECT clock_high_water FROM {META_TABLE} WHERE id=1"),
+        [],
+        |row| row.get(0),
+    )?;
+    if clock_high_water < 0 {
+        return Err(ReverseOnionQueueError::Corrupt);
+    }
+    // [PHALA-QUEUE-CAPACITY-OPEN 2026-10-08 by Codex] Never clamp a stale
+    // startup clock forward and then commit recovery/migration side effects.
+    let now = sqlite_integer(trusted_now.unwrap_or(clock_high_water as u64))?;
+    if now < clock_high_water {
+        return Err(ReverseOnionQueueError::Rejected);
+    }
+    let keys = {
+        let mut statement = connection.prepare(&format!(
+            "SELECT queue_key FROM {TABLE} ORDER BY queue_key LIMIT ?1"
+        ))?;
+        let limit = sqlite_integer(limits.max_items.checked_add(1)
+            .ok_or(ReverseOnionQueueError::Rejected)?)?;
+        let rows = statement.query_map(params![limit], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if keys.len() as u64 > limits.max_items {
+        return Err(ReverseOnionQueueError::Capacity);
+    }
+    for raw_key in keys {
+        let key: [u8; COMMITMENT_BYTES] = raw_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| ReverseOnionQueueError::Corrupt)?;
+        let row = load_row(connection, &key)?.ok_or(ReverseOnionQueueError::Corrupt)?;
+        validate_row(&row)?;
+        if row.state == PENDING || row.retained_until <= now { continue; }
+        let route_deadline = u64::try_from(row.route_deadline)
+            .map_err(|_| ReverseOnionQueueError::Corrupt)?;
+        let minimum = sqlite_integer(route_deadline
+            .checked_add(limits.recovery_retention_secs)
+            .ok_or(ReverseOnionQueueError::Rejected)?)?;
+        if minimum > row.retained_until
+            && connection.execute(
+                &format!("UPDATE {TABLE} SET retained_until=?1 WHERE queue_key=?2 AND retained_until=?3"),
+                params![minimum, key.as_slice(), row.retained_until],
+            )? != 1
+        {
+            return Err(ReverseOnionQueueError::Corrupt);
+        }
+    }
+    let marker_keys = {
+        let mut statement = connection.prepare(&format!(
+            "SELECT claim_id FROM {NO_WORK_TABLE} ORDER BY claim_id LIMIT ?1"
+        ))?;
+        let limit = sqlite_integer(limits.max_items.checked_add(1)
+            .ok_or(ReverseOnionQueueError::Rejected)?)?;
+        let rows = statement.query_map(params![limit], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if marker_keys.len() as u64 > limits.max_items {
+        return Err(ReverseOnionQueueError::Capacity);
+    }
+    for raw_key in marker_keys {
+        let key: [u8; ID_BYTES] = raw_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| ReverseOnionQueueError::Corrupt)?;
+        let row = load_no_work(connection, &key)?.ok_or(ReverseOnionQueueError::Corrupt)?;
+        let minimum = sqlite_integer(
+            u64::try_from(row.recorded_at)
+                .map_err(|_| ReverseOnionQueueError::Corrupt)?
+                .checked_add(limits.recovery_retention_secs)
+                .ok_or(ReverseOnionQueueError::Rejected)?,
+        )?;
+        if row.retained_until > now && row.retained_until < minimum
+            && connection.execute(
+                &format!("UPDATE {NO_WORK_TABLE} SET retained_until=?1 WHERE claim_id=?2 AND retained_until=?3"),
+                params![minimum, key.as_slice(), row.retained_until],
+            )? != 1
+        {
+            return Err(ReverseOnionQueueError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
+// [PHALA-QUEUE-CAPACITY-OPEN 2026-10-08 by Codex] Reserve each active
+// row's entire future Claim/Lease/Result budget throughout its lifetime.
+// Counting only stored frames lets many small Pending rows oversubscribe it.
+fn reserved_usage(connection: &Connection) -> Result<(u64, u64), ReverseOnionQueueError> {
+    let future_frames = (MAX_CLAIM_BYTES + MAX_LEASE_BYTES + MAX_RESULT_BYTES) as i64;
+    let (main_count, main_bytes): (i64, i64) = connection.query_row(&format!(
+        "SELECT COUNT(*), COALESCE(SUM(LENGTH(envelope)
+            + CASE WHEN state = ?1 THEN 0 ELSE ?2 END), 0) FROM {TABLE}"
+    ), params![TOMBSTONE, future_frames], |row| Ok((row.get(0)?, row.get(1)?)))?;
     let (marker_count, marker_bytes): (i64, i64) = connection.query_row(&format!("SELECT COUNT(*), COALESCE(SUM(LENGTH(claim_frame) + 80), 0) FROM {NO_WORK_TABLE}"), [], |row| Ok((row.get(0)?, row.get(1)?)))?;
     let count = main_count.checked_add(marker_count).ok_or(ReverseOnionQueueError::Corrupt)?;
     let bytes = main_bytes.checked_add(marker_bytes).ok_or(ReverseOnionQueueError::Corrupt)?;
-    let count = u64::try_from(count).map_err(|_| ReverseOnionQueueError::Corrupt)?; let bytes = u64::try_from(bytes).map_err(|_| ReverseOnionQueueError::Corrupt)?;
+    Ok((u64::try_from(count).map_err(|_| ReverseOnionQueueError::Corrupt)?,
+        u64::try_from(bytes).map_err(|_| ReverseOnionQueueError::Corrupt)?))
+}
+
+fn validate_stored_quotas(connection: &Connection, limits: &ReverseOnionQueueLimits)
+    -> Result<(), ReverseOnionQueueError> {
+    let (count, bytes) = reserved_usage(connection)?;
+    let over_recipient: bool = connection.query_row(&format!(
+        "SELECT EXISTS(SELECT immediate_recipient FROM (
+            SELECT immediate_recipient FROM {TABLE}
+            UNION ALL SELECT immediate_recipient FROM {NO_WORK_TABLE}
+         ) GROUP BY immediate_recipient HAVING COUNT(*) > ?1)"
+    ), params![sqlite_integer(limits.max_items_per_recipient)?], |row| row.get(0))?;
+    if count > limits.max_items || bytes > limits.max_bytes || over_recipient {
+        return Err(ReverseOnionQueueError::Capacity);
+    }
+    Ok(())
+}
+
+fn enforce_quotas(connection: &Connection, limits: &ReverseOnionQueueLimits, recipient: &[u8; COMMITMENT_BYTES], incoming: u64) -> Result<(), ReverseOnionQueueError> {
+    let (count, bytes) = reserved_usage(connection)?;
     if count >= limits.max_items || bytes.checked_add(incoming).is_none_or(|v| v > limits.max_bytes) { return Err(ReverseOnionQueueError::Capacity); }
     let main_recipient_count: i64 = connection.query_row(&format!("SELECT COUNT(*) FROM {TABLE} WHERE immediate_recipient = ?1"), params![recipient.as_slice()], |row| row.get(0))?;
     let marker_recipient_count: i64 = connection.query_row(&format!("SELECT COUNT(*) FROM {NO_WORK_TABLE} WHERE immediate_recipient = ?1"), params![recipient.as_slice()], |row| row.get(0))?;
@@ -2171,7 +2477,7 @@ fn validate_no_work_indexes(connection: &Connection) -> Result<bool, ReverseOnio
         } else if name.as_str() == retention.as_str() {
             if unique != 0
                 || partial != 0
-                || index_columns(connection, name)? != vec!["retained_until".to_owned()]
+                || index_columns(connection, &name)? != vec!["retained_until".to_owned()]
             {
                 return Err(ReverseOnionQueueError::Corrupt);
             }
@@ -2185,9 +2491,8 @@ fn validate_no_work_indexes(connection: &Connection) -> Result<bool, ReverseOnio
 
 fn index_columns(connection: &Connection, index: &str) -> Result<Vec<String>, ReverseOnionQueueError> {
     let mut statement = connection.prepare(&format!("PRAGMA index_info({index})"))?;
-    Ok(statement
-        .query_map([], |row| row.get::<_, String>(2))?
-        .collect::<Result<Vec<_>, _>>()?)
+    let rows = statement.query_map([], |row| row.get::<_, String>(2))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 fn sqlite_integer(value: u64) -> Result<i64, ReverseOnionQueueError> { i64::try_from(value).map_err(|_| ReverseOnionQueueError::Rejected) }
@@ -2253,7 +2558,7 @@ mod tests {
 
     #[test]
     fn source_index_v3_migration_preserves_rows_and_rolls_back_damage() {
-        let (queue, connection) = initialized_queue(4, 600, 120);
+        let (queue, connection) = initialized_queue(4, 600, 3_600);
         let row = item(81, 200);
         queue.enqueue(&connection, &row, 100).unwrap();
         downgrade_fixture_to_v3(&connection);
@@ -2294,7 +2599,13 @@ mod tests {
 
     #[test]
     fn source_index_reads_only_target_projection_and_bounds_key_before_load() {
-        let (queue, connection) = initialized_queue(128, 600, 120);
+        // [PHALA-QUEUE-CAPACITY-OPEN 2026-10-08 by Codex] This is a row
+        // projection test; fund all 64 reservations so it reaches that path.
+        let mut cap = limits(128, 600, 120);
+        cap.max_bytes = 64 * 1024 * 1024;
+        let queue = SqliteReverseOnionQueue::new(cap);
+        let connection = connection();
+        queue.initialize(&connection).unwrap();
         for seed in 1..65 { queue.enqueue(&connection, &item(seed, 200), 100).unwrap(); }
         let target = item(32, 200);
         let changes_before: i64 = connection.lock().query_row("SELECT total_changes()", [], |r| r.get(0)).unwrap();
@@ -2340,7 +2651,9 @@ mod tests {
         let row = ReverseOnionQueueItem::new([3; 32], [2; 16], [4; 32],
             source.public_key_bytes(), [5; 32], recipient.public_key_bytes(),
             envelope_hash, envelope_bytes, NOW + 600).unwrap();
-        let (queue, connection) = initialized_queue(4, 600, 120);
+        // [PHALA-QUEUE-FIXTURE-REPAIR 2026-10-08 by Codex] This fixture
+        // explicitly asserts a 3,600s recovery horizon below.
+        let (queue, connection) = initialized_queue(4, 600, 3_600);
         queue.enqueue(&connection, &row, NOW).unwrap();
         let verify_claim = |bytes: &[u8]| {
             let frame = ReverseOnionFrameV1::decode(bytes, NOW)
@@ -2376,6 +2689,22 @@ mod tests {
         let issued = match issued { ReverseOnionQueueIssue::Issued(value) => value,
             _ => panic!("expected real signed lease") };
         let lease = ReverseOnionFrameV1::decode_for_recovery(issued.frame()).unwrap();
+        let retained_until: i64 = connection.lock().query_row(
+            &format!("SELECT retained_until FROM {TABLE} WHERE queue_key=?1"),
+            params![issued.queue_key.as_slice()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(retained_until, (NOW + 600 + 3_600) as i64);
+        connection.lock().execute(
+            &format!("UPDATE {TABLE} SET retained_until=?1 WHERE queue_key=?2"),
+            params![lease.replay_evidence_deadline().unwrap() as i64,
+                issued.queue_key.as_slice()],
+        ).unwrap();
+        queue.initialize(&connection).unwrap();
+        let migrated_retention: i64 = connection.lock().query_row(
+            &format!("SELECT retained_until FROM {TABLE} WHERE queue_key=?1"),
+            params![issued.queue_key.as_slice()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(migrated_retention, retained_until);
         let (reply_request, _session) = OnionReplySession::prepare_source_sealed([2; 16],
             recipient.public_key_bytes(), ONION_REPLY_RESPONSE_SIZE_CLASSES[0], b"operation".to_vec()).unwrap();
         let reply = seal_onion_reply([2; 16], &reply_request, b"opaque result", &recipient).unwrap();
@@ -2392,6 +2721,15 @@ mod tests {
                 .map_err(|_| ReverseOnionQueueError::Rejected)?;
             Ok(result.commitment())
         }).unwrap();
+        // [REVERSE-ONION-RESULT-CUSTODY-ECHO 2026-10-05 by Codex] An exact
+        // duplicate is acknowledged as already stored; changed bytes conflict.
+        assert_eq!(queue.complete(&connection, &issued, &result.encode(), NOW + 2,
+            |_, _| panic!("durable duplicate must not re-run result verification")),
+            Ok(ReverseOnionQueueCompletion::AlreadyComplete));
+        let mut changed_result = result.encode();
+        *changed_result.last_mut().unwrap() ^= 1;
+        assert!(queue.complete(&connection, &issued, &changed_result, NOW + 2,
+            |_, _| panic!("conflicting duplicate must not reach result verifier" )).is_err());
         let snapshot = queue.lookup_source(&connection, source.public_key_bytes(), [2; 16],
             [4; 32], NOW + 2).unwrap().unwrap();
         let stored_claim = ReverseOnionFrameV1::decode_for_recovery(snapshot.claim_frame().unwrap()).unwrap();
@@ -2419,7 +2757,7 @@ mod tests {
     // [REVERSE-ONION-QUEUE-REGRESSIONS 2026-10-04 by Codex] These fixtures
     // below use opaque structural placeholders. The separate source snapshot
     // interoperability fixture above uses actual core-signed frames.
-    fn limits(max_items: u64, lease_max_secs: u64, recovery_retention_secs: u64) -> ReverseOnionQueueLimits {
+fn limits(max_items: u64, lease_max_secs: u64, recovery_retention_secs: u64) -> ReverseOnionQueueLimits {
         ReverseOnionQueueLimits::new(
             max_items,
             8 * 1024 * 1024,
@@ -2505,10 +2843,10 @@ mod tests {
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
                     ),
                     params![
-                        [1; 16].as_slice(),
-                        [2; 32].as_slice(),
-                        [3; 32].as_slice(),
-                        [4; 5].as_slice(),
+                        [1u8; 16].as_slice(),
+                        [2u8; 32].as_slice(),
+                        [3u8; 32].as_slice(),
+                        [4_u8; 5].as_slice(),
                         observed_at,
                         observed_at + 10_000,
                     ],
@@ -2518,6 +2856,8 @@ mod tests {
         connection
     }
 
+    // [REVERSE-ONION-QUEUE-FIXTURES 2026-10-06 by Codex] Bind SQL byte arrays
+    // to u8 explicitly so rusqlite never infers integer-array payloads.
     fn legacy_connection_with_main_row(state: i64) -> Mutex<Connection> {
         let connection = legacy_connection(120);
         let connection_guard = connection.lock();
@@ -2535,24 +2875,24 @@ mod tests {
                                ?17, ?18, ?19, ?20)"
                 ),
                 params![
-                    [40; 32].as_slice(),
-                    [41; 16].as_slice(),
-                    [42; 32].as_slice(),
-                    [43; 32].as_slice(),
-                    [44; 32].as_slice(),
-                    [45; 32].as_slice(),
-                    [46; 3].as_slice(),
+                    [40u8; 32].as_slice(),
+                    [41u8; 16].as_slice(),
+                    [42u8; 32].as_slice(),
+                    [43u8; 32].as_slice(),
+                    [44u8; 32].as_slice(),
+                    [45u8; 32].as_slice(),
+                    [46u8; 3].as_slice(),
                     state,
-                    [47; 16].as_slice(),
-                    [48; 32].as_slice(),
-                    [49; 5].as_slice(),
-                    [50; 16].as_slice(),
-                    [51; 32].as_slice(),
-                    [52; 5].as_slice(),
+                    [47u8; 16].as_slice(),
+                    [48u8; 32].as_slice(),
+                    [49u8; 5].as_slice(),
+                    [50u8; 16].as_slice(),
+                    [51u8; 32].as_slice(),
+                    [52u8; 5].as_slice(),
                     150i64,
                     200i64,
-                    if state == RESULT { Some([53; 6].as_slice()) } else { None },
-                    if state == RESULT { Some([54; 32].as_slice()) } else { None },
+                    if state == RESULT { Some([53u8; 6].as_slice()) } else { None },
+                    if state == RESULT { Some([54u8; 32].as_slice()) } else { None },
                     if state == RESULT { Some(160i64) } else { None },
                     300i64,
                 ],
@@ -2650,7 +2990,7 @@ mod tests {
         let source: Option<Vec<u8>> = connection
             .query_row(
                 &format!("SELECT source_node_id FROM {TABLE} WHERE queue_key = ?1"),
-                params![[40; 32].as_slice()],
+                params![[40u8; 32].as_slice()],
                 |row| row.get(0),
             )
             .unwrap();
@@ -2833,6 +3173,39 @@ mod tests {
         assert!(matches!(queue.initialize(&connection), Err(ReverseOnionQueueError::Corrupt)));
     }
 
+    // [PHALA-SOURCE-EVIDENCE-CLOCK 2026-10-07 by Codex] Authored, not run.
+    #[test]
+    fn source_lookup_samples_inside_lock_and_preserves_read_only_expiry() {
+        let (queue, connection) = initialized_queue(4, 600, 120);
+        let item = item(80, 300);
+        queue.enqueue(&connection, &item, 100).unwrap();
+        let calls = Cell::new(0);
+        let snapshot = queue.lookup_source_at(
+            &connection, source_node_id(), item.route_id, item.request_commitment,
+            || {
+                assert!(connection.try_lock().is_none());
+                calls.set(calls.get() + 1);
+                Ok(299)
+            },
+        ).unwrap().unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(snapshot.observed_at(), 299);
+        assert_eq!(snapshot.available_until(), 300);
+        assert!(queue.lookup_source_at(
+            &connection, source_node_id(), item.route_id, item.request_commitment,
+            || Ok(300),
+        ).unwrap().is_none());
+        let durable_clock: i64 = connection.lock().query_row(
+            &format!("SELECT clock_high_water FROM {META_TABLE} WHERE id = 1"),
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(durable_clock, 100);
+        let rows: i64 = connection.lock().query_row(
+            &format!("SELECT COUNT(*) FROM {TABLE}"), [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(rows, 1, "expired reads must not delete custody");
+    }
+
     #[test]
     fn exact_no_work_retry_is_durable_and_conflict_fenced() {
         let (queue, connection) = initialized_queue(4, 60, 120);
@@ -2911,6 +3284,123 @@ mod tests {
             queue.enqueue(&connection, &item(16, 150), 100),
             Err(ReverseOnionQueueError::Capacity)
         ));
+    }
+
+    // [PHALA-QUEUE-CAPACITY-OPEN 2026-10-08 by Codex] Authored, not run.
+    #[test]
+    fn empty_polls_enforce_recipient_quota_without_blocking_exact_replay() {
+        let mut cap = limits(4, 60, 120);
+        cap.max_items_per_recipient = 1;
+        let queue = SqliteReverseOnionQueue::new(cap);
+        let connection = connection();
+        queue.initialize_at(&connection, 100).unwrap();
+        let calls = Cell::new(0);
+        let poll = |recipient, claim| no_work_issue(&queue, &connection,
+            [recipient; 32], [claim; 16], [claim; 32], vec![claim; 4], 100, &calls);
+        assert!(matches!(poll(12, 13).unwrap(), ReverseOnionQueueIssue::NoWork));
+        assert!(matches!(poll(12, 14), Err(ReverseOnionQueueError::Capacity)));
+        assert!(matches!(poll(12, 13).unwrap(), ReverseOnionQueueIssue::NoWork));
+        assert!(matches!(poll(15, 16).unwrap(), ReverseOnionQueueIssue::NoWork));
+        let marker_count: i64 = connection.lock().query_row(
+            &format!("SELECT COUNT(*) FROM {NO_WORK_TABLE}"), [], |r| r.get(0)).unwrap();
+        assert_eq!(marker_count, 2);
+    }
+
+    #[test]
+    fn pending_rows_reserve_all_future_frames_and_reopen_keeps_the_budget() {
+        // Exactly two items fit. The old actual-byte sum allowed a third.
+        let sample = item(81, 200);
+        let reservation = sample.envelope.len() as u64
+            + (MAX_CLAIM_BYTES + MAX_LEASE_BYTES + MAX_RESULT_BYTES) as u64;
+        let mut cap = limits(4, 60, 120);
+        // [PHALA-QUEUE-FIXTURE-REPAIR 2026-10-08 by Codex] The synthetic
+        // route lasts 100s while the independent execution cap remains 60s.
+        cap.route_max_secs = 100;
+        cap.max_bytes = reservation * 2;
+        let queue = SqliteReverseOnionQueue::new(cap);
+        let connection = connection();
+        queue.initialize_at(&connection, 100).unwrap();
+        queue.enqueue(&connection, &sample, 100).unwrap();
+        queue.enqueue(&connection, &item(82, 200), 100).unwrap();
+        assert_eq!(reserved_usage(&connection.lock()).unwrap(), (2, cap.max_bytes));
+        assert_eq!(queue.enqueue(&connection, &item(83, 200), 100),
+            Err(ReverseOnionQueueError::Capacity));
+        queue.initialize_existing_at(&connection, 101).unwrap();
+        assert!(matches!(queue.enqueue(&connection, &sample, 101).unwrap(),
+            ReverseOnionQueueAdmission::Pending));
+        let mut reduced = cap;
+        reduced.max_bytes -= 1;
+        let smaller = SqliteReverseOnionQueue::new(reduced);
+        assert_eq!(smaller.initialize_existing_at(&connection, 102),
+            Err(ReverseOnionQueueError::Capacity));
+        assert_eq!(reserved_usage(&connection.lock()).unwrap(), (2, cap.max_bytes));
+        let observed: i64 = connection.lock().query_row(
+            &format!("SELECT clock_high_water FROM {META_TABLE}"), [], |r| r.get(0)).unwrap();
+        assert_eq!(observed, 101);
+    }
+
+    #[test]
+    fn lease_and_result_growth_use_the_original_reservation() {
+        let sample = item(81, 200);
+        let mut cap = limits(4, 60, 120);
+        // [PHALA-QUEUE-FIXTURE-REPAIR 2026-10-08 by Codex]
+        cap.route_max_secs = 100;
+        cap.max_bytes = sample.envelope.len() as u64
+            + (MAX_CLAIM_BYTES + MAX_LEASE_BYTES + MAX_RESULT_BYTES) as u64;
+        let queue = SqliteReverseOnionQueue::new(cap);
+        let connection = connection();
+        queue.initialize_at(&connection, 100).unwrap();
+        queue.enqueue(&connection, &sample, 100).unwrap();
+        let issued = queue.issue_lease(&connection, sample.immediate_recipient,
+            [21; 16], [22; 32], vec![23; MAX_CLAIM_BYTES], 100, |_| Ok([22; 32]),
+            |_, _| ReverseOnionQueueLeaseMaterial::new([24; 16], [25; 32],
+                vec![26; MAX_LEASE_BYTES], 150, 450)).unwrap();
+        let ReverseOnionQueueIssue::Issued(lease) = issued else { panic!("expected lease"); };
+        assert_eq!(reserved_usage(&connection.lock()).unwrap(), (1, cap.max_bytes));
+        let result = vec![27; MAX_RESULT_BYTES];
+        assert_eq!(queue.complete(&connection, &lease, &result, 101, |_, _| Ok([28; 32])).unwrap(),
+            ReverseOnionQueueCompletion::Stored);
+        assert_eq!(reserved_usage(&connection.lock()).unwrap(), (1, cap.max_bytes));
+        assert_eq!(queue.complete(&connection, &lease, &result, 101, |_, _| panic!("exact replay")).unwrap(),
+            ReverseOnionQueueCompletion::AlreadyComplete);
+        assert_eq!(queue.enqueue(&connection, &item(82, 200), 101),
+            Err(ReverseOnionQueueError::Capacity));
+        queue.initialize_existing_at(&connection, 102).unwrap();
+        assert_eq!(reserved_usage(&connection.lock()).unwrap(), (1, cap.max_bytes));
+    }
+
+    #[test]
+    fn rollback_open_never_commits_schema_or_retention_changes() {
+        for version in [2, 3, 4] {
+            let connection = v2_connection_with_main_row(ARMED);
+            let queue = SqliteReverseOnionQueue::new(limits(4, 60, 120));
+            if version >= 3 { queue.initialize_existing_at(&connection, 150).unwrap(); }
+            {
+                let c = connection.lock();
+                if version == 3 {
+                    c.execute_batch(&format!("DROP INDEX {SOURCE_ROUTE_INDEX};
+                        UPDATE {META_TABLE} SET schema_version=3")).unwrap();
+                }
+                c.execute(&format!("UPDATE {META_TABLE} SET clock_high_water=180"), []).unwrap();
+            }
+            let before: (i64, i64) = connection.lock().query_row(&format!(
+                "SELECT schema_version, clock_high_water FROM {META_TABLE}"), [],
+                |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            let retention: i64 = connection.lock().query_row(
+                &format!("SELECT retained_until FROM {TABLE}"), [], |r| r.get(0)).unwrap();
+            assert_eq!(queue.initialize_existing_at(&connection, 170),
+                Err(ReverseOnionQueueError::Rejected));
+            let c = connection.lock();
+            let after: (i64, i64) = c.query_row(&format!(
+                "SELECT schema_version, clock_high_water FROM {META_TABLE}"), [],
+                |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            assert_eq!(after, before);
+            assert_eq!(metadata_schema_version(&c).unwrap(), version);
+            let after_retention: i64 = c.query_row(
+                &format!("SELECT retained_until FROM {TABLE}"), [], |r| r.get(0)).unwrap();
+            assert_eq!(after_retention, retention);
+            assert_eq!(named_object_type(&c, SOURCE_ROUTE_INDEX).unwrap().is_some(), version == 4);
+        }
     }
 
     #[test]
@@ -3242,6 +3732,22 @@ mod tests {
         assert_eq!(after, before);
     }
 
+    // [PHALA-OWNED-RECOVERY-SCHEMA 2026-10-07 by Codex] Authored, not run.
+    #[test]
+    fn recovery_schema_requires_owner_but_preserves_legacy_migration() {
+        let empty = connection();
+        let queue = SqliteReverseOnionQueue::new(limits(4, 60, 120));
+        assert_eq!(queue.initialize_existing_at(&empty, 150), Err(ReverseOnionQueueError::MigrationRequired));
+        assert!(application_objects(&empty.lock()).unwrap().is_empty());
+        queue.initialize_at(&empty, 150).unwrap();
+        let before = application_objects(&empty.lock()).unwrap();
+        queue.initialize_existing_at(&empty, 151).unwrap();
+        assert_eq!(application_objects(&empty.lock()).unwrap(), before);
+        let legacy = legacy_connection(120);
+        queue.initialize_existing_at(&legacy, 150).unwrap();
+        assert_eq!(metadata_schema_version(&legacy.lock()).unwrap(), SCHEMA_VERSION);
+    }
+
     #[test]
     fn owned_schema_reopen_is_idempotent() {
         let (queue, connection) = initialized_queue(4, 60, 120);
@@ -3312,7 +3818,7 @@ mod tests {
             lease_commitment: recovered.lease_commitment,
             frame: recovered.frame.clone(),
         };
-        let wrong_callback_calls = Cell::new(0);
+        let wrong_callback_calls = Cell::new(0u8);
         assert!(matches!(
             restarted.complete(&connection, &wrong, &[59; 4], now + 1, |_, _| {
                 wrong_callback_calls.set(wrong_callback_calls.get().saturating_add(1));
@@ -3340,6 +3846,10 @@ mod tests {
     #[test]
     fn owned_v1_migration_uses_observed_time_and_trusted_now_only() {
         let connection = legacy_connection(120);
+        connection.lock().execute(
+            &format!("UPDATE {NO_WORK_TABLE} SET retained_until=?1 WHERE claim_id=?2"),
+            params![200_i64, [1u8; 16].as_slice()],
+        ).unwrap();
         let queue = SqliteReverseOnionQueue::new(limits(4, 60, 120));
         queue.initialize_at(&connection, 150).unwrap();
         let connection = connection.lock();
@@ -3350,13 +3860,35 @@ mod tests {
                        FROM {META_TABLE} m CROSS JOIN {NO_WORK_TABLE} n
                       WHERE m.id = 1 AND n.claim_id = ?1"
                 ),
-                params![[1; 16].as_slice()],
+                params![[1u8; 16].as_slice()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(clock, 150);
-        assert_eq!(retained, 10_120);
+        assert_eq!(retained, 240);
+    }
+
+    // [REVERSE-ONION-RETENTION-MIGRATION 2026-10-05 by Codex] Authored,
+    // unexecuted: increasing retention never revives expired replay evidence.
+    #[test]
+    fn startup_does_not_extend_expired_no_work_marker() {
+        let connection = legacy_connection(120);
+        connection.lock().execute(
+            &format!("UPDATE {NO_WORK_TABLE} SET retained_until=?1 WHERE claim_id=?2"),
+            params![140_i64, [1u8; 16].as_slice()],
+        ).unwrap();
+        let queue = SqliteReverseOnionQueue::new(limits(4, 60, 120));
+        queue.initialize_at(&connection, 150).unwrap();
+        // [PHALA-QUEUE-CAPACITY-OPEN 2026-10-08 by Codex] Timed initialize
+        // now also performs production startup cleanup in the same transaction.
+        // Expired evidence is removed, never revived by the retention upgrade.
+        let remaining: i64 = connection.lock().query_row(
+            &format!("SELECT COUNT(*) FROM {NO_WORK_TABLE} WHERE claim_id=?1"),
+            params![[1u8; 16].as_slice()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[test]
@@ -3404,14 +3936,18 @@ mod tests {
         );
     }
 
+    // [REVERSE-ONION-QUEUE-STATE 2026-10-06 by Codex] Re-enqueue returns the
+    // persisted Pending state; absence checks avoid formatting result bytes.
     #[test]
     fn rollback_lookup_rejects_without_mutation_and_valid_lookup_advances_clock() {
-        let (queue, connection) = initialized_queue(4, 60, 120);
+        // [PHALA-QUEUE-FIXTURE-REPAIR 2026-10-08 by Codex] Fund the
+        // route being tested; this test exercises rollback, not admission caps.
+        let (queue, connection) = initialized_queue(4, 200, 120);
         let queued = item(71, 300);
         queue.enqueue(&connection, &queued, 100).unwrap();
         assert_eq!(
             queue.enqueue(&connection, &queued, 101).unwrap(),
-            ReverseOnionQueueAdmission::Existing
+            ReverseOnionQueueAdmission::Pending
         );
         let clock: i64 = connection
             .lock()
@@ -3441,18 +3977,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(clock, 101);
-        assert_eq!(
-            queue
-                .lookup_result(
-                    &connection,
-                    queued.queue_key,
-                    queued.envelope_commitment,
-                    queued.immediate_recipient,
-                    101,
-                )
-                .unwrap(),
-            None
-        );
+        assert!(queue
+            .lookup_result(
+                &connection,
+                queued.queue_key,
+                queued.envelope_commitment,
+                queued.immediate_recipient,
+                101,
+            )
+            .unwrap()
+            .is_none());
         let clock: i64 = connection
             .lock()
             .query_row(
@@ -3466,6 +4000,9 @@ mod tests {
 
     #[test]
     fn expired_complete_outcomes_commit_observed_clock_without_partial_result() {
+        // [PHALA-QUEUE-FIXTURE-REPAIR 2026-10-08 by Codex] Expiry is
+        // immutable execution deadline + core Result grace, not Claim time.
+        let expired_at = 120 + REVERSE_ONION_RESULT_RETENTION_SECS + 1;
         let queue = SqliteReverseOnionQueue::new(limits(4, 100, 200))
             .with_route_max_secs(400)
             .unwrap();
@@ -3507,7 +4044,7 @@ mod tests {
         );
         assert_eq!(
             queue
-                .complete(&connection, &lease, &[79; 4], 301, |_, _| {
+                .complete(&connection, &lease, &[79; 4], expired_at, |_, _| {
                     Err(ReverseOnionQueueError::Rejected)
                 })
                 .unwrap_err(),
@@ -3521,7 +4058,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(clock, 301);
+        assert_eq!(clock, expired_at as i64);
         let connection = connection.lock();
         let (state, stored): (i64, Vec<u8>) = connection
             .query_row(
@@ -3536,6 +4073,8 @@ mod tests {
 
     #[test]
     fn expired_armed_complete_commits_clock_but_keeps_row_armed() {
+        // [PHALA-QUEUE-FIXTURE-REPAIR 2026-10-08 by Codex]
+        let expired_at = 120 + REVERSE_ONION_RESULT_RETENTION_SECS + 1;
         let queue = SqliteReverseOnionQueue::new(limits(4, 100, 200))
             .with_route_max_secs(400)
             .unwrap();
@@ -3569,7 +4108,7 @@ mod tests {
         };
         assert_eq!(
             queue
-                .complete(&connection, &lease, &[88; 4], 301, |_, _| {
+                .complete(&connection, &lease, &[88; 4], expired_at, |_, _| {
                     Err(ReverseOnionQueueError::Rejected)
                 })
                 .unwrap_err(),
@@ -3583,7 +4122,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(clock, 301);
+        assert_eq!(clock, expired_at as i64);
         let connection = connection.lock();
         let (state, result_frame): (i64, Option<Vec<u8>>) = connection
             .query_row(
@@ -3596,6 +4135,8 @@ mod tests {
         assert_eq!(result_frame, None);
     }
 
+    // [REVERSE-ONION-RESULT-CLOCK 2026-10-05 by Codex] Lock-time callbacks
+    // are threaded through exact completion and retention lookup.
     #[test]
     fn result_context_lookup_is_authenticated_read_only_and_restart_safe() {
         let queue = SqliteReverseOnionQueue::new(limits(4, 100, 200))
@@ -3698,7 +4239,8 @@ mod tests {
         };
         assert_eq!(
             reopened
-                .complete(&connection, &recovered, &[101; 4], 110, |_, _| {
+                .complete_at(&connection, &recovered, &[101; 4], || Ok(110), |_, _, checked_at| {
+                    assert_eq!(checked_at, 110);
                     Ok([102; COMMITMENT_BYTES])
                 })
                 .unwrap(),
@@ -3721,13 +4263,14 @@ mod tests {
             _ => panic!("expected stored result context"),
         }
         let expired = reopened
-            .lookup_result_context(
+            .lookup_result_context_at(
                 &connection,
                 queued.immediate_recipient,
                 claim_id,
                 lease_id(&lease),
                 queued.route_id,
-                301,
+                // [PHALA-QUEUE-FIXTURE-REPAIR 2026-10-08 by Codex]
+                || Ok(120 + REVERSE_ONION_RESULT_RETENTION_SECS + 1),
             )
             .unwrap();
         assert!(matches!(expired, ReverseOnionQueueResultContext::NoWork));

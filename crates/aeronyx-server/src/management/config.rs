@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagementConfig {
+    /// [PHALA-MANAGEMENT-ISOLATION 2026-10-06 by Codex] Disable all management
+    /// clients/reporters for isolated deployments; legacy configs stay enabled.
+    #[serde(default = "default_management_enabled")]
+    pub enabled: bool,
+
     #[serde(default = "default_cms_url")]
     pub cms_url: String,
 
@@ -32,6 +37,10 @@ fn default_cms_url() -> String {
     "https://api.aeronyx.network/api/privacy_network".to_string()
 }
 
+fn default_management_enabled() -> bool {
+    true
+}
+
 fn default_heartbeat_interval() -> u64 {
     30
 }
@@ -52,6 +61,7 @@ fn default_node_info_path() -> String {
 impl Default for ManagementConfig {
     fn default() -> Self {
         Self {
+            enabled: default_management_enabled(),
             cms_url: default_cms_url(),
             heartbeat_interval_secs: default_heartbeat_interval(),
             session_report_interval_secs: default_session_report_interval(),
@@ -64,6 +74,9 @@ impl Default for ManagementConfig {
 
 impl ManagementConfig {
     pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
         if self.cms_url.is_empty() {
             return Err("cms_url cannot be empty".to_string());
         }
@@ -81,5 +94,35 @@ impl ManagementConfig {
 
     pub fn is_registered(&self) -> bool {
         std::path::Path::new(&self.node_info_path).exists()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ManagementConfig;
+
+    // [PHALA-MANAGEMENT-ISOLATION 2026-10-06 by Codex] Source coverage only;
+    // tests are not executed during the current development phase.
+    #[test]
+    fn management_defaults_on_for_legacy_configs() {
+        let config = ManagementConfig::default();
+        assert!(config.enabled);
+        assert!(config.validate().is_ok());
+
+        // [PHALA-CONFIG-EXECUTED-REGRESSION 2026-10-08 by Codex] An empty
+        // TOML table is an empty document, not the JSON object spelling.
+        let legacy: ManagementConfig = toml::from_str("").unwrap();
+        assert!(legacy.enabled);
+    }
+
+    #[test]
+    fn disabled_management_needs_no_cms_configuration() {
+        let mut config = ManagementConfig::default();
+        config.enabled = false;
+        config.cms_url.clear();
+        config.heartbeat_interval_secs = 0;
+        config.session_report_interval_secs = 0;
+        config.request_timeout_secs = 0;
+        assert!(config.validate().is_ok());
     }
 }

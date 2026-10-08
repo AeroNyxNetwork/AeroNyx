@@ -11,16 +11,12 @@
 //!   - Response shape uses `content[].text` not `choices[].message.content`
 //!   - Token usage field names: `input_tokens`, `output_tokens`, `cache_read_input_tokens`
 //!
-//! ## Configuration
-//! ```toml
-//! [[memchain.supernode.providers]]
-//! name = "anthropic"
-//! type = "anthropic"
-//! api_key = "$ANTHROPIC_API_KEY"
-//! model = "claude-haiku-4-5-20251001"
-//! max_tokens = 1000
-//! temperature = 0.3
-//! ```
+//! [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex] This legacy adapter remains
+//! available for compatibility, but enabled MemChain configuration rejects it;
+//! private cognitive payloads are routed through Phala ACI only.
+//! [PHALA-NODE-PLAINTEXT-GATE 2026-10-07 by Codex] Direct non-ACI calls
+//! are also held: ordinary nodes cannot use this legacy adapter as a plaintext
+//! fallback while the source-owned Phala path is unavailable.
 //!
 //! ## Request Format
 //! POST https://api.anthropic.com/v1/messages
@@ -71,6 +67,7 @@ use tracing::{debug, warn};
 
 use super::llm_provider::{
     build_llm_http_client, normalize_llm_api_base, read_bounded_llm_response, resolve_llm_api_key,
+    require_source_e2ee_transport,
     ChatRequest, ChatResponse, LlmError, LlmProvider, LlmProviderInitError, ProviderHealth,
     TokenUsage, MAX_LLM_ERROR_BODY_BYTES, MAX_LLM_SUCCESS_BODY_BYTES,
 };
@@ -235,6 +232,14 @@ fn messages_url(api_base: &str) -> String {
 #[async_trait::async_trait]
 impl LlmProvider for AnthropicProvider {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex] Defense in depth for
+        // callers that bypass LlmRouter: Anthropic cannot meet the ACI policy.
+        if req.require_aci_verified {
+            return Err(LlmError::ConfidentialServingRequired);
+        }
+        // [PHALA-NODE-PLAINTEXT-GATE 2026-10-07 by Codex] Enforce the
+        // same policy even when a caller omits the confidential request bit.
+        require_source_e2ee_transport()?;
         let start = Instant::now();
 
         let model = req.model_override.as_deref().unwrap_or(&self.model);
@@ -423,6 +428,9 @@ impl LlmProvider for AnthropicProvider {
             model_used,
             provider_name: self.name.clone(),
             latency_ms,
+            // Anthropic is not an ACI-compatible confidential provider.
+            aci_response_hints: None,
+            aci_verification: None,
         })
     }
 
@@ -499,5 +507,39 @@ mod tests {
             AnthropicProvider::new("claude", "", "test-model", None, None),
             Err(LlmProviderInitError::ProviderSecretRequired)
         ));
+    }
+
+    // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex] Authored, not executed.
+    #[tokio::test]
+    async fn anthropic_refuses_confidential_request_before_network() {
+        let provider = AnthropicProvider::new(
+            "anthropic",
+            "test-key",
+            "test-model",
+            None,
+            None,
+        )
+        .unwrap();
+        let mut request = ChatRequest::simple("");
+        request.require_aci_verified = true;
+
+        assert!(matches!(
+            provider.chat(&request).await,
+            Err(LlmError::ConfidentialServingRequired)
+        ));
+    }
+
+    // [PHALA-NODE-PLAINTEXT-GATE 2026-10-07 by Codex] Authored, not run.
+    #[tokio::test]
+    async fn direct_anthropic_plaintext_is_not_a_phala_fallback() {
+        let mut provider = AnthropicProvider::new_with_api_base(
+            "anthropic", "http://127.0.0.1:1", "synthetic-key", "model", None, None,
+        ).unwrap();
+        provider.api_base = "://invalid-before-network".into();
+        let request = ChatRequest::simple("source-private-prompt");
+        assert!(matches!(provider.chat(&request).await,
+            Err(LlmError::ConfidentialE2eeTransportUnavailable)));
+        assert!(provider.is_healthy());
+        assert_eq!(request.messages[0].content, "source-private-prompt");
     }
 }

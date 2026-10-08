@@ -4,8 +4,72 @@
 // [BLIND-VAULT-PUBLIC-ADMISSION-PARITY 2026-10-04 by Codex] Public and
 // combined vault routes share explicit replica admission and validated policy.
 use super::*;
+
+// [PHALA-QUOTE-RESPONSE-OWNERSHIP 2026-10-08 by Codex] The required
+// task's cancellation/unwind closes only its policy owner. Other server
+// lifetimes still share the process-wide permit pool but are not stopped.
+struct PhalaAttestationDeliverySupervisorGuard(Arc<crate::api::discovery::PhalaAttestationDeliveryOwner>);
+
+impl Drop for PhalaAttestationDeliverySupervisorGuard {
+    fn drop(&mut self) { self.0.stop(); }
+}
+
+pub(super) async fn run_phala_attestation_delivery_cleanup(
+    owner: Arc<crate::api::discovery::PhalaAttestationDeliveryOwner>,
+    shutdown: Arc<AtomicBool>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    let _guard = PhalaAttestationDeliverySupervisorGuard(Arc::clone(&owner));
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        if shutdown.load(Ordering::SeqCst) { break; }
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => break,
+            _ = tick.tick() => owner.expire_buffers(),
+        }
+    }
+}
 use crate::api::chat_handlers::build_chat_pull_http_router;
 use crate::api::public_node_router::build_public_node_router_with_replica_admission;
+use crate::api::reverse_onion::build_reverse_onion_router;
+// [PHALA-SOURCE-PREAUTH-DRAIN 2026-10-07 by Codex] This constructor owns
+// both the private route and its MPI-external HTTP admission boundary.
+use crate::api::mpi::build_mpi_router_with_reverse_onion_source;
+
+// [PHALA-SOURCE-MPI-COMPOSITION 2026-10-08 by Codex] Check observed
+// runtime composition, not just configuration. Startup calls this before
+// source-journal effects; API assembly calls it with the actual MPI mode
+// before opening evidence stores, binding listeners or spawning API work.
+pub(super) fn validate_reverse_source_api_composition(
+    source_enabled: bool,
+    vpn_enabled: bool,
+    mpi_mode: Option<Mode>,
+) -> Result<()> {
+    if source_enabled && (!vpn_enabled || mpi_mode != Some(Mode::Local)) {
+        return Err(ServerError::startup_failed(
+            "Reverse onion source requires authenticated local VPN MPI runtime",
+        ));
+    }
+    Ok(())
+}
+
+// [PHALA-PROMOTION-CANCEL-OWNERSHIP 2026-10-08 by Codex] Observe
+// shutdown throughout the entire round, not only between cadence ticks.
+// Dropping work also drops its round owner; blocking cells retain only a veto.
+pub(super) async fn run_permissionless_promotion_round_until_shutdown(
+    shutdown: &mut broadcast::Receiver<()>,
+    process_shutdown: &AtomicBool,
+    work: impl std::future::Future<Output = ()>,
+) -> bool {
+    if process_shutdown.load(Ordering::SeqCst) { return false; }
+    tokio::select! {
+        biased;
+        _ = shutdown.recv() => false,
+        _ = work => true,
+    }
+}
 
 impl Server {
     // ============================================
@@ -66,6 +130,9 @@ impl Server {
             chat_relay,
             blind_vault,
             None,
+            None,
+            None,
+            None,
             anonymous_mailbox,
             anonymous_mailbox_source,
             udp,
@@ -95,6 +162,9 @@ impl Server {
         chat_relay: Option<Arc<ChatRelayService>>,
         blind_vault: Option<Arc<BlindVaultService>>,
         blind_vault_replica_admission: Option<Arc<dyn BlindVaultReplicaJobAdmission>>,
+        reverse_onion_api: Option<Arc<ReverseOnionApi>>,
+        reverse_onion_private_admission: Option<Arc<PrivateBlindRelayAdmission>>,
+        reverse_onion_source: Option<Arc<reverse_onion_source_runtime::ReverseOnionSourceLifecycle>>,
         anonymous_mailbox: Option<Arc<SqliteAnonymousMailboxStore>>,
         anonymous_mailbox_source: Option<Arc<AnonymousMailboxSourceCoordinator>>,
         udp: Arc<UdpTransport>,
@@ -109,6 +179,10 @@ impl Server {
                 "Anonymous mailbox source requires authenticated VPN MPI runtime",
             ));
         }
+        // [PHALA-SOURCE-MPI-COMPOSITION 2026-10-08 by Codex] An installed
+        // journal owner is not proof that the eventual source router is usable.
+        validate_reverse_source_api_composition(reverse_onion_source.is_some(),
+            self.config.vpn_enabled(), mpi_state.as_ref().map(|state| state.mode))?;
         let endpoint_evidence =
             open_endpoint_evidence_store(&self.config.discovery, &self.identity).await?;
         let endpoint_attestation_inbox =
@@ -118,11 +192,17 @@ impl Server {
         let shutdown_rx_public = self.shutdown_tx.subscribe();
         let shutdown_rx_supervisor = self.shutdown_tx.subscribe();
         let runtime_shutdown = Arc::clone(&self.shutdown);
+        let vpn_enabled = self.config.vpn_enabled();
         let vpn_listen_addr =
             Self::vpn_client_api_listen_addr(self.config.gateway_ip(), listen_addr);
         let node_listener = Self::bind_required_api_listener("node_api", listen_addr).await?;
-        let vpn_listener =
-            Self::bind_required_api_listener("vpn_client_api", vpn_listen_addr).await?;
+        // [PHALA-OPTIONAL-VPN-API 2026-10-06 by Codex] The client/MPI surface
+        // is bound only when the node also runs its VPN gateway data plane.
+        let vpn_listener = if self.config.vpn_enabled() {
+            Some(Self::bind_required_api_listener("vpn_client_api", vpn_listen_addr).await?)
+        } else {
+            None
+        };
         let public_api_listener = match self.config.discovery.public_api_listen_addr {
             Some(public_addr) => Some((
                 public_addr,
@@ -139,7 +219,18 @@ impl Server {
                     .chat_relay
                     .anonymous_mailbox_source
                     .enabled;
-        let discovery_api_policy = DiscoveryApiPolicy::from_config(&self.config.discovery);
+        // [PHALA-RECIPIENT-QUOTE-PIN 2026-10-06 by Codex] Keep the public
+        // quote API's recipient binding identical to the single queue pin
+        // advertised by this relay; malformed direct config stays fail-closed.
+        let queue = &self.config.reverse_onion.queue;
+        let discovery_api_policy = DiscoveryApiPolicy::from_config(&self.config.discovery)
+            .with_phala_private_recipient_queue(queue);
+        // [PHALA-QUOTE-RESPONSE-OWNERSHIP 2026-10-08 by Codex] Register
+        // cleanup only for the opt-in quote API, before either listener starts.
+        let phala_delivery_cleanup = self.config.discovery.phala_attestation_socket_path.as_ref().map(|_| (
+            discovery_api_policy.phala_attestation_delivery_owner(),
+            Arc::clone(&self.shutdown), self.shutdown_tx.subscribe(),
+        ));
         let chat_relay_runtime_ready = chat_relay.is_some();
         let local_capability_status = Self::discovery_local_capability_status_for_runtime(
             &vpn_health_config,
@@ -164,9 +255,24 @@ impl Server {
             })?;
             let store = Arc::clone(&peer_store);
             let identity = Arc::clone(&node_identity);
+            // [PHALA-ATTESTED-DNS-PROMOTION 2026-10-06 by Codex] Promotion
+            // receives the same local trust roots used by live route appraisal.
+            let phala_attested_dns_required =
+                self.config.discovery.phala_attested_peers_required;
+            let phala_trusted_app_ids = self.config.discovery.phala_trusted_app_ids.clone();
+            let phala_trusted_compose_hashes =
+                self.config.discovery.phala_trusted_compose_hashes.clone();
             Some(Arc::new(
                 tokio::task::spawn_blocking(move || {
-                    PermissionlessPromotionCoordinator::open(&prefix, store, inbox, identity)
+                    PermissionlessPromotionCoordinator::open(
+                        &prefix,
+                        store,
+                        inbox,
+                        identity,
+                        phala_attested_dns_required,
+                        phala_trusted_app_ids,
+                        phala_trusted_compose_hashes,
+                    )
                 })
                 .await
                 .map_err(|_| ServerError::startup_failed("Endpoint promotion unavailable"))?
@@ -177,6 +283,7 @@ impl Server {
         };
         let public_promotion_runtime = promotion_runtime.clone();
         let mut promotion_shutdown = self.shutdown_tx.subscribe();
+        let promotion_process_shutdown = Arc::clone(&self.shutdown);
         let peer_http_client = Arc::clone(&peer_http_clients.control);
         let smoke_peer_store = Arc::clone(&peer_store);
         let smoke_node_identity = Arc::clone(&node_identity);
@@ -286,12 +393,55 @@ impl Server {
         // peer router before spawn/readiness. Adapter and ordinary local listener
         // use clones of this exact router, identity and admission/shared state.
         let custody_store_opened = local_anonymous_mailbox.is_some();
-        let ticket_terminal_router = build_chat_peer_router_with_anonymous_mailbox(
+        let peer_relay_runtime = PeerRelaySharedRuntime::new(chat_relay.clone());
+        let ticket_terminal_router = build_chat_peer_router_with_private_recipient_admission_and_runtime(
             chat_relay.clone(), Arc::clone(&sessions), Arc::clone(&udp),
             Arc::clone(&peer_store), Arc::clone(&node_identity), Arc::clone(&peer_http_client),
             blind_vault_public_api_enabled.then(|| blind_vault.clone()).flatten(),
-            local_anonymous_mailbox.map(|store| store as Arc<dyn AnonymousMailboxCustodyRepository>),
+            local_anonymous_mailbox.clone().map(|store| store as Arc<dyn AnonymousMailboxCustodyRepository>),
+            None,
+            Some(Arc::clone(&peer_relay_runtime)),
         );
+        // [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex] This router is used
+        // only by the recipient worker's in-process `oneshot` adapter. Do not
+        // merge its Blind Vault service into either network listener.
+        let reverse_onion_terminal_router = if self.config.reverse_onion.recipient.enabled {
+            let terminal_vault = blind_vault.clone().ok_or_else(|| {
+                ServerError::startup_failed("Private recipient Blind Vault unavailable")
+            })?;
+            Some(build_chat_peer_router_with_private_recipient_admission_and_runtime(
+                chat_relay.clone(),
+                Arc::clone(&sessions),
+                Arc::clone(&udp),
+                Arc::clone(&peer_store),
+                Arc::clone(&node_identity),
+                Arc::clone(&peer_http_client),
+                Some(terminal_vault),
+                local_anonymous_mailbox.clone().map(|store| {
+                    store as Arc<dyn AnonymousMailboxCustodyRepository>
+                }),
+                None,
+                Some(Arc::clone(&peer_relay_runtime)),
+            ))
+        } else {
+            None
+        };
+        let node_peer_router = if let Some(admission) = reverse_onion_private_admission {
+            build_chat_peer_router_with_private_recipient_admission_and_runtime(
+                chat_relay.clone(),
+                Arc::clone(&sessions),
+                Arc::clone(&udp),
+                Arc::clone(&peer_store),
+                Arc::clone(&node_identity),
+                Arc::clone(&peer_http_client),
+                blind_vault_public_api_enabled.then(|| blind_vault.clone()).flatten(),
+                local_anonymous_mailbox.map(|store| store as Arc<dyn AnonymousMailboxCustodyRepository>),
+                Some(admission),
+                Some(peer_relay_runtime),
+            )
+        } else {
+            ticket_terminal_router.clone()
+        };
         let ticket_terminal_wired = custody_store_opened;
         let reverse_worker = if self.config.reverse_onion.recipient.enabled {
             let owner = self.reverse_recipient.as_ref().filter(|owner| owner.active.load(Ordering::SeqCst))
@@ -299,12 +449,19 @@ impl Server {
             let mut relay = [0; 32];
             hex::decode_to_slice(&self.config.reverse_onion.recipient.relay_node_id, &mut relay)
                 .map_err(|_| ServerError::startup_failed("Recipient identity policy unavailable"))?;
+            let terminal_router = reverse_onion_terminal_router.clone().ok_or_else(|| {
+                ServerError::startup_failed("Private recipient terminal router unavailable")
+            })?;
             let adapter = Arc::new(crate::api::reverse_onion_terminal::ReverseOnionTerminalAdapter::new(
-                ticket_terminal_router.clone(), Arc::clone(&node_identity), relay,
+                terminal_router,
+                Arc::clone(&node_identity), relay,
                 Duration::from_secs(self.config.reverse_onion.recipient.request_timeout_secs))
                 .map_err(|_| ServerError::startup_failed("Recipient adapter unavailable"))?);
             let worker = Arc::new(reverse_onion_runtime::ReverseOnionRecipientWorker::start(
-                &self.config.reverse_onion, Arc::clone(&node_identity), adapter)
+                &self.config.reverse_onion, Arc::clone(&node_identity),
+                // [REVERSE-ONION-RECIPIENT-ROUTE-REFRESH 2026-10-05 by Codex]
+                // Share the live signed descriptor cache with the owned worker.
+                Arc::clone(&peer_store), adapter)
                 .map_err(|_| ServerError::startup_failed("Recipient worker unavailable"))?);
             if owner.install(Arc::clone(&worker)).is_err() {
                 let _ = worker.shutdown_and_drain().await;
@@ -324,6 +481,16 @@ impl Server {
             // live in one JoinSet. No listener may outlive or disappear behind
             // a detached task that the process cannot observe.
             let mut listener_tasks = JoinSet::new();
+            if let Some((owner, shutdown, rx)) = phala_delivery_cleanup {
+                // Construct before spawn: an abort before the child's first
+                // poll must still fence late handler handoff and free buffers.
+                let guard = PhalaAttestationDeliverySupervisorGuard(Arc::clone(&owner));
+                listener_tasks.spawn(async move {
+                    let _guard = guard;
+                    run_phala_attestation_delivery_cleanup(owner, shutdown, rx).await;
+                    RequiredApiListenerExit { role: "phala-attestation-delivery", address: listen_addr, result: Ok(()) }
+                });
+            }
             // Only the non-stopping observer belongs to the abortable listener
             // group. The worker is retained by the dedicated server owner.
             if let Some((worker, owner)) = reverse_worker {
@@ -381,6 +548,12 @@ impl Server {
                     ),
                     None => build_public_node_router(public_deps),
                 };
+                // [REVERSE-ONION-PUBLIC-PEER-MOUNT 2026-10-06 by Codex]
+                // Recipient Claim/Result frames arrive on the existing public
+                // node-peer listener; never expose source-pull or MPI routes.
+                if let Some(api) = reverse_onion_api.as_ref() {
+                    public_app = public_app.merge(build_reverse_onion_router(Arc::clone(api)));
+                }
                 if let Some(runtime) = public_promotion_runtime {
                     public_app = public_app.merge(build_endpoint_possession_responder(Arc::clone(
                         &node_identity,
@@ -397,29 +570,36 @@ impl Server {
                             tokio::select! {
                                 _ = promotion_shutdown.recv() => break,
                                 _ = interval.tick() => {
-                                    match runtime.advance_one().await {
-                                        Ok(Some(descriptor)) => {
-                                            // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex]
-                                            // Promotion is not route readiness. Only an existing
-                                            // signed blind-relay control probe can open the gate.
-                                            // An identity already in route quarantine cannot
-                                            // use descriptor rotation to accelerate recovery.
-                                            let now = unix_now_secs();
-                                            if probe_store.is_route_quarantined_now(&descriptor.node_id(), now) {
-                                                continue;
+                                    if !run_permissionless_promotion_round_until_shutdown(
+                                        &mut promotion_shutdown,
+                                        promotion_process_shutdown.as_ref(),
+                                        async {
+                                            match runtime.advance_one(Arc::clone(&promotion_process_shutdown)).await {
+                                                Ok(Some(descriptor)) => {
+                                                    // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex]
+                                                    // Promotion is not route readiness. Only an existing
+                                                    // signed blind-relay control probe can open the gate.
+                                                    // An identity already in route quarantine cannot
+                                                    // use descriptor rotation to accelerate recovery.
+                                                    let now = unix_now_secs();
+                                                    if !promotion_process_shutdown.load(Ordering::SeqCst)
+                                                        && !probe_store.is_route_quarantined_now(&descriptor.node_id(), now)
+                                                    {
+                                                        let self_id = probe_identity.public_key_bytes();
+                                                        Self::probe_blind_relay_candidate_descriptor(
+                                                            probe_http.as_ref(), probe_store.as_ref(),
+                                                            probe_identity.as_ref(), &self_id, descriptor, now,
+                                                            true,
+                                                        ).await;
+                                                    }
+                                                }
+                                                Ok(None) => {}
+                                                Err(reason) => debug!(reason = %reason,
+                                                    "[DISCOVERY] Permissionless promotion deferred"),
                                             }
-                                            let self_id = probe_identity.public_key_bytes();
-                                            Self::probe_blind_relay_candidate_descriptor(
-                                                probe_http.as_ref(), probe_store.as_ref(),
-                                                probe_identity.as_ref(), &self_id, descriptor, now,
-                                                true,
-                                            ).await;
-                                        }
-                                        Ok(None) => {}
-                                        Err(reason) => debug!(reason = %reason,
-                                            "[DISCOVERY] Permissionless promotion deferred"),
-    }
-}
+                                        },
+                                    ).await { break; }
+                                }
                             }
                         }
                         // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex]
@@ -493,7 +673,6 @@ impl Server {
                     chat_relay.clone(),
                     anonymous_mailbox_readiness.clone(),
                 ))
-                .merge(ticket_terminal_router)
                 // Local/VPN-only operator smoke trigger. The public discovery API
                 // intentionally does not expose this route; it actively sends a
                 // synthetic two-hop onion delivery probe and returns aggregate
@@ -743,10 +922,14 @@ impl Server {
             };
 
             info!("[API] Node API on http://{}", listen_addr);
-            info!(
-                "[API] Client API also available on http://{} (VPN clients only)",
-                vpn_listen_addr
-            );
+            if vpn_enabled {
+                info!(
+                    "[API] Client API also available on http://{} (VPN clients only)",
+                    vpn_listen_addr
+                );
+            } else {
+                info!("[API] VPN client/MPI listener disabled with VPN data plane");
+            }
             // [ANONYMOUS-MAILBOX-SOURCE-WIRING 2026-09-03 by Codex] The
             // source request route is an MPI-unified-auth client/VPN-only
             // composition surface. Node-peer, public discovery, ordinary
@@ -760,7 +943,11 @@ impl Server {
                 // router. It must not be merged into the ordinary local app or
                 // node/public surfaces, and it is absent when chat relay is off.
                 let mut vpn_source_router = axum::Router::new();
+                // [REVERSE-ONION-SOURCE-MOUNT 2026-10-05 by Codex] Route
+                // presence selects MPI source composition; readiness continues
+                // to describe only the anonymous-mailbox dispatcher.
                 let mut dispatcher_admitted = false;
+                let mut vpn_source_routes_present = false;
                 if let Some(source) = vpn_anonymous_mailbox_source {
                     vpn_source_router =
                         vpn_source_router.merge(build_chat_anonymous_mailbox_source_router(
@@ -769,23 +956,37 @@ impl Server {
                             &anonymous_mailbox_source_config,
                         ));
                     dispatcher_admitted = true;
+                    vpn_source_routes_present = true;
                 }
                 let chat_pull_enabled = chat_relay.is_some();
                 if let Some(relay) = chat_relay.clone() {
                     vpn_source_router = vpn_source_router.merge(build_chat_pull_http_router(relay));
                 }
-                let vpn_mpi = if dispatcher_admitted || chat_pull_enabled {
+                // [PHALA-SOURCE-PREAUTH-DRAIN 2026-10-07 by Codex] Bound
+                // MPI's pre-auth source body read with the same lifecycle that
+                // server shutdown stops/drains. No node/public route is added.
+                let vpn_mpi = if let Some(source) = reverse_onion_source {
+                    build_mpi_router_with_reverse_onion_source(mpi_state, vpn_source_router, source)
+                } else if vpn_source_routes_present || chat_pull_enabled {
                     build_mpi_router_with_source(mpi_state, vpn_source_router)
                 } else {
                     build_mpi_router(mpi_state)
                 };
                 (
-                    app.clone().merge(node_mpi),
-                    app.merge(vpn_mpi),
+                    app.clone().merge(node_peer_router.clone()).merge(node_mpi),
+                    app.merge(ticket_terminal_router).merge(vpn_mpi),
                     dispatcher_admitted,
                 )
             } else {
-                (app.clone(), app, false)
+                (app.clone().merge(node_peer_router), app.merge(ticket_terminal_router), false)
+            };
+            // [REVERSE-ONION-NODE-PEER-ROUTE 2026-10-04 by Codex] The signed
+            // queue API is peer-only: it is available to local/public node-peer
+            // callers but absent from VPN/MPI, public discovery, admin, and ticket paths.
+            let app = if let Some(reverse_onion_api) = reverse_onion_api {
+                app.merge(build_reverse_onion_router(reverse_onion_api))
+            } else {
+                app
             };
             anonymous_mailbox_readiness.publish_local_composition(
                 anonymous_mailbox_configured,
@@ -795,13 +996,15 @@ impl Server {
                 dispatcher_admitted,
                 anonymous_mailbox_cleanup_runtime_supervised,
             );
-            listener_tasks.spawn(Self::serve_required_api_listener(
-                "vpn_client_api",
-                vpn_listen_addr,
-                vpn_listener,
-                vpn_app,
-                shutdown_rx_vpn,
-            ));
+            if let Some(vpn_listener) = vpn_listener {
+                listener_tasks.spawn(Self::serve_required_api_listener(
+                    "vpn_client_api",
+                    vpn_listen_addr,
+                    vpn_listener,
+                    vpn_app,
+                    shutdown_rx_vpn,
+                ));
+            }
             listener_tasks.spawn(Self::serve_required_api_listener(
                 "node_api",
                 listen_addr,
@@ -940,6 +1143,26 @@ impl Server {
         chat_relay_enabled: bool,
         anonymous_mailbox_readiness: AnonymousMailboxReadinessProjection,
     ) -> Result<ManagementRuntime> {
+        // [PHALA-MANAGEMENT-ISOLATION 2026-10-06 by Codex] Do not construct
+        // the default CMS client or resolve public IP when an isolated node
+        // explicitly disables the management plane. Keep the fixed supervised
+        // task contract and session-event API intact without network workers.
+        if !self.config.management.enabled {
+            let dormant_task = || {
+                let mut shutdown = self.shutdown_tx.subscribe();
+                tokio::spawn(async move {
+                    let _ = shutdown.recv().await;
+                })
+            };
+            return Ok(ManagementRuntime {
+                session_events: SessionEventSender::disabled(),
+                tasks: [
+                    ("management-command-handler", dormant_task()),
+                    ("management-heartbeat", dormant_task()),
+                    ("management-session-reporter", dormant_task()),
+                ],
+            });
+        }
         info!("Initializing management reporting...");
 
         // [MANAGEMENT-CLIENT-STARTUP 2026-08-12 by Codex] Build the shared

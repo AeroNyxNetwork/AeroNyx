@@ -51,10 +51,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# [PINNED-RUST-TOOLCHAIN 2026-07-26 by Codex] This remains the workspace MSRV
-# contract. Production release reproducibility is separately pinned to one
-# exact compiler in rust-toolchain.toml.
-rust-version = "1.75"
+# [MEMCHAIN-PHALA-ACI-VERIFIER 2026-10-05 by Codex] The official Phala ACI
+# verifier integration requires Rust 1.89; release builds remain pinned below.
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/aeronyx/aeronyx-server"
 authors = ["AeroNyx Contributors"]
@@ -85,13 +84,26 @@ futures = "0.3"
 #   zeroize:            1.3  ←→  1.3  ✓
 # ============================================
 ed25519-dalek = "1.0"
+# [MEMCHAIN-PHALA-ACI-RECEIPT-COMPAT 2026-10-06 by Codex] Verify ACI secp256k1 receipts.
+k256 = { version = "0.13.4", features = ["ecdsa"] }
 x25519-dalek = "1.1"
 chacha20poly1305 = "0.9"
 hkdf = "0.12"
 sha2 = "0.10"
+# [PHALA-133171-PROFILE 2026-10-08 by Codex] Dstack KMS recovery hashes.
+sha3 = "0.10"
 rand = "0.7"
 rand_core = "0.5"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+rustls-native-certs = "0.8"
+# [MEMCHAIN-PHALA-ACI-VERIFIER 2026-10-05 by Codex] Pin the upstream ACI
+# mechanism helpers to one reviewed source revision; relying-party policy
+# and hardware-quote appraisal remain in aeronyx-server.
+# [PHALA-133171-PROFILE 2026-10-08 by Codex] These crates provide JCS and
+# hardened quote/event-log mechanisms, NOT the 133171 ACI report wire types.
+aci-protocol = { git = "https://github.com/Dstack-TEE/private-ai-gateway", rev = "a991c08553cbd0638199abfd6eace9c83ee0a891" }
+aci-verify = { git = "https://github.com/Dstack-TEE/private-ai-gateway", rev = "a991c08553cbd0638199abfd6eace9c83ee0a891" }
+dcap-qvl = { version = "0.3.12", default-features = false, features = ["std", "report", "rustcrypto"] }
 zeroize = { version = "1.3", features = ["zeroize_derive"] }
 
 # ============================================
@@ -176,6 +188,13 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# [PHALA-UNWIND-BUILD-CONTRACT 2026-10-07 by Codex] Reverse owners must
+# unwind into ordered durable-work drain. Keep the ordinary release ABI/policy
+# unchanged; the Phala image selects this explicit profile and artifact path.
+[profile.phala]
+inherits = "release"
+panic = "unwind"
 
 [profile.bench]
 debug = true

@@ -55,7 +55,7 @@ impl VerifiedSubmitExecution {
         relay: &Arc<ChatRelayService>,
         request: &ChatRelayVerifiedSubmitRequestV1,
         operation: F,
-    ) -> Result<T, VerifiedSubmitDbFailure>
+    ) -> std::result::Result<T, VerifiedSubmitDbFailure>
     where
         T: Send + 'static,
         F: FnOnce(&ChatRelayService, &ChatRelayVerifiedSubmitRequestV1) -> ChatRelayResult<T>

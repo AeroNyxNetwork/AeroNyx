@@ -148,6 +148,11 @@ pub(super) struct PreparedTerminalReply {
 }
 
 impl PreparedTerminalReply {
+    // [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex]
+    pub(super) const fn purpose(&self) -> OnionRoutePurpose {
+        self.purpose
+    }
+
     pub(super) const fn effect(&self) -> TerminalReplyEffect {
         self.effect
     }

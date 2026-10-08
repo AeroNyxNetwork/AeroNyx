@@ -364,6 +364,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use aeronyx_core::protocol::discovery::{
     DirectoryDescriptorCommitmentV1, NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage,
     NodeProtocolFeature, RouteDomainAttestationCertificateV1, SignedNodeDescriptor,
+    SignedPrivateOnionRecipientAuthorizationV1,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -377,6 +378,11 @@ mod permissionless_promotion;
 use permissionless_promotion::PermissionlessPromotionGate;
 mod route_domain_certificates;
 mod route_selection;
+// [PHALA-PINNED-RELAY-APPRAISAL 2026-10-07 by Codex] Only PeerStore
+// selection can mint this descriptor-bound, non-public appraisal scope.
+// [PHALA-APPRAISAL-EGRESS-PIN 2026-10-07 by Codex] Keep scope construction
+// separate from the private-field, authenticated-descriptor target.
+pub(crate) use route_selection::{PhalaPeerAppraisalEgress, PhalaPeerAppraisalTarget};
 mod status;
 use route_domain_certificates::PeerStoreRouteDomainAttestorPolicy;
 pub use route_domain_certificates::{
@@ -2872,9 +2878,115 @@ pub(crate) enum PermissionlessNodeAdmissionOutcome {
 // PeerStore
 // ============================================
 
+// [PHALA-QUEUE-IDENTITY-PINS 2026-10-08 by Codex] One bounded operator
+// policy is shared by startup, gossip selection, and both admission paths.
+// These pins grant no descriptor, attestation, execution, or reply authority.
+pub(crate) struct PrivateOnionQueueIdentityPins {
+    relay: [u8; 32],
+    recipient: [u8; 32],
+    sources: Vec<[u8; 32]>,
+}
+
+impl PrivateOnionQueueIdentityPins {
+    pub(crate) fn new(
+        relay: [u8; 32], recipient: [u8; 32], sources: Vec<[u8; 32]>,
+    ) -> Result<Self, PeerStoreError> {
+        let valid = |id: &[u8; 32]| *id != [0; 32]
+            && aeronyx_core::crypto::IdentityPublicKey::from_bytes(id).is_ok();
+        if !valid(&relay) || !valid(&recipient) || relay == recipient
+            || !(1..=64).contains(&sources.len())
+        {
+            return Err(PeerStoreError::VerificationFailed);
+        }
+        let mut unique = HashSet::with_capacity(sources.len());
+        if sources.iter().any(|source| !valid(source) || *source == relay
+            || *source == recipient || !unique.insert(*source))
+        {
+            return Err(PeerStoreError::VerificationFailed);
+        }
+        Ok(Self { relay, recipient, sources })
+    }
+
+    pub(crate) fn relay(&self) -> [u8; 32] { self.relay }
+    pub(crate) fn recipient(&self) -> [u8; 32] { self.recipient }
+    pub(crate) fn sources(&self) -> &[[u8; 32]] { &self.sources }
+    pub(crate) fn into_sources(self) -> Vec<[u8; 32]> { self.sources }
+}
+
+// [REVERSE-ONION-AUTHORITY-EPOCH 2026-10-06 by Codex] Keep the relay route,
+// terminal descriptor and grant as one comparison unit across async DNS work.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PrivateOnionPullAuthoritySnapshot {
+    pub(crate) relay: SignedNodeDescriptor,
+    pub(crate) recipient: SignedNodeDescriptor,
+    pub(crate) authorization: SignedPrivateOnionRecipientAuthorizationV1,
+}
+
+// [PHALA-APPRAISAL-OBSERVATION-FLOOR 2026-10-07 by Codex] These times
+// belong to verifier-local observations, never descriptor/wire timestamps.
+struct PhalaPeerAppraisalCacheEntry {
+    commitment: [u8; 32],
+    challenged_at: u64,
+    published_at: u64,
+    started: std::time::Instant,
+    observed_at: AtomicU64,
+    #[cfg(test)]
+    elapsed_override: Option<std::time::Duration>,
+}
+
+impl PhalaPeerAppraisalCacheEntry {
+    fn elapsed(&self) -> std::time::Duration {
+        #[cfg(test)]
+        if let Some(elapsed) = self.elapsed_override { return elapsed; }
+        self.started.elapsed()
+    }
+
+    fn is_fresh_at(&self, descriptor: &SignedNodeDescriptor, now: u64, max_age_secs: u64) -> bool {
+        // Retain projected expiry observations even when the age/descriptor
+        // check fails, so re-appraisal at a rolled-back wall time cannot erase
+        // an expiry already observed through the original monotonic anchor.
+        let elapsed = self.elapsed();
+        let Some(projected_now) = self.challenged_at.checked_add(elapsed.as_secs())
+            else { return false; };
+        let previous = self.observed_at.fetch_max(now.max(projected_now), Ordering::AcqRel);
+        if now < self.published_at || now < previous || now < projected_now {
+            return false;
+        }
+        let Some(effective_now) = crate::api::discovery::phala_appraisal_effective_time(
+            self.challenged_at, now, elapsed, max_age_secs,
+        ) else { return false; };
+        self.observed_at.fetch_max(effective_now, Ordering::AcqRel);
+        // The exact signed commitment was compared by the caller. Rechecking
+        // the validity window here does not replace signature/QVL appraisal.
+        effective_now == now && descriptor.descriptor.is_valid_at(effective_now)
+    }
+}
+
 /// In-memory verified descriptor store for known AeroNyx nodes.
 pub struct PeerStore {
     peers: RwLock<HashMap<[u8; 32], SignedNodeDescriptor>>,
+    // [PHALA-PEER-ATTESTATION-CACHE 2026-10-06 by Codex] Process-local only;
+    // entries bind appraisal time to the exact canonical signed descriptor.
+    // [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] Preserve the
+    // challenge's monotonic age after publication, including clock rollback.
+    // [PHALA-APPRAISAL-OBSERVATION-FLOOR 2026-10-07 by Codex] Keep
+    // publication and subsequent observation floors without persisting trust.
+    phala_peer_attestations: RwLock<HashMap<[u8; 32], PhalaPeerAppraisalCacheEntry>>,
+    phala_attested_peers_required: AtomicBool,
+    phala_peer_attestation_max_age_secs: AtomicU64,
+    // [REVERSE-ONION-AUTHORITY-FENCE 2026-10-05 by Codex] Live descriptor and
+    // P-grant writes serialize against the Claim-to-Lease database transaction.
+    private_onion_authority_gate: RwLock<()>,
+    // [REVERSE-ONION-AUTHORITY-GOSSIP 2026-10-05 by Codex] Public signed
+    // grants are process-local and always revalidated against live descriptors.
+    // [PRIVATE-ONION-AUTHORITY-PURPOSES 2026-10-05 by Codex] One pinned R/P
+    // pair may hold independent operation grants without one overwriting the
+    // other.
+    private_onion_authorizations: RwLock<HashMap<([u8; 32], [u8; 32], String), SignedPrivateOnionRecipientAuthorizationV1>>,
+    // [REVERSE-ONION-AUTHORITY-GOSSIP 2026-10-05 by Codex] Explicit local
+    // operator pins permit signed current R/P descriptor refreshes at source.
+    private_onion_route_identity_pins: RwLock<HashSet<([u8; 32], [u8; 32])>>,
+    private_onion_source_identity_pins: RwLock<HashSet<[u8; 32]>>,
     // [PERMISSIONLESS-DISCOVERY-CANDIDATES 2026-09-14 by Codex] A descriptor
     // learned through legacy, unauthenticated gossip is evidence of only its
     // own signature. Keep it outside `peers` until a later endpoint-possession
@@ -2923,6 +3035,13 @@ impl PeerStore {
     pub fn new() -> Self {
         Self {
             peers: RwLock::new(HashMap::new()),
+            phala_peer_attestations: RwLock::new(HashMap::new()),
+            phala_attested_peers_required: AtomicBool::new(false),
+            phala_peer_attestation_max_age_secs: AtomicU64::new(900),
+            private_onion_authority_gate: RwLock::new(()),
+            private_onion_authorizations: RwLock::new(HashMap::new()),
+            private_onion_route_identity_pins: RwLock::new(HashSet::new()),
+            private_onion_source_identity_pins: RwLock::new(HashSet::new()),
             untrusted_discovery_candidates: RwLock::new(UntrustedDiscoveryCandidateState::default()),
             untrusted_discovery_candidate_mode: AtomicBool::new(false),
             permissionless_promotions: RwLock::new(HashMap::new()),
@@ -2954,6 +3073,204 @@ impl PeerStore {
         }
     }
 
+    // [PHALA-PEER-ATTESTATION-CACHE 2026-10-06 by Codex]
+    pub(crate) fn configure_phala_attested_peer_routes(&self, required: bool, max_age_secs: u64) {
+        // [PHALA-FINAL-ROUTE-ADMISSION 2026-10-07 by Codex] Publish policy
+        // and cache invalidation in the same epoch as signed route authority.
+        let _authority_update = self.private_onion_authority_gate.write();
+        self.phala_attested_peers_required
+            .store(required, Ordering::Release);
+        self.phala_peer_attestation_max_age_secs
+            .store(max_age_secs, Ordering::Release);
+        if !required {
+            self.phala_peer_attestations.write().clear();
+        }
+    }
+
+    // [PHALA-BOUNDED-PEER-APPRAISAL 2026-10-07 by Codex] Production
+    // callers cannot manufacture completion timestamps or bypass QVL/ACI.
+    pub(crate) fn record_verified_phala_peer_attestation(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        appraisal: &crate::api::discovery::VerifiedPhalaPeerAttestation,
+    ) -> bool {
+        self.record_verified_phala_peer_attestation_if(descriptor, appraisal, || true)
+    }
+
+    // [PHALA-APPRAISAL-TASK-OWNERSHIP 2026-10-07 by Codex] The owner
+    // predicate is sampled inside publication's authority/cache locks, after
+    // any wait. It can only veto an otherwise verified result; it never grants
+    // authority or substitutes for exact descriptor, age or QVL checks.
+    pub(crate) fn record_verified_phala_peer_attestation_if(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        appraisal: &crate::api::discovery::VerifiedPhalaPeerAttestation,
+        owner_running: impl FnOnce() -> bool,
+    ) -> bool {
+        self.record_phala_peer_appraisal(descriptor, |max_age| {
+            if !owner_running() { return None; }
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            let (challenged_at, started) = appraisal.cache_time_for(descriptor, now, max_age)?;
+            Some((challenged_at, started, now))
+        })
+    }
+
+    // Legacy deterministic fixtures are not a production publication API.
+    #[cfg(test)]
+    pub(crate) fn record_phala_peer_attestation(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        verified_at: u64,
+    ) -> bool {
+        // [PHALA-APPRAISAL-OBSERVATION-FLOOR 2026-10-07 by Codex] Old
+        // fixtures use a fixed synthetic Unix clock. Freeze only their matching
+        // synthetic cache entry, never a production verified-result entry.
+        let started = std::time::Instant::now();
+        let recorded = self.record_phala_peer_appraisal(descriptor, |_| Some((verified_at, started, verified_at)));
+        if recorded {
+            if let Some(entry) = self.phala_peer_attestations.write().get_mut(&descriptor.node_id()) {
+                if entry.challenged_at == verified_at && entry.started == started {
+                    entry.elapsed_override = Some(std::time::Duration::ZERO);
+                }
+            }
+        }
+        recorded
+    }
+
+    fn record_phala_peer_appraisal(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        publication_clock: impl FnOnce(u64) -> Option<(u64, std::time::Instant, u64)>,
+    ) -> bool {
+        use aeronyx_core::protocol::discovery::signed_descriptor_commitment_hash;
+
+        let Ok(commitment) = signed_descriptor_commitment_hash(descriptor) else {
+            return false;
+        };
+        if !descriptor
+            .descriptor
+            .advertises_protocol_feature(NodeProtocolFeature::PhalaNodeAttestationV1)
+        {
+            return false;
+        }
+        // [PHALA-FINAL-ROUTE-ADMISSION 2026-10-07 by Codex] Descriptor
+        // comparison and appraisal publication cannot straddle a route update.
+        // The existing lock order is authority -> peers -> appraisal cache.
+        let _authority_update = self.private_onion_authority_gate.write();
+        let node_id = descriptor.node_id();
+        let peers = self.peers.read();
+        let Some(current) = peers.get(&node_id) else {
+            return false;
+        };
+        if current != descriptor {
+            return false;
+        }
+        drop(peers);
+        let mut cache = self.phala_peer_attestations.write();
+        let max_entries = (*self.max_peers.read()).unwrap_or(2048).max(1);
+        // Recheck actual publication time after every potentially blocking
+        // lock. A delayed quarantine result cannot become fresh again here.
+        let Some((challenged_at, started, now)) = publication_clock(self.phala_peer_attestation_max_age_secs()) else {
+            return false;
+        };
+        // [PHALA-APPRAISAL-OBSERVATION-FLOOR 2026-10-07 by Codex]
+        let Some(effective_now) = crate::api::discovery::phala_appraisal_effective_time(
+            challenged_at, now, started.elapsed(), self.phala_peer_attestation_max_age_secs(),
+        ) else { return false; };
+        if effective_now != now
+            || descriptor.verify_at(effective_now).is_err() || descriptor.verify_at(challenged_at).is_err() {
+            return false;
+        }
+        if let Some(saved) = cache.get(&node_id).filter(|saved| saved.commitment == commitment) {
+            if now < saved.observed_at.load(Ordering::Acquire) {
+                return false;
+            }
+            if saved.challenged_at > challenged_at
+                || (saved.challenged_at == challenged_at && saved.started > started)
+            {
+                // An older completion cannot restamp or revive newer evidence,
+                // even if the newer entry has already become ineligible.
+                return saved.is_fresh_at(descriptor, now, self.phala_peer_attestation_max_age_secs());
+            }
+        }
+        if !cache.contains_key(&node_id) && cache.len() >= max_entries {
+            if let Some(oldest) = cache.iter().min_by_key(|(_, entry)| entry.challenged_at).map(|(id, _)| *id) {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(node_id, PhalaPeerAppraisalCacheEntry {
+            commitment, challenged_at, published_at: now, started, observed_at: AtomicU64::new(now),
+            #[cfg(test)]
+            elapsed_override: None,
+        });
+        true
+    }
+
+    // [PHALA-PEER-ATTESTATION-CACHE 2026-10-06 by Codex]
+    pub(crate) fn phala_peer_attestation_is_fresh(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+        max_age_secs: u64,
+    ) -> bool {
+        use aeronyx_core::protocol::discovery::signed_descriptor_commitment_hash;
+
+        let node_id = descriptor.node_id();
+        let Ok(commitment) = signed_descriptor_commitment_hash(descriptor) else {
+            return false;
+        };
+        self.phala_peer_attestations
+            .read()
+            .get(&node_id)
+            .is_some_and(|entry| {
+                entry.commitment == commitment && entry.is_fresh_at(descriptor, now, max_age_secs)
+            })
+    }
+
+    // [PHALA-PEER-ATTESTED-ROUTING 2026-10-06 by Codex]
+    pub(crate) fn phala_peer_route_is_eligible(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+    ) -> bool {
+        !self.phala_attested_peer_routes_required()
+            || (descriptor
+                .descriptor
+                .advertises_protocol_feature(NodeProtocolFeature::PhalaNodeAttestationV1)
+                && self.phala_peer_attestation_is_fresh(
+                    descriptor,
+                    now,
+                    self.phala_peer_attestation_max_age_secs(),
+                ))
+    }
+
+    // [PHALA-PEER-ATTESTED-ROUTING 2026-10-06 by Codex]
+    pub(crate) fn phala_attested_peer_routes_required(&self) -> bool {
+        self.phala_attested_peers_required.load(Ordering::Acquire)
+    }
+
+    // [PHALA-PEER-ATTESTED-ROUTING 2026-10-06 by Codex]
+    pub(crate) fn phala_peer_attestation_max_age_secs(&self) -> u64 {
+        self.phala_peer_attestation_max_age_secs.load(Ordering::Acquire)
+    }
+
+    // [REVERSE-ONION-AUTHORITY-FENCE 2026-10-05 by Codex] Hold this read
+    // boundary through lease persistence so a concurrent authority refresh
+    // is ordered either wholly before or wholly after new lease issuance.
+    pub(crate) fn private_onion_authority_read_guard(
+        &self,
+    ) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.private_onion_authority_gate.read()
+    }
+
+    // [PHALA-FINAL-ROUTE-ADMISSION 2026-10-07 by Codex] HTTP entry may
+    // defer behind a writer, but must never synchronously block its executor.
+    pub(crate) fn try_private_onion_authority_read_guard(
+        &self,
+    ) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+        self.private_onion_authority_gate.try_read()
+    }
+
     /// Creates an empty peer store with a maximum descriptor capacity.
     #[must_use]
     pub fn with_max_peers(max_peers: usize) -> Self {
@@ -2964,6 +3281,10 @@ impl PeerStore {
 
     /// Updates the maximum peer capacity.
     pub fn set_max_peers(&self, max_peers: Option<usize>) {
+        // [REVERSE-ONION-AUTHORITY-ATOMIC-IMPORT 2026-10-05 by Codex]
+        // Capacity changes share the descriptor/grant epoch so a two-descriptor
+        // authority import cannot pass preflight then fail halfway through.
+        let _authority_update = self.private_onion_authority_gate.write();
         *self.max_peers.write() = max_peers;
     }
 

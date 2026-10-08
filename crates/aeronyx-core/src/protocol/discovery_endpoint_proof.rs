@@ -35,6 +35,7 @@ const PROOF_FRAME_BYTES: usize = FRAME_HEADER_BYTES + PROOF_BODY_BYTES;
 const CHALLENGE_SIGNATURE_DOMAIN: &[u8] = b"AeroNyx/DiscoveryEndpointChallengeV1\0";
 const CHALLENGE_COMMITMENT_DOMAIN: &[u8] = b"AeroNyx/DiscoveryEndpointChallengeCommitmentV1\0";
 const ENDPOINT_COMMITMENT_DOMAIN: &[u8] = b"AeroNyx/DiscoveryPublicEndpointV1\0";
+const DNS_ENDPOINT_COMMITMENT_DOMAIN: &[u8] = b"AeroNyx/DiscoveryPublicHttpsDnsEndpointV1\0";
 const PROOF_SIGNATURE_DOMAIN: &[u8] = b"AeroNyx/DiscoveryEndpointProofV1\0";
 
 // [PERMISSIONLESS-ENDPOINT-TRANSPORT 2026-09-24 by Codex] Keep transport
@@ -1314,6 +1315,90 @@ pub fn canonical_public_endpoint_commitment(
         return Err(DiscoveryEndpointProofError::Malformed);
     }
     Ok(domain_hash(ENDPOINT_COMMITMENT_DOMAIN, endpoint.as_bytes()))
+}
+
+/// Commits to one canonical credential-free HTTPS DNS authority.
+///
+/// This is an additive endpoint form for Phala-attested peers. Unlike the
+/// legacy socket commitment, the hostname remains the committed identity and
+/// callers must pin every resolved address to public unicast IPs while
+/// preserving TLS hostname verification. IP socket commitments retain their
+/// existing V1 bytes and domain.
+///
+/// # Errors
+/// Returns [`DiscoveryEndpointProofError::Malformed`] for non-canonical or
+/// unsafe authorities.
+// [PHALA-DNS-ENDPOINT-COMMITMENT 2026-10-06 by Codex]
+pub fn canonical_public_https_dns_endpoint_commitment_v1(
+    endpoint: &str,
+) -> Result<[u8; 32], DiscoveryEndpointProofError> {
+    if endpoint.is_empty() || endpoint.len() > 280 || endpoint.trim() != endpoint {
+        return Err(DiscoveryEndpointProofError::Malformed);
+    }
+    let authority = endpoint
+        .strip_prefix("https://")
+        .ok_or(DiscoveryEndpointProofError::Malformed)?;
+    if authority.is_empty()
+        || authority
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@' | b'\\' | b'%'))
+    {
+        return Err(DiscoveryEndpointProofError::Malformed);
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            let parsed = port
+                .parse::<u16>()
+                .map_err(|_| DiscoveryEndpointProofError::Malformed)?;
+            if parsed == 0 || parsed.to_string() != port {
+                return Err(DiscoveryEndpointProofError::Malformed);
+            }
+            (host, parsed)
+        }
+        None => (authority, 443),
+    };
+    if host.len() > 253
+        || !host.contains('.')
+        || host.starts_with('.')
+        || host.ends_with('.')
+        || host.bytes().any(|byte| byte.is_ascii_uppercase())
+        || host.parse::<IpAddr>().is_ok()
+        || [
+            ".localhost",
+            ".local",
+            ".internal",
+            ".test",
+            ".invalid",
+            ".example",
+            ".onion",
+        ]
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+    {
+        return Err(DiscoveryEndpointProofError::Malformed);
+    }
+    let mut numeric_labels = true;
+    for label in host.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(DiscoveryEndpointProofError::Malformed);
+        }
+        numeric_labels &= label.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    if numeric_labels {
+        return Err(DiscoveryEndpointProofError::Malformed);
+    }
+    let canonical_authority = format!("{host}:{port}");
+    Ok(domain_hash(
+        DNS_ENDPOINT_COMMITMENT_DOMAIN,
+        canonical_authority.as_bytes(),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

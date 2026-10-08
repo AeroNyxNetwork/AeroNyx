@@ -12,7 +12,7 @@
 use aeronyx_core::protocol::discovery::{
     DirectoryDescriptorCommitmentV1, SignedNodeDescriptor, MAX_SIGNED_NODE_DESCRIPTOR_BYTES,
 };
-use aeronyx_core::protocol::discovery_endpoint_attestation::canonical_attested_public_endpoint_socket_v1;
+use aeronyx_core::protocol::discovery_endpoint_attestation::canonical_attested_public_endpoint_commitment_v1;
 use aeronyx_core::protocol::discovery_endpoint_proof::canonical_public_endpoint_commitment;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -300,14 +300,11 @@ impl PreparedProbation {
             .public_endpoint
             .as_deref()
             .ok_or(DiscoveryEndpointPromotionProbationError::Rejected)?;
-        // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] ADAT and
-        // the direct dialer bind the signed HTTP(S) endpoint's canonical
-        // public socket, not its URL text. Keep the durable record identical.
-        let endpoint_socket = canonical_attested_public_endpoint_socket_v1(endpoint)
+        // [PHALA-DNS-ENDPOINT-COMMITMENT 2026-10-06 by Codex] Persist the
+        // exact endpoint commitment used by ADEA for both legacy IP sockets
+        // and the additive Phala HTTPS-DNS form.
+        let endpoint_commitment = canonical_attested_public_endpoint_commitment_v1(endpoint)
             .map_err(|_| DiscoveryEndpointPromotionProbationError::Rejected)?;
-        let endpoint_commitment =
-            canonical_public_endpoint_commitment(&endpoint_socket.to_string())
-                .map_err(|_| DiscoveryEndpointPromotionProbationError::Rejected)?;
         if descriptor_commitment != material.descriptor_commitment()
             || endpoint_commitment != material.endpoint_commitment()
             || material.group_commitment() != readiness.group_commitment
@@ -527,10 +524,8 @@ pub(super) fn startup_audit(
             material_valid_until,
             record_commitment,
         };
-        let endpoint_socket = canonical_attested_public_endpoint_socket_v1(endpoint)
-            .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Corrupt)?;
         let canonical_endpoint_commitment =
-            canonical_public_endpoint_commitment(&endpoint_socket.to_string())
+            canonical_attested_public_endpoint_commitment_v1(endpoint)
                 .map_err(|_| DiscoveryEndpointQuarantineRevocationError::Corrupt)?;
         if commitment.node_id != node_id
             || commitment.sequence != descriptor_sequence
@@ -826,11 +821,8 @@ mod tests {
         let descriptor = SignedNodeDescriptor::sign(descriptor, target).expect("descriptor");
         let descriptor_pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
             .expect("descriptor commitment");
-        let endpoint_socket =
-            canonical_attested_public_endpoint_socket_v1(endpoint).expect("public socket");
-        let endpoint_commitment =
-            canonical_public_endpoint_commitment(&endpoint_socket.to_string())
-                .expect("endpoint commitment");
+        let endpoint_commitment = canonical_attested_public_endpoint_commitment_v1(endpoint)
+            .expect("endpoint commitment");
         let inbox = SqliteDiscoveryEndpointAttestationInbox::open(
             DiscoveryEndpointAttestationInboxConfig {
                 db_path: directory

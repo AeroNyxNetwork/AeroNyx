@@ -322,6 +322,7 @@ impl MemoryStorage {
                 entity_type         TEXT NOT NULL,
                 description         TEXT,
                 embedding           BLOB,
+                embedding_model     TEXT NOT NULL DEFAULT '',
                 community_id        TEXT,
                 created_at          INTEGER NOT NULL,
                 updated_at          INTEGER NOT NULL,
@@ -1619,6 +1620,28 @@ impl MemoryStorage {
             info!(
                 "[STORAGE] Migration to v18 (custody witness receipt admission evidence) complete"
             );
+        }
+
+        // [MEMCHAIN-PHALA-EMBEDDINGS 2026-10-06 by Codex] Entity vectors are
+        // model-scoped. Keep legacy vectors and mark them unclassified so they
+        // are never compared with a newly configured Phala embedding space.
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| row.get(0))
+            .unwrap_or(18);
+        if current < 19 {
+            let entities_exist: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entities'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0) > 0;
+            if entities_exist && conn.prepare("SELECT embedding_model FROM entities LIMIT 0").is_err() {
+                conn.execute_batch("ALTER TABLE entities ADD COLUMN embedding_model TEXT NOT NULL DEFAULT '';")
+                    .map_err(|error| format!("v19 migration: add entities.embedding_model: {error}"))?;
+            }
+            conn.execute("UPDATE schema_version SET version = 19", [])
+                .map_err(|error| format!("Update schema version to v19: {error}"))?;
         }
 
         Ok(())

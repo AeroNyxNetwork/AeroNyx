@@ -189,6 +189,18 @@ impl MemoryStorage {
         }
     }
 
+    // [MEMCHAIN-PHALA-SUMMARY-SCHEDULING 2026-10-06 by Codex]
+    pub(crate) async fn session_artifacts_are_extracted(&self, session_id: &str) -> bool {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT artifacts_extracted FROM sessions WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .unwrap_or(false)
+    }
+
     /// Mark a session as having completed summary generation. Used by Miner Step 10.
     pub async fn mark_session_summary_generated(&self, session_id: &str) {
         let conn = self.conn.lock().await;
@@ -227,6 +239,64 @@ impl MemoryStorage {
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
+    }
+
+    /// Return vectors only from the currently selected model space.
+    // [MEMCHAIN-PHALA-EMBEDDINGS 2026-10-06 by Codex]
+    pub async fn get_entities_with_embedding_for_model(
+        &self,
+        owner: &[u8; 32],
+        model: &str,
+        limit: usize,
+    ) -> Vec<(String, String, String, Vec<f32>)> {
+        if model.is_empty() || model.len() > 256 { return Vec::new(); }
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT entity_id, name, entity_type, embedding FROM entities
+             WHERE owner = ?1 AND embedding IS NOT NULL AND embedding_model = ?2
+             ORDER BY mention_count DESC LIMIT ?3",
+        ) { Ok(stmt) => stmt, Err(_) => return Vec::new() };
+        stmt.query_map(params![owner.as_slice(), model, limit as i64], |row| {
+            let blob: Vec<u8> = row.get(3)?;
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, super::storage::bytes_to_embedding(&blob)))
+        }).map(|rows| rows.filter_map(|row| row.ok()).collect()).unwrap_or_default()
+    }
+
+    /// Bounded public SaaS entity text waiting for the selected embedding model.
+    // [MEMCHAIN-PHALA-EMBEDDINGS 2026-10-06 by Codex]
+    pub async fn get_entities_needing_embedding(
+        &self, owner: &[u8; 32], model: &str, limit: usize,
+    ) -> Vec<(String, String)> {
+        if model.is_empty() || model.len() > 256 { return Vec::new(); }
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT entity_id, COALESCE(NULLIF(description, ''), name) FROM entities
+             WHERE owner = ?1
+               AND length(CAST(COALESCE(NULLIF(description, ''), name) AS BLOB))
+                   BETWEEN 1 AND 16384
+               AND (embedding IS NULL OR embedding_model != ?2)
+             ORDER BY mention_count DESC LIMIT ?3",
+        ) { Ok(stmt) => stmt, Err(_) => return Vec::new() };
+        stmt.query_map(params![owner.as_slice(), model, limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        }).map(|rows| rows.filter_map(|row| row.ok()).collect()).unwrap_or_default()
+    }
+
+    /// Replace only the model-scoped entity index; identity/text rows remain unchanged.
+    // [MEMCHAIN-PHALA-EMBEDDINGS 2026-10-06 by Codex]
+    pub async fn update_entity_embedding(
+        &self, owner: &[u8; 32], entity_id: &str, embedding: &[f32], model: &str,
+    ) -> bool {
+        if embedding.is_empty() || embedding.len() > 16_384 || model.is_empty() || model.len() > 256
+            || embedding.iter().any(|value| !value.is_finite()) { return false; }
+        let bytes = super::storage::embedding_to_bytes(embedding);
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE entities SET embedding = ?1, embedding_model = ?2, updated_at = ?3
+             WHERE owner = ?4 AND entity_id = ?5",
+            params![bytes, model, SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
+                owner.as_slice(), entity_id],
+        ).is_ok_and(|updated| updated == 1)
     }
 
     /// Merge entity `source_id` into `target_id`.

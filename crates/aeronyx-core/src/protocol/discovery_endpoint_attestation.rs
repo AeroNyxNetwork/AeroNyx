@@ -12,7 +12,8 @@ use sha2::{Digest, Sha256};
 use crate::crypto::{IdentityKeyPair, IdentityPublicKey};
 use crate::protocol::discovery::{DirectoryDescriptorCommitmentV1, SignedNodeDescriptor};
 use crate::protocol::discovery_endpoint_proof::{
-    canonical_public_endpoint_commitment, DiscoveryEndpointChallengeV1, DiscoveryEndpointProofV1,
+    canonical_public_endpoint_commitment, canonical_public_https_dns_endpoint_commitment_v1,
+    DiscoveryEndpointChallengeV1, DiscoveryEndpointProofV1,
 };
 
 // [PERMISSIONLESS-ENDPOINT-ATTESTATION 2026-09-24 by Codex] Freeze this
@@ -97,6 +98,21 @@ pub fn canonical_attested_public_endpoint_socket_v1(
     canonical_public_endpoint_commitment(&socket.to_string())
         .map_err(|_| DiscoveryEndpointAttestationError::Malformed)?;
     Ok(socket)
+}
+
+/// Derives the endpoint commitment for an IP socket or canonical HTTPS DNS
+/// authority. DNS is domain-separated and is accepted only by transports that
+/// resolve and pin the complete public address set while retaining TLS SNI.
+// [PHALA-DNS-ENDPOINT-COMMITMENT 2026-10-06 by Codex]
+pub fn canonical_attested_public_endpoint_commitment_v1(
+    endpoint: &str,
+) -> Result<[u8; 32], DiscoveryEndpointAttestationError> {
+    if let Ok(socket) = canonical_attested_public_endpoint_socket_v1(endpoint) {
+        return canonical_public_endpoint_commitment(&socket.to_string())
+            .map_err(|_| DiscoveryEndpointAttestationError::Malformed);
+    }
+    canonical_public_https_dns_endpoint_commitment_v1(endpoint)
+        .map_err(|_| DiscoveryEndpointAttestationError::Malformed)
 }
 
 /// Closed purpose domain for endpoint evidence attestations.
@@ -200,10 +216,9 @@ impl DiscoveryEndpointEvidenceAttestationV1 {
             .public_endpoint
             .as_deref()
             .ok_or(DiscoveryEndpointAttestationError::Malformed)?;
-        let descriptor_socket = canonical_attested_public_endpoint_socket_v1(descriptor_endpoint)?;
+        // [PHALA-DNS-ENDPOINT-COMMITMENT 2026-10-06 by Codex]
         let descriptor_endpoint_commitment =
-            canonical_public_endpoint_commitment(&descriptor_socket.to_string())
-                .map_err(|_| DiscoveryEndpointAttestationError::Malformed)?;
+            canonical_attested_public_endpoint_commitment_v1(descriptor_endpoint)?;
         let observer_node_id = observer.public_key_bytes();
         if observer_node_id != challenge.challenger_node_id()
             || descriptor.node_id != challenge.target_node_id()
@@ -713,6 +728,84 @@ mod tests {
             ),
             Err(DiscoveryEndpointAttestationError::ContextMismatch)
         );
+    }
+
+    // [PHALA-DNS-ENDPOINT-COMMITMENT 2026-10-06 by Codex]
+    #[test]
+    fn dns_endpoint_commitment_is_canonical_tls_only_and_domain_separated() {
+        let dns = canonical_attested_public_endpoint_commitment_v1(
+            "https://node.example.net:443",
+        )
+        .unwrap();
+        assert_eq!(
+            dns,
+            canonical_attested_public_endpoint_commitment_v1("https://node.example.net").unwrap()
+        );
+        assert_ne!(dns, canonical_public_endpoint_commitment("8.8.8.8:443").unwrap());
+        for endpoint in [
+            "http://node.example.net:443",
+            "https://Node.example.net:443",
+            "https://node.example.net:0443",
+            "https://node.example.net/path",
+            "https://node.example.net?x=1",
+            "https://node.example.net.",
+            "https://node.local:443",
+            "https://999.999.999.999:443",
+            "https://node..example.net:443",
+        ] {
+            assert_eq!(
+                canonical_attested_public_endpoint_commitment_v1(endpoint),
+                Err(DiscoveryEndpointAttestationError::Malformed),
+                "{endpoint}"
+            );
+        }
+
+        let f = fixture();
+        let mut body = f.signed_descriptor.descriptor.clone();
+        body.public_endpoint = Some("https://node.example.net:443".into());
+        let signed = SignedNodeDescriptor::sign(body, &f.subject).unwrap();
+        let pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&signed).unwrap();
+        let challenge = DiscoveryEndpointChallengeV1::issue(
+            f.subject.public_key_bytes(),
+            pin.descriptor_hash,
+            dns,
+            [0x59; 32],
+            f.context,
+            NOW,
+            NOW + 120,
+            &f.observer,
+        )
+        .unwrap();
+        let proof = DiscoveryEndpointProofV1::respond(
+            &challenge,
+            &f.context,
+            NOW + 1,
+            &f.subject,
+        )
+        .unwrap();
+        let attestation = DiscoveryEndpointEvidenceAttestationV1::issue_from_verified_proof(
+            &signed,
+            &challenge,
+            &proof,
+            f.context,
+            DiscoveryEndpointAttestationPurposeV1::EndpointPossessionObservation,
+            NOW + 1,
+            NOW + 120,
+            &f.observer,
+        )
+        .unwrap();
+        assert_eq!(attestation.endpoint_commitment(), dns);
+        assert!(attestation
+            .verify_at(
+                NOW + 1,
+                &f.observer.public_key_bytes(),
+                &pin,
+                &dns,
+                &discovery_endpoint_evidence_commitment_v1(&challenge, &proof),
+                &f.context,
+                DiscoveryEndpointAttestationPurposeV1::EndpointPossessionObservation,
+            )
+            .is_ok());
     }
 
     #[test]

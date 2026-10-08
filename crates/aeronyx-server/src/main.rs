@@ -1215,51 +1215,61 @@ async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
 
     let key_path = PathBuf::from(&config.server_key.key_file);
     let node_info_path = &config.management.node_info_path;
-
-    if !std::path::Path::new(node_info_path).exists() {
-        println!();
-        println!("❌ Node is not registered!");
-        println!();
-        println!("All nodes must be registered to join the AeroNyx network.");
-        println!();
-        println!("To register your node:");
-        println!("  1. Get a registration code from https://app.aeronyx.network");
-        println!("  2. Pipe it privately: printf '%s\\n' '<YOUR_CODE>' | aeronyx-server register --code-stdin");
-        println!("     Legacy compatibility: aeronyx-server register --code <YOUR_CODE>");
-        println!();
-        std::process::exit(1);
-    }
-
-    let node_info = match StoredNodeInfo::load(node_info_path) {
-        Ok(info) => info,
-        Err(e) => {
-            error!("Failed to load registration info: {}", e);
+    let identity = if config.management.enabled {
+        if !std::path::Path::new(node_info_path).exists() {
             println!();
-            println!("❌ Registration data is corrupted.");
+            println!("❌ Node is not registered!");
+            println!();
+            println!("All CMS-managed nodes must be registered to join the managed network.");
+            println!();
+            println!("To register your node:");
+            println!("  1. Get a registration code from https://app.aeronyx.network");
+            println!("  2. Pipe it privately: printf '%s\\n' '<YOUR_CODE>' | aeronyx-server register --code-stdin");
+            println!("     Legacy compatibility: aeronyx-server register --code <YOUR_CODE>");
+            println!();
+            std::process::exit(1);
+        }
+
+        let node_info = match StoredNodeInfo::load(node_info_path) {
+            Ok(info) => info,
+            Err(e) => {
+                error!("Failed to load registration info: {}", e);
+                println!();
+                println!("❌ Registration data is corrupted.");
+                println!();
+                println!("Please re-register your node:");
+                println!("  rm {node_info_path}");
+                println!("  aeronyx-server register --code <YOUR_CODE>");
+                std::process::exit(1);
+            }
+        };
+        if !key_path.exists() {
+            println!();
+            println!("❌ Server key not found!");
             println!();
             println!("Please re-register your node:");
             println!("  rm {node_info_path}");
             println!("  aeronyx-server register --code <YOUR_CODE>");
+            println!();
             std::process::exit(1);
         }
-    };
-
-    let identity = if key_path.exists() {
+        info!("════════════════════════════════════════");
+        info!("Node ID:    {}", node_info.node_id);
+        info!("Node Name:  {}", node_info.name);
+        info!("Owner:      {}", node_info.owner_wallet);
+        info!("════════════════════════════════════════");
         load_key(&key_path).await?
     } else {
-        println!();
-        println!("❌ Server key not found!");
-        println!();
-        println!("The key file is missing. Please re-register your node:");
-        println!("  aeronyx-server register --code <YOUR_CODE>");
-        std::process::exit(1);
+        // [PHALA-STANDALONE-IDENTITY 2026-10-06 by Codex] An explicitly
+        // unmanaged node has no CMS registration artifact, but still needs a
+        // stable persistent identity for discovery and protocol signatures.
+        let identity = load_or_create_standalone_key(&key_path).await?;
+        info!(
+            node_id = %hex::encode(identity.public_key_bytes()),
+            "CMS management disabled; using the persistent local node identity"
+        );
+        identity
     };
-
-    info!("════════════════════════════════════════");
-    info!("Node ID:    {}", node_info.node_id);
-    info!("Node Name:  {}", node_info.name);
-    info!("Owner:      {}", node_info.owner_wallet);
-    info!("════════════════════════════════════════");
 
     // v1.0.0-MultiTenant: pass config_path so auto-generated secrets
     // (api_secret, jwt_secret) are written back to disk on first startup.
@@ -3246,13 +3256,21 @@ async fn cmd_pubkey(config_path: PathBuf, format: String) -> anyhow::Result<()> 
     let config = load_or_default_config(&config_path).await;
     let key_path = PathBuf::from(&config.server_key.key_file);
 
-    if !key_path.exists() {
+    if !key_path.exists() && config.management.enabled {
         println!("❌ Node key not found. Register first:");
         println!("   aeronyx-server register --code <YOUR_CODE>");
         std::process::exit(1);
     }
 
-    let identity = load_key(&key_path).await?;
+    // [PHALA-STANDALONE-IDENTITY 2026-10-06 by Codex] In an explicitly
+    // unmanaged profile, `pubkey` initializes the persistent identity before
+    // first server boot. Only the public ID is printed; the private key stays
+    // in the owner-only mounted state volume.
+    let identity = if config.management.enabled {
+        load_key(&key_path).await?
+    } else {
+        load_or_create_standalone_key(&key_path).await?
+    };
 
     match format.as_str() {
         "base64" => println!("{}", identity.public_key()),
@@ -4166,7 +4184,13 @@ async fn load_or_default_config(path: &PathBuf) -> ServerConfig {
 
 async fn load_key(path: &PathBuf) -> anyhow::Result<IdentityKeyPair> {
     let content = tokio::fs::read_to_string(path).await?;
-    let key_data: KeyFile = serde_json::from_str(&content)?;
+    // [PHALA-IDENTITY-PUBLICATION 2026-10-08 by Codex] Share the existing
+    // decoder with synchronous, cancellation-owned standalone publication.
+    decode_key(&content)
+}
+
+fn decode_key(content: &str) -> anyhow::Result<IdentityKeyPair> {
+    let key_data: KeyFile = serde_json::from_str(content)?;
 
     let private_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
@@ -4175,6 +4199,140 @@ async fn load_key(path: &PathBuf) -> anyhow::Result<IdentityKeyPair> {
 
     let identity = IdentityKeyPair::from_bytes(&private_bytes)?;
     Ok(identity)
+}
+
+// [PHALA-STANDALONE-IDENTITY 2026-10-06 by Codex] Only management-disabled
+// deployments may create an identity at first start. The key is durable,
+// owner-only, and never replaced by a later process.
+async fn load_or_create_standalone_key(path: &Path) -> anyhow::Result<IdentityKeyPair> {
+    // [PHALA-IDENTITY-PUBLICATION 2026-10-08 by Codex] Once dispatched,
+    // publication owns its file/parent until durability completes, even if the
+    // async startup or pubkey waiter is cancelled. Only the decoded identity
+    // returns; serialized key material is never returned or logged.
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || load_or_create_standalone_key_owned(&path))
+        .await.map_err(|_| anyhow::anyhow!("standalone identity publication task failed"))?
+}
+
+// [PHALA-IDENTITY-PUBLICATION 2026-10-08 by Codex] The configured state
+// parent is trusted operator storage, not protection against a hostile same-
+// uid directory writer. Publish a complete synced inode without replacing an
+// existing identity. A crash can leave an owner-only staging file; never use
+// that file as a recovery identity or remove the published path on an error.
+fn load_or_create_standalone_key_owned(path: &Path) -> anyhow::Result<IdentityKeyPair> {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = prepare_standalone_identity_parent(parent)?;
+    if path.try_exists()? {
+        return load_durable_standalone_key(path, directory.as_ref());
+    }
+    let identity = IdentityKeyPair::generate();
+    let key_data = KeyFile {
+        version: "1.0".to_owned(),
+        key_type: "ed25519".to_owned(),
+        public_key: base64::engine::general_purpose::STANDARD
+            .encode(identity.public_key_bytes()),
+        private_key: base64::engine::general_purpose::STANDARD.encode(identity.to_bytes()),
+        created_at: chrono_lite_timestamp(),
+    };
+    let content = zeroize::Zeroizing::new(serde_json::to_vec_pretty(&key_data)?);
+    let mut staged = None;
+    for _ in 0..8 {
+        let candidate = parent.join(format!(".aeronyx-identity-{}.pending",
+            hex::encode(rand::random::<[u8; 16]>())));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+        }
+        match options.open(&candidate) {
+            Ok(file) => { staged = Some((StandaloneIdentityStaging(candidate), file)); break; }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let (staging, mut file) = staged
+        .ok_or_else(|| anyhow::anyhow!("standalone identity staging capacity unavailable"))?;
+    file.write_all(&content)?;
+    file.sync_all()?;
+    drop(file);
+    publish_standalone_identity(&staging.0, path)?;
+    drop(staging);
+    load_durable_standalone_key(path, directory.as_ref())
+}
+
+// [PHALA-IDENTITY-PUBLICATION 2026-10-08 by Codex] A newly created nested
+// state directory needs its ancestors' entries synced too. Non-Unix retains
+// no-clobber publication without claiming Unix directory-fsync semantics.
+fn prepare_standalone_identity_parent(parent: &Path) -> anyhow::Result<Option<File>> {
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::MetadataExt;
+        let directory = File::open(parent)?;
+        let device = directory.metadata()?.dev();
+        // Another initializer may have just created an ancestor but not yet
+        // synced it. Observing that path already exists is not durability.
+        // The mounted volume is an external deployment boundary; do not fsync
+        // the unrelated read-only container root above that filesystem.
+        for ancestor in parent.ancestors().skip(1) {
+            let ancestor = if ancestor.as_os_str().is_empty() { Path::new(".") } else { ancestor };
+            let ancestor = File::open(ancestor)?;
+            if ancestor.metadata()?.dev() != device { break; }
+            ancestor.sync_all()?;
+        }
+        Ok(Some(directory))
+    }
+    #[cfg(not(unix))]
+    Ok(None)
+}
+
+// [PHALA-IDENTITY-PUBLICATION 2026-10-08 by Codex] Hard-link creation is
+// atomic/no-clobber on the same state filesystem. Another initializer's
+// complete inode wins; no rename/delete fallback may replace that winner.
+fn publish_standalone_identity(staging: &Path, path: &Path) -> anyhow::Result<()> {
+    match std::fs::hard_link(staging, path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+// [PHALA-IDENTITY-PUBLICATION 2026-10-08 by Codex] Both the publisher
+// and a concurrent existing-key reader establish file + parent durability
+// before making the identity available to Server::run or public-ID output.
+fn load_durable_standalone_key(path: &Path, directory: Option<&File>) -> anyhow::Result<IdentityKeyPair> {
+    use std::io::Read as _;
+    anyhow::ensure!(std::fs::symlink_metadata(path)?.is_file(),
+        "standalone identity must be a regular non-symlink file");
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    anyhow::ensure!(file.metadata()?.is_file(), "standalone identity must be a regular file");
+    let mut content = zeroize::Zeroizing::new(String::new());
+    file.by_ref().take(16 * 1024 + 1).read_to_string(&mut content)?;
+    anyhow::ensure!(content.len() <= 16 * 1024, "standalone identity exceeds its read bound");
+    let identity = decode_key(&content)?;
+    #[cfg(unix)] {
+        file.sync_all()?;
+        directory.ok_or_else(|| anyhow::anyhow!("standalone identity parent unavailable"))?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(identity)
+}
+
+// [PHALA-IDENTITY-PUBLICATION 2026-10-08 by Codex] Only the unpublished
+// staging name is disposable. A failed final sync must retain the winner.
+struct StandaloneIdentityStaging(PathBuf);
+impl Drop for StandaloneIdentityStaging {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
 }
 
 async fn save_key(identity: &IdentityKeyPair, path: &PathBuf) -> anyhow::Result<()> {
@@ -4236,6 +4394,108 @@ mod tests {
         DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
     };
     use sha2::{Digest, Sha256};
+
+    // [PHALA-STANDALONE-IDENTITY 2026-10-06 by Codex]
+    #[tokio::test]
+    async fn unmanaged_start_identity_is_persisted_without_overwrite() {
+        // [PHALA-IDENTITY-PUBLICATION 2026-10-08 by Codex] Keep authored
+        // identity regression storage on the explicitly approved volume.
+        let directory = tempfile::Builder::new().prefix("phala-identity-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").expect("standalone identity directory");
+        let key_path = directory.path().join("state/server_key.json");
+        let first = load_or_create_standalone_key(&key_path)
+            .await
+            .expect("create standalone identity");
+        let second = load_or_create_standalone_key(&key_path)
+            .await
+            .expect("reload standalone identity");
+        assert_eq!(first.public_key_bytes(), second.public_key_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        let corrupt_path = directory.path().join("state/corrupt.json");
+        std::fs::write(&corrupt_path, b"not-a-key").unwrap();
+        assert!(load_or_create_standalone_key(&corrupt_path).await.is_err());
+        assert_eq!(std::fs::read(&corrupt_path).unwrap(), b"not-a-key");
+    }
+
+    // [PHALA-IDENTITY-PUBLICATION 2026-10-08 by Codex] Authored only:
+    // concurrent first-start/pubkey producers converge on one complete inode.
+    #[tokio::test]
+    async fn concurrent_standalone_initializers_publish_one_complete_identity() {
+        let directory = tempfile::Builder::new().prefix("phala-identity-race-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+        let path = directory.path().join("nested/state/server_key.json");
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let path = path.clone(); let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                load_or_create_standalone_key(&path).await.unwrap().public_key_bytes()
+            }));
+        }
+        let first = tasks.remove(0).await.unwrap();
+        for task in tasks { assert_eq!(task.await.unwrap(), first); }
+        assert_eq!(load_or_create_standalone_key(&path).await.unwrap().public_key_bytes(), first);
+        let entries: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap()
+            .map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("server_key.json")]);
+    }
+
+    // [PHALA-IDENTITY-PUBLICATION 2026-10-08 by Codex] Publication is
+    // no-clobber, failed destinations retain the stage until its owner drops,
+    // and an error after publication can never remove the final identity.
+    #[test]
+    fn standalone_publication_never_replaces_or_cleans_up_the_final_path() {
+        let directory = tempfile::Builder::new().prefix("phala-identity-publish-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+        let path = directory.path().join("published");
+        std::fs::write(&path, b"existing synthetic artifact").unwrap();
+        let stage = StandaloneIdentityStaging(directory.path().join("stage"));
+        std::fs::write(&stage.0, b"replacement synthetic artifact").unwrap();
+        publish_standalone_identity(&stage.0, &path).unwrap();
+        drop(stage);
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing synthetic artifact");
+        let stage = StandaloneIdentityStaging(directory.path().join("stage"));
+        std::fs::write(&stage.0, b"new synthetic artifact").unwrap();
+        assert!(publish_standalone_identity(&stage.0, &directory.path().join("missing/final")).is_err());
+        assert!(stage.0.exists());
+        let fresh = directory.path().join("fresh");
+        publish_standalone_identity(&stage.0, &fresh).unwrap();
+        drop(stage);
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"new synthetic artifact");
+        assert!(!directory.path().join("stage").exists());
+    }
+
+    // [PHALA-IDENTITY-PUBLICATION 2026-10-08 by Codex] Neither a corrupt
+    // existing identity nor an orphaned crash stage becomes a replacement key.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn standalone_identity_rejects_links_and_bounded_read_failures_without_replacement() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::Builder::new().prefix("phala-identity-reject-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+        let target = directory.path().join("target");
+        std::fs::write(&target, b"synthetic invalid existing identity").unwrap();
+        let link = directory.path().join("linked-key");
+        symlink(&target, &link).unwrap();
+        assert!(load_or_create_standalone_key(&link).await.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"synthetic invalid existing identity");
+        let oversized = directory.path().join("oversized");
+        std::fs::write(&oversized, vec![b' '; 16 * 1024 + 1]).unwrap();
+        assert!(load_or_create_standalone_key(&oversized).await.is_err());
+        assert_eq!(std::fs::metadata(&oversized).unwrap().len(), 16 * 1024 + 1);
+        let orphan = directory.path().join(".aeronyx-identity-orphan.pending");
+        std::fs::write(&orphan, b"synthetic orphan, never promoted").unwrap();
+        let fresh = directory.path().join("new-key");
+        load_or_create_standalone_key(&fresh).await.unwrap();
+        assert_eq!(std::fs::read(&orphan).unwrap(), b"synthetic orphan, never promoted");
+        assert!(fresh.exists());
+    }
 
     #[test]
     fn registration_cli_keeps_legacy_code_and_accepts_stdin_mode() {

@@ -544,6 +544,10 @@ impl TunDevice for LinuxTun {
                 error = %err,
                 "Failed to bring TUN device down"
             );
+            // [PHALA-TUN-DEACTIVATION-ERROR 2026-10-08 by Codex] A failed
+            // or timed-out command is not evidence that the kernel link is
+            // down. Retain the last confirmed state and expose the failure.
+            return Err(err);
         }
 
         self.is_up.store(false, Ordering::Release);
@@ -622,5 +626,98 @@ mod tests {
             .expect_err("long command should time out");
 
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    // [PHALA-TUN-DEACTIVATION-ERROR 2026-10-08 by Codex] No TUN/device
+    // privilege is required: the private socket supplies an async descriptor,
+    // and '/' makes the requested interface name impossible in the kernel.
+    #[tokio::test]
+    async fn failed_deactivation_preserves_state_and_reports_each_retry() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        for was_up in [false, true] {
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let fd: OwnedFd = socket.into();
+            let device = LinuxTun {
+                async_fd: AsyncFd::new(File::from(fd)).unwrap(),
+                config: TunConfig::new("axy/invalid"),
+                is_up: AtomicBool::new(was_up),
+                lifecycle: Mutex::new(()),
+            };
+            for _ in 0..2 {
+                device.down().await.expect_err("failed kernel operation must surface");
+                assert_eq!(device.is_up(), was_up);
+            }
+        }
+    }
+
+    // [PHALA-ISOLATED-TUN-REGRESSION 2026-10-08 by Codex] This opt-in
+    // acknowledgement is not proof of namespace isolation. The operator must
+    // independently review the restricted trial container before execution.
+    #[tokio::test]
+    #[ignore = "requires an approved isolated network namespace, NET_ADMIN and /dev/net/tun"]
+    async fn isolated_tun_lifecycle_releases_kernel_device() {
+        use nix::ifaddrs::getifaddrs;
+        use nix::net::if_::InterfaceFlags;
+
+        assert_eq!(
+            std::env::var("AERONYX_ISOLATED_TUN_TEST").as_deref(),
+            Ok("isolated-net-admin-tun"),
+            "review network isolation and explicitly opt in before touching TUN",
+        );
+        let address = Ipv4Addr::new(198, 18, 255, 254);
+        let netmask = Ipv4Addr::new(255, 255, 255, 255);
+        // Kernel allocation of %d avoids attaching to an existing named
+        // interface. Non-persistence makes fd drop clean up on every panic.
+        let device = LinuxTun::create(
+            TunConfig::new("axyph%d")
+                .with_address(address)
+                .with_netmask(netmask)
+                .with_mtu(1280)
+                .with_persist(false),
+        )
+        .await
+        .expect("isolated trial must permit TUN creation");
+        let name = device.name().to_owned();
+        assert!(name.starts_with("axyph") && !name.contains('%'));
+        assert!(!device.is_up());
+        let observed = || {
+            getifaddrs().expect("read kernel interface metadata").find_map(|interface| {
+                if interface.interface_name != name {
+                    return None;
+                }
+                let address = interface.address.as_ref()?.as_sockaddr_in()?.ip();
+                let mask = interface.netmask.as_ref()?.as_sockaddr_in()?.ip();
+                Some((address, mask, interface.flags.contains(InterfaceFlags::IFF_UP)))
+            })
+        };
+        for up in [true, false, true] {
+            tokio::time::timeout(Duration::from_secs(45), async {
+                if up { device.up().await } else { device.down().await }
+            })
+            .await
+            .expect("interface transition exceeded the bounded command budget")
+            .expect("interface transition failed");
+            assert_eq!(device.is_up(), up);
+            assert_eq!(observed(), Some((address, netmask, up)));
+            let mtu = std::fs::read_to_string(format!("/sys/class/net/{name}/mtu"))
+                .expect("read actual kernel MTU");
+            assert_eq!(mtu.trim().parse::<u16>().unwrap(), 1280);
+        }
+        drop(device);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !getifaddrs().expect("read interface cleanup state")
+                    .any(|interface| interface.interface_name == name)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("closing a non-persistent TUN must release its kernel interface");
     }
 }

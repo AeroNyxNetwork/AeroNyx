@@ -288,6 +288,7 @@ pub struct ReflectionMiner {
     embed_engine: Option<Arc<EmbedEngine>>,
     ner_engine: Option<Arc<NerEngine>>,
     llm_router: Option<Arc<LlmRouter>>,
+    allow_full_entity_extraction: bool,
     commitment_coordinator_enabled: bool,
     commitment_tip_notifier: Option<mpsc::Sender<u64>>,
 }
@@ -321,6 +322,7 @@ impl ReflectionMiner {
             embed_engine: None,
             ner_engine: None,
             llm_router: None,
+            allow_full_entity_extraction: false,
             commitment_coordinator_enabled: false,
             commitment_tip_notifier: None,
         }
@@ -352,20 +354,29 @@ impl ReflectionMiner {
     }
 
     #[must_use]
-    pub fn with_embed_engine(mut self, engine: Arc<EmbedEngine>) -> Self {
-        self.embed_engine = Some(engine);
+    // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Preserve the legacy builder
+    // signature for source compatibility, but never attach a local model.
+    pub fn with_embed_engine(self, _engine: Arc<EmbedEngine>) -> Self {
         self
     }
 
     #[must_use]
-    pub fn with_ner_engine(mut self, engine: Arc<NerEngine>) -> Self {
-        self.ner_engine = Some(engine);
+    // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex]
+    pub fn with_ner_engine(self, _engine: Arc<NerEngine>) -> Self {
         self
     }
 
     #[must_use]
-    pub fn with_llm_router(mut self, router: Arc<LlmRouter>) -> Self {
-        self.llm_router = Some(router);
+    // [MEMCHAIN-PHALA-E2EE-BOUNDARY 2026-10-06 by Codex] Preserve the builder
+    // API, but never let the node decrypt memory and enqueue it as model input.
+    pub fn with_llm_router(self, _router: Arc<LlmRouter>) -> Self {
+        self
+    }
+
+    // [MEMCHAIN-PHALA-EXTRACTION 2026-10-05 by Codex]
+    #[must_use]
+    pub fn with_full_entity_extraction_allowed(mut self, allowed: bool) -> Self {
+        self.allow_full_entity_extraction = allowed;
         self
     }
 
@@ -421,20 +432,128 @@ impl ReflectionMiner {
     pub(crate) async fn run_one_tick_with_outcome(&self) -> MinerTickOutcome {
         self.step_0_positive_feedback().await;
         self.step_05_backfill_embeddings().await;
+        self.step_05_backfill_entity_embeddings().await;
         self.step_06_correction_chaining().await;
         self.pack_commitment_blocks(RECORD_COMMITMENT_BLOCKS_PER_TICK)
             .await;
         let compaction_outcome = self.step_1_5_legacy_compaction().await;
 
-        if self.ner_engine.is_some() {
-            self.step_7_entity_extraction().await;
+        if self.llm_router.is_some() {
+            self.enqueue_phala_entity_extraction_tasks().await;
             self.step_8_community_detection().await;
             self.step_9_recursive_merge().await;
             self.step_10_session_summary().await;
+            // [MEMCHAIN-PHALA-SUMMARY-SCHEDULING 2026-10-06 by Codex] Summary
+            // results arrive asynchronously; title work must also run on later ticks.
+            let owner = self.owner_context.storage_owner();
+            self.enqueue_session_title_tasks(&owner).await;
             self.step_11_episode_ingestion().await;
         }
 
         compaction_outcome
+    }
+
+    // [MEMCHAIN-PHALA-QUEUE-GATE 2026-10-07 by Codex] Do not persist model
+    // inputs on an ordinary node until source-bound TEE E2EE is available.
+    fn confidential_inference_ready(&self) -> bool {
+        self.llm_router
+            .as_ref()
+            .is_some_and(|router| router.has_client_to_tee_e2ee_transport())
+    }
+
+    // [MEMCHAIN-PHALA-EXTRACTION 2026-10-05 by Codex]
+    async fn enqueue_phala_entity_extraction_tasks(&self) {
+        if !self.allow_full_entity_extraction || !self.confidential_inference_ready() {
+            return;
+        }
+        const MAX_EXTRACTION_INPUT_BYTES: usize = 64 * 1024;
+        let owner = self.owner_context.storage_owner();
+        let owner_hex = hex::encode(owner);
+        let rawlog_key = crate::services::memchain::derive_rawlog_key(
+            &self.node_identity.to_bytes(),
+        );
+        let pending = self
+            .storage
+            .get_pending_sessions(&owner, MINER_SESSION_BATCH)
+            .await;
+
+        for session in pending.into_iter().filter(|session| !session.entities_extracted) {
+            let prior_tasks = self
+                .storage
+                .get_tasks_for_target("sessions", &session.session_id, None)
+                .await;
+            if prior_tasks.iter().any(|task| {
+                task.task_type == "entity_extraction"
+                    && matches!(task.status.as_str(), "failed" | "cancelled" | "completed")
+            }) {
+                continue;
+            }
+            let logs = self.storage.get_rawlogs_for_session(&session.session_id).await;
+            let mut conversation = String::new();
+            let mut truncated = false;
+            let mut decryption_failed = false;
+            for log in logs {
+                let content = if log.encrypted == 1 {
+                    let Ok(bytes) = crate::services::memchain::decrypt_rawlog_content_pub(
+                        &rawlog_key,
+                        &log.content,
+                    ) else {
+                        decryption_failed = true;
+                        break;
+                    };
+                    String::from_utf8(bytes).unwrap_or_default()
+                } else {
+                    String::from_utf8_lossy(&log.content).into_owned()
+                };
+                if content.is_empty() {
+                    continue;
+                }
+                let remaining = MAX_EXTRACTION_INPUT_BYTES.saturating_sub(conversation.len());
+                if remaining == 0 {
+                    break;
+                }
+                let line = format!("[{}] {}\n", log.role, content);
+                let mut end = line.len().min(remaining);
+                while !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                conversation.push_str(&line[..end]);
+                if end < line.len() {
+                    truncated = true;
+                    break;
+                }
+            }
+            if decryption_failed {
+                warn!(session = %session.session_id,
+                    "[MINER_S7] Raw-log decryption failed; extraction remains pending");
+                continue;
+            }
+            if conversation.trim().is_empty() {
+                self.storage
+                    .mark_session_entities_extracted(&session.session_id)
+                    .await;
+                continue;
+            }
+            let payload = serde_json::json!({
+                "session_id": session.session_id,
+                "owner": owner_hex.clone(),
+                "conversation": conversation,
+                "truncated": truncated,
+            });
+            if let Err(error) = self.storage.insert_cognitive_task(
+                "entity_extraction",
+                crate::config_supernode::CognitiveTaskType::EntityExtraction.default_priority(),
+                &payload.to_string(),
+                None,
+                Some("sessions"),
+                Some(&session.session_id),
+                "full",
+                SUPERNODE_MAX_RETRIES,
+            ).await {
+                warn!(session = %session.session_id, error = %error,
+                    "[MINER_S7] Phala extraction task enqueue failed");
+            }
+        }
     }
 
     // ============================================
@@ -634,43 +753,58 @@ impl ReflectionMiner {
     // ============================================
 
     async fn step_05_backfill_embeddings(&self) {
+        // [MEMCHAIN-PHALA-EMBEDDINGS 2026-10-06 by Codex] Backfill is enabled
+        // only by an explicitly configured SaaS Phala ACI route.
+        let Some(router) = self.llm_router.as_ref().filter(|router| router.has_embedding_route()) else {
+            return;
+        };
+        let model = router.embedding_model().unwrap_or_default().to_owned();
+        let owner = self.owner_context.storage_owner();
         let records = self
             .storage
-            .get_records_needing_embedding(EMBEDDING_BACKFILL_BATCH)
+            .get_records_needing_embedding(&owner, &model, EMBEDDING_BACKFILL_BATCH.min(32))
             .await;
         if records.is_empty() {
             debug!("[MINER_S05] No records need embedding backfill");
             return;
         }
 
-        let owner = self.owner_context.storage_owner();
         let mut filled = 0u32;
 
-        for record in &records {
-            let content = String::from_utf8_lossy(&record.encrypted_content).to_string();
-            if content.is_empty() {
-                continue;
+        let candidates: Vec<_> = records.iter().filter_map(|record| {
+            let content = String::from_utf8_lossy(&record.encrypted_content).into_owned();
+            (!content.trim().is_empty()).then_some((record, content))
+        }).collect();
+        let vectors = match router.embed_batch(candidates.iter().map(|(_, text)| text.clone()).collect()).await {
+            Ok(vectors) if vectors.len() == candidates.len() => vectors,
+            Ok(_) => {
+                warn!("[MINER_S05] Phala embedding batch response shape rejected");
+                return;
             }
-
-            if let Some(embedding) = self.local_embedding(&content).await {
-                let dim = embedding.len();
-                let embedding_blob: Vec<u8> =
-                    embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-
-                let conn = self.storage.conn_lock().await;
-                let _ = conn.execute(
-                    "UPDATE records SET embedding = ?1, embedding_model = ?2, embedding_dim = ?3 WHERE record_id = ?4",
-                    rusqlite::params![embedding_blob.as_slice(), "minilm-l6-v2", dim as i64, record.record_id.as_slice()],
-                );
-                drop(conn);
-
+            Err(error) => {
+                warn!(reason = error.reason_code(), "[MINER_S05] Phala embedding unavailable; no local fallback");
+                return;
+            }
+        };
+        for ((record, _), embedding) in candidates.into_iter().zip(vectors) {
+            let dim = embedding.len();
+            let embedding_blob: Vec<u8> = embedding.iter().flat_map(|value| value.to_le_bytes()).collect();
+            let conn = self.storage.conn_lock().await;
+            let updated = conn.execute(
+                "UPDATE records SET embedding = ?1, embedding_model = ?2, embedding_dim = ?3
+                 WHERE record_id = ?4 AND owner = ?5 AND status = 0 AND blind = 0",
+                rusqlite::params![embedding_blob.as_slice(), model, dim as i64,
+                    record.record_id.as_slice(), owner.as_slice()],
+            ).unwrap_or(0);
+            drop(conn);
+            if updated == 1 {
                 self.vector_index.upsert(
                     record.record_id,
                     embedding,
                     record.layer,
                     record.timestamp,
-                    &owner,
-                    "minilm-l6-v2",
+                    &record.owner,
+                    &model,
                 );
                 filled += 1;
             }
@@ -681,11 +815,53 @@ impl ReflectionMiner {
         }
     }
 
+    // [MEMCHAIN-PHALA-EMBEDDINGS 2026-10-06 by Codex]
+    async fn step_05_backfill_entity_embeddings(&self) {
+        let Some(router) = self.llm_router.as_ref().filter(|router| router.has_embedding_route()) else {
+            return;
+        };
+        let model = router.embedding_model().unwrap_or_default().to_owned();
+        let owner = self.owner_context.storage_owner();
+        let entities = self.storage
+            .get_entities_needing_embedding(&owner, &model, 32).await;
+        if entities.is_empty() { return; }
+        let candidates: Vec<_> = entities.into_iter()
+            .filter(|(_, text)| !text.trim().is_empty() && text.len() <= 16 * 1024)
+            .collect();
+        if candidates.is_empty() { return; }
+        let vectors = match router.embed_batch(candidates.iter().map(|(_, text)| text.clone()).collect()).await {
+            Ok(vectors) if vectors.len() == candidates.len() => vectors,
+            Ok(_) => return,
+            Err(error) => {
+                warn!(reason = error.reason_code(), "[MINER_S05] Phala entity embedding unavailable; no local fallback");
+                return;
+            }
+        };
+        let mut updated = 0usize;
+        for ((entity_id, _), vector) in candidates.into_iter().zip(vectors) {
+            if self.storage
+                .update_entity_embedding(&owner, &entity_id, &vector, &model).await
+            {
+                updated += 1;
+            }
+        }
+        if updated > 0 {
+            info!(updated, "[MINER_S05] Phala entity embeddings refreshed");
+        }
+    }
+
     // ============================================
     // Step 0.6: Correction Chaining
     // ============================================
 
     async fn step_06_correction_chaining(&self) {
+        // [MEMCHAIN-SEALED-VECTOR-BOUNDARY 2026-10-05 by Codex] Historical
+        // unsealed vectors are preserved but not used on this node.
+        // [MEMCHAIN-PHALA-SYNTAX 2026-10-06 by Codex] Keep absent-route early return explicit.
+        let Some(model) = self.llm_router.as_ref().filter(|router| router.has_embedding_route())
+            .and_then(|router| router.embedding_model()) else {
+            return;
+        };
         let corrections = self.storage.get_correction_records().await;
         if corrections.is_empty() {
             return;
@@ -695,13 +871,13 @@ impl ReflectionMiner {
         let mut chained = 0u32;
 
         for correction in &corrections {
-            if !correction.has_embedding() {
+            if !correction.has_embedding()
+                || self.storage.get_embedding_model(&correction.record_id).await.as_deref() != Some(model)
+            {
                 continue;
             }
 
-            let candidates =
-                self.vector_index
-                    .search(&correction.embedding, &owner, "minilm-l6-v2", 5, 0.5);
+            let candidates = self.vector_index.search(&correction.embedding, &owner, model, 5, 0.5);
 
             let best_match = candidates
                 .iter()
@@ -1135,6 +1311,9 @@ impl ReflectionMiner {
                 };
 
                 let embedding = self.local_embedding(&entity.text).await;
+                let embedding_model = self.llm_router.as_ref()
+                    .filter(|router| router.has_embedding_route())
+                    .and_then(|router| router.embedding_model());
                 let description = if entity.confidence > 0.8 {
                     Some(format!("{} ({})", entity.text, entity.label))
                 } else {
@@ -1143,7 +1322,7 @@ impl ReflectionMiner {
 
                 match self
                     .storage
-                    .upsert_entity(
+                    .upsert_entity_with_embedding_model(
                         &entity_id,
                         &owner,
                         &entity.text,
@@ -1151,6 +1330,7 @@ impl ReflectionMiner {
                         &entity.label,
                         description.as_deref(),
                         embedding.as_deref(),
+                        embedding.as_ref().and(embedding_model),
                     )
                     .await
                 {
@@ -1443,10 +1623,17 @@ impl ReflectionMiner {
     }
 
     async fn step_9_recursive_merge(&self) {
+        // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Entity similarity merges
+        // depend on semantic vectors and therefore stay disabled on nodes.
+        // [MEMCHAIN-PHALA-SYNTAX 2026-10-06 by Codex] Keep absent-route early return explicit.
+        let Some(model) = self.llm_router.as_ref().filter(|router| router.has_embedding_route())
+            .and_then(|router| router.embedding_model()) else {
+            return;
+        };
         let owner = self.owner_context.storage_owner();
         let entities = self
             .storage
-            .get_entities_with_embedding(&owner, MINER_MERGE_BATCH)
+            .get_entities_with_embedding_for_model(&owner, model, MINER_MERGE_BATCH)
             .await;
 
         if entities.len() < 2 {
@@ -1597,33 +1784,10 @@ impl ReflectionMiner {
         let rawlog_key =
             crate::services::memchain::derive_rawlog_key(&self.node_identity.to_bytes());
 
-        let mut total_summaries = 0u32;
+        let mut summary_tasks_queued = 0u32;
         let mut total_artifacts = 0u32;
 
         for session in &pending {
-            let raw_logs = self
-                .storage
-                .get_rawlogs_for_session(&session.session_id)
-                .await;
-
-            let mut full_text = String::new();
-            for log in &raw_logs {
-                let content = if log.encrypted == 1 {
-                    String::from_utf8(
-                        crate::services::memchain::decrypt_rawlog_content_pub(
-                            &rawlog_key,
-                            &log.content,
-                        )
-                        .unwrap_or_default(),
-                    )
-                    .unwrap_or_default()
-                } else {
-                    String::from_utf8_lossy(&log.content).to_string()
-                };
-                full_text.push_str(&content);
-                full_text.push('\n');
-            }
-
             let entity_names: Vec<String> = {
                 let mut session_entity_ids: HashSet<String> = HashSet::new();
                 let episodes = self
@@ -1667,86 +1831,89 @@ impl ReflectionMiner {
                 format!("Topics: {}", entity_names.join(", "))
             };
 
-            let title = {
-                let project_name: Option<String> = if let Some(ref pid) = session.project_id {
-                    self.storage.get_project(pid, &owner).await.map(|p| p.name)
-                } else {
-                    None
-                };
-
-                if !entity_names.is_empty() {
-                    let top_entities = entity_names
-                        .iter()
-                        .take(3)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    match project_name {
-                        Some(pname) => format!("{}: {}", pname, top_entities),
-                        None => top_entities,
-                    }
-                } else {
-                    // BUG-FIX-1: UTF-8 safe truncation via char_indices
-                    let first_user_msg = raw_logs
-                        .iter()
-                        .find(|l| l.role == "user")
-                        .map(|l| {
-                            let content = if l.encrypted == 1 {
-                                String::from_utf8(
-                                    crate::services::memchain::decrypt_rawlog_content_pub(
-                                        &rawlog_key,
-                                        &l.content,
-                                    )
-                                    .unwrap_or_default(),
-                                )
-                                .unwrap_or_default()
-                            } else {
-                                String::from_utf8_lossy(&l.content).to_string()
-                            };
-                            let char_count = content.chars().count();
-                            if char_count <= 60 {
-                                content
-                            } else {
-                                let byte_60 = content
-                                    .char_indices()
-                                    .nth(60)
-                                    .map(|(pos, _)| pos)
-                                    .unwrap_or(content.len());
-                                let truncated = &content[..byte_60];
-                                match truncated.rfind(' ') {
-                                    Some(pos) if pos > 20 => format!("{}...", &truncated[..pos]),
-                                    _ => format!("{}...", truncated),
-                                }
-                            }
-                        })
-                        .unwrap_or_else(|| format!("Session {}", &session.session_id));
-
-                    match project_name {
-                        Some(pname) => format!("{}: {}", pname, first_user_msg),
-                        None => first_user_msg,
+            // [MEMCHAIN-PHALA-SUMMARY-QUEUE 2026-10-06 by Codex] Never mark
+            // heuristic topic labels as a completed semantic summary. Send only
+            // the bounded summary context and entity labels, not raw turns.
+            if (session.entities_extracted || !self.allow_full_entity_extraction)
+                && self.confidential_inference_ready()
+            {
+                let prior_tasks = self
+                    .storage
+                    .get_tasks_for_target("sessions", &session.session_id, None)
+                    .await;
+                let terminal_summary_task_exists = prior_tasks.iter().any(|task| {
+                    task.task_type == "recall_synthesis"
+                        && matches!(task.status.as_str(), "failed" | "cancelled" | "completed")
+                });
+                if !terminal_summary_task_exists {
+                    let payload = serde_json::json!({
+                        "session_id": session.session_id,
+                        "existing_summary": summary,
+                        "entity_names": entity_names,
+                        "turn_count": session.turn_count,
+                    });
+                    match self
+                        .storage
+                        .insert_cognitive_task(
+                            "recall_synthesis",
+                            crate::config_supernode::CognitiveTaskType::RecallSynthesis
+                                .default_priority(),
+                            &payload.to_string(),
+                            None,
+                            Some("sessions"),
+                            Some(&session.session_id),
+                            crate::config_supernode::CognitiveTaskType::RecallSynthesis
+                                .default_privacy_level(),
+                            SUPERNODE_MAX_RETRIES,
+                        )
+                        .await
+                    {
+                        Ok(Some(_)) => summary_tasks_queued += 1,
+                        Ok(None) => {}
+                        Err(error) => warn!(
+                            session = %session.session_id,
+                            error = %error,
+                            "[MINER_S10] Phala summary task enqueue failed"
+                        ),
                     }
                 }
-            };
-
-            self.storage
-                .update_session_summary(&session.session_id, &summary, None, Some(&title))
-                .await;
-            self.storage
-                .fts_index_session(&session.session_id, &owner, &summary)
-                .await;
-            self.storage
-                .mark_session_summary_generated(&session.session_id)
-                .await;
+            } else {
+                debug!(session = %session.session_id,
+                    "[MINER_S10] Waiting for consented Phala entity extraction before summary");
+            }
             self.storage
                 .update_session_ended_at(&session.session_id, now_ts)
                 .await;
-            self.storage
-                .mark_session_artifacts_extracted(&session.session_id)
-                .await;
-            total_summaries += 1;
 
-            // ── v2.5.3+ArtifactChain: Code artifact extraction with version chain ──
-            for cap in code_regex.captures_iter(&full_text) {
+            if !self
+                .storage
+                .session_artifacts_are_extracted(&session.session_id)
+                .await
+            {
+                let raw_logs = self
+                    .storage
+                    .get_rawlogs_for_session(&session.session_id)
+                    .await;
+                let mut full_text = String::new();
+                for log in &raw_logs {
+                    let content = if log.encrypted == 1 {
+                        String::from_utf8(
+                            crate::services::memchain::decrypt_rawlog_content_pub(
+                                &rawlog_key,
+                                &log.content,
+                            )
+                            .unwrap_or_default(),
+                        )
+                        .unwrap_or_default()
+                    } else {
+                        String::from_utf8_lossy(&log.content).to_string()
+                    };
+                    full_text.push_str(&content);
+                    full_text.push('\n');
+                }
+
+                // ── v2.5.3+ArtifactChain: Code artifact extraction with version chain ──
+                for cap in code_regex.captures_iter(&full_text) {
                 let language = cap
                     .get(1)
                     .map(|m| m.as_str())
@@ -1827,20 +1994,19 @@ impl ReflectionMiner {
                     );
                     total_artifacts += 1;
                 }
+                }
+                self.storage
+                    .mark_session_artifacts_extracted(&session.session_id)
+                    .await;
             }
         }
 
-        if total_summaries > 0 || total_artifacts > 0 {
+        if summary_tasks_queued > 0 || total_artifacts > 0 {
             info!(
-                summaries = total_summaries,
+                summary_tasks_queued,
                 artifacts = total_artifacts,
                 "[MINER_S10] Complete"
             );
-        }
-
-        if self.llm_router.is_some() {
-            let owner = self.owner_context.storage_owner();
-            self.enqueue_session_title_tasks(&owner).await;
         }
     }
 
@@ -1857,6 +2023,7 @@ impl ReflectionMiner {
                  FROM sessions
                  WHERE owner = ?1
                    AND entities_extracted = 1
+                   AND summary_generated = 1
                    AND session_id NOT IN (
                        SELECT DISTINCT session_id FROM episodes
                        WHERE session_id IS NOT NULL
@@ -1990,6 +2157,12 @@ impl ReflectionMiner {
     // ============================================
 
     async fn enqueue_community_narrative_tasks(&self, owner: &[u8]) {
+        // [MEMCHAIN-PHALA-NODE-BOUNDARY 2026-10-05 by Codex] Queue payloads
+        // include tenant/session-derived context; never persist them from a
+        // node miner without the explicitly configured SaaS inference owner.
+        if !self.confidential_inference_ready() {
+            return;
+        }
         let owner32: [u8; 32] = match owner.try_into() {
             Ok(arr) => arr,
             Err(_) => {
@@ -2054,6 +2227,10 @@ impl ReflectionMiner {
     }
 
     async fn enqueue_entity_description_tasks(&self, owner: &[u8]) {
+        // [MEMCHAIN-PHALA-NODE-BOUNDARY 2026-10-05 by Codex]
+        if !self.confidential_inference_ready() {
+            return;
+        }
         let owner32: [u8; 32] = match owner.try_into() {
             Ok(arr) => arr,
             Err(_) => {
@@ -2122,6 +2299,10 @@ impl ReflectionMiner {
     }
 
     async fn enqueue_session_title_tasks(&self, owner: &[u8]) {
+        // [MEMCHAIN-PHALA-NODE-BOUNDARY 2026-10-05 by Codex]
+        if !self.confidential_inference_ready() {
+            return;
+        }
         let sessions_needing_title = {
             let conn = self.storage.conn_lock().await;
             let mut stmt = match conn.prepare(
@@ -2226,18 +2407,11 @@ impl ReflectionMiner {
     }
 
     async fn local_embedding(&self, text: &str) -> Option<Vec<f32>> {
-        if let Some(ref engine) = self.embed_engine {
-            match engine.embed_single(text) {
-                Ok(embedding) => {
-                    debug!(dim = embedding.len(), "[MINER] Local embed succeeded");
-                    return Some(embedding);
-                }
-                Err(e) => {
-                    warn!(error = %e, "[MINER] Local embed failed");
-                }
-            }
+        let router = self.llm_router.as_ref()?;
+        if !router.has_embedding_route() || text.is_empty() || text.len() > 16 * 1024 {
+            return None;
         }
-        None
+        router.embed_batch(vec![text.to_owned()]).await.ok()?.pop()
     }
 
     // ============================================

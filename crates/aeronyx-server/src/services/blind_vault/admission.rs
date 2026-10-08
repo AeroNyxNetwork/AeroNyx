@@ -242,6 +242,21 @@ pub(super) fn derive_node_key(
 }
 
 impl BlindVaultService {
+    /// Whether general direct Blind Vault HTTP operations are enabled.
+    // [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex]
+    pub(crate) const fn public_api_enabled(&self) -> bool {
+        self.config.public_api_enabled
+    }
+
+    /// Checks that the durable store can answer a private terminal Pull.
+    /// This deliberately does not require public mutation issuers or free
+    /// admission capacity: Pull is read-only and independently source-sealed.
+    // [PRIVATE-ONION-PULL-READINESS 2026-10-05 by Codex]
+    pub fn private_terminal_readiness(&self) -> Result<(), BlindVaultServiceError> {
+        self.connection.lock().query_row("SELECT 1", [], |_| Ok(()))?;
+        Ok(())
+    }
+
     /// Returns a single privacy-safe admission decision for discovery,
     /// heartbeat, and local operations.
     ///

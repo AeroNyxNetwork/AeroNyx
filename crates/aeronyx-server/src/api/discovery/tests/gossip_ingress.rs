@@ -907,6 +907,8 @@ async fn gossip_rate_limiter_recovers_after_lock_owner_panic() {
         rate_limit,
         node_admission_rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
         route_domain_certificate_rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
+        // [PHALA-NODE-COMPILE-REPAIR 2026-10-08 by Codex] Phala quote
+        // limiting is process-wide, not a field of the gossip fixture.
     };
     let response = gossip_handler(
         State(state),

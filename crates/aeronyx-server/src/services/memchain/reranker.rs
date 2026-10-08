@@ -274,6 +274,11 @@ pub struct RerankedCandidate {
     pub ce_score_normalized: f64,
 }
 
+// [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Preserve public API compatibility
+// but never allow a Rust node to load or run a local cross-encoder.
+#[inline(never)]
+fn local_model_execution_disabled() -> bool { true }
+
 impl RerankerEngine {
     /// Load cross-encoder ONNX model and tokenizer.
     ///
@@ -285,6 +290,12 @@ impl RerankerEngine {
     /// * `model_dir` - Directory containing model.onnx and tokenizer.json
     /// * `max_seq_length` - Max combined query+document token length (pass 0 for default 512)
     pub fn load(model_dir: impl AsRef<Path>, max_seq_length: usize) -> Result<Self, String> {
+        // [MEMCHAIN-PHALA-ONLY 2026-10-05 by Codex] Preserve the old API
+        // shape but fail closed before loading model files or ONNX Runtime.
+        if local_model_execution_disabled() {
+            return Err("local reranking is disabled; use the attested Phala ACI route".into());
+        }
+
         let model_dir = model_dir.as_ref();
         let max_seq_length = resolve_model_sequence_length(
             "Reranker",
@@ -571,16 +582,7 @@ mod tests {
         let result = RerankerEngine::load("/nonexistent/path", 512);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            err.contains("not found"),
-            "Error should mention 'not found': {}",
-            err
-        );
-        assert!(
-            err.contains("download_models.sh"),
-            "Error should hint at download script: {}",
-            err
-        );
+        assert!(err.contains("disabled"), "unexpected error: {}", err);
     }
 
     #[test]

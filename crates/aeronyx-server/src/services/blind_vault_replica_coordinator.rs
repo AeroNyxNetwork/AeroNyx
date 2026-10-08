@@ -120,6 +120,9 @@ pub(crate) struct BlindVaultReplicaTargetBundleV1 {
     canonical_effects: [Vec<u8>; REPLICA_TARGET_EFFECT_COUNT],
     canonical_bytes: Vec<u8>,
     commitment: [u8; 32],
+    // [REPLICA-ADMISSION-CLOCK 2026-10-08 by Codex] Preserve the trusted
+    // construction bounds for revalidation, never in the durable wire record.
+    validation_policy: BlindVaultReplicaTargetBundlePolicyV1,
 }
 
 impl BlindVaultReplicaTargetBundleV1 {
@@ -207,7 +210,31 @@ impl BlindVaultReplicaTargetBundleV1 {
             canonical_effects,
             canonical_bytes,
             commitment,
+            validation_policy: policy,
         })
+    }
+
+    fn revalidate_at(&self, now_ms: u64) -> Result<(), BlindVaultReplicaCoordinatorError> {
+        // [REPLICA-ADMISSION-CLOCK 2026-10-08 by Codex] A typed bundle is
+        // immutable, not timeless. Recheck all signed target effects before
+        // staging after an async/blocking queue or a delayed embedded caller.
+        if now_ms < self.validation_policy.now_ms {
+            return Err(BlindVaultReplicaCoordinatorError::Rejected);
+        }
+        let mut policy = self.validation_policy;
+        policy.now_ms = now_ms;
+        let checked = Self::from_wire_parts(
+            REPLICA_TARGET_BUNDLE_VERSION_V1,
+            self.target_node_id,
+            &self.canonical_effects[0],
+            &self.canonical_effects[1],
+            &self.canonical_effects[2],
+            policy,
+        )?;
+        if checked.canonical_bytes != self.canonical_bytes || checked.commitment != self.commitment {
+            return Err(BlindVaultReplicaCoordinatorError::Rejected);
+        }
+        Ok(())
     }
 
     pub(crate) const fn target_node_id(&self) -> [u8; 32] {
@@ -416,6 +443,7 @@ where
         // verification rejects stale submissions before allocation. The second
         // is deliberately adjacent to durable staging and has no await,
         // callback, or network boundary between authority and use.
+        submission.target_bundle.revalidate_at(now_ms)?;
         self.verifier
             .verify(submission.authorization(), now_ms)
             .map_err(map_authorization_error)?;
@@ -1272,6 +1300,36 @@ mod tests {
             Err(BlindVaultReplicaCoordinatorError::Rejected)
         ));
         assert_eq!(coordinator.store.stage_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // [REPLICA-ADMISSION-CLOCK 2026-10-08 by Codex] Calibrate with a bundle
+    // valid at construction; an accepting source verifier cannot make expired
+    // target effects or a rolled-back sample eligible for durable staging.
+    #[test]
+    fn delayed_typed_bundle_rechecks_target_freshness_before_stage() {
+        for admitted_at in [0, NOW_MS - 1, NOW_MS + 1_001, NOW_MS + 60_000] {
+            let fixture = Fixture::new();
+            let authorization = fixture.authorization([72; 16], fixture.bundle.commitment());
+            let submission = BlindVaultReplicaJobSubmissionV1::new(authorization, fixture.bundle)
+                .expect("valid constructed submission");
+            let coordinator = BlindVaultReplicaCoordinator::new(
+                CountingVerifier::accepting(), ExactMemoryStore::default(),
+            );
+            assert!(matches!(coordinator.admit_v1(submission, admitted_at),
+                Err(BlindVaultReplicaCoordinatorError::Rejected)));
+            assert_eq!(coordinator.verifier.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(coordinator.store.stage_calls.load(Ordering::SeqCst), 0);
+        }
+        let fixture = Fixture::new();
+        let authorization = fixture.authorization([72; 16], fixture.bundle.commitment());
+        let submission = BlindVaultReplicaJobSubmissionV1::new(authorization, fixture.bundle)
+            .expect("fresh submission");
+        let coordinator = BlindVaultReplicaCoordinator::new(
+            CountingVerifier::accepting(), ExactMemoryStore::default(),
+        );
+        assert_eq!(coordinator.admit_v1(submission, NOW_MS + 1_000).unwrap(),
+            BlindVaultReplicaAdmissionOutcome::Inserted);
+        assert_eq!(coordinator.store.stage_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

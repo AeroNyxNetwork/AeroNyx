@@ -34,7 +34,10 @@
 use std::path::{Path, PathBuf};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
+use aeronyx_core::protocol::onion::reverse_delivery::MAX_REVERSE_ONION_RECOVERY_RETENTION_SECS;
+use aeronyx_core::protocol::discovery::MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_LIFETIME_SECS_V1;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
@@ -86,6 +89,10 @@ pub(crate) enum ReverseOnionQueueDbError {
     Ambiguous,
     #[error("reverse onion queue database unavailable")]
     Unavailable,
+    // [REVERSE-ONION-RESULT-CLOCK 2026-10-05 by Codex] Clock failure is a
+    // retryable request failure, distinct from corrupt/unavailable storage.
+    #[error("reverse onion queue database clock unavailable")]
+    ClockUnavailable,
     #[error("reverse onion queue database has no work")]
     NoWork,
     #[error("reverse onion queue database has a lease conflict")]
@@ -107,6 +114,7 @@ impl From<ReverseOnionQueueError> for ReverseOnionQueueDbError {
             ReverseOnionQueueError::LeaseLost => Self::LeaseLost,
             ReverseOnionQueueError::AlreadyComplete => Self::AlreadyComplete,
             ReverseOnionQueueError::Unavailable => Self::Unavailable,
+            ReverseOnionQueueError::ClockUnavailable => Self::ClockUnavailable,
             ReverseOnionQueueError::Corrupt => Self::Corrupt,
             ReverseOnionQueueError::MigrationRequired => Self::MigrationRequired,
         }
@@ -214,18 +222,48 @@ impl std::fmt::Debug for ReverseOnionQueueDb {
 }
 
 impl ReverseOnionQueueDb {
+    // [REVERSE-RECOVERY-BOOT 2026-10-05 by Codex] A recovery boot must not
+    // silently replace missing custody with an empty database. The normal
+    // opener still performs owner/mode/inode/sidecar/schema validation.
+    pub(crate) fn open_existing(
+        config: ReverseOnionQueueDbConfig,
+        now: u64,
+    ) -> Result<Self, ReverseOnionQueueDbError> {
+        // [PHALA-EXISTING-CUSTODY-OPEN 2026-10-07 by Codex]
+        #[cfg(unix)]
+        { Self::open_inner(config, now, true) }
+        #[cfg(not(unix))]
+        {
+            let _ = (config, now);
+            Err(ReverseOnionQueueDbError::Rejected)
+        }
+    }
+
     #[cfg(unix)]
     pub(crate) fn open(
         config: ReverseOnionQueueDbConfig,
         now: u64,
     ) -> Result<Self, ReverseOnionQueueDbError> {
+        Self::open_inner(config, now, false)
+    }
+
+    // [PHALA-EXISTING-CUSTODY-OPEN 2026-10-07 by Codex] Both modes retain
+    // identical locks, schema audits, physical limits and startup cleanup.
+    #[cfg(unix)]
+    fn open_inner(config: ReverseOnionQueueDbConfig, now: u64, existing_only: bool)
+        -> Result<Self, ReverseOnionQueueDbError> {
         if now == 0 {
             return Err(ReverseOnionQueueDbError::Rejected);
         }
         validate_limits(config.physical_bytes, config.limits)?;
 
         preflight_existing_boundary(&config.db_path, config.physical_bytes)?;
-        let target = prepare_private_sqlite_target(&config.db_path)?;
+        let (target, existing_inode) = if existing_only {
+            let (target, inode) = super::chat_relay_mailbox::open_existing_private_sqlite_target(&config.db_path)?;
+            (target, Some(inode))
+        } else {
+            (prepare_private_sqlite_target(&config.db_path)?, None)
+        };
         verify_private_file(&target.resolved_path, true)?;
         let baseline = std::fs::symlink_metadata(&target.resolved_path)
             .map_err(|_| ReverseOnionQueueDbError::Unavailable)?;
@@ -233,26 +271,32 @@ impl ReverseOnionQueueDb {
         let baseline_identity = InodeIdentity::from_metadata(&baseline);
         audit_sidecars(&target.resolved_path, config.physical_bytes, baseline.len())?;
 
-        let inode_lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-            .open(&target.resolved_path)
-            .map_err(|_| ReverseOnionQueueDbError::Unavailable)?;
+        let inode_lock = if let Some(inode) = existing_inode {
+            inode
+        } else {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+                .open(&target.resolved_path)
+                .map_err(|_| ReverseOnionQueueDbError::Unavailable)?
+        };
         let inode_metadata = inode_lock
             .metadata()
             .map_err(|_| ReverseOnionQueueDbError::Unavailable)?;
         validate_opened_inode(&inode_metadata, config.physical_bytes)?;
+        if existing_only && inode_metadata.len() == 0 {
+            return Err(ReverseOnionQueueDbError::Rejected);
+        }
         if InodeIdentity::from_metadata(&inode_metadata) != baseline_identity {
             return Err(ReverseOnionQueueDbError::Rejected);
         }
 
-        // SAFETY: the descriptor is a live owner-private regular-file handle.
-        if unsafe { nix::libc::flock(inode_lock.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) }
-            != 0
-        {
-            return Err(ReverseOnionQueueDbError::Busy);
-        }
+        // [PHALA-SQLITE-INODE-LOCK 2026-10-08 by Codex]
+        super::chat_relay_mailbox::lock_private_sqlite_inode(&inode_lock).map_err(|error| match error {
+            super::chat_relay_mailbox::AnonymousMailboxStoreError::Busy => ReverseOnionQueueDbError::Busy,
+            _ => ReverseOnionQueueDbError::Unavailable,
+        })?;
 
         let parent_metadata = target
             .parent
@@ -288,13 +332,18 @@ impl ReverseOnionQueueDb {
             _parent: target.parent,
         };
         db.with_operation(true, |queue, connection| {
-            queue
-                .initialize_at(connection, now)
-                .map_err(ReverseOnionQueueDbError::from)
+            // [PHALA-OWNED-RECOVERY-SCHEMA 2026-10-07 by Codex] Carry the
+            // fixed startup mode through to the actual schema transaction.
+            let initialized = if existing_only {
+                queue.initialize_existing_at(connection, now)
+            } else {
+                queue.initialize_at(connection, now)
+            };
+            initialized.map_err(ReverseOnionQueueDbError::from)
         })?;
-        // Initialization validates schema ownership; cleanup additionally runs
-        // the queue's bounded row/no-work audit before production activation.
-        db.cleanup(now)?;
+        // [PHALA-QUEUE-CAPACITY-OPEN 2026-10-08 by Codex] Timed initialize
+        // atomically audits quotas/clock, migrates and cleans expired custody.
+        // A second transaction must not discover rollback after schema commit.
         Ok(db)
     }
 
@@ -304,6 +353,14 @@ impl ReverseOnionQueueDb {
         _now: u64,
     ) -> Result<Self, ReverseOnionQueueDbError> {
         Err(ReverseOnionQueueDbError::Rejected)
+    }
+
+    // [PHALA-CLAIM-EXECUTION-CAP 2026-10-08 by Codex] Pure immutable
+    // policy lookup, safe inside the owned Lease transaction; no nested lock.
+    pub(crate) fn maximum_execution_deadline(
+        &self, route_deadline: u64, now: u64,
+    ) -> Result<u64, ReverseOnionQueueError> {
+        self.queue.maximum_execution_deadline(route_deadline, now)
     }
 
     pub(crate) fn enqueue(
@@ -318,33 +375,82 @@ impl ReverseOnionQueueDb {
         })
     }
 
-    pub(crate) fn issue_lease<V, F>(
+    // [REVERSE-ONION-AUTHORITY-FENCE 2026-10-05 by Codex] The caller builds
+    // its durable row under a stable authority epoch; that guard ends with the
+    // SQL transaction, before the expensive post-operation integrity audit.
+    pub(crate) fn enqueue_with_authority<F>(
+        &self,
+        authority_store: &crate::services::peer_store::PeerStore,
+        now: u64,
+        refresh_now: impl FnOnce() -> Option<u64>,
+        build_item: F,
+    ) -> Result<ReverseOnionQueueAdmission, ReverseOnionQueueDbError>
+    where
+        F: FnOnce(u64) -> Result<ReverseOnionQueueItem, ReverseOnionQueueDbError>,
+    {
+        self.with_operation(true, |queue, connection| {
+            let _authority_epoch = authority_store.private_onion_authority_read_guard();
+            // [REVERSE-ONION-CLAIM-FRESHNESS 2026-10-05 by Codex] Do not let
+            // DB lock wait turn a valid route into an expired accepted row.
+            let mutation_now = refresh_now()
+                .filter(|fresh| *fresh >= now)
+                .ok_or(ReverseOnionQueueDbError::Rejected)?;
+            let item = build_item(mutation_now)?;
+            queue
+                .enqueue(connection, &item, mutation_now)
+                .map_err(ReverseOnionQueueDbError::from)
+        })
+    }
+
+    // [REVERSE-ONION-LIVE-CLAIM-AUTH 2026-10-05 by Codex] Keep current route
+    // authority validation inside the database operation that commits Lease.
+    pub(crate) fn issue_lease<V, A, F>(
         &self,
         recipient: [u8; 32],
         claim_id: [u8; 16],
         claim_commitment: [u8; 32],
         claim_frame: Vec<u8>,
         now: u64,
+        operation_now: Arc<AtomicU64>,
+        refresh_now: impl FnOnce() -> Option<u64>,
+        authority_store: Option<&crate::services::peer_store::PeerStore>,
         verify_claim: V,
+        authorize_item: A,
         build_lease: F,
     ) -> Result<ReverseOnionQueueIssue, ReverseOnionQueueDbError>
     where
         V: Fn(&[u8]) -> Result<[u8; 32], ReverseOnionQueueError>,
+        A: Fn(&super::reverse_onion_queue::ReverseOnionQueueStoredItem) -> Result<(), ReverseOnionQueueError>,
         F: FnOnce(
             &super::reverse_onion_queue::ReverseOnionQueueStoredItem,
             &[u8],
         ) -> Result<super::reverse_onion_queue::ReverseOnionQueueLeaseMaterial, ReverseOnionQueueError>,
     {
         self.with_operation(true, |queue, connection| {
+            // [REVERSE-ONION-AUTHORITY-FENCE 2026-10-05 by Codex] Snapshot
+            // validation and lease transaction share the same live authority.
+            let _authority_epoch = authority_store
+                .map(crate::services::peer_store::PeerStore::private_onion_authority_read_guard);
+            // [REVERSE-ONION-CLAIM-FRESHNESS 2026-10-05 by Codex] Refresh
+            // monotonic time after the DB operation lock, so waiting cannot
+            // revive a Claim that aged past its freshness window.
+            let issue_now = refresh_now()
+                .filter(|fresh| *fresh >= now)
+                // [PHALA-CLAIM-REJECTION-WIRING 2026-10-08 by Codex]
+                // Missing/regressed trusted time is a retryable clock fault,
+                // not the Claim transaction's explicit no-effect rejection.
+                .ok_or(ReverseOnionQueueDbError::ClockUnavailable)?;
+            operation_now.store(issue_now, Ordering::Release);
             queue
-                .issue_lease(
+                .issue_lease_authorized(
                     connection,
                     recipient,
                     claim_id,
                     claim_commitment,
                     claim_frame,
-                    now,
+                    issue_now,
                     verify_claim,
+                    authorize_item,
                     build_lease,
                 )
                 .map_err(ReverseOnionQueueDbError::from)
@@ -390,15 +496,29 @@ impl ReverseOnionQueueDb {
         ReverseOnionQueueResultContext,
         ReverseOnionQueueDbError,
     > {
+        self.lookup_result_context_at(recipient, claim_id, lease_id, route_id, || Ok(now))
+    }
+
+    // [REVERSE-ONION-RESULT-CLOCK 2026-10-05 by Codex] Outer DB operation
+    // serialization precedes the core connection lock; refresh time in the
+    // core only after both have been acquired.
+    pub(crate) fn lookup_result_context_at(
+        &self,
+        recipient: [u8; 32],
+        claim_id: [u8; 16],
+        lease_id: [u8; 16],
+        route_id: [u8; 16],
+        refresh_now: impl FnOnce() -> Result<u64, ReverseOnionQueueError>,
+    ) -> Result<ReverseOnionQueueResultContext, ReverseOnionQueueDbError> {
         self.with_operation(true, |queue, connection| {
             queue
-                .lookup_result_context(
+                .lookup_result_context_at(
                     connection,
                     recipient,
                     claim_id,
                     lease_id,
                     route_id,
-                    now,
+                    refresh_now,
                 )
                 .map_err(ReverseOnionQueueDbError::from)
         })
@@ -411,19 +531,36 @@ impl ReverseOnionQueueDb {
         request_commitment: [u8; 32],
         now: u64,
     ) -> Result<Option<ReverseOnionQueueSourceSnapshot>, ReverseOnionQueueDbError> {
+        self.lookup_source_at(source_node_id, route_id, request_commitment, || Ok(now))
+    }
+
+    // [PHALA-SOURCE-EVIDENCE-CLOCK 2026-10-07 by Codex] The read clock is
+    // sampled inside both locks, not before outer operation serialization.
+    pub(crate) fn lookup_source_at(
+        &self,
+        source_node_id: [u8; 32],
+        route_id: [u8; 16],
+        request_commitment: [u8; 32],
+        refresh_now: impl FnOnce() -> Result<u64, ReverseOnionQueueError>,
+    ) -> Result<Option<ReverseOnionQueueSourceSnapshot>, ReverseOnionQueueDbError> {
         self.with_operation_fence(true, OperationFence::BoundedSourceRead, |queue, connection| {
             // Reject invalid times before touching the memory fence. Advancing
             // before the post-operation fence is conservative: fence failure
             // poisons this wrapper, so no subsequent read can observe success.
-            if now == 0 || i64::try_from(now).is_err()
-                || now < self.source_read_high_water.load(Ordering::Relaxed)
-            {
-                return Err(ReverseOnionQueueDbError::Rejected);
-            }
+            let mut observed_at = 0;
             let snapshot = queue
-                .lookup_source(connection, source_node_id, route_id, request_commitment, now)
+                .lookup_source_at(connection, source_node_id, route_id, request_commitment, || {
+                    let now = refresh_now()?;
+                    if now == 0 || i64::try_from(now).is_err()
+                        || now < self.source_read_high_water.load(Ordering::Relaxed)
+                    {
+                        return Err(ReverseOnionQueueError::Rejected);
+                    }
+                    observed_at = now;
+                    Ok(now)
+                })
                 .map_err(ReverseOnionQueueDbError::from)?;
-            self.source_read_high_water.store(now, Ordering::Relaxed);
+            self.source_read_high_water.store(observed_at, Ordering::Relaxed);
             Ok(snapshot)
         })
     }
@@ -438,9 +575,26 @@ impl ReverseOnionQueueDb {
             &[u8],
         ) -> Result<[u8; 32], ReverseOnionQueueError>,
     ) -> Result<ReverseOnionQueueCompletion, ReverseOnionQueueDbError> {
+        self.complete_at(lease, result_frame, || Ok(now),
+            |stored, bytes, _| verify_result(stored, bytes))
+    }
+
+    // [REVERSE-ONION-RESULT-CLOCK 2026-10-05 by Codex] The clock callback is
+    // forwarded to the queue's post-lock point, not sampled before DB wait.
+    pub(crate) fn complete_at(
+        &self,
+        lease: &ReverseOnionQueueIssuedLease,
+        result_frame: &[u8],
+        refresh_now: impl FnOnce() -> Result<u64, ReverseOnionQueueError>,
+        verify_result: impl FnOnce(
+            &ReverseOnionQueueStoredResultContext,
+            &[u8],
+            u64,
+        ) -> Result<[u8; 32], ReverseOnionQueueError>,
+    ) -> Result<ReverseOnionQueueCompletion, ReverseOnionQueueDbError> {
         self.with_operation(true, |queue, connection| {
             queue
-                .complete(connection, lease, result_frame, now, verify_result)
+                .complete_at(connection, lease, result_frame, refresh_now, verify_result)
                 .map_err(ReverseOnionQueueDbError::from)
         })
     }
@@ -582,7 +736,11 @@ fn validate_limits(
         || limits.max_bytes > MAX_QUEUE_BYTES
         || limits.lease_max_secs == 0
         || limits.recovery_retention_secs == 0
+        // [REVERSE-ONION-RETENTION-BOUND 2026-10-05 by Codex] Enforce the
+        // shared protocol maximum at the persistence boundary as well.
+        || limits.recovery_retention_secs > MAX_REVERSE_ONION_RECOVERY_RETENTION_SECS
         || limits.route_max_secs == 0
+        || limits.route_max_secs > MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_LIFETIME_SECS_V1
         || physical_bytes == 0
         || physical_bytes > MAX_QUEUE_PHYSICAL_BYTES
     {
@@ -873,9 +1031,6 @@ fn effective_user_id() -> u32 {
     unsafe { nix::libc::geteuid() }
 }
 
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,6 +1050,11 @@ mod tests {
             .prefix("r6-reverse-onion-queue-db-")
             .tempdir_in("/Volumes/disk/aeronyx-codex-tmp")
             .expect("fixture directory");
+        // [PHALA-JOURNAL-FIXTURE-REPAIR 2026-10-08 by Codex] Preflight
+        // rejects insecure existing parents before it may touch a sidecar.
+        #[cfg(unix)]
+        std::fs::set_permissions(directory.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700)).unwrap();
         let config = ReverseOnionQueueDbConfig::new(
             directory.path().join("queue.sqlite"),
             16 * 1024 * 1024,
@@ -902,6 +1062,33 @@ mod tests {
         )
         .expect("valid queue config");
         (directory, config)
+    }
+
+    // [REVERSE-RECOVERY-BOOT 2026-10-05 by Codex] Authored, not executed.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_open_requires_existing_custody_database() {
+        let (_directory, config) = fixture();
+        // [PHALA-EXISTING-CUSTODY-OPEN 2026-10-07 by Codex] Authored, not run.
+        let mut nested = config.clone();
+        nested.db_path = config.db_path.parent().unwrap().join("missing/queue.sqlite");
+        assert!(ReverseOnionQueueDb::open_existing(nested.clone(), NOW).is_err());
+        assert!(!nested.db_path.parent().unwrap().exists());
+        assert!(ReverseOnionQueueDb::open_existing(config.clone(), NOW).is_err());
+        assert!(!config.db_path.exists());
+        let empty = OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .open(&config.db_path).unwrap();
+        drop(empty);
+        assert!(ReverseOnionQueueDb::open_existing(config.clone(), NOW).is_err());
+        assert_eq!(std::fs::metadata(&config.db_path).unwrap().len(), 0);
+        std::fs::remove_file(&config.db_path).unwrap();
+        let queue = ReverseOnionQueueDb::open(config.clone(), NOW).unwrap();
+        queue.enqueue(&queue_item(), NOW).unwrap();
+        drop(queue);
+        let recovered = ReverseOnionQueueDb::open_existing(config, NOW + 1).unwrap();
+        let source = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap().public_key_bytes();
+        assert!(recovered.lookup_source(source, [2; 16], [3; 32], NOW + 1).unwrap().is_some());
+        drop(recovered);
     }
 
     fn queue_item() -> ReverseOnionQueueItem {
@@ -920,6 +1107,73 @@ mod tests {
             NOW + 60,
         )
         .expect("valid opaque queue item")
+    }
+
+    // [PHALA-CLAIM-REJECTION-WIRING 2026-10-08 by Codex] Calibrate the
+    // clock gate before Claim verification; a later valid sample must still
+    // reach verification without losing the existing queued ciphertext.
+    #[cfg(unix)]
+    #[test]
+    fn claim_clock_fault_is_not_a_protocol_rejection_or_owner_poison() {
+        for clock in [None, Some(NOW - 1)] {
+            let (_directory, config) = fixture();
+            let db = ReverseOnionQueueDb::open(config, NOW).unwrap();
+            db.enqueue(&queue_item(), NOW).unwrap();
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let result = db.issue_lease([5; 32], [9; 16], [10; 32], vec![11; 32], NOW,
+                Arc::new(AtomicU64::new(NOW)), || clock, None,
+                |_| { calls.fetch_add(1, Ordering::SeqCst); Err(ReverseOnionQueueError::Rejected) },
+                |_| unreachable!("clock/Claim gate must precede item authorization"),
+                |_, _| unreachable!("rejected Claim cannot create a Lease"));
+            assert!(matches!(result, Err(ReverseOnionQueueDbError::ClockUnavailable)));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let result = db.issue_lease([5; 32], [9; 16], [10; 32], vec![11; 32], NOW,
+                Arc::new(AtomicU64::new(NOW)), || Some(NOW), None,
+                |_| { calls.fetch_add(1, Ordering::SeqCst); Err(ReverseOnionQueueError::Rejected) },
+                |_| unreachable!("rejected Claim cannot authorize an item"),
+                |_, _| unreachable!("rejected Claim cannot create a Lease"));
+            assert!(matches!(result, Err(ReverseOnionQueueDbError::Rejected)));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(!db.poisoned.load(Ordering::Acquire));
+            let source = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap().public_key_bytes();
+            assert!(db.lookup_source(source, [2; 16], [3; 32], NOW).unwrap().is_some());
+        }
+    }
+
+    // [PHALA-QUEUE-CAPACITY-OPEN 2026-10-08 by Codex] Authored, not run:
+    // the production file opener must not commit migration then reject time.
+    #[cfg(unix)]
+    #[test]
+    fn rejected_recovery_open_preserves_schema_clock_and_custody() {
+        let (_directory, config) = fixture();
+        let queue = ReverseOnionQueueDb::open(config.clone(), NOW).unwrap();
+        queue.enqueue(&queue_item(), NOW).unwrap();
+        drop(queue);
+        {
+            let c = Connection::open(&config.db_path).unwrap();
+            c.execute_batch("DROP INDEX idx_reverse_onion_delivery_queue_v1_source_route;
+                UPDATE reverse_onion_delivery_queue_v1_meta SET schema_version=3;").unwrap();
+            c.execute("UPDATE reverse_onion_delivery_queue_v1_meta SET clock_high_water=?1",
+                rusqlite::params![(NOW + 20) as i64]).unwrap();
+        }
+        assert!(matches!(ReverseOnionQueueDb::open_existing(config.clone(), NOW + 10),
+            Err(ReverseOnionQueueDbError::Rejected)));
+        {
+            let c = Connection::open(&config.db_path).unwrap();
+            let metadata: (i64, i64) = c.query_row(
+                "SELECT schema_version,clock_high_water FROM reverse_onion_delivery_queue_v1_meta",
+                [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            assert_eq!(metadata, (3, (NOW + 20) as i64));
+            let objects: i64 = c.query_row("SELECT count(*) FROM sqlite_master
+                WHERE name='idx_reverse_onion_delivery_queue_v1_source_route'", [], |r| r.get(0)).unwrap();
+            assert_eq!(objects, 0);
+            let count: i64 = c.query_row("SELECT count(*) FROM reverse_onion_delivery_queue_v1",
+                [], |r| r.get(0)).unwrap();
+            assert_eq!(count, 1);
+        }
+        let recovered = ReverseOnionQueueDb::open_existing(config, NOW + 20).unwrap();
+        let source = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap().public_key_bytes();
+        assert!(recovered.lookup_source(source, [2; 16], [3; 32], NOW + 20).unwrap().is_some());
     }
 
     // [REVERSE-ONION-SOURCE-INDEX 2026-10-04 by Codex] Authored, unexecuted.
@@ -957,6 +1211,31 @@ mod tests {
         assert!(matches!(outcome, Err(ReverseOnionQueueDbError::Ambiguous)));
         assert!(matches!(db.lookup_source(source, [2; 16], [3; 32], NOW + 2),
             Err(ReverseOnionQueueDbError::Unavailable)));
+    }
+
+    // [PHALA-SOURCE-EVIDENCE-CLOCK 2026-10-07 by Codex] Authored, not run.
+    #[cfg(unix)]
+    #[test]
+    fn source_read_refresh_holds_both_locks_and_keeps_memory_clock_monotonic() {
+        let (_directory, config) = fixture();
+        let db = ReverseOnionQueueDb::open(config, NOW).unwrap();
+        let item = queue_item();
+        db.enqueue(&item, NOW).unwrap();
+        let source = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap().public_key_bytes();
+        let snapshot = db.lookup_source_at(source, [2; 16], [3; 32], || {
+            assert!(db.operation.try_lock().is_none());
+            assert!(db.connection.try_lock().is_none());
+            Ok(NOW + 1)
+        }).unwrap().unwrap();
+        assert_eq!(snapshot.observed_at(), NOW + 1);
+        assert_eq!(snapshot.available_until(), NOW + 60);
+        assert!(matches!(db.lookup_source_at(source, [2; 16], [3; 32], || Ok(NOW)),
+            Err(ReverseOnionQueueDbError::Rejected)));
+        assert!(matches!(db.lookup_source_at(source, [2; 16], [3; 32],
+            || Err(ReverseOnionQueueError::ClockUnavailable)),
+            Err(ReverseOnionQueueDbError::ClockUnavailable)));
+        assert_eq!(db.source_read_high_water.load(Ordering::Relaxed), NOW + 1);
+        assert!(!db.poisoned.load(Ordering::Acquire));
     }
 
     #[cfg(unix)]
@@ -1007,6 +1286,27 @@ mod tests {
             limits,
         )
         .is_ok());
+    }
+
+    // [PHALA-OWNED-RECOVERY-SCHEMA 2026-10-07 by Codex] Authored, not run.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_nonempty_unowned_sqlite_is_not_empty_custody() {
+        let (_directory, config) = fixture();
+        let connection = Connection::open(&config.db_path).unwrap();
+        connection.execute_batch("CREATE TABLE removed(value BLOB); DROP TABLE removed;").unwrap();
+        drop(connection);
+        private_mode(&config.db_path);
+        assert!(std::fs::metadata(&config.db_path).unwrap().len() > 0);
+        assert_eq!(ReverseOnionQueueDb::open_existing(config.clone(), NOW).unwrap_err(),
+            ReverseOnionQueueDbError::MigrationRequired);
+        let connection = Connection::open(&config.db_path).unwrap();
+        let count: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+        drop(connection);
+        // Explicit live bootstrap still supports a deliberately empty schema.
+        drop(ReverseOnionQueueDb::open(config, NOW).unwrap());
     }
 
     #[cfg(unix)]
@@ -1238,29 +1538,41 @@ mod tests {
         assert_eq!(
             db.lookup_result([1; 32], [2; 32], [3; 32], NOW)
                 .err(),
-            Some(ReverseOnionQueueDbError::Unavailable)
+            // [PHALA-REVERSE-FIXTURE-REPAIR 2026-10-08 by Codex] This
+            // read commits a durable clock observation before the fence fails.
+            Some(ReverseOnionQueueDbError::Ambiguous)
         );
         force_fence(false);
+        assert_eq!(db.lookup_result([1; 32], [2; 32], [3; 32], NOW + 1).err(),
+            Some(ReverseOnionQueueDbError::Unavailable));
     }
 
     #[cfg(unix)]
+    // [REVERSE-ONION-RESULT-CLOCK 2026-10-05 by Codex] Verify refresh errors
+    // fail closed without poisoning the durable queue handle.
+    // [REVERSE-ONION-DB-COMPILE 2026-10-06 by Codex] Match the error without
+    // formatting opaque result-context payloads in the assertion path.
     #[test]
     fn result_context_lookup_is_fenced_and_never_issues_unknown_claim() {
         let (_directory, config) = fixture();
         let db = ReverseOnionQueueDb::open(config, NOW).expect("queue database");
         let outcome = db
-            .lookup_result_context([5; 32], [6; 16], [7; 16], [8; 16], NOW + 1)
+            .lookup_result_context_at([5; 32], [6; 16], [7; 16], [8; 16], || Ok(NOW + 1))
             .expect("read-only lookup");
         assert!(matches!(
             outcome,
             ReverseOnionQueueResultContext::NoWork
         ));
         force_fence(true);
-        assert_eq!(
-            db.lookup_result_context([5; 32], [6; 16], [7; 16], [8; 16], NOW + 2)
-                .unwrap_err(),
-            ReverseOnionQueueDbError::Ambiguous
-        );
+        assert!(matches!(
+            db.lookup_result_context_at([5; 32], [6; 16], [7; 16], [8; 16], || {
+                Err(ReverseOnionQueueError::ClockUnavailable)
+            }),
+            Err(ReverseOnionQueueDbError::ClockUnavailable)
+        ));
         force_fence(false);
+        assert!(db
+            .lookup_result_context([5; 32], [6; 16], [7; 16], [8; 16], NOW + 3)
+            .is_ok());
     }
 }

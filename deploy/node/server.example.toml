@@ -78,6 +78,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# [MEMCHAIN-PHALA-ONLY 2026-10-06 by Codex] Clarified model-free ordinary-node defaults.
 # v1.19.0-node-deploy - Documented crash-safe verified-submit admission bounds.
 # v1.18.0-node-deploy - Documented custody renewal warning lifecycle.
 # v1.17.0-node-deploy - Documented custody quorum expiry warning behavior.
@@ -140,6 +141,9 @@ session_timeout = 86400
 level = "info"
 
 [management]
+# [MANAGEMENT-DEFAULT-ON 2026-10-06 by Codex] Production installs retain
+# existing CMS registration, heartbeat, command, and session reporting.
+enabled = true
 cms_url = "https://api.aeronyx.network/api/privacy_network"
 heartbeat_interval_secs = 30
 session_report_interval_secs = 30
@@ -292,6 +296,31 @@ public_api_listen_addr = "0.0.0.0:8422"
 region = "unknown"
 descriptor_ttl_secs = 7200
 public_discovery = false
+# [PHALA-NODE-ATTESTATION-API 2026-10-06 by Codex] Optional dstack socket;
+# evidence is forwarded as opaque bytes and must be verified independently.
+# Optional Phala dstack guest-agent Unix socket. When enabled, the node signs
+# support for GET /api/discovery/phala-attestation?nonce=<64 hex chars> and
+# binds its Ed25519 node id plus the verifier nonce into dstack report_data.
+# Mount the socket into the node container only when this endpoint is desired.
+# The response is opaque evidence; clients must independently appraise the
+# quote, app identity/compose and TCB. No local attestation verdict is implied.
+# Requires enabled self-advertisement, public_discovery, a public API listener,
+# and a public endpoint.
+# phala_attestation_socket_path = "/var/run/dstack.sock"
+# Frozen dstack v0 /GetQuote compatibility is disabled unless explicitly
+# enabled. It is attempted only after the v1 route is confirmed absent (404).
+# phala_attestation_allow_legacy_v0 = false
+# [PHALA-PEER-ATTESTATION-POLICY 2026-10-06 by Codex] Optional outbound
+# route gate, including fixed source-pull and recipient-poll relay paths. Do
+# not enable until the operator independently pins the exact dstack app id and
+# measured compose hash accepted by this deployment. Strict mode also requires
+# the relay's signed descriptor to advertise the attestation feature publicly.
+# phala_attested_peers_required = false
+# [PHALA-APP-ID-PIN-FORMAT 2026-10-06 by Codex]
+# Use 0x + lowercase hex of exact RTMR3-measured app-id payload bytes.
+# phala_trusted_app_ids = ["0x<measured-app-id-bytes>"]
+# phala_trusted_compose_hashes = []
+# phala_peer_attestation_max_age_secs = 900
 # The one-command permissionless `join` path explicitly turns this on after
 # installing an operator-selected public endpoint. It does not imply relay
 # routeability, receipt proof, or nodeboard/economic admission.
@@ -363,10 +392,10 @@ api_listen_addr = "127.0.0.1:8421"
 db_path = "/var/lib/aeronyx/memchain.db"
 aof_path = "/var/lib/aeronyx/.memchain"
 miner_interval_secs = 60
-# Set to false on protocol-only relay nodes that do not install local ONNX
-# embedding models. This keeps encrypted storage, public discovery, and
-# ChatRelay routes available without noisy model-missing warnings.
-embed_enabled = true
+# [MEMCHAIN-PHALA-ONLY 2026-10-06 by Codex] Legacy compatibility switch only.
+# Local model inference is disabled; MemChain model work is Phala ACI-only.
+# This does not disable encrypted record storage or deterministic indexes.
+embed_enabled = false
 
 # A follower may verify and recover the coordinator's current-tip certificate
 # from independently pinned witnesses after signed block/checkpoint convergence.
@@ -454,3 +483,24 @@ custody_backup_retention_target_artifacts = 8
 custody_backup_retention_target_bytes = 8589934592
 # Interrupted private SQLite files remain untouched for at least 24 hours.
 custody_backup_partial_grace_secs = 86400
+# [PHALA-SOURCE-AUTHORITY-BOOTSTRAP 2026-10-06 by Codex]
+# Optional source-side reverse-onion caller. Keep disabled unless the existing
+# authenticated VPN/MPI source route is configured and discovery gossip is on.
+[reverse_onion.source]
+enabled = false
+recovery_only = false
+state_db_path = "/var/lib/aeronyx/reverse-onion-source.sqlite"
+relay_node_id = ""
+relay_endpoint = ""
+recipient_node_id = ""
+# Optional historical cache seeds only; never required for live startup.
+relay_descriptor_b64 = ""
+recipient_descriptor_b64 = ""
+recipient_authorization_b64 = ""
+max_pending_items = 16
+max_bytes = 67108864
+max_in_flight = 4
+request_timeout_secs = 15
+result_wait_secs = 5
+result_poll_interval_ms = 250
+lease_max_secs = 120

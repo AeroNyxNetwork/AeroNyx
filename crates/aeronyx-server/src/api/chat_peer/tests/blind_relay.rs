@@ -2,6 +2,202 @@
 // Behavior is unchanged. Names resolve through `use super::*;`.
 use super::*;
 
+// [PHALA-QUEUE-IDENTITY-PINS 2026-10-08 by Codex] Authored, not run:
+// signed seeds and cold start must enforce exactly the same local limits.
+#[cfg(unix)]
+#[test]
+fn both_private_admission_constructors_enforce_the_complete_identity_policy() {
+    let now = now_secs();
+    let (_directory, base) = queue_effect_admission_fixture(now);
+    let relay = IdentityKeyPair::from_bytes(&[101; 32]).unwrap();
+    let recipient = IdentityKeyPair::from_bytes(&[102; 32]).unwrap();
+    let source = IdentityKeyPair::from_bytes(&[103; 32]).unwrap().public_key_bytes();
+    let purpose = OnionRoutePurpose::BlindVaultPull;
+    let mut r = NodeDescriptor::new(relay.public_key_bytes(), 1, now - 1, now + 600, "test")
+        .with_x25519_kem(relay.x25519_public_key_bytes())
+        .with_protocol_features(purpose.required_path_protocol_features().iter().copied());
+    r.public_endpoint = Some("https://relay.example.net".into());
+    r.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
+    let mut p = NodeDescriptor::new(recipient.public_key_bytes(), 1, now - 1, now + 600, "test")
+        .with_x25519_kem(recipient.x25519_public_key_bytes())
+        .with_protocol_features(purpose.required_terminal_protocol_features().iter().copied());
+    p.policy.public_discovery = false;
+    p.capabilities = vec![NodeCapability::BlindVaultReplica];
+    let r = SignedNodeDescriptor::sign(r, &relay).unwrap();
+    let p = SignedNodeDescriptor::sign(p, &recipient).unwrap();
+    let grant = SignedPrivateOnionRecipientAuthorizationV1::new_signed(
+        &r, &p, purpose.as_str(), now, now + 600, &recipient).unwrap();
+    let seeded = |sources, capacity, route_cap, observed_at| PrivateBlindRelayAdmission::new(
+        relay.public_key_bytes(), r.clone(), p.clone(), grant.clone(), purpose,
+        sources, Arc::clone(base.queue()), capacity, route_cap, observed_at);
+    let cold = |sources, capacity, route_cap| PrivateBlindRelayAdmission::new_pinned_identity_only(
+        relay.public_key_bytes(), recipient.public_key_bytes(), purpose,
+        sources, Arc::clone(base.queue()), capacity, route_cap);
+    let ids: Vec<_> = (1..=64).map(|seed|
+        IdentityKeyPair::from_bytes(&[seed; 32]).unwrap().public_key_bytes()).collect();
+    let cap = aeronyx_core::protocol::discovery::MAX_PRIVATE_ONION_RECIPIENT_AUTHORIZATION_LIFETIME_SECS_V1;
+    assert!(seeded(ids.clone(), 64, cap, now).is_ok());
+    assert!(cold(ids.clone(), 64, cap).is_ok());
+    let mut too_many = ids;
+    too_many.push(source);
+    for sources in [Vec::new(), too_many, vec![source, source], vec![[0; 32]],
+        vec![relay.public_key_bytes()], vec![recipient.public_key_bytes()]]
+    {
+        assert!(seeded(sources.clone(), 1, 60, now).is_err());
+        assert!(cold(sources, 1, 60).is_err());
+    }
+    for capacity in [0, 65, usize::MAX] {
+        assert!(seeded(vec![source], capacity, 60, now).is_err());
+        assert!(cold(vec![source], capacity, 60).is_err());
+    }
+    for route_cap in [0, cap + 1, u64::MAX] {
+        assert!(seeded(vec![source], 1, route_cap, now).is_err());
+        assert!(cold(vec![source], 1, route_cap).is_err());
+    }
+    assert!(seeded(vec![source], 1, 60, 0).is_err());
+    assert!(seeded(vec![source], 1, 60, now + 601).is_ok(),
+        "expired signed seeds remain identity hints, never live authority");
+    assert_eq!(base.queue_semaphore().available_permits(), 1);
+}
+
+// [PHALA-QUEUE-EFFECT-ADMISSION 2026-10-08 by Codex] Synthetic identities,
+// distinct queue/relay DBs, and volume-local paths; authored, not executed.
+#[cfg(unix)]
+fn queue_effect_admission_fixture(now: u64) -> (tempfile::TempDir, PrivateBlindRelayAdmission) {
+    let directory = tempfile::Builder::new().prefix("queue-effect-admission-")
+        .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+    let relay = IdentityKeyPair::from_bytes(&[101; 32]).unwrap();
+    let recipient = IdentityKeyPair::from_bytes(&[102; 32]).unwrap();
+    let source = IdentityKeyPair::from_bytes(&[103; 32]).unwrap();
+    let limits = crate::services::reverse_onion_queue::ReverseOnionQueueLimits::new(
+        4, 8 * 1024 * 1024, 4, 60, 120).unwrap();
+    let config = crate::services::reverse_onion_queue_db::ReverseOnionQueueDbConfig::new(
+        directory.path().join("queue.sqlite"), 16 * 1024 * 1024, limits).unwrap();
+    let queue = Arc::new(ReverseOnionQueueDb::open(config, now).unwrap());
+    let admission = PrivateBlindRelayAdmission::new_pinned_identity_only(
+        relay.public_key_bytes(), recipient.public_key_bytes(), OnionRoutePurpose::BlindVaultPull,
+        vec![source.public_key_bytes()], queue, 1, 60).unwrap();
+    (directory, admission)
+}
+
+// [PHALA-QUEUE-EFFECT-ADMISSION 2026-10-08 by Codex] Authored, not run.
+#[cfg(unix)]
+#[test]
+fn queue_capacity_failure_does_not_arm_fresh_local_replay() {
+    let now = now_secs();
+    let (_directory, admission) = queue_effect_admission_fixture(now);
+    let registry: Arc<dyn BlindRelayReplayRegistry> = Arc::new(BlindRelayReplayDomain::default());
+    let route = [104; 16];
+    let request = [105; 32];
+    let generation = match registry.observe(route, request, now) {
+        BlindRelayRouteReplayDecision::New { generation } => generation,
+        other => panic!("expected new route: {other:?}"),
+    };
+    let mut lease = BlindRelayRouteLease::local(Arc::clone(&registry), route, request, generation);
+    let held = admission.try_queue_permit().unwrap();
+    assert!(matches!(lease.arm_private_queue_effect(&admission, now),
+        Err(BlindRelayError::Backpressure)));
+    assert_eq!(lease.state, BlindRelayRouteLeaseState::Acquired);
+    drop(lease);
+    let generation = match registry.observe(route, request, now) {
+        BlindRelayRouteReplayDecision::New { generation } => generation,
+        other => panic!("zero-effect pressure must release exact replay: {other:?}"),
+    };
+    drop(held);
+    let mut lease = BlindRelayRouteLease::local(Arc::clone(&registry), route, request, generation);
+    let permit = lease.arm_private_queue_effect(&admission, now).unwrap();
+    assert_eq!(lease.state, BlindRelayRouteLeaseState::Armed);
+    assert!(admission.try_queue_permit().is_err());
+    drop(permit);
+    drop(lease);
+    assert_eq!(registry.observe(route, request, now), BlindRelayRouteReplayDecision::InFlight);
+
+    let held = admission.try_queue_permit().unwrap();
+    let mut already_armed = BlindRelayRouteLease::local(
+        Arc::clone(&registry), route, request, generation);
+    already_armed.state = BlindRelayRouteLeaseState::Armed;
+    assert!(matches!(already_armed.arm_private_queue_effect(&admission, now),
+        Err(BlindRelayError::Backpressure)));
+    assert_eq!(already_armed.state, BlindRelayRouteLeaseState::Armed);
+    drop(already_armed);
+    drop(held);
+    assert_eq!(registry.observe(route, request, now), BlindRelayRouteReplayDecision::InFlight);
+
+    // An invalid completed transition must return its newly-acquired slot.
+    let mut completed = BlindRelayRouteLease::local(registry, route, request, generation);
+    completed.state = BlindRelayRouteLeaseState::Completed;
+    assert!(matches!(completed.arm_private_queue_effect(&admission, now),
+        Err(BlindRelayError::ReplayProtectionUnavailable)));
+    assert!(admission.try_queue_permit().is_ok());
+}
+
+// [PHALA-QUEUE-EFFECT-ADMISSION 2026-10-08 by Codex] Authored, not run.
+#[cfg(unix)]
+#[test]
+fn queue_pressure_releases_only_unarmed_durable_custody() {
+    for stopped in [false, true] {
+        let now = now_secs();
+        let (directory, admission) = queue_effect_admission_fixture(now);
+        let relay_path = directory.path().join("relay.sqlite");
+        let relay = Arc::new(ChatRelayService::new(
+            test_chat_config(relay_path.to_string_lossy().into_owned()), [7; 32]).unwrap());
+        let route = [106; 16];
+        let request = [107; 32];
+        assert_eq!(relay.reserve_blind_relay_route(&route, &request).unwrap(),
+            BlindRelayRouteAdmission::Reserved);
+        let mut lease = BlindRelayRouteLease::durable(Arc::clone(&relay), route, request, false);
+        let held = admission.try_queue_permit().unwrap();
+        if stopped { admission.request_stop(); }
+        assert!(matches!(lease.arm_private_queue_effect(&admission, now),
+            Err(BlindRelayError::Backpressure)));
+        assert_eq!(lease.state, BlindRelayRouteLeaseState::Acquired);
+        drop(lease);
+        let count: i64 = Connection::open(&relay_path).unwrap().query_row(
+            "SELECT COUNT(*) FROM relay_blind_route_reservations", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+        let queued: i64 = Connection::open(directory.path().join("queue.sqlite")).unwrap().query_row(
+            "SELECT COUNT(*) FROM reverse_onion_delivery_queue_v1", [], |row| row.get(0)).unwrap();
+        assert_eq!(queued, 0);
+        drop(held);
+        assert_eq!(relay.reserve_blind_relay_route(&route, &request).unwrap(),
+            BlindRelayRouteAdmission::Reserved);
+        let mut lease = BlindRelayRouteLease::durable(Arc::clone(&relay), route, request, false);
+        if !stopped {
+            let permit = lease.arm_private_queue_effect(&admission, now).unwrap();
+            assert_eq!(lease.state, BlindRelayRouteLeaseState::Armed);
+            drop(permit);
+            drop(lease);
+            let armed: i64 = Connection::open(&relay_path).unwrap().query_row(
+                "SELECT COUNT(*) FROM relay_blind_route_reservations WHERE effect_started_at IS NOT NULL",
+                [], |row| row.get(0)).unwrap();
+            assert_eq!(armed, 1);
+            assert_eq!(relay.reserve_blind_relay_route(&route, &request).unwrap(),
+                BlindRelayRouteAdmission::Pending);
+        } else {
+            assert!(matches!(lease.arm_private_queue_effect(&admission, now),
+                Err(BlindRelayError::Backpressure)));
+            drop(lease);
+        }
+    }
+}
+
+// [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex] Authored, not executed.
+#[test]
+fn private_terminal_allows_only_source_sealed_pull_without_public_api() {
+    assert!(private_terminal_purpose_allowed(
+        false,
+        OnionRoutePurpose::BlindVaultPull,
+    ));
+    assert!(!private_terminal_purpose_allowed(
+        false,
+        OnionRoutePurpose::BlindVaultPut,
+    ));
+    assert!(private_terminal_purpose_allowed(
+        true,
+        OnionRoutePurpose::BlindVaultPut,
+    ));
+}
+
 #[tokio::test]
 async fn blind_relay_signature_admission_rejects_without_queueing() {
     // [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] A saturated
@@ -373,6 +569,7 @@ async fn blind_relay_rejects_stale_timestamp_without_parsing_blob() {
     let node_identity = Arc::new(IdentityKeyPair::generate());
     let peer_store = Arc::new(PeerStore::new());
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -425,6 +622,7 @@ async fn blind_relay_rejects_future_timestamp_without_parsing_blob() {
     let node_identity = Arc::new(IdentityKeyPair::generate());
     let peer_store = Arc::new(PeerStore::new());
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -480,6 +678,7 @@ async fn onion_terminal_layer_is_peeled_and_delivered() {
     let peer_store = Arc::new(PeerStore::new());
     let (relay, path) = temp_chat_relay("onion-terminal");
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: Some(Arc::clone(&relay)),
         blind_vault: None,
         anonymous_mailbox: None,
@@ -640,6 +839,7 @@ async fn onion_terminal_armed_claim_recovers_without_duplicate_storage() {
         .expect("restart relay for armed reconciliation"),
     );
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: Some(Arc::clone(&recovered_relay)),
         blind_vault: None,
         anonymous_mailbox: None,
@@ -725,6 +925,7 @@ async fn onion_middle_armed_claim_recovers_through_terminal_durable_replay() {
 
     let (old_middle_relay, middle_path) = temp_chat_relay("onion-middle-armed-recovery");
     let old_middle_state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: Some(Arc::clone(&old_middle_relay)),
         blind_vault: None,
         anonymous_mailbox: None,
@@ -843,6 +1044,7 @@ async fn onion_middle_armed_claim_recovers_through_terminal_durable_replay() {
         .expect("restart middle relay for armed reconciliation"),
     );
     let recovered_middle_state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: Some(Arc::clone(&recovered_middle_relay)),
         blind_vault: None,
         anonymous_mailbox: None,
@@ -929,6 +1131,7 @@ async fn onion_terminal_rejects_same_message_id_with_different_ciphertext() {
     let peer_store = Arc::new(PeerStore::new());
     let (relay, path) = temp_chat_relay("onion-terminal-id-conflict");
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: Some(Arc::clone(&relay)),
         blind_vault: None,
         anonymous_mailbox: None,
@@ -1022,6 +1225,7 @@ async fn onion_terminal_persists_anonymous_blind_vault_put_idempotently() {
     let encoded_put =
         encode_blind_vault_frame(&BlindVaultFrame::Put(put)).expect("encode vault put");
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: Some(Arc::clone(&vault)),
         anonymous_mailbox: None,
@@ -1124,6 +1328,7 @@ async fn onion_terminal_requires_chat_relay_delivery_before_ack() {
         Arc::new(BlindRelayReplayDomain::default());
     let abuse_guard: Arc<dyn BlindRelayAbusePolicy> = Arc::new(BlindRelayAbuseDomain::default());
     let failed_state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -1165,6 +1370,7 @@ async fn onion_terminal_requires_chat_relay_delivery_before_ack() {
 
     let (relay, path) = temp_chat_relay("onion-terminal-retry-after-relay-failure");
     let retry_state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: Some(Arc::clone(&relay)),
         blind_vault: None,
         anonymous_mailbox: None,
@@ -1216,6 +1422,7 @@ async fn onion_layer_with_wrong_node_key_is_rejected() {
     let peer_store = Arc::new(PeerStore::new());
     let (relay, path) = temp_chat_relay("onion-wrong-node-key-retry");
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: Some(relay),
         blind_vault: None,
         anonymous_mailbox: None,
@@ -1319,6 +1526,7 @@ async fn onion_middle_allows_fresh_signed_peer_before_routeability_probe() {
         .unwrap();
 
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -1523,6 +1731,7 @@ async fn two_hop_onion_relay_delivers_real_ciphertext_payload_to_terminal_store(
         .unwrap();
 
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -1620,6 +1829,7 @@ async fn blind_relay_http_gate_requires_durable_replay_before_body_parse() {
     // extractor can parse or allocate for an attacker-controlled envelope.
     let peer_store = Arc::new(PeerStore::new());
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -1681,6 +1891,7 @@ async fn blind_relay_rejects_immediate_previous_hop_loop_without_parsing_blob() 
     let node_identity = Arc::new(IdentityKeyPair::generate());
     let peer_store = Arc::new(PeerStore::new());
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -1869,6 +2080,7 @@ async fn blind_relay_replays_completed_response_without_forwarding_again() {
     let node_identity = Arc::new(IdentityKeyPair::generate());
     let peer_store = Arc::new(PeerStore::new());
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -1966,6 +2178,7 @@ async fn blind_relay_in_flight_duplicate_never_returns_false_acceptance() {
     );
     let peer_store = Arc::new(PeerStore::new());
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: Some(relay),
         blind_vault: None,
         anonymous_mailbox: None,
@@ -2028,6 +2241,7 @@ async fn blind_relay_capacity_rejects_before_terminal_or_forward_effects() {
     }
     let peer_store = Arc::new(PeerStore::new());
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -2105,6 +2319,7 @@ async fn blind_relay_forward_retries_transient_next_hop_failure() {
     peer_store.record_route_forward_success(&next_hop_identity.public_key_bytes(), now);
 
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -2209,6 +2424,7 @@ async fn blind_relay_middle_hop_forwards_onward_envelope_without_payload_inspect
     peer_store.record_route_forward_success(&terminal_identity.public_key_bytes(), now);
 
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -2332,6 +2548,7 @@ async fn blind_relay_forward_requires_accepted_next_hop_ack() {
     peer_store.record_route_forward_success(&next_hop_identity.public_key_bytes(), now);
 
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -2415,6 +2632,7 @@ async fn blind_relay_forward_rejects_malformed_success_ack() {
     peer_store.record_route_forward_success(&next_hop_identity.public_key_bytes(), now);
 
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -2506,6 +2724,7 @@ async fn blind_relay_requires_next_hop_chat_relay_capability() {
         .unwrap();
 
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -2599,6 +2818,7 @@ async fn blind_relay_requires_routeability_evidence_before_forwarding() {
         .unwrap();
 
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,
@@ -2697,6 +2917,7 @@ async fn blind_relay_forward_reports_retry_exhaustion_without_payload_data() {
     peer_store.record_route_forward_success(&next_hop_identity.public_key_bytes(), now);
 
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: Some(relay),
         blind_vault: None,
         anonymous_mailbox: None,
@@ -2802,6 +3023,7 @@ async fn blind_relay_forward_retries_timeout_without_endpoint_leak() {
     peer_store.record_route_forward_success(&next_hop_identity.public_key_bytes(), now);
 
     let state = ChatPeerState {
+        private_recipient_admission: None,
         chat_relay: None,
         blind_vault: None,
         anonymous_mailbox: None,

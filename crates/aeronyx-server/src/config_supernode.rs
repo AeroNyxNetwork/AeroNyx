@@ -7,15 +7,19 @@
 //! v2.5.0-SuperNode — Extracted from config.rs to keep MemChainConfig manageable.
 //!
 //! ## Main Functionality
-//! - SuperNodeConfig: top-level supernode config (enabled flag + sub-configs)
-//! - ProviderConfig: individual LLM provider definition (API endpoint, model, auth)
-//! - ProviderType: enum for provider protocol (OpenAI-compatible vs Anthropic)
+//! - SuperNodeConfig: top-level inference config, disabled by default
+//! - ProviderConfig: provider endpoint, model, and authentication metadata
+//! - ProviderType: legacy variants remain deserializable, but enabled MemChain
+//!   inference accepts only the Phala ACI provider.
+//! - Server-side SuperNode is restricted to SaaS mode; local/P2P node profiles
+//!   must not accept plaintext cognition requests and do not proxy client ACI calls.
 //! - CognitiveTaskType: **CANONICAL** enum for the 6 cognitive task types
 //!   (SessionTitle, CommunityNarrative, ConflictResolution, RecallSynthesis,
 //!    CodeAnalysis, EntityDescription). This is the SINGLE SOURCE OF TRUTH —
 //!   llm_provider.rs re-exports this type, NOT the other way around.
 //! - TaskRoutingConfig: maps each task type to a named provider
-//! - PrivacyLevel: Structured / Summary / Full — controls what data is sent to LLM
+//! - PrivacyLevel: Structured / Summary / Full — controls the task payload sent
+//!   to the Phala ACI gateway; it does not imply a blind gateway proxy.
 //! - PrivacyConfig: controls what data is sent to external LLM APIs
 //! - WorkerConfig: async task worker parameters (polling, concurrency, retries)
 //! - Validation for all config sections
@@ -37,9 +41,16 @@
 //! - SuperNodeConfig::default() returns enabled=false — existing nodes upgrading
 //!   to v2.5.0 see ZERO behavior change until explicitly enabled in config.
 //! - api_key supports "$ENV_VAR" syntax — resolved at runtime by the provider
-//!   implementation (llm_openai.rs / llm_anthropic.rs), NOT during config loading.
-//! - ProviderType::OpenaiCompatible covers DeepSeek, OpenAI, Groq, Together,
-//!   Ollama, vLLM, and any other OpenAI Chat Completion API compatible endpoint.
+//!   implementation. Never print the value or treat ACI attestation as proof
+//!   that plaintext is hidden from every gateway/backend component.
+//! - [MEMCHAIN-PHALA-ONLY 2026-10-06 by Codex] Server-side inference is SaaS-only
+//!   and fail-closed: only Phala ACI, canonical Phala HTTPS endpoint, explicit
+//!   reviewed compose measurements, and accepted KMS roots are valid.
+//! - [MEMCHAIN-PHALA-ACI-PINNED-CONTRACT 2026-10-06 by Codex] Response proof
+//!   follows the Cargo.lock-pinned ACI v1 headers, receipt and session formats;
+//!   do not assume fields from a newer, unpinned draft.
+//! - [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex] Enabled SuperNode inference
+//!   accepts only Phala ACI providers; legacy adapter variants are rejected.
 //! - TaskRoutingConfig fields are all Option<String>. When None, the fallback
 //!   provider is used.
 //! - PrivacyConfig.level_for() returns PrivacyLevel (owned, cloned).
@@ -91,6 +102,8 @@ use crate::error::{Result, ServerError};
 /// - RecallSynthesis → "recall_synthesis"
 /// - CodeAnalysis → "code_analysis"
 /// - EntityDescription → "entity_description"
+/// - EntityExtraction → "entity_extraction"
+/// - EntityExtraction → "entity_extraction"
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CognitiveTaskType {
@@ -101,6 +114,9 @@ pub enum CognitiveTaskType {
     CodeAnalysis,
     /// Entity description enrichment (v2.5.0+SuperNode Phase B, enqueued by Step 9)
     EntityDescription,
+    /// Phala-only extraction from user-approved full session content.
+    // [MEMCHAIN-PHALA-EXTRACTION 2026-10-05 by Codex]
+    EntityExtraction,
 }
 
 impl CognitiveTaskType {
@@ -111,6 +127,7 @@ impl CognitiveTaskType {
         Self::RecallSynthesis,
         Self::CodeAnalysis,
         Self::EntityDescription,
+        Self::EntityExtraction,
     ];
 
     /// Canonical string for DB storage in `task_type` column.
@@ -124,6 +141,7 @@ impl CognitiveTaskType {
             Self::RecallSynthesis => "recall_synthesis",
             Self::CodeAnalysis => "code_analysis",
             Self::EntityDescription => "entity_description",
+            Self::EntityExtraction => "entity_extraction",
         }
     }
 
@@ -142,8 +160,11 @@ impl CognitiveTaskType {
             Self::SessionTitle => "structured",
             Self::CommunityNarrative => "structured",
             Self::EntityDescription => "structured",
+            Self::EntityExtraction => "full",
             Self::ConflictResolution => "structured",
-            Self::RecallSynthesis => "structured",
+            // [MEMCHAIN-PHALA-SUMMARY-PRIVACY 2026-10-06 by Codex] Summary
+            // synthesis receives only a bounded prior summary and topic labels.
+            Self::RecallSynthesis => "summary",
             Self::CodeAnalysis => "structured",
         }
     }
@@ -155,6 +176,7 @@ impl CognitiveTaskType {
             Self::SessionTitle => 7,
             Self::CommunityNarrative => 5,
             Self::EntityDescription => 4,
+            Self::EntityExtraction => 6,
             Self::RecallSynthesis => 6,
             Self::ConflictResolution => 5,
             Self::CodeAnalysis => 5,
@@ -177,6 +199,7 @@ impl CognitiveTaskType {
             "recall_synthesis" => Some(Self::RecallSynthesis),
             "code_analysis" => Some(Self::CodeAnalysis),
             "entity_description" => Some(Self::EntityDescription),
+            "entity_extraction" => Some(Self::EntityExtraction),
             _ => None,
         }
     }
@@ -195,10 +218,13 @@ impl std::fmt::Display for CognitiveTaskType {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderType {
-    /// OpenAI Chat Completion API compatible endpoint.
+    /// Legacy OpenAI Chat Completion adapter; rejected for enabled MemChain inference.
     OpenaiCompatible,
-    /// Anthropic Messages API (Claude models).
+    /// Legacy Anthropic adapter; rejected for enabled MemChain inference.
     Anthropic,
+    /// Phala Confidential AI API with ACI-verified upstream routing.
+    // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex]
+    PhalaAci,
 }
 
 impl std::fmt::Display for ProviderType {
@@ -206,6 +232,7 @@ impl std::fmt::Display for ProviderType {
         match self {
             Self::OpenaiCompatible => write!(f, "openai_compatible"),
             Self::Anthropic => write!(f, "anthropic"),
+            Self::PhalaAci => write!(f, "phala_aci"),
         }
     }
 }
@@ -219,6 +246,11 @@ pub struct ProviderConfig {
     pub name: String,
     #[serde(rename = "type")]
     pub provider_type: ProviderType,
+    /// For `phala_aci`, the ACI/1 gateway origin or `/v1` base. Responses
+    /// must include ACI/1 version, keyset digest, and receipt-id headers;
+    /// runtime verification binds the digest to the fresh report and verifies
+    /// the signed receipt/session under the Cargo.lock-pinned contract.
+    // [MEMCHAIN-PHALA-IDENTITY-BINDING 2026-10-06 by Codex]
     #[serde(default)]
     pub api_base: String,
     #[serde(default)]
@@ -256,6 +288,10 @@ pub struct TaskRoutingConfig {
     pub code_analysis: Option<String>,
     #[serde(default)]
     pub entity_description: Option<String>,
+    /// Phala provider route for consented full-content entity extraction.
+    // [MEMCHAIN-PHALA-EXTRACTION 2026-10-05 by Codex]
+    #[serde(default)]
+    pub entity_extraction: Option<String>,
     #[serde(default)]
     pub fallback: Option<String>,
 }
@@ -270,6 +306,7 @@ impl TaskRoutingConfig {
             CognitiveTaskType::RecallSynthesis => self.recall_synthesis.as_deref(),
             CognitiveTaskType::CodeAnalysis => self.code_analysis.as_deref(),
             CognitiveTaskType::EntityDescription => self.entity_description.as_deref(),
+            CognitiveTaskType::EntityExtraction => self.entity_extraction.as_deref(),
         };
         explicit.or(self.fallback.as_deref())
     }
@@ -282,6 +319,7 @@ impl TaskRoutingConfig {
             self.recall_synthesis.as_deref(),
             self.code_analysis.as_deref(),
             self.entity_description.as_deref(),
+            self.entity_extraction.as_deref(),
             self.fallback.as_deref(),
         ];
         fields.iter().filter_map(|f| *f).collect()
@@ -297,6 +335,7 @@ impl Default for TaskRoutingConfig {
             recall_synthesis: None,
             code_analysis: None,
             entity_description: None,
+            entity_extraction: None,
             fallback: None,
         }
     }
@@ -476,8 +515,27 @@ impl Default for WorkerConfig {
 pub struct SuperNodeConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Exact ACI-measured Phala compose hashes accepted for confidential inference.
+    // [MEMCHAIN-PHALA-MEASUREMENT-POLICY 2026-10-05 by Codex]
+    #[serde(default)]
+    pub accepted_compose_hashes: Vec<String>,
+    /// Operator-reviewed link from each measured compose to its public source or image.
+    // [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex]
+    #[serde(default)]
+    pub accepted_source_provenance: Vec<AcceptedAciSourceProvenance>,
+    /// Dstack KMS roots trusted to have custody of the attested ACI receipt key.
+    // [MEMCHAIN-PHALA-KMS-POLICY 2026-10-05 by Codex]
+    #[serde(default)]
+    pub accepted_kms_root_public_keys: Vec<String>,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    /// Explicit Phala ACI provider used for semantic embeddings. Both fields
+    /// must be configured together; absent configuration disables embeddings.
+    // [MEMCHAIN-PHALA-EMBEDDINGS 2026-10-06 by Codex]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
     #[serde(default)]
     pub routing: TaskRoutingConfig,
     #[serde(default)]
@@ -486,7 +544,36 @@ pub struct SuperNodeConfig {
     pub worker: WorkerConfig,
 }
 
+/// An operator-reviewed provenance mapping tied to one quote-measured compose.
+/// The mapping is relying-party policy, not a cryptographic proof by itself.
+// [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedAciSourceProvenance {
+    pub compose_hash: String,
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    #[serde(default)]
+    pub repo_commit: Option<String>,
+    #[serde(default)]
+    pub image_digest: Option<String>,
+}
+
 impl SuperNodeConfig {
+    // [MEMCHAIN-PHALA-NODE-BOUNDARY 2026-10-05 by Codex]
+    /// Validate the queue configuration against the process trust boundary.
+    /// P2P/local nodes cannot accept plaintext cognition payloads; their clients
+    /// call the attested Phala endpoint directly instead.
+    pub fn validate_for_mode(&self, is_saas: bool) -> Result<()> {
+        if self.enabled && !is_saas {
+            return Err(ServerError::config_invalid(
+                "memchain.supernode.enabled",
+                "server-side cognition tasks are restricted to SaaS mode; ordinary nodes must not handle plaintext prompts",
+            ));
+        }
+        self.validate()
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -497,6 +584,199 @@ impl SuperNodeConfig {
                 "memchain.supernode.providers",
                 "at least one provider must be configured when supernode is enabled",
             ));
+        }
+
+        // [MEMCHAIN-PHALA-EMBEDDINGS 2026-10-06 by Codex]
+        match (&self.embedding_provider, &self.embedding_model) {
+            (None, None) => {}
+            (Some(provider_name), Some(model)) => {
+                let provider = self.providers.iter().find(|provider| provider.name == *provider_name);
+                if provider.is_none_or(|provider| provider.provider_type != ProviderType::PhalaAci) {
+                    return Err(ServerError::config_invalid(
+                        "memchain.supernode.embedding_provider",
+                        "semantic embeddings require an explicitly named phala_aci provider",
+                    ));
+                }
+                if model.trim().is_empty() || model.len() > 256 {
+                    return Err(ServerError::config_invalid(
+                        "memchain.supernode.embedding_model",
+                        "embedding model must contain 1..=256 bytes",
+                    ));
+                }
+            }
+            _ => {
+                return Err(ServerError::config_invalid(
+                    "memchain.supernode.embedding_model",
+                    "embedding_provider and embedding_model must be configured together",
+                ));
+            }
+        }
+
+        // [MEMCHAIN-PHALA-MEASUREMENT-POLICY 2026-10-05 by Codex] ACI defines
+        // artifact bindings, not which workload the relying party trusts.
+        // Never interpret an empty allowlist as accepting any measured code.
+        if self.accepted_compose_hashes.is_empty() {
+            return Err(ServerError::config_invalid(
+                "memchain.supernode.accepted_compose_hashes",
+                "at least one reviewed sha256 compose measurement is required",
+            ));
+        }
+        let mut accepted_compose_hashes = HashSet::new();
+        for (index, digest) in self.accepted_compose_hashes.iter().enumerate() {
+            let Some(hex) = digest.strip_prefix("sha256:") else {
+                return Err(ServerError::config_invalid(
+                    &format!("memchain.supernode.accepted_compose_hashes[{index}]"),
+                    "expected canonical sha256:<64 lowercase hex> measurement",
+                ));
+            };
+            if hex.len() != 64
+                || !hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(ServerError::config_invalid(
+                    &format!("memchain.supernode.accepted_compose_hashes[{index}]"),
+                    "expected canonical sha256:<64 lowercase hex> measurement",
+                ));
+            }
+            if !accepted_compose_hashes.insert(digest) {
+                return Err(ServerError::config_invalid(
+                    "memchain.supernode.accepted_compose_hashes",
+                    "duplicate compose measurements are not allowed",
+                ));
+            }
+        }
+
+        // [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex] ACI source
+        // fields are outside the quote; require the operator's explicit,
+        // reviewed mapping from every measured workload to its provenance.
+        if self.accepted_source_provenance.is_empty() {
+            return Err(ServerError::config_invalid(
+                "memchain.supernode.accepted_source_provenance",
+                "each accepted compose measurement requires reviewed source provenance",
+            ));
+        }
+        let accepted_compose_set: HashSet<&str> =
+            self.accepted_compose_hashes.iter().map(String::as_str).collect();
+        let mut mapped_compose_hashes = HashSet::new();
+        let mut source_mappings = HashSet::new();
+        for (index, mapping) in self.accepted_source_provenance.iter().enumerate() {
+            let prefix = format!("memchain.supernode.accepted_source_provenance[{index}]");
+            let Some(compose_hex) = mapping.compose_hash.strip_prefix("sha256:") else {
+                return Err(ServerError::config_invalid(
+                    &format!("{prefix}.compose_hash"),
+                    "expected canonical sha256:<64 lowercase hex> measurement",
+                ));
+            };
+            if compose_hex.len() != 64
+                || !compose_hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || !accepted_compose_set.contains(mapping.compose_hash.as_str())
+            {
+                return Err(ServerError::config_invalid(
+                    &format!("{prefix}.compose_hash"),
+                    "mapping must reference an accepted canonical compose measurement",
+                ));
+            }
+            let repo_mapping = match (
+                mapping.repo_url.as_deref(),
+                mapping.repo_commit.as_deref(),
+            ) {
+                (Some(url), Some(revision)) => {
+                    let valid_url = reqwest::Url::parse(url).is_ok_and(|parsed| {
+                        parsed.scheme() == "https"
+                            && parsed.host_str().is_some()
+                            && parsed.username().is_empty()
+                            && parsed.password().is_none()
+                            && parsed.query().is_none()
+                            && parsed.fragment().is_none()
+                    });
+                    valid_url
+                        && matches!(revision.len(), 40 | 64)
+                        && revision.bytes().all(|byte| {
+                            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                        })
+                }
+                (None, None) => false,
+                _ => false,
+            };
+            let image_mapping = match mapping.image_digest.as_deref() {
+                Some(digest) => digest.strip_prefix("sha256:").is_some_and(|hex| {
+                    hex.len() == 64
+                        && hex
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }),
+                None => false,
+            };
+            let repo_fields_well_formed = match (
+                mapping.repo_url.as_deref(),
+                mapping.repo_commit.as_deref(),
+            ) {
+                (None, None) => true,
+                (Some(_), Some(_)) => repo_mapping,
+                _ => false,
+            };
+            let image_field_well_formed = mapping.image_digest.is_none() || image_mapping;
+            if !repo_fields_well_formed
+                || !image_field_well_formed
+                || (!repo_mapping && !image_mapping)
+            {
+                return Err(ServerError::config_invalid(
+                    &prefix,
+                    "mapping requires a complete HTTPS repository revision or sha256 image digest",
+                ));
+            }
+            if !source_mappings.insert(mapping) {
+                return Err(ServerError::config_invalid(
+                    "memchain.supernode.accepted_source_provenance",
+                    "duplicate source-provenance mappings are not allowed",
+                ));
+            }
+            mapped_compose_hashes.insert(mapping.compose_hash.as_str());
+        }
+        if mapped_compose_hashes != accepted_compose_set {
+            return Err(ServerError::config_invalid(
+                "memchain.supernode.accepted_source_provenance",
+                "every accepted compose measurement must have a source-provenance mapping",
+            ));
+        }
+
+        // [MEMCHAIN-PHALA-KMS-POLICY 2026-10-05 by Codex] A valid TDX quote
+        // binds workload keys, but this deployment policy must separately
+        // decide which Dstack KMS roots may attest the receipt signer.
+        if self.accepted_kms_root_public_keys.is_empty() {
+            return Err(ServerError::config_invalid(
+                "memchain.supernode.accepted_kms_root_public_keys",
+                "at least one reviewed compressed secp256k1 KMS root is required",
+            ));
+        }
+        let mut accepted_kms_roots = HashSet::new();
+        for (index, root) in self.accepted_kms_root_public_keys.iter().enumerate() {
+            let Some(hex) = root.strip_prefix("0x") else {
+                return Err(ServerError::config_invalid(
+                    &format!("memchain.supernode.accepted_kms_root_public_keys[{index}]"),
+                    "expected canonical 0x-prefixed compressed secp256k1 public key",
+                ));
+            };
+            if hex.len() != 66
+                || !(hex.starts_with("02") || hex.starts_with("03"))
+                || !hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(ServerError::config_invalid(
+                    &format!("memchain.supernode.accepted_kms_root_public_keys[{index}]"),
+                    "expected canonical 0x-prefixed compressed secp256k1 public key",
+                ));
+            }
+            if !accepted_kms_roots.insert(root) {
+                return Err(ServerError::config_invalid(
+                    "memchain.supernode.accepted_kms_root_public_keys",
+                    "duplicate KMS roots are not allowed",
+                ));
+            }
         }
 
         let mut seen_names: HashSet<String> = HashSet::new();
@@ -531,7 +811,36 @@ impl SuperNodeConfig {
                              will use default https://api.anthropic.com at runtime"
                         );
                     }
+                    ProviderType::PhalaAci => {}
                 }
+            }
+
+            // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex] A configured
+            // ordinary provider must never become a MemChain inference path.
+            if provider.provider_type != ProviderType::PhalaAci {
+                return Err(ServerError::config_invalid(
+                    &format!("{}.type", prefix),
+                    "MemChain inference requires Phala ACI providers",
+                ));
+            }
+
+            // [MEMCHAIN-PHALA-ENDPOINT-CONTRACT 2026-10-05 by Codex]
+            // Reject endpoint drift during config validation, not only while
+            // constructing the runtime provider.
+            let phala_api_base: &str = if provider.api_base.is_empty() {
+                crate::services::memchain::llm_provider::PHALA_ACI_API_BASE_DEFAULT
+            } else {
+                &provider.api_base
+            };
+            if crate::services::memchain::llm_provider::validate_phala_aci_api_base(
+                phala_api_base,
+            )
+            .is_err()
+            {
+                return Err(ServerError::config_invalid(
+                    &format!("{}.api_base", prefix),
+                    "must use https://inference.phala.com with an optional /v1 path",
+                ));
             }
 
             if provider.model.is_empty() {
@@ -583,7 +892,7 @@ impl SuperNodeConfig {
                     task_type = %task_name,
                     "[SUPERNODE] Unknown task type in privacy.allow_full_for — ignored. \
                      Valid types: session_title, community_narrative, conflict_resolution, \
-                     recall_synthesis, code_analysis, entity_description"
+                     recall_synthesis, code_analysis, entity_description, entity_extraction"
                 );
             }
         }
@@ -655,7 +964,12 @@ impl Default for SuperNodeConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            accepted_compose_hashes: Vec::new(),
+            accepted_source_provenance: Vec::new(),
+            accepted_kms_root_public_keys: Vec::new(),
             providers: Vec::new(),
+            embedding_provider: None,
+            embedding_model: None,
             routing: TaskRoutingConfig::default(),
             privacy: PrivacyConfig::default(),
             worker: WorkerConfig::default(),
@@ -670,6 +984,15 @@ impl Default for SuperNodeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // [MEMCHAIN-PHALA-SUMMARY-PRIVACY 2026-10-06 by Codex]
+    #[test]
+    fn recall_synthesis_defaults_to_summary_privacy() {
+        assert_eq!(
+            CognitiveTaskType::RecallSynthesis.default_privacy_level(),
+            "summary"
+        );
+    }
 
     #[test]
     fn provider_debug_does_not_expose_credentials_or_endpoint_metadata() {
@@ -701,6 +1024,7 @@ mod tests {
     fn test_default_is_disabled() {
         let cfg = SuperNodeConfig::default();
         assert!(!cfg.enabled);
+        assert!(cfg.accepted_compose_hashes.is_empty());
         assert!(!cfg.is_enabled());
         assert!(cfg.providers.is_empty());
         assert!(cfg.validate().is_ok());
@@ -726,15 +1050,16 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
+    // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex]
     #[test]
     fn test_provider_empty_name_rejected() {
         let cfg = SuperNodeConfig {
             enabled: true,
             providers: vec![ProviderConfig {
                 name: String::new(),
-                provider_type: ProviderType::OpenaiCompatible,
-                api_base: "http://localhost:11434/v1".into(),
-                api_key: None,
+                provider_type: ProviderType::PhalaAci,
+                api_base: String::new(),
+                api_key: Some("$PHALA_API_KEY".into()),
                 model: "test".into(),
                 max_tokens: None,
                 temperature: None,
@@ -744,14 +1069,15 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
+    // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex]
     #[test]
     fn test_provider_duplicate_name_rejected() {
         let provider = ProviderConfig {
-            name: "deepseek".into(),
-            provider_type: ProviderType::OpenaiCompatible,
-            api_base: "http://api.deepseek.com/v1".into(),
-            api_key: None,
-            model: "deepseek-reasoner".into(),
+            name: "phala".into(),
+            provider_type: ProviderType::PhalaAci,
+            api_base: String::new(),
+            api_key: Some("$PHALA_API_KEY".into()),
+            model: "confidential-model".into(),
             max_tokens: None,
             temperature: None,
         };
@@ -781,22 +1107,121 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
+    // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex]
     #[test]
-    fn test_anthropic_allows_empty_api_base() {
+    fn test_ordinary_provider_rejected_even_with_valid_endpoint() {
         let cfg = SuperNodeConfig {
             enabled: true,
             providers: vec![ProviderConfig {
-                name: "claude".into(),
-                provider_type: ProviderType::Anthropic,
+                name: "ordinary".into(),
+                provider_type: ProviderType::OpenaiCompatible,
+                api_base: "https://api.example.invalid/v1".into(),
+                api_key: Some("$ORDINARY_API_KEY".into()),
+                model: "ordinary-model".into(),
+                max_tokens: None,
+                temperature: None,
+            }],
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex]
+    fn test_phala_aci_allows_default_api_base() {
+        let cfg = SuperNodeConfig {
+            enabled: true,
+            accepted_compose_hashes: vec![format!("sha256:{}", "a".repeat(64))],
+            accepted_source_provenance: vec![AcceptedAciSourceProvenance {
+                compose_hash: format!("sha256:{}", "a".repeat(64)),
+                repo_url: Some("https://example.invalid/phala-gateway".into()),
+                repo_commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                image_digest: None,
+            }],
+            accepted_kms_root_public_keys: vec![format!("0x02{}", "a".repeat(64))],
+            providers: vec![ProviderConfig {
+                name: "phala".into(),
+                provider_type: ProviderType::PhalaAci,
                 api_base: String::new(),
-                api_key: Some("$ANTHROPIC_API_KEY".into()),
-                model: "claude-sonnet-4-20250514".into(),
+                api_key: Some("$PHALA_API_KEY".into()),
+                model: "confidential-model".into(),
                 max_tokens: None,
                 temperature: None,
             }],
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+        // [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex]
+        let mut missing_provenance_mapping = cfg.clone();
+        missing_provenance_mapping.accepted_source_provenance.clear();
+        assert!(missing_provenance_mapping.validate().is_err());
+        let mut mismatched_compose_mapping = cfg.clone();
+        mismatched_compose_mapping.accepted_source_provenance[0].compose_hash =
+            format!("sha256:{}", "b".repeat(64));
+        assert!(mismatched_compose_mapping.validate().is_err());
+        let mut malformed_source_mapping = cfg.clone();
+        malformed_source_mapping.accepted_source_provenance[0].repo_commit =
+            Some("not-a-revision".into());
+        assert!(malformed_source_mapping.validate().is_err());
+    }
+
+    // [MEMCHAIN-PHALA-MEASUREMENT-POLICY 2026-10-05 by Codex]
+    #[test]
+    fn test_phala_measurement_policy_is_explicit_and_canonical() {
+        let valid_provider = || ProviderConfig {
+            name: "phala".into(),
+            provider_type: ProviderType::PhalaAci,
+            api_base: String::new(),
+            api_key: Some("$PHALA_API_KEY".into()),
+            model: "confidential-model".into(),
+            max_tokens: None,
+            temperature: None,
+        };
+        for accepted_compose_hashes in [
+            Vec::new(),
+            vec!["sha256:ABC".to_string()],
+            vec![format!("sha256:{}", "A".repeat(64))],
+            vec![
+                format!("sha256:{}", "b".repeat(64)),
+                format!("sha256:{}", "b".repeat(64)),
+            ],
+        ] {
+            let cfg = SuperNodeConfig {
+                enabled: true,
+                accepted_compose_hashes,
+                accepted_kms_root_public_keys: vec![format!("0x02{}", "a".repeat(64))],
+                providers: vec![valid_provider()],
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err());
+        }
+    }
+
+    // [MEMCHAIN-PHALA-ENDPOINT-CONTRACT 2026-10-05 by Codex]
+    #[test]
+    fn test_phala_aci_rejects_noncanonical_endpoint_during_config_validation() {
+        for api_base in [
+            "http://inference.phala.com/v1",
+            "https://example.invalid/v1",
+            "https://inference.phala.com/v1?target=elsewhere",
+            "https://user@inference.phala.com/v1",
+            "https://inference.phala.com/custom",
+        ] {
+            let cfg = SuperNodeConfig {
+                enabled: true,
+                providers: vec![ProviderConfig {
+                    name: "phala".into(),
+                    provider_type: ProviderType::PhalaAci,
+                    api_base: api_base.into(),
+                    api_key: Some("$PHALA_API_KEY".into()),
+                    model: "confidential-model".into(),
+                    max_tokens: None,
+                    temperature: None,
+                }],
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err(), "accepted endpoint: {api_base}");
+        }
     }
 
     #[test]
@@ -805,7 +1230,7 @@ mod tests {
             enabled: true,
             providers: vec![ProviderConfig {
                 name: "test".into(),
-                provider_type: ProviderType::Anthropic,
+                provider_type: ProviderType::PhalaAci,
                 api_base: String::new(),
                 api_key: None,
                 model: "test".into(),
@@ -824,7 +1249,7 @@ mod tests {
                 enabled: true,
                 providers: vec![ProviderConfig {
                     name: "test".into(),
-                    provider_type: ProviderType::Anthropic,
+                    provider_type: ProviderType::PhalaAci,
                     api_base: String::new(),
                     api_key: None,
                     model: "test".into(),
@@ -847,7 +1272,7 @@ mod tests {
             enabled: true,
             providers: vec![ProviderConfig {
                 name: "test".into(),
-                provider_type: ProviderType::Anthropic,
+                provider_type: ProviderType::PhalaAci,
                 api_base: String::new(),
                 api_key: None,
                 model: "test".into(),
@@ -859,16 +1284,17 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
+    // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex]
     #[test]
     fn test_routing_unknown_provider_rejected() {
         let cfg = SuperNodeConfig {
             enabled: true,
             providers: vec![ProviderConfig {
                 name: "deepseek".into(),
-                provider_type: ProviderType::OpenaiCompatible,
-                api_base: "http://api.deepseek.com/v1".into(),
-                api_key: None,
-                model: "deepseek-reasoner".into(),
+                provider_type: ProviderType::PhalaAci,
+                api_base: String::new(),
+                api_key: Some("$PHALA_API_KEY".into()),
+                model: "confidential-model".into(),
                 max_tokens: None,
                 temperature: None,
             }],
@@ -887,28 +1313,28 @@ mod tests {
             enabled: true,
             providers: vec![
                 ProviderConfig {
-                    name: "deepseek".into(),
-                    provider_type: ProviderType::OpenaiCompatible,
-                    api_base: "http://api.deepseek.com/v1".into(),
-                    api_key: None,
-                    model: "deepseek-reasoner".into(),
+                    name: "phala-primary".into(),
+                    provider_type: ProviderType::PhalaAci,
+                    api_base: String::new(),
+                    api_key: Some("$PHALA_API_KEY".into()),
+                    model: "confidential-model-a".into(),
                     max_tokens: None,
                     temperature: None,
                 },
                 ProviderConfig {
-                    name: "claude".into(),
-                    provider_type: ProviderType::Anthropic,
+                    name: "phala-fallback".into(),
+                    provider_type: ProviderType::PhalaAci,
                     api_base: String::new(),
-                    api_key: Some("$ANTHROPIC_API_KEY".into()),
-                    model: "claude-sonnet-4-20250514".into(),
+                    api_key: Some("$PHALA_API_KEY".into()),
+                    model: "confidential-model-b".into(),
                     max_tokens: None,
                     temperature: None,
                 },
             ],
             routing: TaskRoutingConfig {
-                session_title: Some("deepseek".into()),
-                code_analysis: Some("claude".into()),
-                fallback: Some("deepseek".into()),
+                session_title: Some("phala-primary".into()),
+                code_analysis: Some("phala-fallback".into()),
+                fallback: Some("phala-primary".into()),
                 ..Default::default()
             },
             ..Default::default()
@@ -922,7 +1348,7 @@ mod tests {
             enabled: true,
             providers: vec![ProviderConfig {
                 name: "test".into(),
-                provider_type: ProviderType::Anthropic,
+                provider_type: ProviderType::PhalaAci,
                 api_base: String::new(),
                 api_key: None,
                 model: "test".into(),
@@ -945,7 +1371,7 @@ mod tests {
                 enabled: true,
                 providers: vec![ProviderConfig {
                     name: "test".into(),
-                    provider_type: ProviderType::Anthropic,
+                    provider_type: ProviderType::PhalaAci,
                     api_base: String::new(),
                     api_key: None,
                     model: "test".into(),
@@ -1135,30 +1561,34 @@ mod tests {
         assert_eq!(SuperNodeConfig::default().effective_fallback(), None);
     }
 
+    // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex]
     #[test]
     fn test_toml_full_config() {
         let toml_str = r#"
 enabled = true
+accepted_compose_hashes = ["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+# [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex]
+accepted_source_provenance = [{ compose_hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", repo_url = "https://example.invalid/phala-gateway", repo_commit = "0123456789abcdef0123456789abcdef01234567" }]
+accepted_kms_root_public_keys = ["0x02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
 
 [[providers]]
-name = "deepseek"
-type = "openai_compatible"
-api_base = "https://api.deepseek.com/v1"
-api_key = "$DEEPSEEK_API_KEY"
-model = "deepseek-reasoner"
+name = "phala-primary"
+type = "phala_aci"
+api_key = "$PHALA_API_KEY"
+model = "confidential-model-a"
 max_tokens = 2000
 temperature = 0.6
 
 [[providers]]
-name = "claude"
-type = "anthropic"
-api_key = "$ANTHROPIC_API_KEY"
-model = "claude-sonnet-4-20250514"
+name = "phala-fallback"
+type = "phala_aci"
+api_key = "$PHALA_API_KEY"
+model = "confidential-model-b"
 
 [routing]
-session_title = "deepseek"
-code_analysis = "claude"
-fallback = "deepseek"
+session_title = "phala-primary"
+code_analysis = "phala-fallback"
+fallback = "phala-primary"
 
 [privacy]
 default_level = "structured"
@@ -1173,7 +1603,7 @@ task_timeout_secs = 180
         let cfg: SuperNodeConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.enabled);
         assert_eq!(cfg.providers.len(), 2);
-        assert_eq!(cfg.routing.code_analysis, Some("claude".into()));
+        assert_eq!(cfg.routing.code_analysis, Some("phala-fallback".into()));
         assert_eq!(cfg.privacy.default_level, PrivacyLevel::Structured);
         assert_eq!(cfg.worker.poll_interval_secs, 10);
         assert!(cfg.validate().is_ok());
@@ -1183,15 +1613,19 @@ task_timeout_secs = 180
     fn test_toml_minimal_config() {
         let toml_str = r#"
 enabled = true
+accepted_compose_hashes = ["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+# [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex]
+accepted_source_provenance = [{ compose_hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", repo_url = "https://example.invalid/phala-gateway", repo_commit = "0123456789abcdef0123456789abcdef01234567" }]
+accepted_kms_root_public_keys = ["0x02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
 
 [[providers]]
-name = "ollama"
-type = "openai_compatible"
-api_base = "http://localhost:11434/v1"
-model = "llama3"
+name = "phala"
+type = "phala_aci"
+api_key = "$PHALA_API_KEY"
+model = "confidential-model"
 "#;
         let cfg: SuperNodeConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.effective_fallback(), Some("ollama"));
+        assert_eq!(cfg.effective_fallback(), Some("phala"));
         assert!(cfg.validate().is_ok());
     }
 

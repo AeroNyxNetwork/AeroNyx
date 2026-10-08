@@ -220,8 +220,40 @@ pub struct DiscoveryConfig {
     /// These seed endpoints are not trusted authorities; they only provide
     /// signed discovery gossip/snapshot transport so nodes can recover when a
     /// cached peer descriptor has an outdated public endpoint.
+    /// [PHALA-DNS-SEED-PIN 2026-10-07 by Codex] HTTPS DNS origins are resolved
+    /// to a bounded, all-public address set and pinned for the gossip request;
+    /// TLS still authenticates the configured hostname.
     #[serde(default)]
     pub seed_endpoints: Vec<String>,
+    /// Optional local dstack v1 guest-agent socket used for nonce-bound node
+    /// attestations. Setting this enables the discovery attestation endpoint.
+    /// The socket is never exposed or proxied; `/v1/Attest` is preferred.
+    #[serde(default)]
+    pub phala_attestation_socket_path: Option<String>,
+    /// [PHALA-DSTACK-V0-FALLBACK 2026-10-06 by Codex] Allows the frozen dstack
+    /// v0 `/GetQuote` API only when the v1 method
+    /// returns the documented missing-mount 404. It is TDX-only and returns
+    /// distinct raw-JSON evidence; no trust decision is made by this node.
+    #[serde(default)]
+    pub phala_attestation_allow_legacy_v0: bool,
+    /// [PHALA-PRIVATE-SOURCE-ROUTE-GATE 2026-10-06 by Codex] Require
+    /// PeerStore-selected peers plus direct blind-relay, source-pull and
+    /// recipient-poll routes to pass fresh dstack v1 TDX appraisal. The peer
+    /// must advertise its signed attestation endpoint. This verifier currently
+    /// rejects GCP-TDX because it does not validate the accompanying TPM quote.
+    /// Inbound admission is unchanged.
+    #[serde(default)]
+    pub phala_attested_peers_required: bool,
+    /// Locally trusted dstack app IDs as `0x` plus lowercase hex of the raw
+    /// measured app-id bytes. Never learned from discovery.
+    #[serde(default)]
+    pub phala_trusted_app_ids: Vec<String>,
+    /// Locally trusted measured compose hashes in `sha256:<64 lowercase hex>` form.
+    #[serde(default)]
+    pub phala_trusted_compose_hashes: Vec<String>,
+    /// Maximum age of a process-local peer attestation decision, in seconds.
+    #[serde(default = "DiscoveryConfig::default_phala_peer_attestation_max_age_secs")]
+    pub phala_peer_attestation_max_age_secs: u64,
     /// Timeout in seconds for fetching a remote bootstrap snapshot.
     #[serde(default = "DiscoveryConfig::default_fetch_timeout_secs")]
     pub fetch_timeout_secs: u64,
@@ -541,6 +573,12 @@ pub struct DiscoveryConfig {
 }
 
 impl DiscoveryConfig {
+    /// Maximum accepted age for remote Phala quote appraisal by default.
+    #[must_use]
+    pub const fn default_phala_peer_attestation_max_age_secs() -> u64 {
+        15 * 60
+    }
+
     /// Default self advertisement behavior when discovery is enabled.
     #[must_use]
     pub const fn default_advertise_self() -> bool {
@@ -728,8 +766,107 @@ impl DiscoveryConfig {
         true
     }
 
+    // [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] Validate the outbound
+    // trust policy independently of listener/socket overrides still in progress.
+    fn validate_phala_peer_policy(&self) -> Result<()> {
+        if self.phala_attested_peers_required {
+            if !self.enabled || !self.gossip_enabled {
+                return Err(ServerError::config_invalid(
+                    "discovery.phala_attested_peers_required",
+                    "requires discovery and gossip to be enabled",
+                ));
+            }
+            if self.phala_trusted_app_ids.is_empty()
+                || self.phala_trusted_compose_hashes.is_empty()
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.phala_trusted_app_ids",
+                    "required Phala peer routing needs explicit app-id and compose-hash allowlists",
+                ));
+            }
+        }
+        if self.phala_peer_attestation_max_age_secs == 0
+            || self.phala_peer_attestation_max_age_secs > 24 * 60 * 60
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.phala_peer_attestation_max_age_secs",
+                "must be between 1 and 86400 seconds",
+            ));
+        }
+        for app_id in &self.phala_trusted_app_ids {
+            let Some(hex_app_id) = app_id.strip_prefix("0x") else {
+                return Err(ServerError::config_invalid(
+                    "discovery.phala_trusted_app_ids",
+                    "entries must use 0x<lowercase hex of measured app-id bytes>",
+                ));
+            };
+            if app_id.trim() != app_id
+                || hex_app_id.is_empty()
+                || hex_app_id.len() > 128
+                || hex_app_id.len() % 2 != 0
+                || !hex_app_id.bytes().all(|byte| {
+                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                })
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.phala_trusted_app_ids",
+                    "entries must use 0x<lowercase hex of 1 to 64 measured app-id bytes>",
+                ));
+            }
+        }
+        for digest in &self.phala_trusted_compose_hashes {
+            let Some(hex_digest) = digest.strip_prefix("sha256:") else {
+                return Err(ServerError::config_invalid(
+                    "discovery.phala_trusted_compose_hashes",
+                    "entries must use sha256:<64 lowercase hex> format",
+                ));
+            };
+            if hex_digest.len() != 64
+                || !hex_digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.phala_trusted_compose_hashes",
+                    "entries must use sha256:<64 lowercase hex> format",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Validates discovery bootstrap configuration.
     pub fn validate(&self) -> Result<()> {
+        self.validate_phala_peer_policy()?;
+        if self.phala_attestation_allow_legacy_v0 && self.phala_attestation_socket_path.is_none() {
+            return Err(ServerError::config_invalid(
+                "discovery.phala_attestation_allow_legacy_v0",
+                "requires discovery.phala_attestation_socket_path",
+            ));
+        }
+        if let Some(path) = &self.phala_attestation_socket_path {
+            let raw_path = path.as_str();
+            let path = path.trim();
+            if raw_path != path
+                || path.is_empty()
+                || path.len() > 4096
+                || path.contains('\0')
+                || !Path::new(path).is_absolute()
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.phala_attestation_socket_path",
+                    "must be a non-empty absolute Unix socket path of at most 4096 bytes",
+                ));
+            }
+            if !self.enabled
+                || !self.advertise_self
+                || !self.public_discovery
+                || self.public_api_listen_addr.is_none()
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.phala_attestation_socket_path",
+                    "requires enabled self-advertisement, public discovery, and public API listener",
+                ));
+            }
+        }
         if self.fetch_timeout_secs == 0 {
             return Err(ServerError::config_invalid(
                 "discovery.fetch_timeout_secs",
@@ -1558,10 +1695,12 @@ impl DiscoveryConfig {
             }
         }
 
-        if self.descriptor_ttl_secs < 60 {
+        // [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] The two-epoch
+        // in-memory KEM store must cover every signed descriptor lifetime.
+        if !crate::services::onion_keys::descriptor_ttl_is_supported(self.descriptor_ttl_secs) {
             return Err(ServerError::config_invalid(
                 "discovery.descriptor_ttl_secs",
-                "must be at least 60 seconds",
+                "must be between 60 and 85799 seconds for bounded onion key overlap",
             ));
         }
 
@@ -1729,6 +1868,12 @@ impl Default for DiscoveryConfig {
             bootstrap_snapshot_path: None,
             bootstrap_snapshot_url: None,
             seed_endpoints: Vec::new(),
+            phala_attestation_socket_path: None,
+            phala_attestation_allow_legacy_v0: false,
+            phala_attested_peers_required: false,
+            phala_trusted_app_ids: Vec::new(),
+            phala_trusted_compose_hashes: Vec::new(),
+            phala_peer_attestation_max_age_secs: Self::default_phala_peer_attestation_max_age_secs(),
             fetch_timeout_secs: Self::default_fetch_timeout_secs(),
             peer_cache_path: None,
             directory_chain_path: None,
@@ -1843,6 +1988,15 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    // [PHALA-EFFECTIVE-DISCOVERY-ENDPOINT 2026-10-06 by Codex] Keep the
+    // validated and descriptor-advertised public origin on one precedence rule.
+    pub(crate) fn effective_public_endpoint(&self) -> Option<&str> {
+        self.discovery
+            .public_endpoint
+            .as_deref()
+            .or(self.network.public_endpoint.as_deref())
+    }
+
     /// Load and validate configuration from a TOML file.
     pub async fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -1850,8 +2004,148 @@ impl ServerConfig {
         let content = tokio::fs::read_to_string(path)
             .await
             .map_err(|e| ServerError::config_load(&path.display().to_string(), e.to_string()))?;
-        let config: Self = toml::from_str(&content)
+        let mut config: Self = toml::from_str(&content)
             .map_err(|e| ServerError::config_load(&path.display().to_string(), e.to_string()))?;
+        // [PHALA-PRIVATE-DISCOVERY-ISOLATION 2026-10-06 by Codex] The
+        // endpoint-free recipient must not inherit public visibility from
+        // the peer image's shared configuration template.
+        if let Some(value) = optional_config_env("AERONYX_DISCOVERY_PUBLIC_DISCOVERY")? {
+            apply_discovery_public_visibility_override(&mut config, &value)?;
+        }
+        // [PHALA-PRIVATE-API-ISOLATION 2026-10-06 by Codex] The endpoint-free
+        // recipient must not inherit the public peer's internal 0.0.0.0
+        // listener; an empty value explicitly removes that inbound surface.
+        match std::env::var("AERONYX_DISCOVERY_PUBLIC_API_LISTEN_ADDR") {
+            Ok(addr) => apply_discovery_api_listener_override(&mut config, &addr)?,
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ServerError::config_load(
+                    "AERONYX_DISCOVERY_PUBLIC_API_LISTEN_ADDR",
+                    "must be valid UTF-8",
+                ));
+            }
+        }
+        // [PHALA-ROLE-ENDPOINT-OVERRIDE 2026-10-07 by Codex] Resolve the
+        // listener before checking the origin it serves. Empty removes both
+        // descriptor endpoint sources; missing preserves mounted TOML. These
+        // values configure transport only, never establish attestation trust.
+        match std::env::var("AERONYX_DISCOVERY_PUBLIC_ENDPOINT") {
+            Ok(endpoint) => {
+                apply_discovery_public_endpoint_if_configured(&mut config, &endpoint)?
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ServerError::config_load(
+                    "AERONYX_DISCOVERY_PUBLIC_ENDPOINT",
+                    "must be valid UTF-8",
+                ));
+            }
+        }
+        // [PHALA-DISCOVERY-SEEDS 2026-10-06 by Codex] Public peer containers
+        // need operator-selected HTTPS seeds to join outbound gossip; private
+        // recipient containers use their separately pinned relay bootstrap.
+        // [PHALA-ROLE-SEED-ISOLATION 2026-10-07 by Codex] Missing preserves
+        // mounted TOML; explicitly empty clears inherited general peers.
+        match std::env::var("AERONYX_DISCOVERY_SEED_ENDPOINTS") {
+            Ok(seeds) => apply_discovery_seed_endpoints(&mut config, &seeds)?,
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ServerError::config_load(
+                    "AERONYX_DISCOVERY_SEED_ENDPOINTS",
+                    "must be valid UTF-8",
+                ));
+            }
+        }
+        // [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] An explicit,
+        // complete protected bundle changes outbound trust, never quote serving
+        // or E2EE availability. Blank Compose values preserve mounted TOML.
+        let phala_routes_required = optional_config_env("AERONYX_DISCOVERY_PHALA_ATTESTED_PEERS_REQUIRED")?;
+        let phala_route_apps = optional_config_env("AERONYX_DISCOVERY_PHALA_TRUSTED_APP_IDS")?;
+        let phala_route_compose = optional_config_env("AERONYX_DISCOVERY_PHALA_TRUSTED_COMPOSE_HASHES")?;
+        let phala_route_age = optional_config_env("AERONYX_DISCOVERY_PHALA_PEER_ATTESTATION_MAX_AGE_SECS")?;
+        apply_phala_peer_policy_env(&mut config, phala_routes_required.as_deref(),
+            phala_route_apps.as_deref(), phala_route_compose.as_deref(), phala_route_age.as_deref())?;
+        // [PHALA-PRIVATE-ATTESTATION-ISOLATION 2026-10-06 by Codex] The
+        // endpoint-free recipient process must not inherit quote authority
+        // merely because the public peer shares its baked config template.
+        match std::env::var("AERONYX_DISCOVERY_PHALA_ATTESTATION_SOCKET_PATH") {
+            Ok(path) => apply_phala_attestation_socket_override(&mut config, &path)?,
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ServerError::config_load(
+                    "AERONYX_DISCOVERY_PHALA_ATTESTATION_SOCKET_PATH",
+                    "must be valid UTF-8",
+                ));
+            }
+        }
+        // [PHALA-REVERSE-ONION-RECIPIENT-CONFIG 2026-10-06 by Codex]
+        // Empty Compose defaults preserve TOML policy; only explicit strings
+        // override the default-off recipient role.
+        let recipient_enabled = optional_config_env("AERONYX_REVERSE_ONION_RECIPIENT_ENABLED")?;
+        let recipient_relay_id = optional_config_env("AERONYX_REVERSE_ONION_RELAY_NODE_ID")?;
+        let recipient_relay_endpoint =
+            optional_config_env("AERONYX_REVERSE_ONION_RELAY_ENDPOINT")?;
+        apply_reverse_onion_recipient_env(
+            &mut config,
+            recipient_enabled.as_deref(),
+            recipient_relay_id.as_deref(),
+            recipient_relay_endpoint.as_deref(),
+        )?;
+        // [PHALA-RECIPIENT-RECOVERY-OVERRIDE 2026-10-06 by Codex] An unset
+        // value preserves the baked TOML safety mode; only an explicit value
+        // changes whether this recipient may request fresh Claims.
+        let recipient_recovery_only = optional_config_env(
+            "AERONYX_REVERSE_ONION_RECOVERY_ONLY",
+        )?;
+        apply_reverse_onion_recovery_only_env(
+            &mut config,
+            recipient_recovery_only.as_deref(),
+        )?;
+        // [PHALA-ONION-RELAY-OPT-IN 2026-10-06 by Codex] The public Phala
+        // identity may offer bounded ciphertext relay, but never infer a VPN
+        // role or enable it merely because the image is running in Phala.
+        if let Some(enabled) = optional_config_env("AERONYX_PHALA_ONION_RELAY_ENABLED")? {
+            apply_phala_onion_relay_override(&mut config, &enabled)?;
+        }
+        // [PHALA-REVERSE-QUEUE-CONFIG 2026-10-06 by Codex] ChatRelay
+        // capability advertisement does not itself mount a reverse task
+        // queue. Require a separate opt-in and complete signed admission
+        // material for the public relay process.
+        let phala_queue_enabled = optional_config_env(
+            "AERONYX_PHALA_REVERSE_ONION_QUEUE_ENABLED",
+        )?;
+        // [PHALA-QUEUE-RECOVERY-ENV 2026-10-06 by Codex] Unset preserves the
+        // baked recovery policy; the public role can opt in explicitly.
+        let phala_queue_recovery_only = optional_config_env(
+            "AERONYX_PHALA_REVERSE_ONION_QUEUE_RECOVERY_ONLY",
+        )?;
+        let phala_queue_recipient_ids = optional_config_env(
+            "AERONYX_PHALA_REVERSE_ONION_QUEUE_RECIPIENT_NODE_IDS",
+        )?;
+        let phala_queue_source_ids = optional_config_env(
+            "AERONYX_PHALA_REVERSE_ONION_QUEUE_SOURCE_NODE_IDS",
+        )?;
+        let phala_queue_relay_descriptor = optional_config_env(
+            "AERONYX_PHALA_REVERSE_ONION_QUEUE_RELAY_DESCRIPTOR_B64",
+        )?;
+        let phala_queue_recipient_descriptor = optional_config_env(
+            "AERONYX_PHALA_REVERSE_ONION_QUEUE_RECIPIENT_DESCRIPTOR_B64",
+        )?;
+        let phala_queue_authorization = optional_config_env(
+            "AERONYX_PHALA_REVERSE_ONION_QUEUE_AUTHORIZATION_B64",
+        )?;
+        config.reverse_onion.queue.apply_phala_environment(
+            phala_queue_enabled.as_deref(),
+            phala_queue_recovery_only.as_deref(),
+            phala_queue_recipient_ids.as_deref(),
+            phala_queue_source_ids.as_deref(),
+            phala_queue_relay_descriptor.as_deref(),
+            phala_queue_recipient_descriptor.as_deref(),
+            phala_queue_authorization.as_deref(),
+            config.discovery.advertise_onion_middle
+                && config.memchain.chat_relay.enabled,
+            config.reverse_onion.recipient.enabled,
+        )?;
         config.validate()?;
         info!("Configuration loaded successfully");
         Ok(config)
@@ -1868,15 +2162,189 @@ impl ServerConfig {
     /// Validate all sub-configs in dependency order.
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
-        // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Reject incomplete
-        // queue composition before any startup side effects, even if paths exist.
-        if self.reverse_onion.queue.enabled {
-            return Err(ServerError::config_invalid("reverse_onion", "queue admission composition unavailable"));
+        // [REVERSE-AUTHORITY-RENEWAL-GATE 2026-10-05 by Codex] Live source
+        // submissions carry a recipient-signed current authority snapshot;
+        // relay admission verifies it against current PeerStore descriptors
+        // immediately before durable enqueue. Recovery-only remains explicit.
+        // [PHALA-REVERSE-ONION-LISTENER-GATES 2026-10-06 by Codex]
+        // Source pulls are composed only on the authenticated VPN/MPI listener.
+        if self.reverse_onion.source.enabled && !self.vpn.enabled {
+            return Err(ServerError::config_invalid(
+                "reverse_onion.source",
+                "source pulls require the authenticated VPN/MPI listener",
+            ));
+        }
+        // [PHALA-SOURCE-MPI-COMPOSITION 2026-10-08 by Codex] Off never
+        // constructs MPI, and SaaS JWT owners cannot authorize this private
+        // source route. Reject before opening/migrating its durable journal.
+        if self.reverse_onion.source.enabled
+            && !matches!(&self.memchain.mode, MemChainMode::Local | MemChainMode::P2p)
+        {
+            return Err(ServerError::config_invalid(
+                "reverse_onion.source",
+                "source pulls require local or p2p MemChain MPI runtime",
+            ));
         }
         self.reverse_onion.validate()?;
+        // [PHALA-REVERSE-ONION-LISTENER-GATES 2026-10-06 by Codex]
+        // Queue frames are a peer protocol on the existing public peer API;
+        // source pulls remain client/MPI-only on the VPN listener.
+        if self.reverse_onion.queue.enabled
+            && self.discovery.public_api_listen_addr.is_none()
+        {
+            return Err(ServerError::config_invalid(
+                "reverse_onion.queue",
+                "enabled queue requires discovery.public_api_listen_addr",
+            ));
+        }
+        // [PHALA-REVERSE-QUEUE-ORIGIN-GATE 2026-10-06 by Codex] A bound
+        // listener without the signed HTTPS origin is not a routable relay.
+        // Phala's first render may omit that origin, so queue activation waits
+        // until the operator re-renders with the assigned endpoint.
+        if self.reverse_onion.queue.enabled
+            && !self.effective_public_endpoint().is_some_and(|endpoint| {
+                crate::api::reverse_onion_endpoint_supported(endpoint.trim())
+            })
+        {
+            return Err(ServerError::config_invalid(
+                "reverse_onion.queue",
+                "enabled queue requires a public HTTPS discovery endpoint",
+            ));
+        }
+        // [REVERSE-ONION-AUTHORITY-GOSSIP 2026-10-05 by Codex] Fresh grants
+        // travel only over the existing authenticated discovery-gossip
+        // exchange. Reject configurations that enable new relay, source, or
+        // recipient work without that renewal channel; recovery-only needs no
+        // renewal.
+        let discovery_renewal_ready = self.discovery.enabled && self.discovery.gossip_enabled;
+        if self.reverse_onion.requires_live_authority_gossip() && !discovery_renewal_ready {
+            return Err(ServerError::config_invalid(
+                "reverse_onion",
+                "live private admission requires discovery gossip",
+            ));
+        }
+        for (enabled, path) in [
+            (self.reverse_onion.queue.enabled, self.reverse_onion.queue.db_path.as_str()),
+            (self.reverse_onion.source.enabled, self.reverse_onion.source.state_db_path.as_str()),
+        ] {
+            if enabled && ([self.memchain.db_path.as_str(), self.memchain.chat_relay.db_path.as_str(),
+                self.blind_vault.db_path.as_str(), self.reverse_onion.recipient.state_db_path.as_str()]
+                .into_iter().any(|other| !other.is_empty() && other.trim() == path)
+                || self.discovery.directory_chain_path.as_deref().is_some_and(|other| other.trim() == path))
+            {
+                return Err(ServerError::config_invalid("reverse_onion", "reverse role requires a dedicated database"));
+            }
+        }
         if self.reverse_onion.recipient.enabled {
-            if !self.blind_vault.enabled || !self.blind_vault.public_api_enabled {
-                return Err(ServerError::config_invalid("reverse_onion", "recipient requires mounted terminal capability"));
+            // [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex] The recipient
+            // serves source-sealed Pulls through the existing authenticated
+            // peer route; it does not require the separate direct HTTP API.
+            // [PHALA-PRIVATE-RECIPIENT-DESCRIPTOR 2026-10-06 by Codex] The
+            // signed recipient descriptor is intentionally non-public. Reject
+            // endpoint publication here instead of starting a worker whose
+            // authority can never satisfy the route's private-recipient gate.
+            // [PHALA-PRIVATE-RECIPIENT-NO-VPN 2026-10-06 by Codex] This role is
+            // an outbound task worker, not a VPN/TUN data-plane node.
+            if self.vpn.enabled {
+                return Err(ServerError::config_invalid(
+                    "vpn.enabled",
+                    "private recipient cannot enable the VPN/TUN data plane",
+                ));
+            }
+            // [PHALA-PRIVATE-RECIPIENT-EGRESS 2026-10-06 by Codex] The
+            // management client and its public-IP discovery probes create
+            // independent outbound destinations, outside the pinned relay.
+            if self.management.enabled {
+                return Err(ServerError::config_invalid(
+                    "management.enabled",
+                    "private recipient management must remain disabled outside its pinned-relay egress profile",
+                ));
+            }
+            // [PHALA-PRIVATE-RECIPIENT-SERVICE-ISOLATION 2026-10-06 by Codex]
+            // ChatRelay and Blind Vault are independent local stores; the
+            // MemChain runtime can expose APIs or start unrelated peer workers.
+            if self.memchain.mode != crate::config_memchain::MemChainMode::Off {
+                return Err(ServerError::config_invalid(
+                    "memchain.mode",
+                    "private recipient requires MemChain mode off; ChatRelay remains independently enabled",
+                ));
+            }
+            let advertises_public_endpoint = self
+                .discovery
+                .public_endpoint
+                .as_deref()
+                .is_some_and(|endpoint| !endpoint.trim().is_empty())
+                || self
+                    .network
+                    .public_endpoint
+                    .as_deref()
+                    .is_some_and(|endpoint| !endpoint.trim().is_empty());
+            if advertises_public_endpoint {
+                return Err(ServerError::config_invalid(
+                    "reverse_onion.recipient",
+                    "private recipient identity cannot advertise a public endpoint",
+                ));
+            }
+            if self.discovery.public_discovery {
+                return Err(ServerError::config_invalid(
+                    "discovery.public_discovery",
+                    "private recipient identity cannot be publicly discoverable",
+                ));
+            }
+            if self.discovery.public_api_listen_addr.is_some() {
+                return Err(ServerError::config_invalid(
+                    "reverse_onion.recipient",
+                    "private recipient identity cannot listen for inbound peer API traffic",
+                ));
+            }
+            // [PHALA-PRIVATE-RECIPIENT-EGRESS 2026-10-06 by Codex] The
+            // recipient's only peer destination is its identity-pinned relay.
+            // Reject independent bootstrap and replication destinations even
+            // though the gossip runtime also applies a relay-only target policy.
+            if self.discovery.bootstrap_snapshot_url.is_some() {
+                return Err(ServerError::config_invalid(
+                    "discovery.bootstrap_snapshot_url",
+                    "private recipient may bootstrap only through its pinned relay",
+                ));
+            }
+            if !self.discovery.seed_endpoints.is_empty() {
+                return Err(ServerError::config_invalid(
+                    "discovery.seed_endpoints",
+                    "private recipient may gossip only with its pinned relay",
+                ));
+            }
+            if !self.discovery.directory_chain_sync_peer_node_ids.is_empty()
+                || self.discovery.directory_full_node_mirror_enabled
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.directory_chain_sync_peer_node_ids",
+                    "private recipient cannot run outbound Directory Replica Sync",
+                ));
+            }
+            if self.memchain.commitment_sync_enabled || self.memchain.commitment_coordinator_enabled
+            {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_sync_enabled",
+                    "private recipient cannot run outbound MemChain commitment synchronization",
+                ));
+            }
+            // [PHALA-PRIVATE-RECIPIENT-API-GATE 2026-10-06 by Codex]
+            // TOML loading must enforce the same private-only boundary as the
+            // environment bootstrap helper; callers can construct ServerConfig
+            // directly and must not turn this terminal into a general API.
+            if self.blind_vault.public_api_enabled {
+                return Err(ServerError::config_invalid(
+                    "blind_vault.public_api_enabled",
+                    "private recipient requires the public Blind Vault API to remain disabled",
+                ));
+            }
+            if !self.blind_vault.enabled
+                || !self.memchain.is_chat_relay_enabled()
+            {
+                return Err(ServerError::config_invalid(
+                    "reverse_onion",
+                    "recipient requires Blind Vault storage and local ChatRelay durability",
+                ));
             }
             let path = self.reverse_onion.recipient.state_db_path.trim();
             if [self.memchain.db_path.as_str(), self.memchain.chat_relay.db_path.as_str(),
@@ -1895,6 +2363,21 @@ impl ServerConfig {
             .map_err(|e| ServerError::config_invalid("management", e))?;
         self.memchain.validate()?;
         self.discovery.validate()?;
+        // [PHALA-ATTESTATION-ENDPOINT-GATE 2026-10-06 by Codex] An attested
+        // public peer must have the HTTPS origin clients will actually dial;
+        // otherwise it starts an unreachable quote API and cannot advertise
+        // the signed Phala feature. Honor the descriptor's existing fallback.
+        if self.discovery.phala_attestation_socket_path.is_some() {
+            let endpoint = self.effective_public_endpoint();
+            if endpoint.is_none_or(|endpoint| {
+                !crate::api::reverse_onion_endpoint_supported(endpoint)
+            }) {
+                return Err(ServerError::config_invalid(
+                    "discovery.phala_attestation_socket_path",
+                    "requires a public HTTPS discovery endpoint",
+                ));
+            }
+        }
         self.blind_vault.validate()?;
         if let Some(directory_path) = self.discovery.directory_chain_path.as_deref() {
             let directory_path = directory_path.trim();
@@ -2007,6 +2490,14 @@ impl ServerConfig {
         self.vpn.dns_proxy_enabled
     }
 
+    // [PHALA-NO-VPN-PROFILE 2026-10-06 by Codex] Relay profiles preserve the
+    // legacy default while exposing the explicit no-tunnel runtime gate.
+    /// Returns whether the UDP/TUN VPN data plane is enabled on this node.
+    #[must_use]
+    pub fn vpn_enabled(&self) -> bool {
+        self.vpn.enabled
+    }
+
     #[must_use]
     pub fn vpn_transports(&self) -> &VpnTransportConfig {
         &self.vpn.transports
@@ -2030,6 +2521,337 @@ impl ServerConfig {
     pub fn parse_ip_range(&self) -> Result<(Ipv4Addr, u8)> {
         self.vpn.parse_ip_range()
     }
+}
+
+// [PHALA-ROLE-ENDPOINT-OVERRIDE 2026-10-07 by Codex] An explicit empty
+// Compose origin must suppress both mounted endpoints, including the legacy
+// network fallback. Missing environment still preserves both at the caller.
+fn apply_discovery_public_endpoint_if_configured(
+    config: &mut ServerConfig,
+    endpoint: &str,
+) -> Result<()> {
+    if endpoint.is_empty() {
+        config.discovery.public_endpoint = None;
+        config.network.public_endpoint = None;
+        return Ok(());
+    }
+    apply_discovery_public_endpoint_override(config, endpoint)
+}
+
+// [PHALA-PUBLIC-ENDPOINT-OVERRIDE 2026-10-06 by Codex]
+fn apply_discovery_public_endpoint_override(
+    config: &mut ServerConfig,
+    endpoint: &str,
+) -> Result<()> {
+    // [PHALA-ROLE-ENDPOINT-OVERRIDE 2026-10-07 by Codex] Compose retains
+    // the protected value verbatim; validate that same value without trimming.
+    let parsed = reqwest::Url::parse(endpoint).ok();
+    if endpoint.is_empty()
+        || endpoint.len() > 2048
+        || endpoint.contains(char::is_whitespace)
+        || !config.discovery.enabled
+        || !config.discovery.advertise_self
+        || config.discovery.public_api_listen_addr.is_none()
+        || parsed.as_ref().is_none_or(|url| {
+            url.scheme() != "https"
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || !matches!(url.path(), "" | "/")
+                || url.query().is_some()
+                || url.fragment().is_some()
+        })
+        || !crate::api::reverse_onion_endpoint_supported(endpoint)
+    {
+        return Err(ServerError::config_invalid(
+            "AERONYX_DISCOVERY_PUBLIC_ENDPOINT",
+            "requires enabled self-advertisement, a peer API listener, and a public HTTPS origin",
+        ));
+    }
+    config.discovery.public_endpoint = Some(endpoint.to_string());
+    Ok(())
+}
+
+// [PHALA-PRIVATE-API-ISOLATION 2026-10-06 by Codex]
+fn apply_discovery_api_listener_override(config: &mut ServerConfig, addr: &str) -> Result<()> {
+    if addr.is_empty() {
+        config.discovery.public_api_listen_addr = None;
+        return Ok(());
+    }
+    let parsed = addr.parse::<SocketAddr>().map_err(|_| {
+        ServerError::config_invalid(
+            "AERONYX_DISCOVERY_PUBLIC_API_LISTEN_ADDR",
+            "must be an IP socket address or empty to disable the listener",
+        )
+    })?;
+    if parsed.port() == 0 {
+        return Err(ServerError::config_invalid(
+            "AERONYX_DISCOVERY_PUBLIC_API_LISTEN_ADDR",
+            "port must be greater than zero",
+        ));
+    }
+    config.discovery.public_api_listen_addr = Some(parsed);
+    Ok(())
+}
+
+// [PHALA-PRIVATE-DISCOVERY-ISOLATION 2026-10-06 by Codex]
+fn apply_discovery_public_visibility_override(
+    config: &mut ServerConfig,
+    value: &str,
+) -> Result<()> {
+    config.discovery.public_discovery = match value {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return Err(ServerError::config_invalid(
+                "AERONYX_DISCOVERY_PUBLIC_DISCOVERY",
+                "must be exactly 'true' or 'false'",
+            ));
+        }
+    };
+    Ok(())
+}
+
+// [PHALA-DISCOVERY-SEEDS 2026-10-06 by Codex] JSON avoids delimiter parsing
+// ambiguity and keeps the deployment value bounded before allocation/validation.
+fn apply_discovery_seed_endpoints(config: &mut ServerConfig, encoded: &str) -> Result<()> {
+    // [PHALA-ROLE-SEED-ISOLATION 2026-10-07 by Codex] Clearing outbound
+    // seeds requires no enabled gossip transport, including recovery startup.
+    if encoded.is_empty() {
+        config.discovery.seed_endpoints.clear();
+        return Ok(());
+    }
+    if encoded.len() > 8 * 1024 || !config.discovery.enabled || !config.discovery.gossip_enabled {
+        return Err(ServerError::config_invalid(
+            "AERONYX_DISCOVERY_SEED_ENDPOINTS",
+            "requires enabled discovery gossip and at most 8192 bytes",
+        ));
+    }
+    let endpoints: Vec<String> = serde_json::from_str(encoded).map_err(|_| {
+        ServerError::config_invalid(
+            "AERONYX_DISCOVERY_SEED_ENDPOINTS",
+            "must be a JSON array of public HTTPS peer origins",
+        )
+    })?;
+    if endpoints.is_empty() || endpoints.len() > 64 {
+        return Err(ServerError::config_invalid(
+            "AERONYX_DISCOVERY_SEED_ENDPOINTS",
+            "requires 1..=64 peer origins",
+        ));
+    }
+    for endpoint in &endpoints {
+        let parsed = reqwest::Url::parse(endpoint).ok();
+        if endpoint.len() > 2048
+            || endpoint.trim() != endpoint
+            || parsed.as_ref().is_none_or(|url| {
+                url.scheme() != "https"
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                    || !matches!(url.path(), "" | "/")
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+            })
+            || !crate::api::reverse_onion_endpoint_supported(endpoint)
+        {
+            return Err(ServerError::config_invalid(
+                "AERONYX_DISCOVERY_SEED_ENDPOINTS",
+                "entries must be bounded public HTTPS peer origins without credentials",
+            ));
+        }
+        DiscoveryConfig::validate_seed_endpoint(endpoint)?;
+    }
+    config.discovery.seed_endpoints = endpoints;
+    Ok(())
+}
+
+// [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] These are local operator
+// pins, never values copied from quote/discovery responses. Validate a complete
+// candidate before changing any field; invalid input must not clear strict mode.
+fn apply_phala_peer_policy_env(config: &mut ServerConfig, required: Option<&str>,
+    apps: Option<&str>, compose: Option<&str>, age: Option<&str>) -> Result<()> {
+    let invalid = || ServerError::config_invalid("discovery.phala_peer_policy",
+        "protected policy needs explicit true with both bounded JSON pin lists, or false without policy inputs");
+    let Some(required) = required else {
+        if apps.is_some() || compose.is_some() || age.is_some() { return Err(invalid()); }
+        return Ok(());
+    };
+    let mut candidate = config.discovery.clone();
+    match required {
+        "false" if apps.is_none() && compose.is_none() && age.is_none() => {
+            candidate.phala_attested_peers_required = false;
+        }
+        "true" => {
+            let pins = |raw: Option<&str>| -> Result<Vec<String>> {
+                let raw = raw.ok_or_else(&invalid)?;
+                if raw.len() > 8192 { return Err(invalid()); }
+                let values: Vec<String> = serde_json::from_str(raw).map_err(|_| invalid())?;
+                if values.is_empty() || values.len() > 64
+                    || values.iter().collect::<std::collections::HashSet<_>>().len() != values.len()
+                { return Err(invalid()); }
+                Ok(values)
+            };
+            candidate.phala_trusted_app_ids = pins(apps)?;
+            candidate.phala_trusted_compose_hashes = pins(compose)?;
+            if let Some(age) = age {
+                if age.is_empty() || age.len() > 5 || age.starts_with('0')
+                    || !age.bytes().all(|byte| byte.is_ascii_digit())
+                { return Err(invalid()); }
+                candidate.phala_peer_attestation_max_age_secs = age.parse().map_err(|_| invalid())?;
+            }
+            candidate.phala_attested_peers_required = true;
+        }
+        _ => return Err(invalid()),
+    }
+    candidate.validate_phala_peer_policy()?;
+    config.discovery = candidate;
+    Ok(())
+}
+
+// [PHALA-REVERSE-ONION-RECIPIENT-CONFIG 2026-10-06 by Codex]
+fn optional_config_env(name: &'static str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) if value.is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ServerError::config_load(
+            name,
+            "must be valid UTF-8",
+        )),
+    }
+}
+
+// [PHALA-PRIVATE-ATTESTATION-ISOLATION 2026-10-06 by Codex]
+fn apply_phala_attestation_socket_override(config: &mut ServerConfig, path: &str) -> Result<()> {
+    if path.is_empty() {
+        config.discovery.phala_attestation_socket_path = None;
+        config.discovery.phala_attestation_allow_legacy_v0 = false;
+    } else {
+        config.discovery.phala_attestation_socket_path = Some(path.to_owned());
+    }
+    config.discovery.validate()
+}
+
+// [PHALA-REVERSE-ONION-RECIPIENT-CONFIG 2026-10-06 by Codex]
+fn apply_reverse_onion_recipient_env(
+    config: &mut ServerConfig,
+    enabled: Option<&str>,
+    relay_node_id: Option<&str>,
+    relay_endpoint: Option<&str>,
+) -> Result<()> {
+    let Some(enabled) = enabled else {
+        if relay_node_id.is_some() || relay_endpoint.is_some() {
+            return Err(ServerError::config_invalid(
+                "reverse_onion.recipient",
+                "relay identity and endpoint require an explicit enable setting",
+            ));
+        }
+        return Ok(());
+    };
+    let enabled = match enabled {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return Err(ServerError::config_invalid(
+                "AERONYX_REVERSE_ONION_RECIPIENT_ENABLED",
+                "must be exactly 'true' or 'false'",
+            ));
+        }
+    };
+    if !enabled {
+        if relay_node_id.is_some() || relay_endpoint.is_some() {
+            return Err(ServerError::config_invalid(
+                "reverse_onion.recipient",
+                "relay identity and endpoint are not accepted while disabled",
+            ));
+        }
+        config.reverse_onion.recipient.enabled = false;
+        return Ok(());
+    }
+
+    let relay_node_id = relay_node_id.filter(|value| !value.is_empty()).ok_or_else(|| {
+        ServerError::config_invalid(
+            "AERONYX_REVERSE_ONION_RELAY_NODE_ID",
+            "is required when the private recipient role is enabled",
+        )
+    })?;
+    let relay_endpoint = relay_endpoint.filter(|value| !value.is_empty()).ok_or_else(|| {
+        ServerError::config_invalid(
+            "AERONYX_REVERSE_ONION_RELAY_ENDPOINT",
+            "is required when the private recipient role is enabled",
+        )
+    })?;
+    if config.blind_vault.public_api_enabled {
+        return Err(ServerError::config_invalid(
+            "blind_vault.public_api_enabled",
+            "Phala private recipient bootstrap does not enable public Blind Vault routes",
+        ));
+    }
+
+    config.reverse_onion.recipient.enabled = true;
+    config.reverse_onion.recipient.relay_node_id = relay_node_id.to_owned();
+    config.reverse_onion.recipient.relay_endpoint = relay_endpoint.to_owned();
+    config.blind_vault.enabled = true;
+    config.memchain.chat_relay.enabled = true;
+    config.memchain.chat_relay.validate()?;
+    Ok(())
+}
+
+// [PHALA-RECIPIENT-RECOVERY-OVERRIDE 2026-10-06 by Codex]
+fn apply_reverse_onion_recovery_only_env(
+    config: &mut ServerConfig,
+    value: Option<&str>,
+) -> Result<()> {
+    let Some(value) = value else { return Ok(()); };
+    if !config.reverse_onion.recipient.enabled {
+        return Err(ServerError::config_invalid(
+            "AERONYX_REVERSE_ONION_RECOVERY_ONLY",
+            "requires the private recipient role to be enabled",
+        ));
+    }
+    config.reverse_onion.recipient.recovery_only = match value {
+        "true" => true,
+        "false" => false,
+        _ => return Err(ServerError::config_invalid(
+            "AERONYX_REVERSE_ONION_RECOVERY_ONLY",
+            "must be exactly 'true' or 'false'",
+        )),
+    };
+    Ok(())
+}
+
+// [PHALA-ONION-RELAY-OPT-IN 2026-10-06 by Codex]
+fn apply_phala_onion_relay_override(config: &mut ServerConfig, value: &str) -> Result<()> {
+    match value {
+        "true" => {
+            if config.reverse_onion.recipient.enabled {
+                return Err(ServerError::config_invalid(
+                    "AERONYX_PHALA_ONION_RELAY_ENABLED",
+                    "public onion relay and endpoint-free private recipient are separate roles",
+                ));
+            }
+            config.memchain.chat_relay.enabled = true;
+            config.memchain.chat_relay.validate()?;
+            config.discovery.advertise_onion_middle = true;
+        }
+        "false" => {
+            // [PHALA-PRIVATE-RELAY-DURABILITY 2026-10-06 by Codex] Private
+            // recipient polling uses ChatRelay's local durable store, but
+            // must never advertise this endpoint-free identity as a relay.
+            // For public peers, explicit false closes both the service and
+            // its signed capability even when mounted TOML enables it.
+            if !config.reverse_onion.recipient.enabled {
+                config.memchain.chat_relay.enabled = false;
+            }
+            config.discovery.advertise_onion_middle = false;
+        }
+        _ => {
+            return Err(ServerError::config_invalid(
+                "AERONYX_PHALA_ONION_RELAY_ENABLED",
+                "must be exactly 'true' or 'false'",
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Default for ServerConfig {
@@ -2059,6 +2881,984 @@ impl Default for ServerConfig {
 mod tests {
     use super::*;
 
+    // [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] Authored only: an
+    // endpoint-free role can enforce outbound trust without quote authority.
+    fn phala_policy_fixture() -> ServerConfig {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.gossip_enabled = true;
+        config.discovery.phala_attested_peers_required = true;
+        config.discovery.phala_trusted_app_ids = vec!["0xab".into()];
+        config.discovery.phala_trusted_compose_hashes = vec![format!("sha256:{}", "a".repeat(64))];
+        config.discovery.phala_peer_attestation_max_age_secs = 42;
+        config
+    }
+
+    // [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] Empty protected
+    // environment is normalized to None by optional_config_env, never false.
+    #[test]
+    fn phala_policy_env_preserves_toml_and_changes_only_explicit_policy() {
+        let mut config = phala_policy_fixture();
+        let before = serde_json::to_value(&config).unwrap();
+        apply_phala_peer_policy_env(&mut config, None, None, None, None).unwrap();
+        assert_eq!(serde_json::to_value(&config).unwrap(), before);
+        let apps = r#"["0xcd"]"#;
+        let compose = format!(r#"["sha256:{}"]"#, "b".repeat(64));
+        let mut expected = config.clone();
+        expected.discovery.phala_trusted_app_ids = vec!["0xcd".into()];
+        expected.discovery.phala_trusted_compose_hashes = vec![format!("sha256:{}", "b".repeat(64))];
+        apply_phala_peer_policy_env(&mut config, Some("true"), Some(apps), Some(&compose), None).unwrap();
+        assert_eq!(serde_json::to_value(&config).unwrap(), serde_json::to_value(&expected).unwrap());
+        for age in ["1", "86400"] {
+            apply_phala_peer_policy_env(&mut config, Some("true"), Some(apps), Some(&compose), Some(age)).unwrap();
+            expected.discovery.phala_peer_attestation_max_age_secs = age.parse().unwrap();
+            assert_eq!(serde_json::to_value(&config).unwrap(), serde_json::to_value(&expected).unwrap());
+        }
+        apply_phala_peer_policy_env(&mut config, Some("false"), None, None, None).unwrap();
+        expected.discovery.phala_attested_peers_required = false;
+        assert_eq!(serde_json::to_value(&config).unwrap(), serde_json::to_value(&expected).unwrap());
+        assert!(config.discovery.phala_attestation_socket_path.is_none());
+        assert!(!config.discovery.phala_attestation_allow_legacy_v0);
+    }
+
+    // [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] A rejected bundle
+    // must leave every config field intact, including an inherited strict gate.
+    #[test]
+    fn phala_policy_env_rejects_partial_noncanonical_and_unbounded_inputs_atomically() {
+        let apps = r#"["0xcd"]"#;
+        let compose = format!(r#"["sha256:{}"]"#, "b".repeat(64));
+        let mut config = phala_policy_fixture();
+        let before = serde_json::to_value(&config).unwrap();
+        let mut reject = |required, app_pins, compose_pins, age| {
+            assert!(apply_phala_peer_policy_env(&mut config, required, app_pins, compose_pins, age).is_err());
+            assert_eq!(serde_json::to_value(&config).unwrap(), before);
+        };
+        for flag in ["", "TRUE", "1", " true", "false "] {
+            reject(Some(flag), Some(apps), Some(&compose), None);
+        }
+        reject(None, Some(apps), None, None);
+        reject(None, None, Some(&compose), None);
+        reject(None, None, None, Some("42"));
+        reject(Some("true"), None, Some(&compose), None);
+        reject(Some("true"), Some(apps), None, None);
+        reject(Some("false"), Some(apps), None, None);
+        reject(Some("false"), None, Some(&compose), None);
+        reject(Some("false"), None, None, Some("42"));
+        let oversized = format!("{}{}", " ".repeat(8192), apps);
+        let too_many_apps = serde_json::to_string(&(0..65).map(|n| format!("0x{n:02x}")).collect::<Vec<_>>()).unwrap();
+        for bad in ["", "[]", "{}", "null", "[1]", r#"["0xcd",null]"#,
+            r#"["0xcd","\u0030xcd"]"#, r#"["0xCD"]"#, r#"["0xabc"]"#,
+            r#"["0xgg"]"#, r#"["0x"]"#, r#"[" 0xcd"]"#, r#"["0xcd"] trailing"#,
+            oversized.as_str(), too_many_apps.as_str()] {
+            reject(Some("true"), Some(bad), Some(&compose), None);
+        }
+        let duplicate_compose = format!(r#"["sha256:{0}","\u0073ha256:{0}"]"#, "b".repeat(64));
+        let too_many_compose = serde_json::to_string(&(0..65).map(|n| format!("sha256:{n:064x}")).collect::<Vec<_>>()).unwrap();
+        let uppercase_compose = format!(r#"["sha256:{}"]"#, "B".repeat(64));
+        let oversized_compose = format!("{}{}", " ".repeat(8192), compose);
+        for bad in ["[]", "[true]", r#"["sha256:ab"]"#, duplicate_compose.as_str(),
+            too_many_compose.as_str(), uppercase_compose.as_str(), oversized_compose.as_str()] {
+            reject(Some("true"), Some(apps), Some(bad), None);
+        }
+        for bad in ["", "0", "01", "+1", " 1", "1 ", "86401", "999999", "1.0"] {
+            reject(Some("true"), Some(apps), Some(&compose), Some(bad));
+        }
+    }
+
+    // [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] Validate discovery
+    // prerequisites now, but leave socket/listener validation to role overrides.
+    #[test]
+    fn phala_policy_env_requires_discovery_but_does_not_grant_listener_authority() {
+        let apps = r#"["0xcd"]"#;
+        let compose = format!(r#"["sha256:{}"]"#, "b".repeat(64));
+        for gossip_disabled in [false, true] {
+            let mut config = phala_policy_fixture();
+            if gossip_disabled { config.discovery.gossip_enabled = false; }
+            else { config.discovery.enabled = false; }
+            let before = serde_json::to_value(&config).unwrap();
+            assert!(apply_phala_peer_policy_env(&mut config, Some("true"), Some(apps), Some(&compose), None).is_err());
+            assert_eq!(serde_json::to_value(&config).unwrap(), before);
+        }
+        let mut config: ServerConfig = toml::from_str(include_str!(
+            "../../../deploy/node/server.phala.peer.example.toml")).unwrap();
+        // [PHALA-EXECUTED-PROFILE-FIXTURES 2026-10-08 by Codex] The
+        // endpoint fallback is owned by ServerConfig, not DiscoveryConfig.
+        assert!(config.validate().is_err());
+        apply_phala_peer_policy_env(&mut config, Some("true"), Some(apps), Some(&compose), None).unwrap();
+        assert!(config.validate().is_err());
+        apply_phala_attestation_socket_override(&mut config, "").unwrap();
+        apply_discovery_api_listener_override(&mut config, "").unwrap();
+        assert!(config.discovery.validate().is_ok());
+        assert!(config.discovery.phala_attested_peers_required);
+        assert!(config.discovery.public_endpoint.is_none());
+        assert!(config.discovery.public_api_listen_addr.is_none());
+        assert!(config.discovery.phala_attestation_socket_path.is_none());
+    }
+
+    // [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] Authored only: use
+    // the actual renderer without launching Compose, containers or services.
+    #[cfg(unix)]
+    fn render_phala_route_policy(modes: &[&str], required: &str, apps: &str,
+        compose: &str, age: &str) -> std::process::Output {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/node/prepare-phala-compose.sh");
+        std::process::Command::new("/bin/bash").arg(script).args(modes)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+            .env("AERONYX_NODE_IMAGE", format!("ghcr.io/aeronyx/node@sha256:{}", "a".repeat(64)))
+            .env("AERONYX_DISCOVERY_PUBLIC_ENDPOINT", "https://peer.aeronyx.network")
+            .env("AERONYX_DISCOVERY_SEED_ENDPOINTS", r#"["https://seed.aeronyx.network"]"#)
+            .env("AERONYX_REVERSE_ONION_RELAY_NODE_ID", "11".repeat(32))
+            .env("AERONYX_REVERSE_ONION_RELAY_ENDPOINT", "https://relay.aeronyx.network")
+            .env("AERONYX_DISCOVERY_PHALA_ATTESTED_PEERS_REQUIRED", required)
+            .env("AERONYX_DISCOVERY_PHALA_TRUSTED_APP_IDS", apps)
+            .env("AERONYX_DISCOVERY_PHALA_TRUSTED_COMPOSE_HASHES", compose)
+            .env("AERONYX_DISCOVERY_PHALA_PEER_ATTESTATION_MAX_AGE_SECS", age)
+            .output().expect("Phala renderer should launch")
+    }
+
+    // [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] Independently check
+    // both process environments for every supported role selection.
+    #[cfg(unix)]
+    #[test]
+    fn phala_route_policy_renderer_preserves_optional_policy_in_each_role() {
+        let names = ["AERONYX_DISCOVERY_PHALA_ATTESTED_PEERS_REQUIRED",
+            "AERONYX_DISCOVERY_PHALA_TRUSTED_APP_IDS",
+            "AERONYX_DISCOVERY_PHALA_TRUSTED_COMPOSE_HASHES",
+            "AERONYX_DISCOVERY_PHALA_PEER_ATTESTATION_MAX_AGE_SECS"];
+        let compose = format!(r#"["sha256:{}"]"#, "b".repeat(64));
+        let selections: &[&[&str]] = &[&[], &["--public-peer"], &["--private-recipient"],
+            &["--public-peer", "--private-recipient"], &["--private-recipient", "--public-peer"]];
+        for modes in selections {
+            for (required, apps, hashes, age) in [("", "", "", ""), ("false", "", "", ""),
+                ("true", r#"["0xcd"]"#, compose.as_str(), "86400")] {
+                let output = render_phala_route_policy(modes, required, apps, hashes, age);
+                assert!(output.status.success(), "{modes:?}: {}", String::from_utf8_lossy(&output.stderr));
+                let rendered = String::from_utf8(output.stdout).unwrap();
+                let (public, remaining) = rendered.split_once("  aeronyx-private-recipient:\n").unwrap();
+                let private = remaining.split_once("\nvolumes:\n").unwrap().0;
+                for service in [public, private] {
+                    for name in names {
+                        let key = format!("      {name}:");
+                        assert_eq!(service.matches(key.as_str()).count(), 1);
+                        assert!(service.contains(&format!("      {name}: \"${{{name}:-}}\"\n")));
+                    }
+                }
+                assert!(!private.contains("    ports:\n"));
+                assert!(!private.contains("source: /var/run/dstack.sock"));
+                assert!(private.contains("AERONYX_DISCOVERY_PUBLIC_API_LISTEN_ADDR: \"\""));
+            }
+        }
+    }
+
+    // [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] Invalid protected
+    // inputs reject before any partial manifest is emitted. Not executed.
+    #[cfg(unix)]
+    #[test]
+    fn phala_route_policy_renderer_rejects_incomplete_and_invalid_policy() {
+        let apps = r#"["0xcd"]"#;
+        let compose = format!(r#"["sha256:{}"]"#, "b".repeat(64));
+        let oversized = format!("{}{}", " ".repeat(8192), apps);
+        let too_many = serde_json::to_string(&(0..65).map(|n| format!("0x{n:02x}")).collect::<Vec<_>>()).unwrap();
+        for (required, pins, hashes, age) in [("", apps, "", ""), ("false", "", "", "1"),
+            ("TRUE", apps, compose.as_str(), ""), ("true", "", compose.as_str(), ""),
+            ("true", apps, "", ""), ("true", "[1]", compose.as_str(), ""),
+            ("true", r#"["0xcd","\u0030xcd"]"#, compose.as_str(), ""),
+            ("true", r#"["0xCD"]"#, compose.as_str(), ""),
+            ("true", oversized.as_str(), compose.as_str(), ""),
+            ("true", too_many.as_str(), compose.as_str(), ""),
+            ("true", apps, "[]", ""), ("true", apps, compose.as_str(), "01"),
+            ("true", apps, compose.as_str(), "86401")] {
+            let output = render_phala_route_policy(&[], required, pins, hashes, age);
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+        }
+    }
+
+    // [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] Authored only: a
+    // role-local omission/duplicate/default must reject even when the other
+    // service keeps the template-wide count apparently correct.
+    #[cfg(unix)]
+    #[test]
+    fn phala_route_policy_renderer_rejects_weakened_role_environment() {
+        let script = include_str!("../../../deploy/node/prepare-phala-compose.sh");
+        let template = include_str!("../../../deploy/node/compose.phala.peer.yaml");
+        let (public, private) = template.split_once("  aeronyx-private-recipient:\n").unwrap();
+        let directory = tempfile::Builder::new().prefix("phala-route-policy-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+        let script_path = directory.path().join("prepare-phala-compose.sh");
+        let template_path = directory.path().join("compose.phala.peer.yaml");
+        std::fs::write(&script_path, script).unwrap();
+        let render = |contents: &str| {
+            std::fs::write(&template_path, contents).unwrap();
+            std::process::Command::new("/bin/bash").arg(&script_path)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+                .env("AERONYX_NODE_IMAGE", format!("ghcr.io/aeronyx/node@sha256:{}", "a".repeat(64)))
+                .output().expect("Phala renderer should launch")
+        };
+        let healthy = render(template);
+        assert!(healthy.status.success(), "{}", String::from_utf8_lossy(&healthy.stderr));
+        for name in ["AERONYX_DISCOVERY_PHALA_ATTESTED_PEERS_REQUIRED",
+            "AERONYX_DISCOVERY_PHALA_TRUSTED_APP_IDS",
+            "AERONYX_DISCOVERY_PHALA_TRUSTED_COMPOSE_HASHES",
+            "AERONYX_DISCOVERY_PHALA_PEER_ATTESTATION_MAX_AGE_SECS"] {
+            let original = format!("      {name}: \"${{{name}:-}}\"\n");
+            for replacement in [String::new(), original.repeat(2),
+                format!("      {name}: \"${{{name}:-false}}\"\n")] {
+                for private_role in [false, true] {
+                    let mutated = if private_role {
+                        format!("{public}  aeronyx-private-recipient:\n{}", private.replacen(original.as_str(), &replacement, 1))
+                    } else {
+                        format!("{}  aeronyx-private-recipient:\n{private}", public.replacen(original.as_str(), &replacement, 1))
+                    };
+                    let rejected = render(&mutated);
+                    assert!(!rejected.status.success(), "{name} private={private_role}");
+                    assert!(rejected.stdout.is_empty());
+                }
+            }
+            let moved = format!("{}  aeronyx-private-recipient:\n{}",
+                public.replacen(original.as_str(), &original.repeat(2), 1), private.replacen(original.as_str(), "", 1));
+            let rejected = render(&moved);
+            assert!(!rejected.status.success());
+            assert!(rejected.stdout.is_empty());
+        }
+    }
+
+    // [PHALA-NODE-ATTESTATION-CONFIG 2026-10-06 by Codex] Opt-in socket
+    // configuration must remain default-off and require a public signed
+    // discovery identity before it can advertise the endpoint.
+    #[test]
+    fn phala_node_attestation_socket_is_default_off_and_publicly_gated() {
+        let mut config = DiscoveryConfig::default();
+        assert!(config.phala_attestation_socket_path.is_none());
+        assert!(!config.phala_attestation_allow_legacy_v0);
+        config.phala_attestation_allow_legacy_v0 = true;
+        assert!(config.validate().is_err());
+        config.phala_attestation_allow_legacy_v0 = false;
+
+        config.phala_attestation_socket_path = Some("/var/run/dstack.sock".into());
+        assert!(config.validate().is_err());
+        config.enabled = true;
+        config.advertise_self = true;
+        config.public_discovery = true;
+        config.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        config.public_endpoint = Some("https://node.example.com".into());
+        assert!(config.validate().is_ok());
+
+        config.phala_attestation_socket_path = Some("relative/dstack.sock".into());
+        assert!(config.validate().is_err());
+        config.phala_attestation_socket_path = Some(" /var/run/dstack.sock ".into());
+        assert!(config.validate().is_err());
+    }
+
+    // [PHALA-PEER-ATTESTATION-POLICY 2026-10-06 by Codex] Route trust must
+    // fail closed when enabled without locally supplied measured identity.
+    #[test]
+    fn phala_peer_route_gate_requires_local_app_and_compose_pins() {
+        let mut config = DiscoveryConfig::default();
+        assert!(!config.phala_attested_peers_required);
+        config.phala_attested_peers_required = true;
+        config.enabled = true;
+        config.gossip_enabled = true;
+        assert!(config.validate().is_err());
+
+        config.phala_trusted_app_ids = vec![format!("0x{}", "ab".repeat(20))];
+        config.phala_trusted_compose_hashes = vec![format!("sha256:{}", "ab".repeat(32))];
+        assert!(config.validate().is_ok());
+
+        // [PHALA-APP-ID-PIN-FORMAT 2026-10-06 by Codex] Pins are canonical
+        // lower-case hex encodings of the measured event payload bytes.
+        config.phala_trusted_app_ids = vec!["0xAB".into()];
+        assert!(config.validate().is_err());
+        config.phala_trusted_app_ids = vec!["0xabc".into()];
+        assert!(config.validate().is_err());
+        config.phala_trusted_app_ids = vec!["0xgg".into()];
+        assert!(config.validate().is_err());
+        config.phala_trusted_app_ids = vec![format!("0x{}", "ab".repeat(20))];
+
+        config.phala_trusted_compose_hashes = vec!["sha256:AB".into()];
+        assert!(config.validate().is_err());
+        config.phala_trusted_compose_hashes = vec![format!("sha256:{}", "ab".repeat(32))];
+        config.phala_peer_attestation_max_age_secs = 0;
+        assert!(config.validate().is_err());
+    }
+
+    // [PHALA-PRIVATE-ATTESTATION-ISOLATION 2026-10-06 by Codex]
+    #[test]
+    fn empty_attestation_socket_override_disables_quote_and_legacy_fallback() {
+        let mut config = ServerConfig::default();
+        config.discovery.phala_attestation_socket_path = Some("/var/run/dstack.sock".into());
+        config.discovery.phala_attestation_allow_legacy_v0 = true;
+
+        apply_phala_attestation_socket_override(&mut config, "").unwrap();
+
+        assert!(config.discovery.phala_attestation_socket_path.is_none());
+        assert!(!config.discovery.phala_attestation_allow_legacy_v0);
+    }
+
+    // [PHALA-PRIVATE-API-ISOLATION 2026-10-06 by Codex]
+    #[test]
+    fn empty_peer_api_listener_override_disables_inbound_listener() {
+        let mut config = ServerConfig::default();
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+
+        apply_discovery_api_listener_override(&mut config, "").unwrap();
+
+        assert!(config.discovery.public_api_listen_addr.is_none());
+        assert!(apply_discovery_api_listener_override(&mut config, "0.0.0.0:0").is_err());
+        assert!(apply_discovery_api_listener_override(&mut config, "localhost:8422").is_err());
+    }
+
+    // [PHALA-PRIVATE-SEED-RENDER-REGRESSION 2026-10-06 by Codex] Exercise
+    // the actual profile renderer with an inherited seed value: private role
+    // output must succeed while replacing that value with an explicit blank.
+    #[cfg(unix)]
+    #[test]
+    fn phala_private_recipient_renderer_clears_inherited_discovery_seeds() {
+        use std::process::Command;
+
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/node/prepare-phala-compose.sh");
+        let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
+        let output = Command::new("/bin/bash")
+            .arg(script)
+            .arg("--private-recipient")
+            .env_clear()
+            .env("PATH", path)
+            .env(
+                "AERONYX_NODE_IMAGE",
+                format!("ghcr.io/aeronyx/node@sha256:{}", "a".repeat(64)),
+            )
+            .env("AERONYX_REVERSE_ONION_RELAY_NODE_ID", "11".repeat(32))
+            .env(
+                "AERONYX_REVERSE_ONION_RELAY_ENDPOINT",
+                "https://relay.aeronyx.network",
+            )
+            .env(
+                "AERONYX_DISCOVERY_SEED_ENDPOINTS",
+                r#"["https://seed.attacker.net"]"#,
+            )
+            .output()
+            .expect("Phala Compose renderer should launch");
+        assert!(
+            output.status.success(),
+            "renderer rejected private role: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let rendered = String::from_utf8(output.stdout).expect("renderer output is UTF-8");
+        let private_service = rendered
+            .split("  aeronyx-private-recipient:\n")
+            .nth(1)
+            .expect("private recipient service is rendered")
+            .split("\nvolumes:\n")
+            .next()
+            .expect("private service ends before top-level volumes");
+        assert!(private_service.contains("AERONYX_DISCOVERY_SEED_ENDPOINTS: \"\""));
+        assert!(!private_service.contains("seed.attacker.net"));
+        assert!(!private_service.contains("    ports:\n"));
+        assert!(!private_service.contains("source: /var/run/dstack.sock"));
+        assert!(!private_service.contains("profiles: [\"private-recipient\"]"));
+    }
+
+    // [PHALA-ROLE-SEED-ISOLATION 2026-10-07 by Codex] Authored, unexecuted:
+    // inspect actual output for every role selection, not marker presence alone.
+    #[cfg(unix)]
+    #[test]
+    fn phala_renderer_scopes_seeds_for_all_role_combinations() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/node/prepare-phala-compose.sh");
+        let selections: &[&[&str]] = &[
+            &[],
+            &["--public-peer"],
+            &["--private-recipient"],
+            &["--public-peer", "--private-recipient"],
+            &["--private-recipient", "--public-peer"],
+        ];
+        for modes in selections {
+            let output = std::process::Command::new("/bin/bash")
+                .arg(&script)
+                .args(*modes)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+                .env("AERONYX_NODE_IMAGE", format!("ghcr.io/aeronyx/node@sha256:{}", "a".repeat(64)))
+                .env("AERONYX_DISCOVERY_PUBLIC_ENDPOINT", "https://peer.aeronyx.network")
+                .env("AERONYX_DISCOVERY_SEED_ENDPOINTS", r#"["https://seed.aeronyx.network"]"#)
+                .env("AERONYX_REVERSE_ONION_RELAY_NODE_ID", "11".repeat(32))
+                .env("AERONYX_REVERSE_ONION_RELAY_ENDPOINT", "https://relay.aeronyx.network")
+                .output()
+                .expect("Phala Compose renderer should launch");
+            assert!(output.status.success(), "{modes:?}: {}", String::from_utf8_lossy(&output.stderr));
+            let rendered = String::from_utf8(output.stdout).unwrap();
+            let (public, remaining) = rendered.split_once("  aeronyx-private-recipient:\n").unwrap();
+            let private = remaining.split_once("\nvolumes:\n").unwrap().0;
+            for service in [public, private] {
+                // [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] A key and
+                // its ${NAME:?} value are one environment entry, not two.
+                assert_eq!(service.matches("      AERONYX_DISCOVERY_SEED_ENDPOINTS:").count(), 1, "{modes:?}");
+                assert!(!service.contains("PHALA_PUBLIC_PEER_SEEDS_ENV"));
+                // [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex]
+                // Authored only: inspect each real rendered role separately.
+                assert_eq!(service.matches("stop_signal:").count(), 1, "{modes:?}");
+                assert!(service.contains("    stop_signal: SIGTERM\n"));
+                assert_eq!(service.matches("stop_grace_period:").count(), 1, "{modes:?}");
+                assert!(service.contains("    stop_grace_period: 2m\n"));
+            }
+            let public_selected = modes.contains(&"--public-peer");
+            let private_selected = modes.contains(&"--private-recipient");
+            assert_eq!(public.contains("${AERONYX_DISCOVERY_SEED_ENDPOINTS:?"), public_selected);
+            assert_eq!(public.contains("AERONYX_DISCOVERY_SEED_ENDPOINTS: \"\""), !public_selected);
+            assert_eq!(public.contains("    ports:\n"), public_selected);
+            assert_eq!(public.contains("source: /var/run/dstack.sock"), public_selected);
+            assert_eq!(public.contains("profiles: [\"public-peer\"]"), private_selected && !public_selected);
+            assert!(private.contains("AERONYX_DISCOVERY_SEED_ENDPOINTS: \"\""));
+            assert!(!private.contains("${AERONYX_DISCOVERY_SEED_ENDPOINTS"));
+            assert!(!private.contains("    ports:\n"));
+            assert!(!private.contains("source: /var/run/dstack.sock"));
+            assert_eq!(private.contains("profiles: [\"private-recipient\"]"), !private_selected);
+            assert_eq!(private.contains("${AERONYX_REVERSE_ONION_RELAY_NODE_ID:?"), private_selected);
+            assert_eq!(private.contains("${AERONYX_REVERSE_ONION_RELAY_ENDPOINT:?"), private_selected);
+        }
+    }
+
+    // [PHALA-EARLY-SHUTDOWN-SIGNALS 2026-10-07 by Codex] Authored, not
+    // run: exercise the actual renderer's role-scoped guard with deliberately
+    // broken templates. No Compose process or service is started by this test.
+    #[cfg(unix)]
+    #[test]
+    fn phala_renderer_rejects_missing_duplicate_or_weakened_stop_policy() {
+        let script = include_str!("../../../deploy/node/prepare-phala-compose.sh");
+        let template = include_str!("../../../deploy/node/compose.phala.peer.yaml");
+        let (public, private) = template.split_once("  aeronyx-private-recipient:\n").unwrap();
+        let directory = tempfile::Builder::new().prefix("phala-stop-policy-")
+            .tempdir_in("/Volumes/disk/aeronyx-codex-tmp").unwrap();
+        let script_path = directory.path().join("prepare-phala-compose.sh");
+        let template_path = directory.path().join("compose.phala.peer.yaml");
+        std::fs::write(&script_path, script).unwrap();
+        let render = |contents: &str| {
+            std::fs::write(&template_path, contents).unwrap();
+            std::process::Command::new("/bin/bash").arg(&script_path)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+                .env("AERONYX_NODE_IMAGE", format!("ghcr.io/aeronyx/node@sha256:{}", "a".repeat(64)))
+                .output().expect("Phala renderer should launch")
+        };
+        let healthy = render(template);
+        assert!(healthy.status.success(), "{}", String::from_utf8_lossy(&healthy.stderr));
+        for private_role in [false, true] {
+            for (original, replacement) in [
+                ("    stop_signal: SIGTERM\n", ""),
+                ("    stop_signal: SIGTERM\n", "    stop_signal: SIGKILL\n"),
+                ("    stop_signal: SIGTERM\n", "    stop_signal: SIGTERM\n    stop_signal: SIGTERM\n"),
+                ("    stop_grace_period: 2m\n", ""),
+                ("    stop_grace_period: 2m\n", "    stop_grace_period: 10s\n"),
+                ("    stop_grace_period: 2m\n", "    stop_grace_period: 2m\n    stop_grace_period: 2m\n"),
+            ] {
+                let mutated = if private_role {
+                    format!("{public}  aeronyx-private-recipient:\n{}", private.replacen(original, replacement, 1))
+                } else {
+                    format!("{}  aeronyx-private-recipient:\n{private}", public.replacen(original, replacement, 1))
+                };
+                let rejected = render(&mutated);
+                assert!(!rejected.status.success(), "accepted broken policy in private={private_role}");
+                assert!(rejected.stdout.is_empty());
+                assert!(String::from_utf8_lossy(&rejected.stderr)
+                    .contains("each Phala role requires exactly SIGTERM and a two-minute stop grace"));
+            }
+        }
+        // Whole-template counts still match when both keys move into one role.
+        let moved = format!("{}  aeronyx-private-recipient:\n{}",
+            public.replace("    stop_signal: SIGTERM\n", "    stop_signal: SIGTERM\n    stop_signal: SIGTERM\n"),
+            private.replace("    stop_signal: SIGTERM\n", ""));
+        assert!(!render(&moved).status.success());
+        let isolated = include_str!("../../../deploy/node/compose.phala.yaml");
+        assert_eq!(isolated.matches("stop_signal:").count(), 1);
+        assert!(isolated.contains("    stop_signal: SIGTERM\n"));
+        assert_eq!(isolated.matches("stop_grace_period:").count(), 1);
+        assert!(isolated.contains("    stop_grace_period: 2m\n"));
+    }
+
+    // [PHALA-RENDER-DNS-PARITY 2026-10-07 by Codex] Authored only: exercise
+    // each real renderer input independently, without starting any services.
+    #[cfg(unix)]
+    fn render_phala_origin(role: &str, endpoint: &str, relay_id: &str) -> std::process::Output {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/node/prepare-phala-compose.sh");
+        let mut command = std::process::Command::new("/bin/bash");
+        command.arg(script).env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+            .env("AERONYX_NODE_IMAGE", format!("ghcr.io/aeronyx/node@sha256:{}", "a".repeat(64)));
+        match role {
+            "recipient" => {
+                command.arg("--private-recipient")
+                    .env("AERONYX_REVERSE_ONION_RELAY_NODE_ID", relay_id)
+                    .env("AERONYX_REVERSE_ONION_RELAY_ENDPOINT", endpoint);
+            }
+            "seed" => {
+                command.arg("--public-peer")
+                    .env("AERONYX_DISCOVERY_SEED_ENDPOINTS", serde_json::to_string(&[endpoint]).unwrap());
+            }
+            "public" => {
+                command.arg("--public-peer")
+                    .env("AERONYX_DISCOVERY_SEED_ENDPOINTS", r#"["https://8.8.8.8"]"#)
+                    .env("AERONYX_DISCOVERY_PUBLIC_ENDPOINT", endpoint);
+            }
+            _ => panic!("unknown renderer test role"),
+        }
+        command.output().expect("Phala Compose renderer should launch")
+    }
+
+    // [PHALA-RENDER-DNS-PARITY 2026-10-07 by Codex] Positive DNS cases
+    // catch the former IP-parse error before the DNS branch was reachable.
+    #[cfg(unix)]
+    #[test]
+    fn phala_renderer_and_startup_accept_public_dns_and_literal_origins() {
+        let relay_id = "11".repeat(32);
+        for endpoint in [
+            "https://relay.example.net:443",
+            "https://1e598a2f983dd80c413627e0b50d91905f3f48be-8422.dstack-prod5.phala.network",
+            "https://8.8.8.8",
+            "https://[2606:4700:4700::1111]",
+            "https://[::ffff:8.8.8.8]",
+        ] {
+            let mut config: ServerConfig = toml::from_str(include_str!(
+                "../../../deploy/node/server.phala.peer.example.toml",
+            )).unwrap();
+            apply_discovery_seed_endpoints(&mut config, &serde_json::to_string(&[endpoint]).unwrap()).unwrap();
+            apply_discovery_public_endpoint_override(&mut config, endpoint).unwrap();
+            for role in ["recipient", "seed", "public"] {
+                let output = render_phala_origin(role, endpoint, &relay_id);
+                assert!(output.status.success(), "{role} {endpoint}: {}",
+                    String::from_utf8_lossy(&output.stderr));
+                assert!(!output.stdout.is_empty());
+            }
+        }
+    }
+
+    // [PHALA-RENDER-DNS-PARITY 2026-10-07 by Codex] Reject before writing
+    // any manifest, including when only the public endpoint is invalid.
+    #[cfg(unix)]
+    #[test]
+    fn phala_renderer_and_startup_reject_nonpublic_and_malformed_origins() {
+        let oversized_label = format!("https://{}.example.net", "a".repeat(64));
+        let relay_id = "11".repeat(32);
+        for endpoint in [
+            "http://relay.example.net", "https://127.0.0.1", "https://10.0.0.1",
+            "https://100.64.0.1", "https://203.0.113.1", "https://224.0.0.1",
+            "https://[::ffff:127.0.0.1]", "https://[2001:db8::1]",
+            "https://[2002:808:808::1]", "https://[3fff::1]", "https://[ff0e::1]",
+            "https://user@relay.example.net", "https://relay.example.net/api",
+            "https://relay.example.net/?token=x", "https://relay.example.net/#fragment",
+            "https://relay.example.net:0", "https://relay.internal",
+            "https://relay..example.net", "https://-relay.example.net",
+            "https://relay-.example.net", "https://relay_name.example.net",
+            oversized_label.as_str(),
+        ] {
+            let mut config: ServerConfig = toml::from_str(include_str!(
+                "../../../deploy/node/server.phala.peer.example.toml",
+            )).unwrap();
+            assert!(apply_discovery_seed_endpoints(&mut config,
+                &serde_json::to_string(&[endpoint]).unwrap()).is_err(), "seed {endpoint}");
+            assert!(apply_discovery_public_endpoint_override(&mut config, endpoint).is_err(),
+                "public {endpoint}");
+            for role in ["recipient", "seed", "public"] {
+                let output = render_phala_origin(role, endpoint, &relay_id);
+                assert!(!output.status.success(), "{role} {endpoint}");
+                assert!(output.stdout.is_empty(), "partial manifest for {role} {endpoint}");
+            }
+        }
+    }
+
+    // [PHALA-RENDER-DNS-PARITY 2026-10-07 by Codex] Required-value
+    // placeholders must not carry a value different from the validated input.
+    #[cfg(unix)]
+    #[test]
+    fn phala_recipient_renderer_rejects_whitespace_in_protected_values() {
+        let relay_id = "11".repeat(32);
+        // [PHALA-ROLE-ENDPOINT-OVERRIDE 2026-10-07 by Codex] A public
+        // origin must be the same exact protected value validated by Rust.
+        for role in ["recipient", "public"] {
+            for endpoint in [" ", " https://relay.example.net", "https://relay.example.net "] {
+                let output = render_phala_origin(role, endpoint, &relay_id);
+                assert!(!output.status.success());
+                assert!(output.stdout.is_empty());
+            }
+        }
+        for invalid_id in [format!(" {relay_id}"), format!("{relay_id} ")] {
+            let output = render_phala_origin("recipient", "https://relay.example.net", &invalid_id);
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+        }
+    }
+
+    // [PHALA-CLOUD-PROFILE 2026-10-06 by Codex] The unrendered template is
+    // invalid until its role-specific renderer disables attestation or
+    // supplies the public HTTPS endpoint bound into the signed descriptor.
+    #[test]
+    fn phala_peer_profile_requires_endpoint_when_attestation_is_enabled() {
+        let source = include_str!("../../../deploy/node/server.phala.peer.example.toml");
+        let mut config: ServerConfig = toml::from_str(source).unwrap();
+        assert!(config.validate().is_err());
+        apply_phala_attestation_socket_override(&mut config, "").unwrap();
+        assert!(config.validate().is_ok());
+        apply_phala_attestation_socket_override(
+            &mut config,
+            "/var/run/aeronyx/phala-agent.sock",
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+        assert!(!config.memchain.chat_relay.enabled);
+        assert!(!config.discovery.advertise_onion_middle);
+        assert_eq!(config.memchain.chat_relay.max_pending_per_wallet, 128);
+        assert_eq!(
+            config.memchain.chat_relay.max_pending_messages_total,
+            2_048
+        );
+        assert_eq!(
+            config.memchain.chat_relay.max_pending_message_bytes_total,
+            64 * 1024 * 1024
+        );
+        assert_eq!(config.memchain.chat_relay.max_message_size, 64 * 1024);
+        assert_eq!(config.memchain.chat_relay.max_blob_size, 5 * 1024 * 1024);
+        assert_eq!(config.memchain.chat_relay.max_blobs_per_receiver, 8);
+        assert_eq!(config.memchain.chat_relay.max_pending_blobs_total, 128);
+        assert_eq!(
+            config.memchain.chat_relay.max_pending_blob_bytes_total,
+            256 * 1024 * 1024
+        );
+        assert!(!config.blind_vault.enabled);
+        assert!(!config.blind_vault.public_api_enabled);
+        assert_eq!(config.blind_vault.max_lease_ttl_secs, 7 * 24 * 60 * 60);
+        assert_eq!(config.blind_vault.max_object_ttl_secs, 7 * 24 * 60 * 60);
+        assert_eq!(config.blind_vault.max_objects_per_lease, 1_024);
+        assert_eq!(config.blind_vault.max_bytes_per_lease, 64 * 1024 * 1024);
+        assert_eq!(config.blind_vault.max_live_leases, 128);
+        assert_eq!(
+            config.blind_vault.max_total_ciphertext_bytes,
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(config.blind_vault.min_free_disk_bytes, 1024 * 1024 * 1024);
+        assert!(config.discovery.public_endpoint.is_none());
+        assert!(apply_discovery_public_endpoint_if_configured(&mut config, " ").is_err());
+        apply_discovery_public_endpoint_if_configured(&mut config, "").unwrap();
+        assert!(config.validate().is_err());
+        assert!(apply_discovery_public_endpoint_override(&mut config, " ").is_err());
+        assert!(apply_discovery_public_endpoint_override(
+            &mut config,
+            "http://node.example.com"
+        )
+        .is_err());
+        for invalid in [
+            "https://localhost",
+            "https://127.0.0.1:8422",
+            "https://node.example.com/path",
+            "https://node.example.com/?token=secret",
+        ] {
+            assert!(apply_discovery_public_endpoint_override(&mut config, invalid).is_err());
+        }
+        apply_discovery_public_endpoint_override(
+            &mut config,
+            "https://node.phala.network",
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.discovery.public_endpoint.as_deref(),
+            Some("https://node.phala.network")
+        );
+        assert_eq!(config.network.listen_addr, "127.0.0.1:51820".parse().unwrap());
+        assert!(!config.management.enabled);
+        assert_eq!(
+            config.discovery.phala_attestation_socket_path.as_deref(),
+            Some("/var/run/aeronyx/phala-agent.sock")
+        );
+        // [PHALA-PEER-INGRESS-OPT-IN 2026-10-06 by Codex] The source template
+        // publishes no port; renderer opt-in is the sole peer ingress path.
+        let compose = include_str!("../../../deploy/node/compose.phala.peer.yaml");
+        assert!(compose.contains("    platform: linux/amd64\n"));
+        assert!(compose.contains("# PHALA_PUBLIC_PEER_INGRESS\n"));
+        assert!(compose.contains("# PHALA_PUBLIC_PEER_ENDPOINT_ENV\n"));
+        assert!(compose.contains("# PHALA_PUBLIC_PEER_DISCOVERY_ENV\n"));
+        assert!(compose.contains("# PHALA_PUBLIC_PEER_API_LISTENER_ENV\n"));
+        assert!(compose.contains("# PHALA_PUBLIC_PEER_ATTESTATION_SOCKET_ENV\n"));
+        assert!(compose.contains("# PHALA_PUBLIC_PEER_SEEDS_ENV\n"));
+        // [PHALA-ROLE-SEED-ISOLATION 2026-10-07 by Codex] The public
+        // substitution marker and private literal belong to distinct services.
+        assert_eq!(compose.matches("# PHALA_PUBLIC_PEER_SEEDS_ENV\n").count(), 1);
+        assert!(compose.contains("# PHALA_PUBLIC_PEER_DSTACK_SOCKET\n"));
+        let renderer = include_str!("../../../deploy/node/prepare-phala-compose.sh");
+        assert!(renderer.contains("AERONYX_DISCOVERY_PUBLIC_ENDPOINT:?Set"));
+        // [PHALA-RELAY-INGRESS-RENDER-GATE 2026-10-06 by Codex] An enabled
+        // public relay must render with both its ingress profile and assigned
+        // origin, rather than starting as an unreachable local store.
+        assert!(renderer.contains(
+            "AERONYX_PHALA_ONION_RELAY_ENABLED=true requires the explicit --public-peer profile"
+        ));
+        assert!(renderer.contains(
+            "AERONYX_PHALA_ONION_RELAY_ENABLED=true requires an assigned public HTTPS endpoint"
+        ));
+        // [PHALA-QUEUE-ROLE-RENDER-GATE 2026-10-06 by Codex] Rendering must
+        // reject the queue unless its required public OnionMiddle role is on.
+        assert!(renderer.contains("queue requires AERONYX_PHALA_ONION_RELAY_ENABLED=true"));
+        assert!(renderer.contains("queue_node_ids("));
+        assert!(renderer.contains("queue signed authority inputs must be supplied together"));
+        assert!(!compose.contains("    ports:\n"));
+        assert!(!compose.contains("source: /var/run/dstack.sock"));
+        let renderer = include_str!("../../../deploy/node/prepare-phala-compose.sh");
+        let dockerfile = include_str!("../../../deploy/node/Dockerfile");
+        let isolated_compose = include_str!("../../../deploy/node/compose.phala.yaml");
+        assert!(dockerfile.contains("FROM --platform=linux/amd64 rust:1.97.1-bookworm AS builder"));
+        assert!(dockerfile.contains("FROM --platform=linux/amd64 debian:bookworm-slim"));
+        assert!(isolated_compose.contains("    platform: linux/amd64\n"));
+        assert!(renderer.contains("if \"--public-peer\" in requested_modes:"));
+        assert!(renderer.contains("public_ingress_mapping = '    ports:\\n      - \"8422:8422\"\\n'"));
+        assert!(renderer.contains(
+            "template.replace(public_endpoint_marker, public_peer_endpoint_env)"
+        ));
+        assert!(renderer.contains(
+            "template.replace(public_discovery_marker, public_peer_visibility_env)"
+        ));
+        assert!(renderer.contains("template.replace(public_api_marker, public_peer_api_env)"));
+        assert!(renderer.contains("public_peer_seeds_env ="));
+        assert!(renderer.contains(
+            "${AERONYX_DISCOVERY_SEED_ENDPOINTS:?Set AERONYX_DISCOVERY_SEED_ENDPOINTS"
+        ));
+        // [PHALA-ATTESTATION-TWO-PHASE-CONFIG 2026-10-06 by Codex]
+        // The renderer must validate public seeds and keep quote transport off
+        // until the Phala-assigned origin is available.
+        assert!(renderer.contains("seeds = json.loads(seeds_encoded)"));
+        assert!(renderer.contains("not 1 <= len(seeds) <= 64"));
+        assert!(renderer.contains("public_peer_endpoint_unassigned_env ="));
+        assert!(renderer.contains("public_peer_attestation_env if public_endpoint else private_attestation_env"));
+        assert!(renderer.contains(
+            "template.replace(public_seeds_marker, public_peer_seeds_env, 1)"
+        ));
+        assert!(renderer.contains(
+            "template.replace(public_seeds_marker, private_seeds_env, 1)"
+        ));
+        assert!(renderer.contains("public_dstack_mount if public_endpoint else \"\""));
+        assert!(renderer.contains("template.replace(public_dstack_marker, \"\")"));
+        assert!(renderer.contains("template.replace(public_attestation_marker, private_attestation_env)"));
+        assert!(renderer.contains(
+            "template.replace(public_endpoint_marker, private_endpoint_env)"
+        ));
+        assert!(renderer.contains(
+            "template.replace(public_discovery_marker, private_visibility_env)"
+        ));
+        assert!(renderer.contains("template.replace(public_api_marker, private_api_env)"));
+        assert!(renderer.contains(
+            "template.replace(public_attestation_marker, private_attestation_env)"
+        ));
+        // [PHALA-PRIVATE-SEED-RENDER-GUARD 2026-10-06 by Codex] The private
+        // renderer allows exactly its empty seed override, never a public seed.
+        assert!(renderer.contains(
+            "private_service.count(\"      AERONYX_DISCOVERY_SEED_ENDPOINTS:\") != 1"
+        ));
+        assert!(renderer.contains("private_service.count(private_seeds_env) != 1"));
+        assert!(!renderer.contains(
+            "\"AERONYX_DISCOVERY_SEED_ENDPOINTS\" in private_service"
+        ));
+        let recipient_compose = compose
+            .split("  aeronyx-private-recipient:\n")
+            .nth(1)
+            .unwrap()
+            .split("\nvolumes:\n")
+            .next()
+            .unwrap();
+        assert!(!recipient_compose.contains("    ports:\n"));
+        // [PHALA-ROUTE-POLICY-ENV 2026-10-07 by Codex] Count the YAML key.
+        assert_eq!(recipient_compose.matches("      AERONYX_DISCOVERY_SEED_ENDPOINTS:").count(), 1);
+        assert!(recipient_compose.contains("AERONYX_DISCOVERY_SEED_ENDPOINTS: \"\""));
+        // [PHALA-ATTESTATION-FAIL-CLOSED 2026-10-06 by Codex] The deployed
+        // Phala peer profile must not silently accept a legacy quote contract.
+        assert!(!config.discovery.phala_attestation_allow_legacy_v0);
+        apply_phala_onion_relay_override(&mut config, "true").unwrap();
+        assert!(config.memchain.chat_relay.enabled);
+        assert!(config.discovery.advertise_onion_middle);
+        assert!(config.validate().is_ok());
+        apply_phala_onion_relay_override(&mut config, "false").unwrap();
+        assert!(!config.memchain.chat_relay.enabled);
+        assert!(!config.discovery.advertise_onion_middle);
+        let relay_id = hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[46; 32])
+                .unwrap()
+                .public_key_bytes(),
+        );
+        apply_reverse_onion_recipient_env(
+            &mut config,
+            Some("true"),
+            Some(&relay_id),
+            // [PHALA-EXECUTED-PROFILE-FIXTURES 2026-10-08 by Codex]
+            // Public-shape origin only; this configuration test performs no IO.
+            Some("https://relay.aeronyx.network"),
+        )
+        .unwrap();
+        // [PHALA-PRIVATE-RELAY-DURABILITY 2026-10-06 by Codex] Match the
+        // actual loader order: private role first, public relay override last.
+        config.discovery.advertise_onion_middle = true;
+        apply_phala_onion_relay_override(&mut config, "false").unwrap();
+        assert!(config.reverse_onion.recipient.enabled);
+        assert!(config.blind_vault.enabled);
+        assert!(config.memchain.chat_relay.enabled);
+        assert!(!config.discovery.advertise_onion_middle);
+        // [PHALA-EXECUTED-PROFILE-FIXTURES 2026-10-08 by Codex] Switching
+        // public relay to private recipient requires the loader's full egress
+        // isolation, not merely its onion-middle advertisement override.
+        apply_discovery_public_endpoint_if_configured(&mut config, "").unwrap();
+        apply_discovery_public_visibility_override(&mut config, "false").unwrap();
+        apply_discovery_api_listener_override(&mut config, "").unwrap();
+        apply_phala_attestation_socket_override(&mut config, "").unwrap();
+        apply_discovery_seed_endpoints(&mut config, "").unwrap();
+        config.reverse_onion.recipient.state_db_path =
+            "/var/lib/aeronyx/reverse-onion-recipient.sqlite".into();
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+        assert!(!config.blind_vault.public_api_enabled);
+        assert_eq!(config.memchain.chat_relay.max_pending_messages_total, 2_048);
+        assert_eq!(
+            config.memchain.chat_relay.max_pending_blob_bytes_total,
+            256 * 1024 * 1024
+        );
+        assert_eq!(config.blind_vault.max_live_leases, 128);
+        assert_eq!(
+            config.blind_vault.max_total_ciphertext_bytes,
+            2 * 1024 * 1024 * 1024
+        );
+    }
+
+    // [PHALA-ROLE-ENDPOINT-OVERRIDE 2026-10-07 by Codex] Clearing the
+    // discovery origin alone would resurrect the legacy fallback in signed
+    // descriptors. An explicit empty value must remove both, not other policy.
+    #[test]
+    fn phala_empty_origin_override_clears_both_descriptor_sources_only() {
+        let mut config = ServerConfig::default();
+        config.discovery.public_endpoint = Some("https://old.aeronyx.network".into());
+        config.network.public_endpoint = Some("https://fallback.aeronyx.network".into());
+        config.discovery.seed_endpoints = vec!["https://seed.aeronyx.network".into()];
+        apply_discovery_public_endpoint_if_configured(&mut config, "").unwrap();
+        assert!(config.discovery.public_endpoint.is_none());
+        assert!(config.network.public_endpoint.is_none());
+        assert!(config.effective_public_endpoint().is_none());
+        assert_eq!(config.discovery.seed_endpoints, vec!["https://seed.aeronyx.network"]);
+        assert!(!config.discovery.enabled);
+        assert!(config.discovery.public_api_listen_addr.is_none());
+    }
+
+    // [PHALA-ONION-RELAY-OPT-IN 2026-10-06 by Codex] Authored, not run.
+    #[test]
+    fn phala_onion_relay_override_is_exact_and_separates_private_role() {
+        let mut config = ServerConfig::default();
+        assert!(apply_phala_onion_relay_override(&mut config, "false").is_ok());
+        assert!(!config.discovery.advertise_onion_middle);
+        assert!(!config.memchain.chat_relay.enabled);
+
+        config.memchain.chat_relay.enabled = true;
+        config.discovery.advertise_onion_middle = true;
+        assert!(apply_phala_onion_relay_override(&mut config, "false").is_ok());
+        assert!(!config.memchain.chat_relay.enabled);
+        assert!(!config.discovery.advertise_onion_middle);
+
+        assert!(apply_phala_onion_relay_override(&mut config, "yes").is_err());
+
+        config.reverse_onion.recipient.enabled = true;
+        config.memchain.chat_relay.enabled = true;
+        config.discovery.advertise_onion_middle = true;
+        assert!(apply_phala_onion_relay_override(&mut config, "false").is_ok());
+        assert!(config.memchain.chat_relay.enabled);
+        assert!(!config.discovery.advertise_onion_middle);
+        assert!(apply_phala_onion_relay_override(&mut config, "true").is_err());
+        assert!(config.memchain.chat_relay.enabled);
+    }
+
+    // [REVERSE-RECOVERY-BOOT 2026-10-05 by Codex] Authored, not executed.
+    #[test]
+    fn reverse_recovery_passes_parent_config_without_enabling_new_admission() {
+        let mut config = ServerConfig::default();
+        config.reverse_onion.queue.enabled = true;
+        config.reverse_onion.queue.recovery_only = true;
+        config.reverse_onion.queue.db_path = "/Volumes/disk/reverse-onion-test/queue.sqlite".into();
+        config.reverse_onion.queue.recipient_node_ids.push(hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[41; 32]).unwrap().public_key_bytes(),
+        ));
+        // [PHALA-REVERSE-ONION-LISTENER-GATES 2026-10-06 by Codex]
+        assert!(config.validate().is_err());
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        // [PHALA-REVERSE-QUEUE-ORIGIN-GATE 2026-10-06 by Codex] A listener
+        // alone cannot advertise or route durable recovery claims.
+        assert!(config.validate().is_err());
+        config.discovery.public_endpoint = Some("https://relay.example.net".into());
+        assert!(config.validate().is_ok());
+        let mut collision = config.clone();
+        collision.blind_vault.db_path = collision.reverse_onion.queue.db_path.clone();
+        assert!(collision.validate().is_err());
+        config.reverse_onion.queue.recovery_only = false;
+        assert!(config.validate().is_err());
+    }
+
+    // [REVERSE-ONION-SOURCE-PENDING 2026-10-05 by Codex] The root server
+    // validation gate must reject unbounded source evidence polling too.
+    #[test]
+    fn source_result_polling_limits_reach_parent_server_gate() {
+        let mut config = ServerConfig::default();
+        config.reverse_onion.source.enabled = true;
+        config.reverse_onion.source.state_db_path =
+            "/Volumes/disk/reverse-onion-test/source.sqlite".into();
+        config.reverse_onion.source.result_wait_secs = 31;
+        assert!(config.validate().is_err());
+    }
+
+    // [PHALA-SOURCE-AUTHORITY-BOOTSTRAP 2026-10-06 by Codex] Authored, not
+    // executed: parent config admits an inert live source with operator pins
+    // and authenticated gossip, without requiring a startup grant bundle.
+    #[test]
+    fn source_bootstrap_uses_identity_origin_pins_and_discovery_gate() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.gossip_enabled = true;
+        config.reverse_onion.source.enabled = true;
+        config.reverse_onion.source.state_db_path =
+            "/Volumes/disk/reverse-onion-test/source-bootstrap.sqlite".into();
+        config.reverse_onion.source.relay_node_id = hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[41; 32])
+                .unwrap().public_key_bytes(),
+        );
+        config.reverse_onion.source.recipient_node_id = hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[42; 32])
+                .unwrap().public_key_bytes(),
+        );
+        config.reverse_onion.source.relay_endpoint = "https://relay.example.net".into();
+        assert!(config.validate().is_ok());
+        // [PHALA-SOURCE-MPI-COMPOSITION 2026-10-08 by Codex] Recovery
+        // also returns through MPI; it cannot relax the composition contract.
+        for recovery in [false, true] {
+            for mode in [MemChainMode::Off, MemChainMode::Saas, MemChainMode::Local, MemChainMode::P2p] {
+                let mut candidate = config.clone();
+                candidate.reverse_onion.source.recovery_only = recovery;
+                candidate.memchain.mode = mode.clone();
+                if matches!(mode, MemChainMode::Off | MemChainMode::Saas) {
+                    assert!(candidate.validate().unwrap_err().to_string()
+                        .contains("source pulls require local or p2p MemChain MPI runtime"));
+                } else {
+                    assert!(candidate.validate().is_ok());
+                }
+            }
+        }
+        config.discovery.gossip_enabled = false;
+        assert!(config.validate().is_err());
+    }
+
+    // [PHALA-REVERSE-ONION-LISTENER-GATES 2026-10-06 by Codex]
+    #[test]
+    fn no_vpn_profile_rejects_source_pull_role() {
+        let mut config = ServerConfig::default();
+        config.vpn.enabled = false;
+        config.reverse_onion.source.enabled = true;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("source pulls require the authenticated VPN/MPI listener"));
+    }
+
     // [RECIPIENT-STARTUP-WIRING 2026-10-04 by Codex] Authored, unexecuted.
     #[test]
     fn reverse_recipient_omitted_config_stays_disabled_and_queue_cannot_opt_in() {
@@ -2073,6 +3873,42 @@ mod tests {
         assert!(recipient.validate().is_err());
     }
 
+    // [PHALA-REVERSE-AUTHORITY-BOOTSTRAP 2026-10-06 by Codex] Queue startup
+    // must accept identity pins without a pre-issued descriptor/grant bundle,
+    // while retaining every parent listener, role, and gossip gate.
+    #[test]
+    fn live_phala_queue_can_boot_before_discovery_authority_arrives() {
+        let mut config = ServerConfig::default();
+        config.memchain.mode = crate::config_memchain::MemChainMode::Off;
+        config.memchain.chat_relay.enabled = true;
+        config.discovery.enabled = true;
+        config.discovery.gossip_enabled = true;
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        config.discovery.public_endpoint = Some("https://relay.example.net".into());
+        config.discovery.advertise_onion_middle = true;
+        config.reverse_onion.queue.enabled = true;
+        config.reverse_onion.queue.db_path =
+            "/Volumes/disk/reverse-onion-test/phala-queue.sqlite".into();
+        config.reverse_onion.queue.recipient_node_ids = vec![hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[51; 32])
+                .unwrap().public_key_bytes(),
+        )];
+        config.reverse_onion.queue.source_node_ids = vec![hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[52; 32])
+                .unwrap().public_key_bytes(),
+        )];
+        assert!(config.validate().is_ok());
+
+        config.discovery.gossip_enabled = false;
+        assert!(config.validate().is_err());
+        config.discovery.gossip_enabled = true;
+        config.discovery.public_api_listen_addr = None;
+        assert!(config.validate().is_err());
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        config.discovery.public_endpoint = None;
+        assert!(config.validate().is_err());
+    }
+
     #[test]
     fn reverse_recipient_missing_terminal_and_db_collision_fail_closed() {
         let mut config = ServerConfig::default();
@@ -2080,12 +3916,387 @@ mod tests {
         config.reverse_onion.recipient.relay_node_id = hex::encode(
             aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[41; 32]).unwrap().public_key_bytes());
         config.reverse_onion.recipient.relay_endpoint = "https://8.8.8.8".into();
-        config.reverse_onion.recipient.state_db_path = "/private/tmp/recipient-test.sqlite".into();
+        // [REVERSE-ONION-TEST-PATH 2026-10-05 by Codex] Keep fixture paths on
+        // the designated data volume; validation never opens this database.
+        config.reverse_onion.recipient.state_db_path =
+            "/Volumes/disk/aeronyx-reverse-onion-tests/recipient-test.sqlite".into();
         assert!(config.validate().is_err());
         config.blind_vault.enabled = true;
-        config.blind_vault.public_api_enabled = true;
         config.blind_vault.db_path = config.reverse_onion.recipient.state_db_path.clone();
         assert!(config.validate().is_err());
+    }
+
+    // [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex] Authored, not executed.
+    #[test]
+    fn reverse_recipient_does_not_require_direct_blind_vault_api() {
+        let mut config = ServerConfig::default();
+        config.vpn.enabled = false;
+        // [PHALA-CONFIG-EXECUTED-REGRESSION 2026-10-08 by Codex] A private
+        // recipient must satisfy management isolation before API role checks.
+        config.management.enabled = false;
+        // [PHALA-CHAT-RELAY-INDEPENDENT-CONFIG 2026-10-06 by Codex]
+        // The recipient stores ciphertext locally without enabling MemChain
+        // inference or the general-purpose memory runtime.
+        config.memchain.mode = crate::config_memchain::MemChainMode::Off;
+        config.discovery.enabled = true;
+        config.discovery.gossip_enabled = true;
+        config.blind_vault.enabled = true;
+        config.blind_vault.public_api_enabled = false;
+        config.memchain.chat_relay.enabled = true;
+        config.reverse_onion.recipient.enabled = true;
+        config.reverse_onion.recipient.relay_node_id = hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[41; 32]).unwrap().public_key_bytes(),
+        );
+        config.reverse_onion.recipient.relay_endpoint = "https://8.8.8.8".into();
+        config.reverse_onion.recipient.state_db_path = "/Volumes/disk/reverse-onion-test/recipient.sqlite".into();
+        assert!(config.validate().is_err());
+        config.discovery.public_discovery = false;
+        config.blind_vault.public_api_enabled = true;
+        assert!(config.validate().is_err());
+        config.blind_vault.public_api_enabled = false;
+        assert!(config.validate().is_ok());
+        assert!(!config.blind_vault.public_api_enabled);
+    }
+
+    // [PRIVATE-ONION-PULL-ROLE 2026-10-05 by Codex] Authored, not executed.
+    #[test]
+    fn reverse_recipient_recovery_only_does_not_require_authority_gossip() {
+        let mut config = ServerConfig::default();
+        config.vpn.enabled = false;
+        // [PHALA-CONFIG-EXECUTED-REGRESSION 2026-10-08 by Codex] Recovery
+        // retains the same independent egress/runtime isolation as live mode.
+        config.management.enabled = false;
+        config.memchain.mode = crate::config_memchain::MemChainMode::Off;
+        config.blind_vault.enabled = true;
+        config.memchain.chat_relay.enabled = true;
+        config.reverse_onion.recipient.enabled = true;
+        config.reverse_onion.recipient.recovery_only = true;
+        config.reverse_onion.recipient.relay_node_id = hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[42; 32]).unwrap().public_key_bytes(),
+        );
+        config.reverse_onion.recipient.relay_endpoint = "https://8.8.8.8".into();
+        config.reverse_onion.recipient.state_db_path = "/Volumes/disk/reverse-onion-test/recovery.sqlite".into();
+        config.discovery.public_discovery = false;
+        assert!(config.validate().is_ok());
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        assert!(config.validate().is_err());
+    }
+
+    // [PHALA-PRIVATE-RECIPIENT-DESCRIPTOR 2026-10-06 by Codex] Authored,
+    // unexecuted. The discovery endpoint may be injected by Compose at load.
+    #[test]
+    fn private_reverse_recipient_rejects_public_descriptor_endpoint() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.gossip_enabled = true;
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        config.blind_vault.enabled = true;
+        config.memchain.chat_relay.enabled = true;
+        let relay = hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[44; 32])
+                .unwrap()
+                .public_key_bytes(),
+        );
+        config.reverse_onion.recipient.state_db_path =
+            "/Volumes/disk/aeronyx-reverse-onion-tests/private-recipient.sqlite".into();
+
+        apply_discovery_public_endpoint_override(
+            &mut config,
+            "https://peer.phala.network",
+        )
+        .unwrap();
+        apply_reverse_onion_recipient_env(
+            &mut config,
+            Some("true"),
+            Some(&relay),
+            Some("https://relay.example.net"),
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+        config.discovery.public_endpoint = None;
+        config.network.public_endpoint = Some("https://peer.phala.network".into());
+        assert!(config.validate().is_err());
+    }
+
+    // [PHALA-PRIVATE-RECIPIENT-EGRESS 2026-10-06 by Codex] Authored, unexecuted.
+    #[test]
+    fn private_recipient_rejects_non_relay_peer_destinations() {
+        let mut base = ServerConfig::default();
+        base.vpn.enabled = false;
+        // [PHALA-CONFIG-EXECUTED-REGRESSION 2026-10-08 by Codex] Establish
+        // a valid isolated base before testing each forbidden destination.
+        base.management.enabled = false;
+        base.memchain.mode = crate::config_memchain::MemChainMode::Off;
+        base.blind_vault.enabled = true;
+        base.memchain.chat_relay.enabled = true;
+        base.reverse_onion.recipient.enabled = true;
+        base.reverse_onion.recipient.recovery_only = true;
+        base.reverse_onion.recipient.relay_node_id = "11".repeat(32);
+        base.reverse_onion.recipient.relay_endpoint = "https://relay.example.net".into();
+        base.reverse_onion.recipient.state_db_path =
+            "/Volumes/disk/reverse-onion-tests/private-recipient-egress.sqlite".into();
+        base.discovery.public_discovery = false;
+        assert!(base.validate().is_ok());
+
+        let mut with_management = base.clone();
+        with_management.management.enabled = true;
+        assert!(with_management.validate().is_err());
+
+        for mode in [
+            crate::config_memchain::MemChainMode::Local,
+            crate::config_memchain::MemChainMode::P2p,
+            crate::config_memchain::MemChainMode::Saas,
+        ] {
+            let mut with_memchain_runtime = base.clone();
+            with_memchain_runtime.memchain.mode = mode;
+            assert!(with_memchain_runtime.validate().is_err());
+        }
+
+        let mut with_vpn = base.clone();
+        with_vpn.vpn.enabled = true;
+        assert!(with_vpn.validate().is_err());
+
+        let mut with_bootstrap_url = base.clone();
+        with_bootstrap_url.discovery.bootstrap_snapshot_url =
+            Some("https://bootstrap.example.net/peers.json".into());
+        assert!(with_bootstrap_url.validate().is_err());
+
+        let mut with_seed = base.clone();
+        with_seed.discovery.seed_endpoints = vec!["https://seed.example.net".into()];
+        assert!(with_seed.validate().is_err());
+
+        let mut with_directory_peer = base.clone();
+        with_directory_peer.discovery.directory_chain_sync_peer_node_ids =
+            vec!["22".repeat(32)];
+        assert!(with_directory_peer.validate().is_err());
+
+        let mut with_mirror = base.clone();
+        with_mirror.discovery.directory_full_node_mirror_enabled = true;
+        assert!(with_mirror.validate().is_err());
+
+        let mut with_memchain_sync = base.clone();
+        with_memchain_sync.memchain.commitment_sync_enabled = true;
+        assert!(with_memchain_sync.validate().is_err());
+
+        let mut with_memchain_coordinator = base;
+        with_memchain_coordinator.memchain.commitment_coordinator_enabled = true;
+        assert!(with_memchain_coordinator.validate().is_err());
+    }
+
+    // [PHALA-DISCOVERY-SEEDS 2026-10-06 by Codex] Authored, unexecuted.
+    #[test]
+    fn phala_seed_env_is_bounded_tls_only_and_replaces_seed_list() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.gossip_enabled = true;
+        config.discovery.seed_endpoints = vec!["https://old.example".into()];
+        apply_discovery_seed_endpoints(
+            &mut config,
+            r#"["https://seed-a.example.net","https://8.8.8.8:8422"]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.discovery.seed_endpoints,
+            vec![
+                "https://seed-a.example.net".to_string(),
+                "https://8.8.8.8:8422".to_string()
+            ]
+        );
+        for invalid in [
+            r#"["http://seed.example.net"]"#,
+            r#"["https://localhost"]"#,
+            r#"["https://user:password@seed.example.net"]"#,
+            r#"["https://seed.example.net/path"]"#,
+            r#"[]"#,
+        ] {
+            assert!(apply_discovery_seed_endpoints(&mut config, invalid).is_err());
+        }
+        let too_many = serde_json::to_string(&vec!["https://seed.example.net"; 65]).unwrap();
+        assert!(apply_discovery_seed_endpoints(&mut config, &too_many).is_err());
+        assert!(apply_discovery_seed_endpoints(&mut config, &"x".repeat(8193)).is_err());
+    }
+
+    // [PHALA-ROLE-SEED-ISOLATION 2026-10-07 by Codex] Explicit clearing is
+    // distinct from a missing override and must not enable disabled discovery.
+    #[test]
+    fn phala_empty_seed_override_clears_without_enabling_gossip() {
+        for enabled in [false, true] {
+            let mut config = ServerConfig::default();
+            config.discovery.enabled = enabled;
+            config.discovery.gossip_enabled = enabled;
+            config.discovery.seed_endpoints = vec!["https://seed.aeronyx.network".into()];
+            apply_discovery_seed_endpoints(&mut config, "").unwrap();
+            assert!(config.discovery.seed_endpoints.is_empty());
+            assert_eq!(config.discovery.enabled, enabled);
+            assert_eq!(config.discovery.gossip_enabled, enabled);
+            for invalid in [" ", "\n", "[]"] {
+                config.discovery.seed_endpoints = vec!["https://kept.aeronyx.network".into()];
+                assert!(apply_discovery_seed_endpoints(&mut config, invalid).is_err());
+                assert_eq!(config.discovery.seed_endpoints, vec!["https://kept.aeronyx.network"]);
+            }
+        }
+    }
+
+    // [PHALA-ROLE-SEED-ISOLATION 2026-10-07 by Codex] The same mounted
+    // peer template must pass the real parent gate after private role overrides,
+    // retaining the pinned relay and the independent recovery policy.
+    #[test]
+    fn phala_private_seed_clear_preserves_pinned_bootstrap_and_recovery_mode() {
+        let template = include_str!("../../../deploy/node/server.phala.peer.example.toml");
+        for recovery_only in [false, true] {
+            let mut config: ServerConfig = toml::from_str(template).unwrap();
+            config.discovery.seed_endpoints = vec!["https://seed.aeronyx.network".into()];
+            let relay_id = hex::encode(
+                aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[47; 32])
+                    .unwrap().public_key_bytes(),
+            );
+            apply_discovery_public_visibility_override(&mut config, "false").unwrap();
+            apply_discovery_api_listener_override(&mut config, "").unwrap();
+            apply_phala_attestation_socket_override(&mut config, "").unwrap();
+            apply_reverse_onion_recipient_env(
+                &mut config, Some("true"), Some(&relay_id), Some("https://relay.aeronyx.network"),
+            ).unwrap();
+            apply_phala_onion_relay_override(&mut config, "false").unwrap();
+            config.reverse_onion.recipient.recovery_only = recovery_only;
+            assert!(matches!(
+                config.validate(),
+                Err(ServerError::ConfigInvalid { field, .. }) if field == "discovery.seed_endpoints"
+            ));
+            apply_discovery_seed_endpoints(&mut config, "").unwrap();
+            assert!(config.validate().is_ok());
+            assert_eq!(config.reverse_onion.recipient.relay_node_id, relay_id);
+            assert_eq!(config.reverse_onion.recipient.relay_endpoint, "https://relay.aeronyx.network");
+            assert_eq!(config.reverse_onion.recipient.recovery_only, recovery_only);
+            assert!(config.memchain.chat_relay.enabled);
+            assert!(config.blind_vault.enabled);
+            assert!(!config.discovery.public_discovery);
+            assert!(config.discovery.public_api_listen_addr.is_none());
+        }
+    }
+
+    // [PHALA-REVERSE-ONION-RECIPIENT-CONFIG 2026-10-06 by Codex]
+    #[test]
+    fn phala_recipient_env_is_explicit_and_keeps_public_vault_closed() {
+        let mut config = ServerConfig::default();
+        config.vpn.enabled = false;
+        // [PHALA-EXECUTED-PROFILE-FIXTURES 2026-10-08 by Codex] Private
+        // execution has no independent management or MemChain egress.
+        config.management.enabled = false;
+        config.memchain.mode = crate::config_memchain::MemChainMode::Off;
+        let relay = hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[43; 32])
+                .unwrap()
+                .public_key_bytes(),
+        );
+        assert!(apply_reverse_onion_recipient_env(&mut config, None, None, None).is_ok());
+        assert!(!config.reverse_onion.recipient.enabled);
+        assert!(!config.blind_vault.enabled);
+        assert!(!config.memchain.chat_relay.enabled);
+
+        assert!(apply_reverse_onion_recipient_env(
+            &mut config,
+            Some("true"),
+            Some(&relay),
+            Some("https://relay.aeronyx.network"),
+        )
+        .is_ok());
+        assert!(apply_discovery_public_visibility_override(&mut config, "false").is_ok());
+        assert!(config.reverse_onion.recipient.enabled);
+        assert!(!config.discovery.public_discovery);
+        assert_eq!(config.reverse_onion.recipient.relay_node_id, relay);
+        assert_eq!(config.reverse_onion.recipient.relay_endpoint, "https://relay.aeronyx.network");
+        assert!(config.blind_vault.enabled);
+        assert!(config.memchain.chat_relay.enabled);
+        assert!(!config.blind_vault.public_api_enabled);
+        assert!(apply_discovery_public_visibility_override(&mut config, "yes").is_err());
+        config.discovery.enabled = true;
+        config.discovery.gossip_enabled = true;
+        config.reverse_onion.recipient.state_db_path =
+            "/var/lib/aeronyx/reverse-onion-recipient.sqlite".into();
+        config.blind_vault.db_path = "/var/lib/aeronyx/private-terminal-vault.sqlite".into();
+        config.memchain.chat_relay.db_path = "/var/lib/aeronyx/chat-pending.sqlite".into();
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+    }
+
+    // [PHALA-REVERSE-ONION-RECIPIENT-CONFIG 2026-10-06 by Codex]
+    #[test]
+    fn phala_recipient_env_rejects_partial_or_unsafe_opt_in() {
+        let mut config = ServerConfig::default();
+        let relay = hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[44; 32])
+                .unwrap()
+                .public_key_bytes(),
+        );
+        let orphan_pin = "04".repeat(32);
+        assert!(apply_reverse_onion_recipient_env(&mut config, Some("yes"), None, None).is_err());
+        assert!(apply_reverse_onion_recipient_env(&mut config, Some("true"), None, None).is_err());
+        assert!(apply_reverse_onion_recipient_env(
+            &mut config,
+            None,
+            Some(&orphan_pin),
+            None,
+        )
+        .is_err());
+        config.blind_vault.public_api_enabled = true;
+        assert!(apply_reverse_onion_recipient_env(
+            &mut config,
+            Some("true"),
+            Some(&relay),
+            Some("https://relay.example"),
+        )
+        .is_err());
+    }
+
+    // [PHALA-REVERSE-ONION-RECIPIENT-CONFIG 2026-10-06 by Codex]
+    #[test]
+    fn phala_recipient_env_cannot_release_a_recovery_hold() {
+        let mut config = ServerConfig::default();
+        config.reverse_onion.recipient.recovery_only = true;
+        let relay = hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[45; 32])
+                .unwrap()
+                .public_key_bytes(),
+        );
+        assert!(apply_reverse_onion_recipient_env(
+            &mut config,
+            Some("true"),
+            Some(&relay),
+            Some("https://relay.example"),
+        )
+        .is_ok());
+        assert!(config.reverse_onion.recipient.enabled);
+        assert!(config.reverse_onion.recipient.recovery_only);
+        assert!(!config.reverse_onion.recipient.permits_new_claims());
+    }
+
+    // [PHALA-RECIPIENT-RECOVERY-OVERRIDE 2026-10-06 by Codex] Authored only;
+    // verify opt-in recovery, explicit release, and fail-closed invalid input.
+    #[test]
+    fn phala_recipient_recovery_override_is_explicit_and_role_scoped() {
+        let mut config = ServerConfig::default();
+        assert!(apply_reverse_onion_recovery_only_env(&mut config, None).is_ok());
+        assert!(!config.reverse_onion.recipient.recovery_only);
+        assert!(apply_reverse_onion_recovery_only_env(&mut config, Some("true")).is_err());
+
+        let relay = hex::encode(
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[47; 32])
+                .unwrap()
+                .public_key_bytes(),
+        );
+        apply_reverse_onion_recipient_env(
+            &mut config,
+            Some("true"),
+            Some(&relay),
+            Some("https://relay.example"),
+        )
+        .unwrap();
+        assert!(apply_reverse_onion_recovery_only_env(&mut config, Some("yes")).is_err());
+        assert!(apply_reverse_onion_recovery_only_env(&mut config, Some("true")).is_ok());
+        assert!(config.reverse_onion.recipient.recovery_only);
+        assert!(!config.reverse_onion.recipient.permits_new_claims());
+        assert!(apply_reverse_onion_recovery_only_env(&mut config, Some("false")).is_ok());
+        assert!(!config.reverse_onion.recipient.recovery_only);
+        assert!(config.reverse_onion.recipient.permits_new_claims());
     }
 
     // ── Full-stack default validation ─────────────────────────────────────
@@ -3430,6 +5641,24 @@ descriptor_ttl_secs = 10
         assert!(ServerConfig::from_str(toml_str).is_err());
     }
 
+    // [PHALA-KEM-RETIREMENT 2026-10-08 by Codex] Authored only:
+    // exercise the parent parser/validation gate, not a duplicate predicate.
+    #[test]
+    fn discovery_descriptor_lifetime_matches_bounded_kem_overlap() {
+        let max = crate::services::onion_keys::MAX_ONION_DESCRIPTOR_TTL_SECS;
+        for ttl in [60, DiscoveryConfig::default_descriptor_ttl_secs(), 7200, max] {
+            let encoded = format!("[discovery]\nenabled = true\ndescriptor_ttl_secs = {ttl}\n");
+            assert!(ServerConfig::from_str(&encoded).is_ok(), "supported TTL {ttl}");
+        }
+        for ttl in [0, 59, max + 1, i64::MAX as u64] {
+            let encoded = format!("[discovery]\nenabled = true\ndescriptor_ttl_secs = {ttl}\n");
+            assert!(ServerConfig::from_str(&encoded).is_err(), "unsupported TTL {ttl}");
+        }
+        let mut discovery = DiscoveryConfig::default();
+        discovery.descriptor_ttl_secs = u64::MAX;
+        assert!(discovery.validate().is_err());
+    }
+
     // ── v1.1.0-ChatRelay: full TOML integration ───────────────────────────
 
     #[test]
@@ -3479,21 +5708,32 @@ db_path = "memchain.db"
 
     // ── v2.5.0: SuperNode + v1.1.0 ChatRelay combined ────────────────────
 
+    // [MEMCHAIN-PHALA-ROUTING 2026-10-05 by Codex]
     #[test]
     fn test_supernode_and_chat_relay_combined() {
         let toml_str = r#"
 [memchain]
-mode = "local"
-ner_enabled = true
+mode = "saas"
+# [MEMCHAIN-PHALA-ONLY 2026-10-06 by Codex] Legacy local-model switches stay
+# off in the Phala ACI integration fixture.
+ner_enabled = false
+jwt_secret = "a-very-long-secret-key-for-this-test-fixture"
+
+[memchain.saas]
+data_root = "/var/lib/aeronyx/memchain-saas-test"
 
 [memchain.supernode]
 enabled = true
+accepted_compose_hashes = ["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+# [MEMCHAIN-PHALA-SOURCE-PROVENANCE 2026-10-06 by Codex]
+accepted_source_provenance = [{ compose_hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", repo_url = "https://example.invalid/phala-gateway", repo_commit = "0123456789abcdef0123456789abcdef01234567" }]
+accepted_kms_root_public_keys = ["0x02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
 
 [[memchain.supernode.providers]]
-name = "ollama"
-type = "openai_compatible"
-api_base = "http://localhost:11434/v1"
-model = "llama3"
+name = "phala"
+type = "phala_aci"
+api_key = "$PHALA_API_KEY"
+model = "confidential-model"
 
 [memchain.chat_relay]
 enabled = true
@@ -3527,10 +5767,10 @@ db_path = "/var/memchain/chat_pending.db"
         assert!(config.validate().is_ok());
     }
 
-    // ── v2.4.0: Full cognitive graph TOML ────────────────────────────────
+    // ── v2.4.0: Legacy cognitive TOML compatibility ──────────────────────
 
     #[test]
-    fn test_v240_toml_full_config() {
+    fn test_v240_legacy_model_toml_parses_but_fails_validation() {
         let toml_str = r#"
 [memchain]
 mode = "local"
@@ -3560,7 +5800,11 @@ vector_saturation_threshold = 3
         assert!(mc.entropy_filter_enabled);
         assert!(mc.miner_entity_extraction);
         assert_eq!(mc.vector_quantization, VectorQuantizationMode::ScalarUint8);
-        assert!(config.validate().is_ok());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("memchain.ner_enabled"));
+        // [MEMCHAIN-PHALA-CONFIG-GATE 2026-10-06 by Codex] Old task flags
+        // remain parseable but cannot silently activate an unwired inference path.
+        assert!(error.contains("legacy inference switch is unsupported"));
         assert!(mc.is_cognitive_graph_enabled());
         assert!(mc.has_cognitive_miner_steps());
         assert!(!mc.is_supernode_enabled());

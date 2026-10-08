@@ -13,6 +13,67 @@
 // Last Modified: 2026-10-04.
 use super::*;
 
+// [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] P2P replication uses the same
+// durable owner and managed-volume limits as the authenticated HTTP writer.
+async fn persist_sealed_v2_replica(
+    storage: &MemoryStorage,
+    replica: &aeronyx_core::protocol::memchain::SealedMemoryV2ReplicaV1,
+    config: &MemChainConfig,
+    server_pubkey_hex: &str,
+    local_owner: [u8; 32],
+) -> bool {
+    let owner_hex = hex::encode(replica.owner);
+    if !replica.verify() || !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
+        return false;
+    }
+    match storage
+        .classify_sealed_v2(
+            &replica.owner,
+            &replica.record_id,
+            replica.created_at,
+            &replica.envelope,
+            &replica.signature,
+        )
+        .await
+    {
+        Ok(Some(outcome)) => return outcome.is_exact_duplicate(),
+        Ok(None) => {}
+        Err(_) => return false,
+    }
+    let growth_bytes = u64::try_from(replica.envelope.len().saturating_add(256))
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let Ok(_growth_permit) = storage.acquire_growth_permit(growth_bytes).await else {
+        return false;
+    };
+    storage
+        .insert_sealed_v2_with_owner_slot(
+            &replica.owner,
+            &replica.record_id,
+            replica.created_at,
+            &replica.envelope,
+            &replica.signature,
+            crate::services::memchain::storage::OwnerSlotPolicy {
+                local_owner,
+                max_remote_owners: config.max_remote_owners,
+            },
+        )
+        .await
+        .is_ok_and(|outcome| outcome.is_inserted() || outcome.is_exact_duplicate())
+}
+
+// [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Authenticated owner sessions may
+// submit their own replicas; other replication traffic is restricted to peers
+// admitted by the existing signed discovery/PeerStore contract.
+fn is_sealed_memory_replication_peer(
+    session: &crate::services::Session,
+    owner: &[u8; 32],
+    peer_store: &PeerStore,
+) -> bool {
+    let sender = session.client_public_key.to_bytes();
+    sender == *owner || peer_store.get_valid(&sender, unix_now_secs()).is_some()
+}
+
 impl Server {
     // [CHAT-V1-COALESCING 2026-10-03 by Codex] Full UDP payload target,
     // NOT a hard admission ceiling, socket capacity, or Internet PMTU promise.
@@ -85,7 +146,7 @@ impl Server {
         mempool: Option<&Arc<MemPool>>,
         aof_writer: Option<&Arc<TokioMutex<AofWriter>>>,
         storage: &Option<Arc<MemoryStorage>>,
-        vector_index: &Option<Arc<VectorIndex>>,
+        _vector_index: &Option<Arc<VectorIndex>>,
         config: &MemChainConfig,
         server_pubkey_hex: &str,
         session: &Arc<crate::services::Session>,
@@ -147,48 +208,18 @@ impl Server {
                 }
             }
             MemChainMessage::BroadcastRecord(record) => {
-                let MemChainStorageAccess::RecordStore { storage } = storage_access else {
+                let MemChainStorageAccess::RecordStore { .. } = storage_access else {
                     error!(
                         reason = "dispatch_gate_invariant",
                         "[MEMCHAIN] Message rejected"
                     );
                     return;
                 };
-                let owner_hex = record.owner_hex();
-                let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
-                    Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
-                    Err(_) => false,
-                };
-                if !sig_ok {
-                    warn!(owner = %owner_hex, "[MEMCHAIN] BroadcastRecord sig failed");
-                    return;
-                }
-                if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
-                    warn!(owner = %owner_hex, "[MEMCHAIN] BroadcastRecord untrusted");
-                    return;
-                }
-                if !record.verify_id() {
-                    warn!(owner = %owner_hex, id = hex::encode(record.record_id), "[MEMCHAIN] record_id hash mismatch");
-                    return;
-                }
-                if storage.insert(&record, "p2p-remote").await {
-                    info!(
-                        id = hex::encode(record.record_id),
-                        "[MEMCHAIN] BroadcastRecord stored"
-                    );
-                    if record.has_embedding() {
-                        if let Some(ref vi) = vector_index {
-                            vi.upsert(
-                                record.record_id,
-                                record.embedding.clone(),
-                                record.layer,
-                                record.timestamp,
-                                &record.owner,
-                                "p2p-remote",
-                            );
-                        }
-                    }
-                }
+                // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] The legacy
+                // variant cannot distinguish client-sealed bytes from content
+                // decrypted by row_to_record. Keep its discriminant readable,
+                // but never ingest an ambiguous peer record.
+                warn!("[MEMCHAIN] Rejected untyped legacy BroadcastRecord");
             }
             MemChainMessage::SyncRequest { last_known_hash } => {
                 let MemChainStorageAccess::FactAof { mempool, .. } = storage_access else {
@@ -230,46 +261,190 @@ impl Server {
                 }
             }
             MemChainMessage::SyncRecordRequest {
-                owner,
-                after_timestamp,
+                owner: _,
+                after_timestamp: _,
             } => {
-                let MemChainStorageAccess::RecordStore { storage } = storage_access else {
+                let MemChainStorageAccess::RecordStore { .. } = storage_access else {
                     error!(
                         reason = "dispatch_gate_invariant",
                         "[MEMCHAIN] Message rejected"
                     );
                     return;
                 };
-                let records = storage.query_by_owner_after(&owner, after_timestamp).await;
-                let resp = MemChainMessage::SyncRecordResponse { records };
+                // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Legacy response
+                // has no authenticated sealed marker and could serialize a
+                // decrypted sighted row. Reply empty; V2 carries signed opaque bytes.
+                let resp = MemChainMessage::SyncRecordResponse { records: vec![] };
                 Self::send_to_session(&resp, session, udp, crypto).await;
             }
-            MemChainMessage::SyncRecordResponse { records } => {
-                let MemChainStorageAccess::RecordStore { storage } = storage_access else {
+            MemChainMessage::SyncRecordResponse { records: _ } => {
+                let MemChainStorageAccess::RecordStore { .. } = storage_access else {
                     error!(
                         reason = "dispatch_gate_invariant",
                         "[MEMCHAIN] Message rejected"
                     );
                     return;
                 };
-                for record in records {
-                    let owner_hex = record.owner_hex();
-                    let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
-                        Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
-                        Err(_) => false,
-                    };
-                    if !sig_ok {
-                        warn!(owner = %owner_hex, "[MEMCHAIN] SyncRecordResponse sig failed");
-                        continue;
+                warn!("[MEMCHAIN] Rejected untyped legacy SyncRecordResponse");
+            }
+            MemChainMessage::BroadcastSealedMemoryV2ReplicaV1(wire_record) => {
+                // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Validate the
+                // signed sealed envelope before durable, idempotent storage.
+                let MemChainStorageAccess::RecordStore { storage } = storage_access else {
+                    error!(reason = "dispatch_gate_invariant", "[MEMCHAIN] Message rejected");
+                    return;
+                };
+                let accepted = is_sealed_memory_replication_peer(
+                    session,
+                    &wire_record.owner,
+                    peer_store,
+                ) && persist_sealed_v2_replica(
+                    &storage,
+                    &wire_record,
+                    config,
+                    server_pubkey_hex,
+                    node_identity.public_key_bytes(),
+                )
+                .await;
+                if !accepted {
+                    warn!(
+                        record_id = hex::encode(wire_record.record_id),
+                        "[MEMCHAIN] Sealed V2 replica rejected"
+                    );
+                    return;
+                }
+            }
+            MemChainMessage::SyncSealedMemoryV2RequestV1 {
+                owner,
+                after_record_id,
+                limit,
+            } => {
+                // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Serve only trusted
+                // owner namespaces and return the V2 opaque cursor page.
+                let MemChainStorageAccess::RecordStore { storage } = storage_access else {
+                    error!(reason = "dispatch_gate_invariant", "[MEMCHAIN] Message rejected");
+                    return;
+                };
+                let owner_hex = hex::encode(owner);
+                let page = if limit == 0
+                    || !is_sealed_memory_replication_peer(session, &owner, peer_store)
+                    || !config.is_origin_trusted(&owner_hex, server_pubkey_hex)
+                {
+                    None
+                } else {
+                    storage.list_sealed_v2(
+                        &owner,
+                        after_record_id.as_ref(),
+                        usize::from(
+                            limit.min(
+                                aeronyx_core::protocol::memchain::MAX_SEALED_MEMORY_P2P_PAGE_RECORDS,
+                            ),
+                        ),
+                    )
+                    .await
+                    .ok()
+                };
+                let (records, next_cursor) = page.map_or((Vec::new(), None), |page| {
+                    let records = page
+                        .rows
+                        .into_iter()
+                        .map(|row| aeronyx_core::protocol::memchain::SealedMemoryV2ReplicaV1 {
+                            record_id: row.record_id,
+                            owner: row.owner,
+                            created_at: row.created_at,
+                            envelope: row.envelope,
+                            signature: row.signature,
+                        })
+                        .collect();
+                    (records, page.next_cursor)
+                });
+                let response = MemChainMessage::SyncSealedMemoryV2ResponseV1 {
+                    owner,
+                    after_record_id,
+                    records,
+                    next_cursor,
+                };
+                Self::send_to_session(&response, session, udp, crypto).await;
+            }
+            MemChainMessage::SyncSealedMemoryV2ResponseV1 {
+                owner,
+                after_record_id,
+                records,
+                next_cursor,
+            } => {
+                // [MEMCHAIN-SEALED-P2P 2026-10-05 by Codex] Responses are
+                // independently verified per row; invalid rows never poison
+                // otherwise valid replicas in the same bounded page.
+                let MemChainStorageAccess::RecordStore { storage } = storage_access else {
+                    error!(reason = "dispatch_gate_invariant", "[MEMCHAIN] Message rejected");
+                    return;
+                };
+                let pending_matches = session.sealed_sync_page_matches(&owner, after_record_id);
+                let authorized_peer = is_sealed_memory_replication_peer(session, &owner, peer_store);
+                let trusted_owner = config.is_origin_trusted(&hex::encode(owner), server_pubkey_hex);
+                let bounded_page = records.len()
+                    <= usize::from(aeronyx_core::protocol::memchain::MAX_SEALED_MEMORY_P2P_PAGE_RECORDS);
+                let mut previous_id = after_record_id;
+                let ordered = records.iter().all(|record| {
+                    let greater_than_cursor = previous_id
+                        .map_or(true, |previous| record.record_id > previous);
+                    let owner_matches = record.owner == owner;
+                    previous_id = Some(record.record_id);
+                    greater_than_cursor && owner_matches && record.verify()
+                });
+                let cursor_matches_page = match (next_cursor, records.last()) {
+                    (Some(cursor), Some(last)) => cursor == last.record_id,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                };
+                if !pending_matches
+                    || !authorized_peer
+                    || !trusted_owner
+                    || !bounded_page
+                    || !ordered
+                    || !cursor_matches_page
+                {
+                    session.abandon_sealed_sync_page(&owner, after_record_id);
+                    warn!("[MEMCHAIN] Sealed V2 sync page rejected");
+                    return;
+                }
+                for wire_record in records {
+                    if !persist_sealed_v2_replica(
+                        &storage,
+                        &wire_record,
+                        config,
+                        server_pubkey_hex,
+                        node_identity.public_key_bytes(),
+                    )
+                    .await
+                    {
+                        session.abandon_sealed_sync_page(&owner, after_record_id);
+                        warn!(
+                            record_id = hex::encode(wire_record.record_id),
+                            "[MEMCHAIN] Sealed V2 replica rejected"
+                        );
+                        return;
                     }
-                    if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
-                        continue;
+                }
+                if !session.advance_sealed_sync_page(&owner, after_record_id, next_cursor) {
+                    return;
+                }
+                if let Some(cursor) = next_cursor {
+                    let next_after = Some(cursor);
+                    if !Self::send_to_session(
+                        &MemChainMessage::SyncSealedMemoryV2RequestV1 {
+                            owner,
+                            after_record_id: next_after,
+                            limit: aeronyx_core::protocol::memchain::MAX_SEALED_MEMORY_P2P_PAGE_RECORDS,
+                        },
+                        session,
+                        udp,
+                        crypto,
+                    )
+                    .await
+                    {
+                        session.abandon_sealed_sync_page(&owner, next_after);
                     }
-                    if !record.verify_id() {
-                        warn!(owner = %owner_hex, id = hex::encode(record.record_id), "[MEMCHAIN] SyncRecordResponse hash mismatch");
-                        continue;
-                    }
-                    let _ = storage.insert(&record, "p2p-sync").await;
                 }
             }
             MemChainMessage::BlockAnnounce(header) => {
