@@ -3138,7 +3138,7 @@ mod tests {
                         || metadata.target().ends_with("server::data_plane_runtime"))
             }));
         let subscriber = tracing_subscriber::registry().with(layer);
-        tracing::subscriber::with_default(subscriber, operation);
+        crate::with_scoped_test_subscriber(subscriber, operation);
         let bytes = captured
             .0
             .lock()
@@ -3158,7 +3158,7 @@ mod tests {
                     && metadata.target().ends_with("crypto::handshake")
             }));
         let subscriber = tracing_subscriber::registry().with(layer);
-        tracing::subscriber::with_default(subscriber, operation);
+        crate::with_scoped_test_subscriber(subscriber, operation);
         let bytes = captured
             .0
             .lock()

@@ -106,6 +106,26 @@ fn strip_systemd_child_authority(command: &mut std::process::Command) {
     }
 }
 
+/// Runs `operation` with `subscriber` as this thread's scoped dispatcher, for
+/// tests that capture log output.
+///
+/// [FLAKY-JUST-ONE-DISPATCH 2026-10-09 by Claude] tracing-core takes a
+/// shortcut while at most one dispatcher is registered: a callsite registered
+/// on any thread rebuilds its interest and the global max level from that
+/// thread's default, which is the no-op dispatcher on every other test thread.
+/// The capturing callsite is then cached as "never" and the level as OFF, and
+/// the capture sees nothing (`api::auth` log test: 11/12 Linux module runs).
+/// Holding a second registered dispatch disables the shortcut, so interest is
+/// combined across all dispatchers and each thread keeps its own answer.
+#[cfg(test)]
+pub(crate) fn with_scoped_test_subscriber<S, T>(subscriber: S, operation: impl FnOnce() -> T) -> T
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    let _second_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    tracing::subscriber::with_default(subscriber, operation)
+}
+
 #[cfg(test)]
 mod process_tests {
     use std::collections::HashMap;

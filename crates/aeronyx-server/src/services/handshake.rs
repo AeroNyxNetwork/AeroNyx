@@ -500,7 +500,7 @@ mod tests {
                     && metadata.target().ends_with("services::handshake")
             }));
         let subscriber = tracing_subscriber::registry().with(layer);
-        let result = tracing::subscriber::with_default(subscriber, operation);
+        let result = crate::with_scoped_test_subscriber(subscriber, operation);
         let logs = String::from_utf8(captured.0.lock().expect("captured log mutex").clone())
             .expect("captured logs are UTF-8");
         (result, logs)
