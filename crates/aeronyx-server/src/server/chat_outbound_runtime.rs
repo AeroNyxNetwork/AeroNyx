@@ -1238,7 +1238,7 @@ impl Server {
         // [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] Keep real chat movement,
         // blind probes, and onion forwarding on the same endpoint boundary as
         // discovery and MemChain. Localhost is a test-only transport seam.
-        if !peer_endpoint_is_public_ip(endpoint) {
+        if !peer_endpoint_is_permitted(endpoint) {
             #[cfg(not(test))]
             return None;
             #[cfg(test)]
@@ -1335,8 +1335,15 @@ mod tests {
             Some("https://[2606:4700:4700::1111]:8421/api/chat/peer/blind-relay")
         );
         assert!(Server::chat_peer_relay_url("http://127.0.0.1:8421").is_some());
+        // [PEER-ENDPOINT-HOSTNAME 2026-10-09 by Claude] https + public DNS name
+        // is a permitted peer (TEE gateway nodes); http names stay rejected.
+        assert_eq!(
+            Server::chat_peer_relay_url("https://node.example.com/").as_deref(),
+            Some("https://node.example.com/api/chat/peer/relay")
+        );
         for endpoint in [
-            "https://node.example.com/",
+            "http://node.example.com/",
+            "https://printer.local/",
             "http://10.0.0.1:8421",
             "http://169.254.169.254/latest/meta-data",
             "http://203.0.113.1:8421",

@@ -21,7 +21,7 @@ use super::super::chat_peer_retry::{
 };
 use super::super::chat_peer_transport::{BlindRelayTransport, ReqwestBlindRelayTransport};
 use super::*;
-use crate::api::{canonical_peer_http_url, peer_endpoint_is_public_ip};
+use crate::api::{canonical_peer_http_url, peer_endpoint_is_permitted};
 use bytes::Bytes;
 use tokio::time::sleep;
 
@@ -741,7 +741,7 @@ pub(super) fn blind_peer_relay_url(endpoint: &str) -> Option<String> {
     // [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] A next-hop descriptor is
     // permissionless input. Its signature cannot authorize localhost, private
     // networks, metadata services, DNS rebinding, or URL-controlled paths.
-    if !peer_endpoint_is_public_ip(endpoint) {
+    if !peer_endpoint_is_permitted(endpoint) {
         #[cfg(not(test))]
         return None;
         #[cfg(test)]

@@ -106,6 +106,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "http-body-util",
+ "hyper 0.14.32",
  "hyper 1.8.1",
  "hyper-util",
  "jsonwebtoken",

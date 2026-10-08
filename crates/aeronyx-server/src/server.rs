@@ -1089,7 +1089,7 @@ use crate::api::vpn_health::{
     collect_vpn_health_value_with_anonymous_mailbox_readiness, AnonymousMailboxReadinessProjection,
 };
 use crate::api::{
-    canonical_peer_http_url, decode_bounded_json_response, peer_endpoint_is_public_ip,
+    canonical_peer_http_url, decode_bounded_json_response, peer_endpoint_is_permitted,
     privacy_safe_peer_http_client_builder, read_bounded_http_response, BoundedHttpResponseError,
     PEER_ACK_RESPONSE_MAX_BYTES,
 };

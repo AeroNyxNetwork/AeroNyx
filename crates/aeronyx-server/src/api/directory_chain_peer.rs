@@ -281,11 +281,11 @@ struct ReqwestWitnessCarrierTransport {
 
 impl ReqwestWitnessCarrierTransport {
     fn new() -> Self {
-        let client = reqwest::Client::builder()
+        // [PEER-ENDPOINT-HOSTNAME 2026-10-09 by Claude] Use the shared peer
+        // builder so this carrier gets the same public-only DNS resolver.
+        let client = crate::api::privacy_safe_peer_http_client_builder()
             // [WITNESS-CARRIER-MATRIX 2026-07-27 by Codex] Build once per
             // router while preserving the existing SSRF and timeout boundary.
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(WITNESS_CARRIER_REQUEST_TIMEOUT_SECS))
             .timeout(Duration::from_secs(WITNESS_CARRIER_REQUEST_TIMEOUT_SECS))
             .build()

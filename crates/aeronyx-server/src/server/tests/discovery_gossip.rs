@@ -1253,11 +1253,18 @@ fn discovery_gossip_url_normalizes_endpoint_forms() {
         Server::discovered_peer_gossip_url("http://8.8.8.8:8422/path").as_deref(),
         Some("http://8.8.8.8:8422/api/discovery/gossip")
     );
+    // [PEER-ENDPOINT-HOSTNAME 2026-10-09 by Claude] https + public DNS name
+    // is a permitted peer (TEE gateway nodes); http names stay rejected.
+    assert_eq!(
+        Server::discovered_peer_gossip_url("https://node.example.com").as_deref(),
+        Some("https://node.example.com/api/discovery/gossip")
+    );
     for endpoint in [
         "http://127.0.0.1:8422",
         "http://169.254.169.254/latest/meta-data",
         "http://10.0.0.1:8422",
-        "https://node.example.com",
+        "http://node.example.com",
+        "https://metadata.google.internal",
     ] {
         assert_eq!(
             Server::discovered_peer_gossip_url(endpoint),

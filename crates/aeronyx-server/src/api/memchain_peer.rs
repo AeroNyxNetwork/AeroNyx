@@ -282,7 +282,7 @@ use aeronyx_core::protocol::{NodeCapability, NodeDiscoveryMessage, SignedNodeDes
 use sha2::{Digest, Sha256};
 
 use super::{
-    canonical_peer_http_url, peer_endpoint_is_public_ip, read_bounded_http_response,
+    canonical_peer_http_url, peer_endpoint_is_permitted, read_bounded_http_response,
     PeerEndpointUrlError,
 };
 use crate::api::discovery::GossipResponse;

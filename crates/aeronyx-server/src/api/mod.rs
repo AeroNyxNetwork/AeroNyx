@@ -133,7 +133,7 @@
 //! v2.8.38-ChatPeerObserverDomain - Split aggregate retry and route-health
 //!   persistence from forwarding control behind a write-only observer trait.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -159,7 +159,7 @@ pub(crate) enum PeerEndpointUrlError {
 /// discovery, `MemChain`, and future peer transports from disagreeing about
 /// credentials, paths, queries, fragments, host casing, or default ports.
 /// This function validates URL structure only. Permissionless descriptors
-/// must additionally pass [`peer_endpoint_is_public_ip`] before transport.
+/// must additionally pass [`peer_endpoint_is_permitted`] before transport.
 pub(crate) fn canonical_peer_http_url(
     endpoint: &str,
     path: &str,
@@ -197,29 +197,94 @@ pub(crate) fn privacy_safe_peer_http_client_builder() -> reqwest::ClientBuilder 
     reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(PublicOnlyResolver))
 }
 
-/// Accepts only public IP literals for permissionless outbound peer traffic.
+/// Accepts the destinations a permissionless descriptor may name.
 ///
 /// A descriptor signature authenticates the advertiser, not the destination's
-/// safety for this host. Domain names are excluded to prevent DNS rebinding;
-/// loopback, private, link-local, CGNAT, benchmark, documentation, multicast,
-/// and reserved ranges are rejected as well.
-pub(crate) fn peer_endpoint_is_public_ip(endpoint: &str) -> bool {
-    let Some(address) = peer_endpoint_ip_literal(endpoint) else {
+/// safety for this host. Two forms are allowed:
+/// - a public IP literal (http or https); loopback, private, link-local,
+///   CGNAT, benchmark, documentation, multicast and reserved ranges are not;
+/// - [PEER-ENDPOINT-HOSTNAME 2026-10-09 by Claude] an `https://` URL with a
+///   public DNS name. TEE nodes behind a gateway (Phala/dstack) have no IP of
+///   their own, only a TLS hostname. DNS rebinding is closed at connect time:
+///   every peer client resolves through [`PublicOnlyResolver`], which drops
+///   any non-public address the name resolves to, and TLS binds the name.
+pub(crate) fn peer_endpoint_is_permitted(endpoint: &str) -> bool {
+    let Ok(url) = canonical_peer_http_url(endpoint, "/") else {
         return false;
     };
-    match address {
-        IpAddr::V4(address) => ipv4_is_public_unicast(address),
-        IpAddr::V6(address) => ipv6_is_public_unicast(address),
+    // The URL parser normalises every IPv4 spelling (`127.1`, `2130706433`,
+    // `0x7f000001`) to dotted form, so any literal is classified here.
+    match peer_endpoint_ip_literal(endpoint) {
+        Some(IpAddr::V4(address)) => ipv4_is_public_unicast(address),
+        Some(IpAddr::V6(address)) => ipv6_is_public_unicast(address),
+        None => url.scheme() == "https" && url.host_str().is_some_and(dns_name_is_public),
     }
+}
+
+/// Rejects names that only resolve inside a private network or this host.
+fn dns_name_is_public(name: &str) -> bool {
+    const PRIVATE_SUFFIXES: [&str; 8] = [
+        ".localhost",
+        ".local",
+        ".internal",
+        ".lan",
+        ".home.arpa",
+        ".intranet",
+        ".corp",
+        ".private",
+    ];
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name.len() <= 253
+        && name.contains('.')
+        && name != "localhost"
+        && !PRIVATE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// DNS resolver for every permissionless peer client: returns only public
+/// unicast addresses, so a hostname cannot be pointed at this host, a private
+/// network or a metadata service, whatever its records say at connect time.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PublicOnlyResolver;
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: hyper_v014::client::connect::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let resolved = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            let public = retain_public_socket_addrs(resolved);
+            if public.is_empty() {
+                return Err("peer host resolved to no public address".into());
+            }
+            Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn retain_public_socket_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    addrs
+        .into_iter()
+        .filter(|addr| match addr.ip() {
+            IpAddr::V4(address) => ipv4_is_public_unicast(address),
+            IpAddr::V6(address) => ipv6_is_public_unicast(address),
+        })
+        .collect()
 }
 
 /// Localhost-only seam for integration tests that bind ephemeral listeners.
 ///
 /// Production peer transports never call this function. Tests still exercise
 /// the same canonical parser while the public-address policy has independent
-/// regression coverage in [`peer_endpoint_is_public_ip`].
+/// regression coverage in [`peer_endpoint_is_permitted`].
 #[cfg(test)]
 pub(crate) fn peer_endpoint_is_loopback_ip(endpoint: &str) -> bool {
     peer_endpoint_ip_literal(endpoint).is_some_and(|address| address.is_loopback())
@@ -450,9 +515,12 @@ mod tests {
 
     #[test]
     fn permissionless_peer_endpoint_rejects_ssrf_targets() {
-        assert!(peer_endpoint_is_public_ip("http://8.8.8.8:8422"));
-        assert!(peer_endpoint_is_public_ip(
+        assert!(peer_endpoint_is_permitted("http://8.8.8.8:8422"));
+        assert!(peer_endpoint_is_permitted(
             "https://[2606:4700:4700::1111]:8422"
+        ));
+        assert!(peer_endpoint_is_permitted(
+            "https://9d09a2686bc9400229db0661df51f8899cf66cd9-8422.dstack-pha-prod9.phala.network"
         ));
         for endpoint in [
             "http://127.0.0.1:8422",
@@ -468,6 +536,13 @@ mod tests {
             "http://198.18.0.1:8422",
             "http://203.0.113.1:8422",
             "http://node.example:8422",
+            "https://localhost:8422",
+            "https://node:8422",
+            "https://printer.local",
+            "https://metadata.google.internal",
+            "https://router.home.arpa",
+            "https://bad_label.example.com",
+            "https://-edge.example.com",
             "http://[::1]:8422",
             "http://[::ffff:127.0.0.1]:8422",
             "http://[fc00::1]:8422",
@@ -475,10 +550,45 @@ mod tests {
             "http://[2001:db8::1]:8422",
         ] {
             assert!(
-                !peer_endpoint_is_public_ip(endpoint),
+                !peer_endpoint_is_permitted(endpoint),
                 "unexpectedly accepted {endpoint}"
             );
         }
+    }
+
+    #[test]
+    fn public_only_resolver_drops_non_public_answers() {
+        let answers: Vec<SocketAddr> = [
+            "127.0.0.1:0",
+            "10.1.2.3:0",
+            "169.254.169.254:0",
+            "100.64.0.1:0",
+            "[::1]:0",
+            "[fd00::1]:0",
+            "8.8.8.8:0",
+            "[2606:4700:4700::1111]:0",
+        ]
+        .iter()
+        .map(|addr| addr.parse().unwrap())
+        .collect();
+        let kept = retain_public_socket_addrs(answers);
+        assert_eq!(
+            kept,
+            vec![
+                "8.8.8.8:0".parse::<SocketAddr>().unwrap(),
+                "[2606:4700:4700::1111]:0".parse().unwrap()
+            ]
+        );
+        assert!(retain_public_socket_addrs(["127.0.0.1:0".parse().unwrap()]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_only_resolver_refuses_a_name_that_resolves_locally() {
+        use reqwest::dns::Resolve;
+        let result = PublicOnlyResolver
+            .resolve("localhost".parse::<hyper_v014::client::connect::dns::Name>().unwrap())
+            .await;
+        assert!(result.is_err());
     }
 }
 

@@ -1648,7 +1648,10 @@ fn permissionless_admission_rejects_unsafe_or_ambiguous_descriptor_shapes() {
     for endpoint in [
         "http://127.0.0.1:8422",
         "http://10.0.0.1:8422",
-        "https://node.example:8422",
+        // [PEER-ENDPOINT-HOSTNAME 2026-10-09 by Claude] https public names are
+        // admissible now; plain-http and private names are not.
+        "http://node.example:8422",
+        "https://printer.local:8422",
         " https://8.8.8.8:8422",
     ] {
         assert_eq!(

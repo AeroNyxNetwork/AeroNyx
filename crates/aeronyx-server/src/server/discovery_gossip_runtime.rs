@@ -2766,7 +2766,7 @@ impl Server {
     /// private addressing. PeerStore descriptors are untrusted network input
     /// and therefore require a public IP literal before any outbound request.
     pub(super) fn discovered_peer_gossip_url(endpoint: &str) -> Option<String> {
-        peer_endpoint_is_public_ip(endpoint).then(|| Self::discovery_gossip_url(endpoint))?
+        peer_endpoint_is_permitted(endpoint).then(|| Self::discovery_gossip_url(endpoint))?
     }
 
     /// Adds only current, signed public peers after operator seeds have taken

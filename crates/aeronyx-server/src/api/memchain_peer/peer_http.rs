@@ -13,7 +13,7 @@ pub(crate) fn commitment_peer_endpoint_is_public(endpoint: &str) -> bool {
     // [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] MemChain and discovery
     // share one public-host policy so a future range update cannot leave one
     // permissionless transport less protected than another.
-    peer_endpoint_is_public_ip(endpoint)
+    peer_endpoint_is_permitted(endpoint)
 }
 
 pub(super) fn commitment_block_range_url(endpoint: &str) -> Result<Url, String> {

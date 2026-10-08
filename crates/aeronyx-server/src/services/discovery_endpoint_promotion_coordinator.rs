@@ -70,7 +70,7 @@ use super::discovery_endpoint_quarantine_revocation::{
 use super::peer_store::PeerStore;
 use crate::api::public_node_router::public_endpoint_flow_context;
 use crate::api::{
-    canonical_peer_http_url, peer_endpoint_is_public_ip, privacy_safe_peer_http_client_builder,
+    canonical_peer_http_url, peer_endpoint_is_permitted, privacy_safe_peer_http_client_builder,
 };
 
 const RESPOND_PATH: &str = "/api/discovery/endpoint-proof/respond";
@@ -133,7 +133,7 @@ fn select_attestation_gossip_targets(
         .filter(|(node_id, endpoint)| {
             *node_id != observer_id
                 && *node_id != candidate_id
-                && peer_endpoint_is_public_ip(endpoint)
+                && peer_endpoint_is_permitted(endpoint)
         })
         .filter_map(|(_, endpoint)| {
             canonical_peer_http_url(&endpoint, "/api/discovery/gossip").ok()
@@ -644,7 +644,7 @@ fn observation_context(
 fn exact_probe_target(endpoint: &str) -> Result<(reqwest::Url, [u8; 32]), EndpointPossessionError> {
     let attested_socket = canonical_attested_public_endpoint_socket_v1(endpoint)
         .map_err(|_| EndpointPossessionError::Rejected)?;
-    if !peer_endpoint_is_public_ip(endpoint) {
+    if !peer_endpoint_is_permitted(endpoint) {
         return Err(EndpointPossessionError::Rejected);
     }
     let url = canonical_peer_http_url(endpoint, RESPOND_PATH)
@@ -898,7 +898,9 @@ mod tests {
             (observer, "https://8.8.8.8:8422".to_string()),
             (candidate, "https://8.8.4.4:8422".to_string()),
             ([0x03; 32], "https://127.0.0.1:8422".to_string()),
-            ([0x04; 32], "https://example.com:8422".to_string()),
+            // [PEER-ENDPOINT-HOSTNAME 2026-10-09 by Claude] https public
+            // names are now permitted peers, so the ineligible case is http.
+            ([0x04; 32], "http://example.com:8422".to_string()),
             ([0x20; 32], "https://8.8.8.10:8422".to_string()),
         ];
         assert!(select_attestation_gossip_targets(

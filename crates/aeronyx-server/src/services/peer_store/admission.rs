@@ -63,7 +63,7 @@ impl PeerStore {
         let Some(endpoint) = descriptor.descriptor.public_endpoint.as_deref() else {
             return false;
         };
-        if endpoint.trim() != endpoint || !crate::api::peer_endpoint_is_public_ip(endpoint) {
+        if endpoint.trim() != endpoint || !crate::api::peer_endpoint_is_permitted(endpoint) {
             return false;
         }
 

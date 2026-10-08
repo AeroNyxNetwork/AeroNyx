@@ -180,6 +180,9 @@ bytes = { workspace = true }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+# [PEER-ENDPOINT-HOSTNAME 2026-10-09 by Claude] reqwest 0.11's DNS hook
+# names hosts with hyper 0.14's `Name`; this is the copy reqwest already locks.
+hyper-v014 = { package = "hyper", version = "0.14", default-features = false, features = ["client", "tcp"] }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 arc-swap = { workspace = true }
