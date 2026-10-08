@@ -1,0 +1,37 @@
+# ============================================
+# File: deploy/node/compose.tee.yaml
+# ============================================
+# Creation Reason:
+# - [TEE-NODE-IMAGE 2026-10-09 by Claude] The whole deployment for a dstack
+#   CVM (Phala Cloud or self-hosted). The CVM measures this file, so the image
+#   is pinned by digest, never by tag.
+#
+# Usage:
+# - Replace IMAGE_DIGEST with the digest CI published for the release tag.
+# - AERONYX_PUBLIC_ENDPOINT: the HTTPS origin the gateway assigns to 8422.
+# - AERONYX_REGISTRATION_CODE: pass as an encrypted secret, first start only.
+#
+# Important Notes for Next Developer:
+# - No privileged mode, no capabilities, no devices: this role has no VPN.
+# ============================================
+
+services:
+  aeronyx-node:
+    image: ghcr.io/aeronyxnetwork/aeronyx-node@sha256:IMAGE_DIGEST
+    restart: unless-stopped
+    ports:
+      - "8422:8422"
+    environment:
+      AERONYX_PUBLIC_ENDPOINT: ${AERONYX_PUBLIC_ENDPOINT}
+      AERONYX_REGION: ${AERONYX_REGION:-tee}
+      AERONYX_REGISTRATION_CODE: ${AERONYX_REGISTRATION_CODE:-}
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - aeronyx-state:/var/lib/aeronyx
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  aeronyx-state:

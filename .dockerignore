@@ -1,0 +1,10 @@
+# [TEE-NODE-IMAGE 2026-10-09 by Claude] Allowlist the build context: only the
+# Rust workspace and the TEE deploy inputs reach the builder.
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/**
+!deploy/node/server.tee.toml
+!deploy/node/tee-entrypoint.sh
+**/target

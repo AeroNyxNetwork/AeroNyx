@@ -1,0 +1,68 @@
+# ============================================
+# File: deploy/node/server.tee.toml
+# ============================================
+# Creation Reason:
+# - [TEE-NODE-IMAGE 2026-10-09 by Claude] Config template for the dstack CVM
+#   role: onion relay plus anonymous mailbox custody. No VPN data plane, no
+#   DNS proxy, no MemChain. The entrypoint fills @PUBLIC_ENDPOINT@ and
+#   @REGION@ and writes the result to /var/lib/aeronyx/server.toml.
+#
+# Important Notes for Next Developer:
+# - The identity comes from dstack KMS (`[server_key] source = "dstack"`);
+#   there is no key file in this role.
+# - Every value here is baked into the image, so it is covered by the image
+#   digest that the CVM attestation measures.
+# ============================================
+
+[network]
+listen_addr = "0.0.0.0:51820"
+
+[vpn]
+# This role has no TUN device and no NET_ADMIN capability.
+enabled = false
+dns_proxy_enabled = false
+
+[server_key]
+source = "dstack"
+dstack_socket = "/var/run/dstack.sock"
+
+[logging]
+level = "info"
+
+[management]
+cms_url = "https://api.aeronyx.network/api/privacy_network"
+heartbeat_interval_secs = 30
+session_report_interval_secs = 60
+request_timeout_secs = 10
+max_retries = 3
+node_info_path = "/var/lib/aeronyx/node_info.json"
+
+[memchain]
+mode = "off"
+
+[discovery]
+enabled = true
+advertise_self = true
+public_discovery = true
+advertise_onion_middle = true
+public_endpoint = "@PUBLIC_ENDPOINT@"
+public_api_listen_addr = "0.0.0.0:8422"
+region = "@REGION@"
+peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+gossip_enabled = true
+seed_endpoints = [
+  "http://8.213.146.244:8422",
+  "http://35.201.143.10:8422",
+  "http://34.32.67.213:8422",
+  "http://111.68.15.70:8422",
+]
+
+[memchain.chat_relay]
+enabled = true
+db_path = "/var/lib/aeronyx/chat_pending.db"
+
+[memchain.chat_relay.anonymous_mailbox]
+enabled = true
+db_path = "/var/lib/aeronyx/chat_relay_mailbox.db"
+ticket_issue_work_bits = 12
