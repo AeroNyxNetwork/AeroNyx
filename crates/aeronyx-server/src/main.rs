@@ -152,6 +152,7 @@ use aeronyx_server::services::{
 };
 use aeronyx_server::{ManagementClient, Server, ServerConfig};
 
+mod mailbox_probe;
 mod relay_smoke;
 
 // ============================================
@@ -277,6 +278,43 @@ enum Commands {
         confirm_live_relay_smoke: bool,
 
         /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Prove a client can run the anonymous mailbox lifecycle over the onion
+    ///
+    /// [MAILBOX-PROBE 2026-10-09 by Claude] Acts as a phone would: ephemeral
+    /// keys, its own onion source, plain HTTP to the entry node, no VPN.
+    MailboxProbe {
+        /// Seed node base URL supplying signed descriptors (repeatable)
+        #[arg(long = "seed", required = true)]
+        seeds: Vec<String>,
+
+        /// Hex node id of the custody node holding the mailbox
+        #[arg(long)]
+        target: String,
+
+        /// Hex node id of a distinct entry node (two-hop route)
+        #[arg(long)]
+        entry: Option<String>,
+
+        /// Ticket proof-of-work bits; at least the target's configured value
+        #[arg(
+            long,
+            default_value_t = aeronyx_server::config_chat_relay::DEFAULT_ANONYMOUS_MAILBOX_TICKET_ISSUE_WORK_BITS
+        )]
+        work_bits: u8,
+
+        /// Per-request HTTP timeout in seconds
+        #[arg(long, default_value_t = 20)]
+        timeout_seconds: u64,
+
+        /// Confirm creating one short-lived mailbox and one test item
+        #[arg(long)]
+        confirm_live_mailbox_probe: bool,
+
+        /// Emit the aggregate JSON report
         #[arg(long)]
         json: bool,
     },
@@ -819,6 +857,28 @@ async fn main() {
             )
             .await
         }
+        Commands::MailboxProbe {
+            seeds,
+            target,
+            entry,
+            work_bits,
+            timeout_seconds,
+            confirm_live_mailbox_probe,
+            json,
+        } => {
+            cmd_mailbox_probe(
+                mailbox_probe::MailboxProbeOptions {
+                    seeds,
+                    target,
+                    entry,
+                    work_bits,
+                    timeout: std::time::Duration::from_secs(timeout_seconds),
+                },
+                confirm_live_mailbox_probe,
+                json,
+            )
+            .await
+        }
         Commands::V1CompatibilitySmoke {
             server,
             health_url,
@@ -851,6 +911,37 @@ async fn main() {
 
 /// Maximum accepted one-time registration-code length after trimming.
 const MAX_REGISTRATION_CODE_BYTES: usize = 128;
+
+/// Runs the client-sourced anonymous mailbox lifecycle against live nodes.
+///
+/// [MAILBOX-PROBE 2026-10-09 by Claude] Creates one short-lived mailbox and
+/// one random test item on the target, so it requires explicit confirmation.
+async fn cmd_mailbox_probe(
+    options: mailbox_probe::MailboxProbeOptions,
+    confirmed: bool,
+    emit_json: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        confirmed,
+        "mailbox probe requires --confirm-live-mailbox-probe"
+    );
+    let report = mailbox_probe::run(options).await?;
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "AeroNyx anonymous mailbox probe: {} ({} hop)",
+            report.status, report.hops
+        );
+        for step in &report.steps {
+            println!(
+                "  {:<13} {:<10} {} ms",
+                step.operation, step.outcome, step.elapsed_ms
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Runs one explicit, aggregate-only proof against the node on this host.
 async fn cmd_relay_smoke(
