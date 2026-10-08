@@ -46,6 +46,11 @@ impl Server {
                 "Anonymous mailbox source requires authenticated VPN MPI runtime",
             ));
         }
+        if anonymous_mailbox_source.is_some() && !self.config.vpn_enabled() {
+            return Err(ServerError::startup_failed(
+                "Anonymous mailbox source is served on the VPN gateway and requires vpn.enabled",
+            ));
+        }
         let endpoint_evidence =
             open_endpoint_evidence_store(&self.config.discovery, &self.identity).await?;
         let endpoint_attestation_inbox =
@@ -58,8 +63,14 @@ impl Server {
         let vpn_listen_addr =
             Self::vpn_client_api_listen_addr(self.config.gateway_ip(), listen_addr);
         let node_listener = Self::bind_required_api_listener("node_api", listen_addr).await?;
-        let vpn_listener =
-            Self::bind_required_api_listener("vpn_client_api", vpn_listen_addr).await?;
+        // [VPN-OPTIONAL-ROLE 2026-10-09 by Claude] The VPN client API lives on
+        // the tunnel gateway address, which does not exist without the VPN
+        // data plane; binding it there would fail startup in every container.
+        let vpn_listener = if self.config.vpn_enabled() {
+            Some(Self::bind_required_api_listener("vpn_client_api", vpn_listen_addr).await?)
+        } else {
+            None
+        };
         let public_api_listener = match self.config.discovery.public_api_listen_addr {
             Some(public_addr) => Some((
                 public_addr,
@@ -655,13 +666,15 @@ impl Server {
                 dispatcher_admitted,
                 anonymous_mailbox_cleanup_runtime_supervised,
             );
-            listener_tasks.spawn(Self::serve_required_api_listener(
-                "vpn_client_api",
-                vpn_listen_addr,
-                vpn_listener,
-                vpn_app,
-                shutdown_rx_vpn,
-            ));
+            if let Some(vpn_listener) = vpn_listener {
+                listener_tasks.spawn(Self::serve_required_api_listener(
+                    "vpn_client_api",
+                    vpn_listen_addr,
+                    vpn_listener,
+                    vpn_app,
+                    shutdown_rx_vpn,
+                ));
+            }
             listener_tasks.spawn(Self::serve_required_api_listener(
                 "node_api",
                 listen_addr,
