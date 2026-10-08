@@ -102,6 +102,13 @@ impl Default for NetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VpnConfig {
+    /// Runs the VPN data plane (TUN device, gateway DNS, keepalive probes).
+    ///
+    /// [VPN-OPTIONAL-ROLE 2026-10-09 by Claude] `false` is the relay/mailbox
+    /// role for containers and TEE CVMs: no TUN, no `NET_ADMIN`, and no
+    /// `PrivacyRelay` capability in the signed descriptor.
+    #[serde(default = "default_vpn_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_ip_range")]
     pub virtual_ip_range: String,
     #[serde(default = "default_gateway_ip")]
@@ -112,6 +119,9 @@ pub struct VpnConfig {
     pub transports: VpnTransportConfig,
 }
 
+fn default_vpn_enabled() -> bool {
+    true
+}
 fn default_ip_range() -> String {
     "100.64.0.0/22".into()
 }
@@ -162,6 +172,7 @@ impl VpnConfig {
 impl Default for VpnConfig {
     fn default() -> Self {
         Self {
+            enabled: default_vpn_enabled(),
             virtual_ip_range: default_ip_range(),
             gateway_ip: default_gateway_ip(),
             dns_proxy_enabled: default_dns_proxy_enabled(),
@@ -438,6 +449,14 @@ mod tests {
     #[test]
     fn test_vpn_default_valid() {
         assert!(VpnConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_vpn_enabled_by_default_and_parsed_when_disabled() {
+        assert!(VpnConfig::default().enabled);
+        let vc: VpnConfig = toml::from_str("enabled = false").unwrap();
+        assert!(!vc.enabled);
+        assert!(vc.validate().is_ok());
     }
 
     #[test]

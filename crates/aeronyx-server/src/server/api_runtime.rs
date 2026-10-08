@@ -197,6 +197,9 @@ impl Server {
         let public_endpoint_proof_ttl_secs =
             self.config.discovery.permissionless_endpoint_proof_ttl_secs;
 
+        let tee_attestation = (self.config.server_key.source
+            == crate::config::ServerKeySource::Dstack)
+            .then(|| crate::tee::DstackClient::new(&self.config.server_key.dstack_socket));
         Ok(tokio::spawn(async move {
             // [RUNTIME-SUPERVISION 2026-07-29 by Codex] Required listeners
             // live in one JoinSet. No listener may outlive or disappear behind
@@ -235,6 +238,7 @@ impl Server {
                     endpoint_proof_ttl_secs: public_endpoint_proof_ttl_secs,
                     endpoint_evidence,
                     endpoint_attestation_inbox: endpoint_attestation_inbox.clone(),
+                    tee_attestation: tee_attestation.clone(),
                 });
                 if let Some(runtime) = public_promotion_runtime {
                     public_app = public_app.merge(build_endpoint_possession_responder(Arc::clone(

@@ -34,6 +34,13 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use std::sync::Arc;
+
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::Request;
@@ -41,6 +48,7 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use tokio::net::UnixStream;
+use tokio::sync::Semaphore;
 
 /// Default dstack guest agent socket inside a dstack CVM container.
 pub const DEFAULT_DSTACK_SOCKET: &str = "/var/run/dstack.sock";
@@ -200,6 +208,74 @@ impl DstackClient {
     }
 }
 
+/// Public path of the identity-bound quote endpoint.
+pub const ATTESTATION_QUOTE_PATH: &str = "/api/attestation/quote";
+/// Quote generation is comparatively expensive; bound concurrent requests.
+const ATTESTATION_MAX_IN_FLIGHT: usize = 2;
+
+#[derive(Clone)]
+struct AttestationState {
+    client: DstackClient,
+    node_id: [u8; 32],
+    admission: Arc<Semaphore>,
+}
+
+#[derive(Deserialize)]
+struct QuoteQuery {
+    nonce: String,
+}
+
+#[derive(Serialize)]
+struct QuoteResponse {
+    node_id: String,
+    nonce: String,
+    report_data: String,
+    report_data_scheme: &'static str,
+    quote: String,
+    event_log: String,
+}
+
+/// `GET /api/attestation/quote?nonce=<64 hex>`: a fresh TDX quote whose report
+/// data commits to this node's identity and the caller's nonce. Mounted only
+/// when the identity itself comes from dstack, so the quote and the signed
+/// descriptor speak for the same key.
+pub fn build_attestation_router(client: DstackClient, node_id: [u8; 32]) -> Router {
+    Router::new()
+        .route(ATTESTATION_QUOTE_PATH, get(handle_quote))
+        .with_state(AttestationState {
+            client,
+            node_id,
+            admission: Arc::new(Semaphore::new(ATTESTATION_MAX_IN_FLIGHT)),
+        })
+}
+
+async fn handle_quote(
+    State(state): State<AttestationState>,
+    Query(query): Query<QuoteQuery>,
+) -> Response {
+    let Ok(nonce) = hex::decode(&query.nonce) else {
+        return (StatusCode::BAD_REQUEST, "nonce must be hex").into_response();
+    };
+    let Ok(nonce) = <[u8; ATTESTATION_NONCE_BYTES]>::try_from(nonce.as_slice()) else {
+        return (StatusCode::BAD_REQUEST, "nonce must be 32 bytes").into_response();
+    };
+    let Ok(_permit) = state.admission.try_acquire() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    match state.client.quote_for_identity(&state.node_id, &nonce).await {
+        Ok(quote) => Json(QuoteResponse {
+            node_id: hex::encode(state.node_id),
+            nonce: hex::encode(nonce),
+            report_data: hex::encode(identity_report_data(&state.node_id, &nonce)),
+            report_data_scheme: "sha512(\"aeronyx-node-attestation-v1\" || node_id || nonce)",
+            quote: quote.quote,
+            event_log: quote.event_log,
+        })
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 /// `SHA-512(ATTESTATION_DOMAIN ‖ node_id ‖ nonce)`, the 64-byte TDX report data.
 #[must_use]
 pub fn identity_report_data(
@@ -277,6 +353,40 @@ mod tests {
             client.derive_identity_seed().await,
             Err(TeeError::Unavailable(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn quote_endpoint_rejects_bad_nonce_and_serves_bound_quote() {
+        use tower::ServiceExt;
+        let (dir, _) = fake_agent(r#"{"quote":"abcd","event_log":"[]"}"#).await;
+        let app = build_attestation_router(DstackClient::new(dir.path().join("dstack.sock")), [7u8; 32]);
+        let bad = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("{ATTESTATION_QUOTE_PATH}?nonce=00"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let nonce = "09".repeat(32);
+        let ok = app
+            .oneshot(
+                axum::http::Request::get(format!("{ATTESTATION_QUOTE_PATH}?nonce={nonce}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let body = ok.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["quote"], "abcd");
+        assert_eq!(
+            value["report_data"],
+            hex::encode(identity_report_data(&[7u8; 32], &[9u8; 32]))
+        );
     }
 
     #[tokio::test]

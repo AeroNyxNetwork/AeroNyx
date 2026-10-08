@@ -94,6 +94,9 @@ pub(crate) struct PublicNodeRouterDependencies {
     pub(crate) endpoint_evidence: Option<Arc<SqliteDiscoveryEndpointEvidenceStore>>,
     /// Shared durable quarantine; it grants no routing or promotion authority.
     pub(crate) endpoint_attestation_inbox: Option<Arc<SqliteDiscoveryEndpointAttestationInbox>>,
+    /// [TEE-DSTACK 2026-10-09 by Claude] Present only when the node identity
+    /// is derived from dstack, so quotes always speak for the signing key.
+    pub(crate) tee_attestation: Option<crate::tee::DstackClient>,
 }
 
 /// Builds the complete public node router.
@@ -101,6 +104,7 @@ pub(crate) struct PublicNodeRouterDependencies {
 /// Endpoint proof transport is absent when its independent rollout gate is
 /// false, so no verifier service or replay state is allocated in that mode.
 pub(crate) fn build_public_node_router(deps: PublicNodeRouterDependencies) -> Router {
+    let local_node_id = deps.node_identity.public_key_bytes();
     let block_peer_store = Arc::clone(&deps.peer_store);
     let block_identity = Arc::clone(&deps.node_identity);
     let directory_peer_store = Arc::clone(&deps.peer_store);
@@ -169,6 +173,9 @@ pub(crate) fn build_public_node_router(deps: PublicNodeRouterDependencies) -> Ro
             deps.node_identity,
             deps.blind_vault_admission,
         ));
+    }
+    if let Some(client) = deps.tee_attestation {
+        app = app.merge(crate::tee::build_attestation_router(client, local_node_id));
     }
     if let Some(storage) = deps.commitment_storage {
         app = app.merge(build_memchain_peer_router_with_runtime(
@@ -719,6 +726,7 @@ mod tests {
             endpoint_proof_ttl_secs: 1,
             endpoint_evidence: None,
             endpoint_attestation_inbox: None,
+            tee_attestation: None,
         };
         let router = build_public_node_router(deps);
         let malformed = router

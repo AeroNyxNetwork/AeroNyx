@@ -189,7 +189,12 @@ impl Server {
         chat_relay_runtime_ready: bool,
         blind_vault_runtime_ready: bool,
     ) -> Vec<NodeCapability> {
-        let mut capabilities = vec![NodeCapability::PrivacyRelay];
+        // [VPN-OPTIONAL-ROLE 2026-10-09 by Claude] A node without the VPN
+        // data plane must not offer one.
+        let mut capabilities = Vec::new();
+        if config.vpn_enabled() {
+            capabilities.push(NodeCapability::PrivacyRelay);
+        }
         let advertises_peer_api = Self::discovery_peer_api_ready_for(config);
 
         if config.memchain.is_chat_relay_enabled()

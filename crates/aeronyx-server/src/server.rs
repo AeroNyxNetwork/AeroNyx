@@ -2128,8 +2128,16 @@ impl Server {
         );
         info!("UDP transport listening on {}", self.config.listen_addr());
 
+        // [VPN-OPTIONAL-ROLE 2026-10-09 by Claude] The relay/mailbox role
+        // (`vpn.enabled = false`) never creates a TUN device, so it runs in a
+        // container without NET_ADMIN or /dev/net/tun.
         #[cfg(target_os = "linux")]
-        let tun = self.init_tun().await?;
+        let tun = if self.config.vpn_enabled() {
+            Some(self.init_tun().await?)
+        } else {
+            info!("[VPN] Data plane disabled by vpn.enabled=false; no TUN device");
+            None
+        };
 
         let server_pubkey_hex = hex::encode(self.identity.public_key_bytes());
 
@@ -2235,7 +2243,7 @@ impl Server {
         let udp_task = self.spawn_udp_task(
             Arc::clone(&udp),
             #[cfg(target_os = "linux")]
-            Arc::clone(&tun),
+            tun.clone(),
             Arc::clone(&handshake_service),
             Arc::clone(&packet_handler),
             Arc::clone(&voucher_verifier),
@@ -2264,9 +2272,9 @@ impl Server {
         ));
 
         #[cfg(target_os = "linux")]
-        {
+        if let Some(tun) = &tun {
             let tun_task = self.spawn_tun_task(
-                Arc::clone(&tun),
+                Arc::clone(tun),
                 Arc::clone(&udp),
                 Arc::clone(&packet_handler),
             );
@@ -2299,13 +2307,15 @@ impl Server {
         );
         tasks.push(("traffic-snapshot", snapshot_task));
 
-        let keepalive_task = self.spawn_keepalive_probe_task(
-            Arc::clone(&sessions),
-            Arc::clone(&udp),
-            Arc::clone(&packet_handler),
-            self.config.gateway_ip(),
-        );
-        tasks.push(("vpn-keepalive", keepalive_task));
+        if self.config.vpn_enabled() {
+            let keepalive_task = self.spawn_keepalive_probe_task(
+                Arc::clone(&sessions),
+                Arc::clone(&udp),
+                Arc::clone(&packet_handler),
+                self.config.gateway_ip(),
+            );
+            tasks.push(("vpn-keepalive", keepalive_task));
+        }
 
         if let Some(ref relay) = chat_relay {
             let relay_cleanup_task = self.spawn_chat_relay_cleanup_task(Arc::clone(relay));

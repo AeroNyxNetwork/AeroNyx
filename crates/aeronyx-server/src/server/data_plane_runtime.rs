@@ -84,7 +84,7 @@ impl Server {
     pub(super) fn spawn_udp_task(
         &self,
         udp: Arc<UdpTransport>,
-        #[cfg(target_os = "linux")] tun: Arc<LinuxTun>,
+        #[cfg(target_os = "linux")] tun: Option<Arc<LinuxTun>>,
         handshake: Arc<HandshakeService>,
         packet_handler: Arc<PacketHandler>,
         voucher_verifier: Arc<VoucherVerifier>,
@@ -203,8 +203,10 @@ impl Server {
                                     MessageType::Data | MessageType::ServerHello => {
                                         match packet_handler.handle_udp_packet(data, source.addr) {
                                             Ok((_sess, DecryptedPayload::Vpn(pkt))) => {
+                                                // [VPN-OPTIONAL-ROLE 2026-10-09 by Claude]
+                                                // Without a TUN there is no data plane to deliver to.
                                                 #[cfg(target_os = "linux")]
-                                                { let _ = tun.write(&pkt).await; }
+                                                if let Some(tun) = &tun { let _ = tun.write(&pkt).await; }
                                             }
                                             // [PROTOCOL-V2] Authenticated liveness and close.
                                             Ok((session, DecryptedPayload::ControlPing { id })) => {

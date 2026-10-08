@@ -1979,9 +1979,16 @@ impl ServerConfig {
         self.vpn.gateway_ip
     }
 
+    /// Whether this node runs the VPN data plane.
+    #[must_use]
+    pub fn vpn_enabled(&self) -> bool {
+        self.vpn.enabled
+    }
+
+    /// The gateway DNS proxy only exists as part of the VPN data plane.
     #[must_use]
     pub fn dns_proxy_enabled(&self) -> bool {
-        self.vpn.dns_proxy_enabled
+        self.vpn.enabled && self.vpn.dns_proxy_enabled
     }
 
     #[must_use]
