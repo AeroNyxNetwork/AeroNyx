@@ -614,10 +614,12 @@ impl Server {
             };
 
             info!("[API] Node API on http://{}", listen_addr);
-            info!(
-                "[API] Client API also available on http://{} (VPN clients only)",
-                vpn_listen_addr
-            );
+            if vpn_listener.is_some() {
+                info!(
+                    "[API] Client API also available on http://{} (VPN clients only)",
+                    vpn_listen_addr
+                );
+            }
             // [ANONYMOUS-MAILBOX-SOURCE-WIRING 2026-09-03 by Codex] The
             // source request route is an MPI-unified-auth client/VPN-only
             // composition surface. Node-peer, public discovery, ordinary
