@@ -62,6 +62,9 @@ use aeronyx_server::api::chat_peer::{PeerBlindRelayRequest, PeerBlindRelayRespon
 
 const BLIND_RELAY_PATH: &str = "/api/chat/peer/blind-relay";
 const CANDIDATES_PATH: &str = "/api/discovery/onion-candidates";
+/// Signed snapshot; unlike the candidate list it also carries the seed's own
+/// descriptor and does not wait for route-health quorum.
+const SNAPSHOT_PATH: &str = "/api/discovery/snapshot";
 /// Purposes queried so both relay-capable entries and mailbox terminals are seen.
 const CANDIDATE_PURPOSES: [&str; 2] = ["message_relay", "anonymous_mailbox_v1"];
 const TICKET_TTL_SECS: u64 = 240;
@@ -435,9 +438,9 @@ impl Probe {
     }
 }
 
-/// Fetches signed descriptors from every seed. Unsigned fields in the
-/// candidate JSON are ignored; `VerifiedOnionRoute` re-verifies every
-/// descriptor it is given.
+/// Fetches signed descriptors from every seed's candidate lists and signed
+/// snapshot. Unsigned fields are ignored; `VerifiedOnionRoute` re-verifies the
+/// signature and the mailbox protocol features of every descriptor it uses.
 async fn collect_descriptors(
     http: &reqwest::Client,
     seeds: &[String],
@@ -473,6 +476,27 @@ async fn collect_descriptors(
                 else {
                     continue;
                 };
+                descriptors.insert(signed.descriptor.node_id, signed);
+            }
+        }
+        let url = format!("{}{}", seed.trim_end_matches('/'), SNAPSHOT_PATH);
+        let snapshot: serde_json::Value = http
+            .get(&url)
+            .send()
+            .await
+            .context("GET snapshot from seed")?
+            .error_for_status()
+            .context("snapshot HTTP status")?
+            .json()
+            .await
+            .context("snapshot JSON")?;
+        for peer in snapshot
+            .get("peers")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(signed) = serde_json::from_value::<SignedNodeDescriptor>(peer.clone()) {
                 descriptors.insert(signed.descriptor.node_id, signed);
             }
         }
