@@ -1,0 +1,62 @@
+# ============================================
+# File: .github/workflows/node-ci.yml
+# ============================================
+# Creation Reason:
+# - [NODE-CI 2026-10-09 by Claude] Every push to main or a claude/* branch,
+#   and every pull request, runs the full workspace test suite on Linux (the
+#   production target) and macOS (where most development happens). Until now
+#   "green" meant someone remembered to run both by hand; the node is about
+#   to be split into roles, and that refactor needs a gate nobody can skip.
+#
+# Main Logical Flow:
+# 1. rustfmt check on the pinned toolchain (cheap, fails fast).
+# 2. Full `cargo test --workspace --locked` on ubuntu-24.04 and macos-14.
+#
+# Important Note for Next Developer:
+# - The toolchain comes from rust-toolchain.toml; do not pin a second one here.
+# - `--locked` is deliberate: CI must build the same graph as the release.
+# - A test that needs root, a TUN device, or the public network does not
+#   belong in this suite; mark it #[ignore] with the reason instead.
+# ============================================
+
+name: node-ci
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: node-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt
+      - run: cargo fmt --all --check
+
+  test:
+    needs: fmt
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked --no-fail-fast
