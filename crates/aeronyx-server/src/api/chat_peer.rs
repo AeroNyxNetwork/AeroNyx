@@ -1920,6 +1920,15 @@ fn now_secs() -> u64 {
 }
 
 fn signature_verification_capacity(hard_cap: usize) -> usize {
+    // [CI-DETERMINISTIC-CAPACITY 2026-10-09 by Claude] These semaphores are
+    // process-global and admission is try_acquire. Unit tests run in parallel
+    // in one process, so a hardware-sized capacity made results depend on the
+    // host: a 2-vCPU CI runner gets one permit and concurrent tests fail with
+    // Backpressure. Tests that exercise backpressure inject their own
+    // semaphore; everything else gets the fixed hard cap.
+    if cfg!(test) {
+        return hard_cap;
+    }
     // Reserve roughly half the reported hardware parallelism for the rest of
     // the node. A one-core process still receives one verification worker.
     let hardware_threads = std::thread::available_parallelism()

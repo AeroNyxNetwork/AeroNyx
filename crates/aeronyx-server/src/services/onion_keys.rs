@@ -156,9 +156,19 @@ impl OnionKeyManager {
 static SHARED: OnceLock<Arc<RwLock<OnionKeyManager>>> = OnceLock::new();
 
 fn shared() -> &'static Arc<RwLock<OnionKeyManager>> {
-    // Lazy default (created_at = 0) covers any read that races ahead of
-    // `init_shared` (e.g. a unit test). `init_shared` re-stamps it at startup.
-    SHARED.get_or_init(|| Arc::new(RwLock::new(OnionKeyManager::new(0))))
+    // [ONION-KEY-LAZY-STAMP 2026-10-09 by Claude] The lazy key is stamped with
+    // the real time. It used to be stamped 0, so any `tick_rotation(now)` that
+    // ran before `init_shared` (server startup paths in unit tests do) rotated
+    // immediately and dropped the old key as already past its grace window,
+    // invalidating every onion route built against `current_public_key()`.
+    SHARED.get_or_init(|| Arc::new(RwLock::new(OnionKeyManager::new(unix_now()))))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
 }
 
 /// Initializes the process-global onion key at server startup. Sets the grace
@@ -174,7 +184,9 @@ fn shared() -> &'static Arc<RwLock<OnionKeyManager>> {
 pub fn init_shared(now: u64, descriptor_ttl_secs: u64) {
     if let Ok(mut manager) = shared().write() {
         manager.grace_secs = effective_grace_secs(descriptor_ttl_secs);
-        if manager.current.created_at == 0 {
+        // The lazy key is already stamped with a real time; only a key from
+        // the future (clock moved backwards) is re-issued at `now`.
+        if manager.current.created_at > now {
             manager.current = OnionKeyEpoch::generate(now);
             manager.previous = None;
         }

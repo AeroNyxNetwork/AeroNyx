@@ -397,6 +397,12 @@ async fn post(app: &axum::Router, body: &[u8]) -> Vec<u8> {
 /// The store refuses symlinked paths (macOS temp dirs live behind
 /// `/var -> /private/var`), so tests use a real directory, as the node's own
 /// store tests do.
+/// [CI-DETERMINISTIC-CAPACITY 2026-10-09 by Claude] The node's blind relay
+/// crypto admission is process-global and sized from the host's cores (one
+/// permit on a 2-vCPU runner). The tests that drive the real handler hold
+/// this lock so they never compete for it.
+static REAL_HANDLER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn test_dir() -> tempfile::TempDir {
     std::fs::create_dir_all("target/test-temp").unwrap();
     tempfile::TempDir::new_in("target/test-temp").unwrap()
@@ -426,6 +432,7 @@ fn now() -> u64 {
 
 #[tokio::test]
 async fn wire_source_runs_the_full_lifecycle_through_the_real_handler() {
+    let _serial = REAL_HANDLER.lock().await;
     let directory = test_dir();
     let node = CoreKey::generate();
     let config = AnonymousMailboxStoreConfig {
@@ -651,6 +658,7 @@ async fn wire_source_runs_the_full_lifecycle_through_the_real_handler() {
 
 #[tokio::test]
 async fn a_reply_opens_once_and_only_for_its_exchange() {
+    let _serial = REAL_HANDLER.lock().await;
     // Two exchanges to the same node: swapping replies must fail, and the
     // session is consumed by the first open (enforced by `open(self)`).
     let directory = test_dir();
