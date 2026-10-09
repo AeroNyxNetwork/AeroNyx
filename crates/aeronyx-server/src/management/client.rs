@@ -1230,10 +1230,7 @@ mod tests {
         assert_eq!(integrity["durability_mode"], "full");
         assert_eq!(integrity["coordinator_fence_state"], "held");
         assert_eq!(integrity["coordinator_fence_acquired_at"], 90);
-        assert_eq!(
-            integrity["coordinator_fence_acquisition_failures_total"],
-            0
-        );
+        assert_eq!(integrity["coordinator_fence_acquisition_failures_total"], 0);
         assert_eq!(integrity["coordinator_lease_state"], "held");
         assert_eq!(integrity["coordinator_lease_granted_witnesses"], 3);
         assert_eq!(integrity["coordinator_lease_required_witnesses"], 3);
@@ -1267,10 +1264,7 @@ mod tests {
         assert_eq!(sync["last_outbound_announcement_result"], "partial");
         assert_eq!(sync["outbound_announcement_rounds_total"], 4);
         assert_eq!(sync["outbound_announcement_rounds_skipped_total"], 1);
-        assert_eq!(
-            sync["outbound_announcement_rounds_superseded_total"],
-            1
-        );
+        assert_eq!(sync["outbound_announcement_rounds_superseded_total"], 1);
         assert_eq!(sync["outbound_announcements_attempted_total"], 9);
         assert_eq!(sync["outbound_announcements_accepted_total"], 5);
         assert_eq!(sync["outbound_announcements_stale_total"], 2);

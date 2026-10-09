@@ -33,8 +33,8 @@ use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
-use crate::crypto::{E2eSession, EphemeralKeyPair, IdentityKeyPair, IdentityPublicKey};
 use crate::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
+use crate::crypto::{E2eSession, EphemeralKeyPair, IdentityKeyPair, IdentityPublicKey};
 
 const TICKET_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-AdmissionTicket-v1";
 const TICKET_ISSUE_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-TicketIssue-v1";
@@ -2274,4 +2274,3 @@ fn decode_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, AnonymousMailboxPr
     decode_bincode_bounded(body, BODY_BYTES, TrailingBytesPolicy::Reject)
         .map_err(|_| AnonymousMailboxProtocolError::Malformed)
 }
-

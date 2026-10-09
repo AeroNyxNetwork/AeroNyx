@@ -246,7 +246,9 @@ fn dns_name_is_public(name: &str) -> bool {
                 && label.len() <= 63
                 && !label.starts_with('-')
                 && !label.ends_with('-')
-                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
 }
 
@@ -586,7 +588,11 @@ mod tests {
     async fn public_only_resolver_refuses_a_name_that_resolves_locally() {
         use reqwest::dns::Resolve;
         let result = PublicOnlyResolver
-            .resolve("localhost".parse::<hyper_v014::client::connect::dns::Name>().unwrap())
+            .resolve(
+                "localhost"
+                    .parse::<hyper_v014::client::connect::dns::Name>()
+                    .unwrap(),
+            )
             .await;
         assert!(result.is_err());
     }

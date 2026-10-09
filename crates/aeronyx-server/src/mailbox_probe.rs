@@ -159,7 +159,9 @@ pub async fn run(options: MailboxProbeOptions) -> Result<MailboxProbeReport> {
     let ticket_request = solve_ticket_request(target_id, claims, now, options.work_bits)?;
     let started = Instant::now();
     let ticket = match probe
-        .exchange(AnonymousMailboxTerminalFrameV1::TicketIssue(ticket_request.clone()))
+        .exchange(AnonymousMailboxTerminalFrameV1::TicketIssue(
+            ticket_request.clone(),
+        ))
         .await?
     {
         AnonymousMailboxTerminalFrameV1::TicketIssueResponse(response) => {
@@ -240,7 +242,10 @@ pub async fn run(options: MailboxProbeOptions) -> Result<MailboxProbeReport> {
     let pulled = probe.pull(mailbox_id, &reader, &mut steps).await?;
     let pulled = pulled.ok_or_else(|| anyhow!("pull returned an empty mailbox after put"))?;
     let pulled_bytes_match = pulled.item_id == put_id && pulled.sealed_item == sealed;
-    ensure!(pulled_bytes_match, "pulled item differs from the deposited item");
+    ensure!(
+        pulled_bytes_match,
+        "pulled item differs from the deposited item"
+    );
 
     // 5. Ack, then confirm the mailbox is empty.
     let now = unix_now()?;
@@ -354,9 +359,8 @@ impl Probe {
             .context("POST blind relay")?;
         let status = http.status();
         let body = http.bytes().await.context("read blind relay response")?;
-        let response: PeerBlindRelayResponse = serde_json::from_slice(&body).with_context(|| {
-            format!("blind relay HTTP {status}: undecodable response body")
-        })?;
+        let response: PeerBlindRelayResponse = serde_json::from_slice(&body)
+            .with_context(|| format!("blind relay HTTP {status}: undecodable response body"))?;
         ensure!(
             status.is_success() && response.accepted,
             "blind relay HTTP {status} rejected: {}",
@@ -464,8 +468,7 @@ async fn collect_descriptors(
                 .json()
                 .await
                 .context("candidates JSON")?;
-            let Some(candidates) = body.get("candidates").and_then(|value| value.as_array())
-            else {
+            let Some(candidates) = body.get("candidates").and_then(|value| value.as_array()) else {
                 continue;
             };
             for candidate in candidates {

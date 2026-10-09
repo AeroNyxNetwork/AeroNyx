@@ -382,7 +382,8 @@ impl DirectoryChainStore {
             Self::verify_checkpoint_tip(&connection, &checkpoint.report)?;
         }
         let rows = Self::load_block_rows_after(&connection, after_height_sql)?;
-        let mut indexed_commitments = Self::load_commitment_index_after(&connection, after_height_sql)?;
+        let mut indexed_commitments =
+            Self::load_commitment_index_after(&connection, after_height_sql)?;
         let mut descriptor_objects =
             Self::load_descriptor_objects_after(&connection, after_height_sql)?;
         let totals = Self::row_totals(&connection)?;
@@ -1007,7 +1008,9 @@ impl DirectoryChainStore {
     fn row_totals(connection: &Connection) -> Result<(u64, u64, u64), DirectoryChainStoreError> {
         let count = |table: &str| -> Result<u64, DirectoryChainStoreError> {
             let value: i64 =
-                connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?;
+                connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
             nonnegative_i64_to_u64(value, "table row count")
         };
         Ok((
@@ -1587,7 +1590,11 @@ mod tests {
         for (seed, sequence) in [(0x82u8, 1u64), (0x83, 1), (0x82, 2)] {
             let peer = IdentityKeyPair::from_bytes(&[seed; 32]).unwrap();
             store
-                .append_descriptors(&[signed_descriptor(&peer, sequence, "peer.example:8422")], NOW, &producer)
+                .append_descriptors(
+                    &[signed_descriptor(&peer, sequence, "peer.example:8422")],
+                    NOW,
+                    &producer,
+                )
                 .unwrap();
             // Each audit after an own append extends the checkpoint.
             store.audit(NOW + 1).unwrap();
@@ -1609,12 +1616,20 @@ mod tests {
         let (store, _) =
             DirectoryChainStore::open(&path, producer.public_key_bytes(), NOW).unwrap();
         store
-            .append_descriptors(&[signed_descriptor(&peer, 1, "peer.example:8422")], NOW, &producer)
+            .append_descriptors(
+                &[signed_descriptor(&peer, 1, "peer.example:8422")],
+                NOW,
+                &producer,
+            )
             .unwrap();
         store.audit(NOW + 1).unwrap();
         let later = IdentityKeyPair::from_bytes(&[0x86; 32]).unwrap();
         store
-            .append_descriptors(&[signed_descriptor(&later, 1, "later.example:8422")], NOW, &producer)
+            .append_descriptors(
+                &[signed_descriptor(&later, 1, "later.example:8422")],
+                NOW,
+                &producer,
+            )
             .unwrap();
         // Tamper with a row at or below the checkpoint through another
         // connection while the store stays open.
@@ -1638,10 +1653,11 @@ mod tests {
     #[ignore = "manual timing against a copied production store"]
     fn directory_chain_audit_timing() {
         let path = std::env::var("AERONYX_DIRECTORY_CHAIN_BENCH_DB").unwrap();
-        let producer: [u8; 32] = hex::decode(std::env::var("AERONYX_DIRECTORY_CHAIN_BENCH_PRODUCER").unwrap())
-            .unwrap()
-            .try_into()
-            .unwrap();
+        let producer: [u8; 32] =
+            hex::decode(std::env::var("AERONYX_DIRECTORY_CHAIN_BENCH_PRODUCER").unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

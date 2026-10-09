@@ -135,7 +135,9 @@ impl DstackClient {
         let key = hex::decode(response.key.trim_start_matches("0x"))
             .map_err(|_| TeeError::InvalidResponse("GetKey key is not hex"))?;
         if key.len() < 32 {
-            return Err(TeeError::InvalidResponse("GetKey key shorter than 32 bytes"));
+            return Err(TeeError::InvalidResponse(
+                "GetKey key shorter than 32 bytes",
+            ));
         }
         // Hash rather than truncate so the Ed25519 seed is uniformly derived
         // from the whole KMS output whatever its curve or length.
@@ -262,7 +264,11 @@ async fn handle_quote(
     let Ok(_permit) = state.admission.try_acquire() else {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     };
-    match state.client.quote_for_identity(&state.node_id, &nonce).await {
+    match state
+        .client
+        .quote_for_identity(&state.node_id, &nonce)
+        .await
+    {
         Ok(quote) => Json(QuoteResponse {
             node_id: hex::encode(state.node_id),
             nonce: hex::encode(nonce),
@@ -278,10 +284,7 @@ async fn handle_quote(
 
 /// `SHA-512(ATTESTATION_DOMAIN ‖ node_id ‖ nonce)`, the 64-byte TDX report data.
 #[must_use]
-pub fn identity_report_data(
-    node_id: &[u8; 32],
-    nonce: &[u8; ATTESTATION_NONCE_BYTES],
-) -> [u8; 64] {
+pub fn identity_report_data(node_id: &[u8; 32], nonce: &[u8; ATTESTATION_NONCE_BYTES]) -> [u8; 64] {
     let mut hasher = Sha512::new();
     hasher.update(ATTESTATION_DOMAIN);
     hasher.update(node_id);
@@ -359,7 +362,8 @@ mod tests {
     async fn quote_endpoint_rejects_bad_nonce_and_serves_bound_quote() {
         use tower::ServiceExt;
         let (dir, _) = fake_agent(r#"{"quote":"abcd","event_log":"[]"}"#).await;
-        let app = build_attestation_router(DstackClient::new(dir.path().join("dstack.sock")), [7u8; 32]);
+        let app =
+            build_attestation_router(DstackClient::new(dir.path().join("dstack.sock")), [7u8; 32]);
         let bad = app
             .clone()
             .oneshot(
@@ -394,7 +398,10 @@ mod tests {
         let (dir, seen) = fake_agent(r#"{"quote":"abcd","event_log":"[]"}"#).await;
         let client = DstackClient::new(dir.path().join("dstack.sock"));
         let (node_id, nonce) = ([7u8; 32], [9u8; 32]);
-        let quote = client.quote_for_identity(&node_id, &nonce).await.expect("quote");
+        let quote = client
+            .quote_for_identity(&node_id, &nonce)
+            .await
+            .expect("quote");
         assert_eq!(quote.quote, "abcd");
         let request = seen.lock().expect("lock").clone();
         assert!(request.starts_with("POST /GetQuote HTTP/1.1"));

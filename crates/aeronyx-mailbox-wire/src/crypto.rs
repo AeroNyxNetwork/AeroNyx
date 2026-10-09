@@ -193,7 +193,11 @@ impl IdentityPublicKey {
 
 impl fmt::Debug for IdentityPublicKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "IdentityPublicKey({:02x?}..)", &self.0.as_bytes()[..4])
+        write!(
+            formatter,
+            "IdentityPublicKey({:02x?}..)",
+            &self.0.as_bytes()[..4]
+        )
     }
 }
 

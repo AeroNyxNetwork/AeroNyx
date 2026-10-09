@@ -519,7 +519,10 @@ impl MemoryStorage {
             params![rid_hex],
         );
         // Also drop any node-blind full-text entry for this record.
-        let _ = conn.execute("DELETE FROM blind_fts WHERE source_id = ?1", params![rid_hex]);
+        let _ = conn.execute(
+            "DELETE FROM blind_fts WHERE source_id = ?1",
+            params![rid_hex],
+        );
     }
 
     /// Index a node-blind record's client-supplied keyed token-hashes for BM25.

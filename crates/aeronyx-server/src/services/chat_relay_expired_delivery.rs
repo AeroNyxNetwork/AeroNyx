@@ -42,8 +42,7 @@ use std::collections::HashSet;
 use rusqlite::{params, Connection, TransactionBehavior};
 
 use super::chat_relay::{
-    ExpiredNotification, MAX_EXPIRED_NOTIFICATIONS_PER_PULL,
-    MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES,
+    ExpiredNotification, MAX_EXPIRED_NOTIFICATIONS_PER_PULL, MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES,
 };
 // [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Delivery repositories depend
 // directly on the typed result boundary while row models remain service-owned.

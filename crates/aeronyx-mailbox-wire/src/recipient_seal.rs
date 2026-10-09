@@ -25,10 +25,10 @@ use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::crypto::IdentityPublicKey;
 use crate::chat::{
     decode_envelope_strict_verified, encode_envelope, ChatEnvelope, MAX_CHAT_ENVELOPE_BYTES,
 };
+use crate::crypto::IdentityPublicKey;
 
 const RECIPIENT_SEAL_MAGIC: [u8; 4] = *b"AMSI";
 const RECIPIENT_SEAL_KEY_SALT_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-RecipientSeal-Salt-v1";
@@ -647,4 +647,3 @@ fn take_u16(encoded: &[u8], offset: &mut usize) -> Result<u16, AnonymousMailboxR
 fn take_u32(encoded: &[u8], offset: &mut usize) -> Result<u32, AnonymousMailboxRecipientSealError> {
     Ok(u32::from_le_bytes(take(encoded, offset)?))
 }
-

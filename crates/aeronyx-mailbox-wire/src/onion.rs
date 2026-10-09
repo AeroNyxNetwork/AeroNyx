@@ -82,7 +82,12 @@ pub fn build_source_envelope(
     for i in (0..path.len()).rev() {
         let next_hop = path.get(i + 1).map(|hop| hop.node_id);
         let encoded = encode_payload(next_hop, &inner)?;
-        inner = seal_layer(&path[i].kem_pub, &encoded, EphemeralKeyPair::generate(), random_nonce())?;
+        inner = seal_layer(
+            &path[i].kem_pub,
+            &encoded,
+            EphemeralKeyPair::generate(),
+            random_nonce(),
+        )?;
     }
     let ttl = u8::try_from(path.len()).map_err(|_| OnionError::PathLength)?;
     Ok(BlindRelayEnvelope {
@@ -100,7 +105,10 @@ pub fn build_source_envelope(
 ///
 /// # Errors
 /// Fails for anything that is not exactly one authentic layer.
-pub fn open_onion_layer(blob: &[u8], node_x25519_sk: &StaticSecret) -> Result<OnionPeel, OnionError> {
+pub fn open_onion_layer(
+    blob: &[u8],
+    node_x25519_sk: &StaticSecret,
+) -> Result<OnionPeel, OnionError> {
     if blob.len() < LAYER_HEADER_LEN || blob[..2] != ONION_MAGIC {
         return Err(OnionError::Malformed);
     }
@@ -163,7 +171,10 @@ fn derive_layer_key(
     Ok(key)
 }
 
-pub(crate) fn encode_payload(next_hop: Option<[u8; 32]>, inner: &[u8]) -> Result<Vec<u8>, OnionError> {
+pub(crate) fn encode_payload(
+    next_hop: Option<[u8; 32]>,
+    inner: &[u8],
+) -> Result<Vec<u8>, OnionError> {
     if inner.len() > MAX_ONION_PAYLOAD_BYTES {
         return Err(OnionError::TooLarge);
     }
@@ -185,7 +196,10 @@ fn decode_payload(bytes: &[u8]) -> Result<OnionPeel, OnionError> {
     let (&flags, rest) = bytes.split_first().ok_or(OnionError::Malformed)?;
     let (next_hop, rest) = if flags & 0x01 == 0x01 {
         let (hop, rest) = rest.split_at_checked(32).ok_or(OnionError::Malformed)?;
-        (Some(<[u8; 32]>::try_from(hop).map_err(|_| OnionError::Malformed)?), rest)
+        (
+            Some(<[u8; 32]>::try_from(hop).map_err(|_| OnionError::Malformed)?),
+            rest,
+        )
     } else {
         (None, rest)
     };
@@ -219,8 +233,8 @@ mod tests {
                 kem_pub: terminal.x25519_public_key_bytes(),
             },
         ];
-        let envelope = build_source_envelope(&path, b"payload", [9u8; 16], 1_800_000_000, &source)
-            .unwrap();
+        let envelope =
+            build_source_envelope(&path, b"payload", [9u8; 16], 1_800_000_000, &source).unwrap();
         assert_eq!(envelope.ttl, 2);
         assert_eq!(envelope.next_hop, entry.public_key_bytes());
         source

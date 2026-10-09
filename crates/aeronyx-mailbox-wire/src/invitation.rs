@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::chat::ChatEnvelope;
 use crate::crypto::{IdentityKeyPair, IdentityPublicKey};
 use crate::mailbox::{
     decode_anonymous_mailbox_terminal_frame, encode_anonymous_mailbox_terminal_frame,
@@ -38,7 +39,6 @@ use crate::recipient_seal::{
     AnonymousMailboxRecipientSealBindingV1, AnonymousMailboxRecipientSealError,
     AnonymousMailboxRecipientSealPublicV1, AnonymousMailboxRecipientSealedItemV1,
 };
-use crate::chat::ChatEnvelope;
 
 const INVITATION_MAGIC: [u8; 4] = *b"AMDI";
 const INVITATION_SIGNATURE_DOMAIN: &[u8] = b"AeroNyx-AnonymousMailbox-DepositInvitation-v1";
@@ -1412,4 +1412,3 @@ fn take_u64(
 ) -> Result<u64, AnonymousMailboxDepositInvitationError> {
     Ok(u64::from_le_bytes(take(encoded, offset)?))
 }
-

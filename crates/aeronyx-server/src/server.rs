@@ -2323,7 +2323,6 @@ impl Server {
             tasks.push(("discovery-gossip", task));
         }
 
-
         if let Some(ref relay) = chat_relay {
             let relay_cleanup_task = self.spawn_chat_relay_cleanup_task(Arc::clone(relay));
             tasks.push(("chat-relay-cleanup", relay_cleanup_task));

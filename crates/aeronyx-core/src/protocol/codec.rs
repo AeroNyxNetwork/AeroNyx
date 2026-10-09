@@ -570,13 +570,25 @@ mod tests {
         data.extend_from_slice(&[0u8; 16]);
         assert_eq!(ProtocolCodec::classify_datagram(&data), MessageType::Data);
         // Real control frames keep their meaning.
-        assert_eq!(ProtocolCodec::classify_datagram(&[0x04u8; 17]), MessageType::Keepalive);
-        assert_eq!(ProtocolCodec::classify_datagram(&[0x01u8; CLIENT_HELLO_SIZE]), MessageType::ClientHello);
+        assert_eq!(
+            ProtocolCodec::classify_datagram(&[0x04u8; 17]),
+            MessageType::Keepalive
+        );
+        assert_eq!(
+            ProtocolCodec::classify_datagram(&[0x01u8; CLIENT_HELLO_SIZE]),
+            MessageType::ClientHello
+        );
         let mut with_voucher = vec![0x01u8; CLIENT_HELLO_SIZE];
         with_voucher.extend_from_slice(b"AVCH\x02\x00ab");
-        assert_eq!(ProtocolCodec::classify_datagram(&with_voucher), MessageType::ClientHello);
+        assert_eq!(
+            ProtocolCodec::classify_datagram(&with_voucher),
+            MessageType::ClientHello
+        );
         // A 138-byte blob that does not start with 0x01 is data, not a hello.
-        assert_eq!(ProtocolCodec::classify_datagram(&[0x09u8; CLIENT_HELLO_SIZE]), MessageType::Data);
+        assert_eq!(
+            ProtocolCodec::classify_datagram(&[0x09u8; CLIENT_HELLO_SIZE]),
+            MessageType::Data
+        );
         assert_eq!(ProtocolCodec::classify_datagram(&[]), MessageType::Data);
     }
 

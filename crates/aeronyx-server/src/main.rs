@@ -134,6 +134,7 @@ use aeronyx_server::api::directory_replica_sync::{
 use aeronyx_server::api::memchain_peer::{
     witness_custody_audit_anchor_round_durable, CustodyAuditWitnessRound,
 };
+use aeronyx_server::config::ServerKeySource;
 use aeronyx_server::management::models::{NodeRegistrationProfile, StoredNodeInfo};
 use aeronyx_server::services::chat_relay::ChatRelayCustodyAuditAnchorGuard;
 use aeronyx_server::services::directory_replica::{
@@ -150,7 +151,6 @@ use aeronyx_server::services::{
     DirectoryReplicaStore, DirectoryReplicaTip, PeerStore, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
     CHAT_RELAY_RESTORE_PLAN_VALIDITY_SECS,
 };
-use aeronyx_server::config::ServerKeySource;
 use aeronyx_server::tee::DstackClient;
 use aeronyx_server::{ManagementClient, Server, ServerConfig};
 

@@ -104,10 +104,19 @@ mod tests {
         for _ in 0..6 {
             assert!(limiter.allow_at(ip, t0));
         }
-        assert!(!limiter.allow_at(ip, t0), "seventh hello in the same instant is refused");
-        assert!(limiter.allow_at(ip, t0 + Duration::from_millis(600)), "refills at 2/s");
+        assert!(
+            !limiter.allow_at(ip, t0),
+            "seventh hello in the same instant is refused"
+        );
+        assert!(
+            limiter.allow_at(ip, t0 + Duration::from_millis(600)),
+            "refills at 2/s"
+        );
         let other: IpAddr = "203.0.113.8".parse().unwrap();
-        assert!(limiter.allow_at(other, t0), "another address has its own bucket");
+        assert!(
+            limiter.allow_at(other, t0),
+            "another address has its own bucket"
+        );
     }
 
     #[test]

@@ -1426,7 +1426,8 @@ impl MemChainConfig {
         if self.commitment_sync_enabled {
             return self.commitment_sync_coordinator_node_id();
         }
-        self.commitment_coordinator_enabled.then_some(*local_node_id)
+        self.commitment_coordinator_enabled
+            .then_some(*local_node_id)
     }
 
     /// Returns validated pinned witness identities in operator order.

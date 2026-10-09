@@ -66,7 +66,11 @@ impl SourceExchange {
     ///
     /// # Errors
     /// Fails for a bad path or frame.
-    pub fn prepare(path: &[OnionHop], terminal_frame: Vec<u8>, now: u64) -> Result<Self, SourceError> {
+    pub fn prepare(
+        path: &[OnionHop],
+        terminal_frame: Vec<u8>,
+        now: u64,
+    ) -> Result<Self, SourceError> {
         let target = path.last().ok_or(SourceError::Path)?.node_id;
         let mut route_id = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut route_id);
@@ -118,7 +122,10 @@ impl SourceExchange {
     /// # Errors
     /// Fails if the relay rejected the request or the reply is not the one
     /// sealed to this exchange.
-    pub fn open(mut self, response_json: &[u8]) -> Result<AnonymousMailboxTerminalFrameV1, SourceError> {
+    pub fn open(
+        mut self,
+        response_json: &[u8],
+    ) -> Result<AnonymousMailboxTerminalFrameV1, SourceError> {
         if response_json.len() > MAX_RESPONSE_JSON_BYTES {
             return Err(SourceError::Reply);
         }
@@ -127,7 +134,9 @@ impl SourceExchange {
         if !response.accepted {
             return Err(SourceError::NoReply);
         }
-        let sealed_b64 = response.opaque_terminal_response_b64.ok_or(SourceError::NoReply)?;
+        let sealed_b64 = response
+            .opaque_terminal_response_b64
+            .ok_or(SourceError::NoReply)?;
         let sealed = base64_decode(&sealed_b64).ok_or(SourceError::Reply)?;
         let opened = self.session.open(&sealed).map_err(|_| SourceError::Reply)?;
         decode_anonymous_mailbox_terminal_frame(&opened).map_err(|_| SourceError::Reply)
@@ -156,8 +165,11 @@ struct RelayResponse {
 ///
 /// # Errors
 /// Fails if the encoding exceeds the MemChain ceiling.
-pub fn encode_route_payload(route: &AnonymousMailboxRouteRequestV1) -> Result<Vec<u8>, SourceError> {
-    let body = encode_bincode_bounded(route, MAX_MEMCHAIN_PAYLOAD_BYTES).map_err(|_| SourceError::Build)?;
+pub fn encode_route_payload(
+    route: &AnonymousMailboxRouteRequestV1,
+) -> Result<Vec<u8>, SourceError> {
+    let body = encode_bincode_bounded(route, MAX_MEMCHAIN_PAYLOAD_BYTES)
+        .map_err(|_| SourceError::Build)?;
     let mut out = Vec::with_capacity(1 + 4 + body.len());
     out.push(MEMCHAIN_MAGIC);
     out.extend_from_slice(&MEMCHAIN_ANONYMOUS_MAILBOX_ROUTE_V1.to_le_bytes());
