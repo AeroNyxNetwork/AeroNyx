@@ -32,18 +32,25 @@ pub(super) struct MemoryStores {
     pub(super) aof_writer: Arc<TokioMutex<AofWriter>>,
 }
 
-/// The data plane and the session state shared with the API.
+/// The VPN data plane: transport, sessions and the packet/handshake services.
 ///
 /// UDP is bound even with `vpn.enabled = false`: management heartbeats and
-/// the miner send through it.
+/// the miner send through it. TUN exists only on Linux with VPN enabled.
 pub(super) struct DataPlane {
     pub(super) udp: Arc<UdpTransport>,
+    #[cfg(target_os = "linux")]
+    pub(super) tun: Option<Arc<LinuxTun>>,
     pub(super) ip_pool: Arc<IpPoolService>,
     pub(super) sessions: Arc<SessionManager>,
-    pub(super) node_policy: Arc<NodePolicyRuntime>,
-    pub(super) voucher_verifier: Arc<VoucherVerifier>,
+    pub(super) routing: Arc<RoutingService>,
+    pub(super) traffic_tracker: Arc<TrafficTracker>,
     pub(super) encrypted_message_counter: Arc<AtomicU64>,
+    /// Written by the management heartbeat, read by the handshake service.
+    pub(super) deny_list: Arc<DenyList>,
+    pub(super) node_policy: Arc<NodePolicyRuntime>,
     pub(super) packet_handler: Arc<PacketHandler>,
+    pub(super) handshake_service: Arc<HandshakeService>,
+    pub(super) voucher_verifier: Arc<VoucherVerifier>,
 }
 
 /// Chat relay, the anonymous mailbox terminal and its VPN-side source.

@@ -444,11 +444,21 @@ async fn anonymous_mailbox_source_without_mpi_is_rejected_before_api_routes_star
     let (ip_pool, sessions, routing) = server.init_services().expect("test services");
     let node_policy = Arc::new(crate::services::NodePolicyRuntime::default());
     let encrypted_message_counter = Arc::new(AtomicU64::new(0));
+    let traffic_tracker = Arc::new(crate::services::traffic_tracker::TrafficTracker::new());
+    let deny_list = Arc::new(crate::services::deny_list::DenyList::new());
     let packet_handler = Arc::new(crate::handlers::PacketHandler::new(
         Arc::clone(&sessions),
-        routing,
-        Arc::new(crate::services::traffic_tracker::TrafficTracker::new()),
+        Arc::clone(&routing),
+        Arc::clone(&traffic_tracker),
         Arc::clone(&encrypted_message_counter),
+        Arc::clone(&node_policy),
+    ));
+    let handshake_service = Arc::new(crate::services::HandshakeService::new(
+        server.identity.clone(),
+        Arc::clone(&ip_pool),
+        Arc::clone(&sessions),
+        Arc::clone(&routing),
+        Arc::clone(&deny_list),
         Arc::clone(&node_policy),
     ));
     // The existing API constructor takes ownership of the UDP transport
@@ -466,12 +476,18 @@ async fn anonymous_mailbox_source_without_mpi_is_rejected_before_api_routes_star
     // [NODE-ROLES 2026-10-09 by Claude] Same values, grouped by role.
     let plane = super::super::DataPlane {
         udp,
+        #[cfg(target_os = "linux")]
+        tun: None,
         ip_pool,
         sessions,
-        node_policy,
-        voucher_verifier: Arc::new(crate::voucher_verifier::VoucherVerifier::new()),
+        routing,
+        traffic_tracker,
         encrypted_message_counter,
+        deny_list,
+        node_policy,
         packet_handler,
+        handshake_service,
+        voucher_verifier: Arc::new(crate::voucher_verifier::VoucherVerifier::new()),
     };
     let directory = super::super::Directory {
         chain_store: None,

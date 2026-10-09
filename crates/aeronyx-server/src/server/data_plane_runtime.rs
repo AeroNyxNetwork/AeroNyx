@@ -595,6 +595,114 @@ impl Server {
             }
         })
     }
+
+    // [NODE-ROLES 2026-10-09 by Claude] Moved verbatim out of `Server::run`:
+    // the UDP and TUN loops, session cleanup, traffic snapshots and VPN
+    // keepalive probes.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn spawn_data_plane_tasks(
+        &self,
+        plane: &DataPlane,
+        session_event_sender: SessionEventSender,
+        memory: Option<&MemoryStores>,
+        chat_relay: Option<Arc<ChatRelayService>>,
+        peer_store: &Arc<PeerStore>,
+        peer_http_clients: &PeerHttpClients,
+        tasks: &mut RuntimeTaskRegistry,
+        critical_failure_tx: &mpsc::Sender<CriticalRuntimeFailure>,
+    ) {
+        let udp = Arc::clone(&plane.udp);
+        #[cfg(target_os = "linux")]
+        let tun = plane.tun.clone();
+        let ip_pool = Arc::clone(&plane.ip_pool);
+        let sessions = Arc::clone(&plane.sessions);
+        let routing = Arc::clone(&plane.routing);
+        let traffic_tracker = Arc::clone(&plane.traffic_tracker);
+        let deny_list = Arc::clone(&plane.deny_list);
+        let packet_handler = Arc::clone(&plane.packet_handler);
+        let handshake_service = Arc::clone(&plane.handshake_service);
+        let voucher_verifier = Arc::clone(&plane.voucher_verifier);
+        let storage = memory.map(|m| Arc::clone(&m.storage));
+        let peer_store = Arc::clone(peer_store);
+        let server_pubkey_hex = hex::encode(self.identity.public_key_bytes());
+
+        let udp_task = self.spawn_udp_task(
+            Arc::clone(&udp),
+            #[cfg(target_os = "linux")]
+            tun.clone(),
+            Arc::clone(&handshake_service),
+            Arc::clone(&packet_handler),
+            Arc::clone(&voucher_verifier),
+            Arc::clone(&sessions),
+            session_event_sender.clone(),
+            memory.map(|m| Arc::clone(&m.mempool)),
+            memory.map(|m| Arc::clone(&m.aof_writer)),
+            storage.clone(),
+            memory.map(|m| Arc::clone(&m.vector_index)),
+            self.config.memchain.clone(),
+            server_pubkey_hex.clone(),
+            chat_relay.clone(),
+            Arc::clone(&routing),
+            Arc::clone(&peer_store),
+            Arc::clone(&peer_http_clients.control),
+            Arc::clone(&traffic_tracker),
+        );
+        tasks.push((
+            "udp",
+            Self::supervise_required_runtime_task(
+                "udp",
+                udp_task,
+                Arc::clone(&self.shutdown),
+                critical_failure_tx.clone(),
+            ),
+        ));
+
+        #[cfg(target_os = "linux")]
+        if let Some(tun) = &tun {
+            let tun_task = self.spawn_tun_task(
+                Arc::clone(tun),
+                Arc::clone(&udp),
+                Arc::clone(&packet_handler),
+            );
+            tasks.push((
+                "tun",
+                Self::supervise_required_runtime_task(
+                    "tun",
+                    tun_task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
+        }
+
+        let cleanup_task = self.spawn_cleanup_task(
+            Arc::clone(&sessions),
+            Arc::clone(&ip_pool),
+            Arc::clone(&routing),
+            session_event_sender.clone(),
+            chat_relay.clone(),
+            Arc::clone(&traffic_tracker),
+            Arc::clone(&deny_list),
+        );
+        tasks.push(("cleanup", cleanup_task));
+
+        let snapshot_task = self.spawn_traffic_snapshot_task(
+            Arc::clone(&sessions),
+            session_event_sender.clone(),
+            self.config.management.session_report_interval_secs,
+        );
+        tasks.push(("traffic-snapshot", snapshot_task));
+
+        if self.config.vpn_enabled() {
+            let keepalive_task = self.spawn_keepalive_probe_task(
+                Arc::clone(&sessions),
+                Arc::clone(&udp),
+                Arc::clone(&packet_handler),
+                self.config.gateway_ip(),
+            );
+            tasks.push(("vpn-keepalive", keepalive_task));
+        }
+    }
 }
 
 #[cfg(test)]
