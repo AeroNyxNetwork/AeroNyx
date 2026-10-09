@@ -16,31 +16,38 @@ impl Server {
     /// logged an error while `Server::run()` still announced successful
     /// startup. Pre-binding makes listener availability part of the startup
     /// transaction and gives `Type=notify` a truthful readiness barrier.
+    // [NODE-ROLES 2026-10-09 by Claude] Takes the role handles instead of 22
+    // positional values; the body below still reads the same local names.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn start_combined_api(
         &self,
         listen_addr: std::net::SocketAddr,
         mpi_state: Option<Arc<MpiState>>,
-        ip_pool: Arc<IpPoolService>,
-        sessions: Arc<SessionManager>,
-        node_policy: Arc<NodePolicyRuntime>,
-        voucher_verifier: Arc<VoucherVerifier>,
-        encrypted_message_counter: Arc<AtomicU64>,
-        packet_handler: Arc<PacketHandler>,
+        plane: &DataPlane,
         peer_store: Arc<PeerStore>,
-        directory_chain_store: Option<Arc<DirectoryChainStore>>,
-        directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
-        directory_replica_sync_runtime: Arc<DirectoryReplicaSyncRuntime>,
-        chat_relay: Option<Arc<ChatRelayService>>,
+        directory: &Directory,
+        messaging: &Messaging,
         blind_vault: Option<Arc<BlindVaultService>>,
-        anonymous_mailbox: Option<Arc<SqliteAnonymousMailboxStore>>,
-        anonymous_mailbox_source: Option<Arc<AnonymousMailboxSourceCoordinator>>,
-        udp: Arc<UdpTransport>,
         peer_http_clients: &PeerHttpClients,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
-        anonymous_mailbox_cleanup_runtime_supervised: bool,
-        anonymous_mailbox_readiness: AnonymousMailboxReadinessProjection,
         critical_failure_tx: mpsc::Sender<CriticalRuntimeFailure>,
     ) -> Result<JoinHandle<()>> {
+        let ip_pool = Arc::clone(&plane.ip_pool);
+        let sessions = Arc::clone(&plane.sessions);
+        let node_policy = Arc::clone(&plane.node_policy);
+        let voucher_verifier = Arc::clone(&plane.voucher_verifier);
+        let encrypted_message_counter = Arc::clone(&plane.encrypted_message_counter);
+        let packet_handler = Arc::clone(&plane.packet_handler);
+        let udp = Arc::clone(&plane.udp);
+        let directory_chain_store = directory.chain_store.clone();
+        let directory_replica_store = directory.replica_store.clone();
+        let directory_replica_sync_runtime = Arc::clone(&directory.replica_sync_runtime);
+        let chat_relay = messaging.chat_relay.clone();
+        let anonymous_mailbox = messaging.anonymous_mailbox.clone();
+        let anonymous_mailbox_source = messaging.anonymous_mailbox_source.clone();
+        let anonymous_mailbox_cleanup_runtime_supervised =
+            messaging.anonymous_mailbox_cleanup_supervised;
+        let anonymous_mailbox_readiness = messaging.anonymous_mailbox_readiness.clone();
         if anonymous_mailbox_source.is_some() && mpi_state.is_none() {
             return Err(ServerError::startup_failed(
                 "Anonymous mailbox source requires authenticated VPN MPI runtime",

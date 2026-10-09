@@ -463,29 +463,40 @@ async fn anonymous_mailbox_source_without_mpi_is_rejected_before_api_routes_star
         PeerHttpClients::build(&server.config).expect("local proxy-free HTTP client profiles");
     let (critical_failure_tx, _critical_failure_rx) = tokio::sync::mpsc::channel(1);
 
+    // [NODE-ROLES 2026-10-09 by Claude] Same values, grouped by role.
+    let plane = super::super::DataPlane {
+        udp,
+        ip_pool,
+        sessions,
+        node_policy,
+        voucher_verifier: Arc::new(crate::voucher_verifier::VoucherVerifier::new()),
+        encrypted_message_counter,
+        packet_handler,
+    };
+    let directory = super::super::Directory {
+        chain_store: None,
+        replica_store: None,
+        replica_sync_runtime: Arc::new(DirectoryReplicaSyncRuntime::default()),
+    };
+    let messaging = super::super::Messaging {
+        chat_relay: None,
+        anonymous_mailbox: None,
+        anonymous_mailbox_source: Some(source.coordinator),
+        anonymous_mailbox_cleanup_supervised: false,
+        anonymous_mailbox_readiness: super::super::AnonymousMailboxReadinessProjection::default(),
+    };
+
     let error = match server
         .start_combined_api(
             "127.0.0.1:0".parse().expect("loopback API address"),
             None,
-            ip_pool,
-            sessions,
-            node_policy,
-            Arc::new(crate::voucher_verifier::VoucherVerifier::new()),
-            encrypted_message_counter,
-            packet_handler,
+            &plane,
             peer_store,
+            &directory,
+            &messaging,
             None,
-            None,
-            Arc::new(DirectoryReplicaSyncRuntime::default()),
-            None,
-            None,
-            None,
-            Some(source.coordinator),
-            udp,
             &peer_http_clients,
             None,
-            false,
-            super::super::AnonymousMailboxReadinessProjection::default(),
             critical_failure_tx,
         )
         .await
