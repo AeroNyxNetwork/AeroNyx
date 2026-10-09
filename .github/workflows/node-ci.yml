@@ -77,6 +77,9 @@ jobs:
           grep -E "^test .* FAILED$" test.log | head -40 | while read -r line; do
             echo "::error title=failed test (${{ matrix.os }})::${line}"
           done
-          grep -E -A2 "panicked at" test.log | head -60 | tr '\n' ' ' | fold -w 900 | head -8 | while read -r line; do
-            echo "::error title=panic (${{ matrix.os }})::${line}"
+          # One annotation per panic: the panic line plus the three lines
+          # after it, where the assertion or error message is printed.
+          awk '/panicked at/ {n = 4; buf = ""} n > 0 {buf = buf " " $0; n--; if (n == 0) print buf}' test.log \
+            | head -8 | while IFS= read -r line || [ -n "$line" ]; do
+            echo "::error title=panic (${{ matrix.os }})::${line:0:900}"
           done
