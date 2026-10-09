@@ -421,14 +421,14 @@ Examples:
   ./deploy/node/aeronyx-node.sh health --json
   ./deploy/node/aeronyx-node.sh status
   ./deploy/node/aeronyx-node.sh relay-probe --json
-  ./deploy/node/aeronyx-node.sh fleet-smoke --endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 --two-hop --json
+  ./deploy/node/aeronyx-node.sh fleet-smoke --endpoints http://8.213.146.244:8422,http://111.68.15.70:8422,http://34.32.67.213:8422,http://35.201.143.10:8422 --two-hop --json
   ./deploy/node/aeronyx-node.sh carrier-smoke --json
   ./deploy/node/aeronyx-node.sh carrier-cold-bootstrap-smoke --json
   ./deploy/node/aeronyx-node.sh build-cache --repo-dir /root/open/AeroNyx
   sudo ./deploy/node/aeronyx-node.sh prune-build-cache --repo-dir /root/open/AeroNyx --dry-run
   sudo ./deploy/node/aeronyx-node.sh prune-build-cache --repo-dir /root/open/AeroNyx --yes
-  sudo ./deploy/node/aeronyx-node.sh refresh-bootstrap --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422
-  ./deploy/node/aeronyx-node.sh fleet-drift-check --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 --json
+  sudo ./deploy/node/aeronyx-node.sh refresh-bootstrap --expected-endpoints http://8.213.146.244:8422,http://111.68.15.70:8422,http://34.32.67.213:8422,http://35.201.143.10:8422
+  ./deploy/node/aeronyx-node.sh fleet-drift-check --expected-endpoints http://8.213.146.244:8422,http://111.68.15.70:8422,http://34.32.67.213:8422,http://35.201.143.10:8422 --json
   sudo ./deploy/node/aeronyx-node.sh chat-relay --enable-chat-relay --restart
   sudo ./deploy/node/aeronyx-node.sh onion-middle --enable-onion-middle --restart
   sudo ./deploy/node/aeronyx-node.sh promote-binary --binary ./target/release/aeronyx-server.next --expected-sha256 HASH

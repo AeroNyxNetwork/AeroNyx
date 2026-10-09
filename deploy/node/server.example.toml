@@ -162,10 +162,15 @@ peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
 # list with only the operator-supplied public seed IPs. These example IPs are
 # never required for permissionless joining or central registration.
 bootstrap_snapshot_path = "/etc/aeronyx/bootstrap-peers.json"
+# [NODE-SEED-REFRESH 2026-10-09 by Claude] The previous second entry
+# (149.33.18.44) and the old US1 addresses no longer answer. These four
+# respond on the public discovery API today. All are AeroNyx-operated, so
+# add or substitute seeds you trust; see `join --seed` below.
 seed_endpoints = [
   "http://8.213.146.244:8422",
-  "http://149.33.18.44:8422",
   "http://111.68.15.70:8422",
+  "http://34.32.67.213:8422",
+  "http://35.201.143.10:8422",
 ]
 # Optional signed local Directory Chain journal. Once configured, startup
 # verifies every stored block, chain link, Merkle root, producer, and

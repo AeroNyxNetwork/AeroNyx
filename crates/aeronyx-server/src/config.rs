@@ -2282,6 +2282,37 @@ db_path = "memchain.db"
     }
 
     #[test]
+    fn the_shipped_example_config_loads_and_its_seeds_are_current() {
+        // [NODE-SEED-REFRESH 2026-10-09 by Claude] install.sh copies this file
+        // into every new node's server.toml, so a dead seed here lands in
+        // every new node. It must load with the real parser and validator, and
+        // the retired addresses must not come back.
+        let example = include_str!("../../../deploy/node/server.example.toml");
+        let config = ServerConfig::from_str(example).expect("example config loads and validates");
+        let seeds = &config.discovery.seed_endpoints;
+        assert!(
+            seeds.len() >= 3,
+            "keep several seeds so one outage is survivable"
+        );
+        let retired = [
+            "149.33.18.44",
+            "35.253.79.169",
+            "34.136.167.59",
+            "34.58.204.226",
+        ];
+        for seed in seeds {
+            for address in retired {
+                assert!(
+                    !seed.contains(address),
+                    "retired seed {address} is back in the example"
+                );
+            }
+        }
+        let distinct: std::collections::HashSet<_> = seeds.iter().collect();
+        assert_eq!(distinct.len(), seeds.len(), "duplicate seed");
+    }
+
+    #[test]
     fn test_discovery_bootstrap_toml_parse() {
         let toml_str = r#"
 [discovery]

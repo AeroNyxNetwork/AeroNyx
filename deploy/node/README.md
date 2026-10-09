@@ -1730,7 +1730,7 @@ discovery node:
 
 ```bash
 sudo ./deploy/node/aeronyx-node.sh refresh-bootstrap \
-  --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422
+  --expected-endpoints http://8.213.146.244:8422,http://111.68.15.70:8422,http://34.32.67.213:8422,http://35.201.143.10:8422
 ```
 
 Preview without writing the target file:
@@ -1738,7 +1738,7 @@ Preview without writing the target file:
 ```bash
 ./deploy/node/aeronyx-node.sh refresh-bootstrap \
   --dry-run \
-  --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 \
+  --expected-endpoints http://8.213.146.244:8422,http://111.68.15.70:8422,http://34.32.67.213:8422,http://35.201.143.10:8422 \
   --json
 ```
 
@@ -1755,7 +1755,7 @@ or new region rollout:
 
 ```bash
 ./deploy/node/aeronyx-node.sh fleet-drift-check \
-  --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 \
+  --expected-endpoints http://8.213.146.244:8422,http://111.68.15.70:8422,http://34.32.67.213:8422,http://35.201.143.10:8422 \
   --json
 ```
 
@@ -1764,7 +1764,7 @@ snapshot hash:
 
 ```bash
 ./deploy/node/aeronyx-node.sh fleet-drift-check \
-  --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 \
+  --expected-endpoints http://8.213.146.244:8422,http://111.68.15.70:8422,http://34.32.67.213:8422,http://35.201.143.10:8422 \
   --expected-binary-sha256 6d4c382907011d8da0adb7038fdb62d2bc5af859aff2ddd6d43d785462af6184 \
   --json
 ```
