@@ -86,3 +86,14 @@ pub(super) struct MemoryRuntime {
     pub(super) commitment_tip_tx: mpsc::Sender<u64>,
     pub(super) commitment_tip_rx: mpsc::Receiver<u64>,
 }
+
+/// The messaging role's stores, opened together at startup.
+pub(super) struct MessagingStores {
+    pub(super) chat_relay_enabled: bool,
+    pub(super) chat_relay: Option<Arc<ChatRelayService>>,
+    pub(super) anonymous_mailbox: Option<Arc<SqliteAnonymousMailboxStore>>,
+    pub(super) blind_vault: Option<Arc<BlindVaultService>>,
+    pub(super) chat_relay_runtime_ready: bool,
+    pub(super) anonymous_mailbox_runtime_ready: bool,
+    pub(super) blind_vault_runtime_ready: bool,
+}
