@@ -161,4 +161,64 @@ impl Server {
         );
         Ok(Some(runtime))
     }
+
+    // [NODE-ROLES 2026-10-09 by Claude] Moved verbatim out of `Server::run`:
+    // opens the messaging role's stores. Explicit enablement is fail-closed,
+    // exactly as before.
+    pub(super) async fn init_messaging_stores(
+        &self,
+        storage: &Option<Arc<MemoryStorage>>,
+    ) -> Result<MessagingStores> {
+        let chat_relay_enabled = self.config.memchain.is_chat_relay_enabled();
+        let chat_relay = self.init_chat_relay_service()?;
+        let anonymous_mailbox = self.init_anonymous_mailbox_store().await?;
+        // [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Strict mode
+        // consumes only already-durable local receipts. Startup does not
+        // contact witnesses or let permissionless discovery supply authority.
+        if self.config.discovery.custody_audit_witness_startup_required {
+            let custody_storage = storage.as_deref().ok_or_else(|| {
+                ServerError::startup_failed(
+                    "Chat Relay custody witness startup guard: local_storage_unavailable",
+                )
+            })?;
+            self.verify_chat_relay_custody_witness_startup(custody_storage)
+                .await?;
+        }
+        // [BLIND-VAULT-SERVICE 2026-07-23 by Codex] This store is independent
+        // from identity-indexed MemChain and receiver-indexed ChatRelay state.
+        // Explicit enablement is fail-closed: a configured database error must
+        // stop startup rather than silently dropping encrypted recovery data.
+        let blind_vault = if self.config.blind_vault.enabled {
+            let service =
+                BlindVaultService::new(self.config.blind_vault.clone(), self.identity.clone())
+                    .map_err(|error| {
+                        ServerError::startup_failed(format!(
+                            "Blind Vault initialization failed: {error}"
+                        ))
+                    })?;
+            info!("[BLIND_VAULT] Anonymous encrypted-object store initialized");
+            Some(Arc::new(service))
+        } else {
+            info!("[BLIND_VAULT] Disabled");
+            None
+        };
+        let chat_relay_runtime_ready = chat_relay.is_some();
+        let anonymous_mailbox_runtime_ready = anonymous_mailbox.is_some();
+        // [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Admission
+        // readiness is an observed service state, not a config synonym. Run
+        // the SQLite/filesystem observation off the async startup worker.
+        let blind_vault_runtime_ready =
+            Self::observe_blind_vault_admission_readiness(blind_vault.clone(), unix_now_secs())
+                .await;
+
+        Ok(MessagingStores {
+            chat_relay_enabled,
+            chat_relay,
+            anonymous_mailbox,
+            blind_vault,
+            chat_relay_runtime_ready,
+            anonymous_mailbox_runtime_ready,
+            blind_vault_runtime_ready,
+        })
+    }
 }

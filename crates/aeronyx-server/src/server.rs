@@ -1850,7 +1850,7 @@ mod startup_network;
 mod verified_submit_ingress;
 // [NODE-ROLES 2026-10-09 by Claude] Typed per-role handles for Server::run.
 mod roles;
-use roles::{DataPlane, Directory, MemoryRuntime, MemoryStores, Messaging};
+use roles::{DataPlane, Directory, MemoryRuntime, MemoryStores, Messaging, MessagingStores};
 
 impl Server {
     pub fn new(
@@ -1957,47 +1957,17 @@ impl Server {
             );
         }
 
-        let chat_relay_enabled = self.config.memchain.is_chat_relay_enabled();
-        let chat_relay = self.init_chat_relay_service()?;
-        let anonymous_mailbox = self.init_anonymous_mailbox_store().await?;
-        // [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Strict mode
-        // consumes only already-durable local receipts. Startup does not
-        // contact witnesses or let permissionless discovery supply authority.
-        if self.config.discovery.custody_audit_witness_startup_required {
-            let custody_storage = storage.as_deref().ok_or_else(|| {
-                ServerError::startup_failed(
-                    "Chat Relay custody witness startup guard: local_storage_unavailable",
-                )
-            })?;
-            self.verify_chat_relay_custody_witness_startup(custody_storage)
-                .await?;
-        }
-        // [BLIND-VAULT-SERVICE 2026-07-23 by Codex] This store is independent
-        // from identity-indexed MemChain and receiver-indexed ChatRelay state.
-        // Explicit enablement is fail-closed: a configured database error must
-        // stop startup rather than silently dropping encrypted recovery data.
-        let blind_vault = if self.config.blind_vault.enabled {
-            let service =
-                BlindVaultService::new(self.config.blind_vault.clone(), self.identity.clone())
-                    .map_err(|error| {
-                        ServerError::startup_failed(format!(
-                            "Blind Vault initialization failed: {error}"
-                        ))
-                    })?;
-            info!("[BLIND_VAULT] Anonymous encrypted-object store initialized");
-            Some(Arc::new(service))
-        } else {
-            info!("[BLIND_VAULT] Disabled");
-            None
-        };
-        let chat_relay_runtime_ready = chat_relay.is_some();
-        let anonymous_mailbox_runtime_ready = anonymous_mailbox.is_some();
-        // [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Admission
-        // readiness is an observed service state, not a config synonym. Run
-        // the SQLite/filesystem observation off the async startup worker.
-        let blind_vault_runtime_ready =
-            Self::observe_blind_vault_admission_readiness(blind_vault.clone(), unix_now_secs())
-                .await;
+        // [NODE-ROLES 2026-10-09 by Claude] The messaging role's stores open
+        // together: chat relay, anonymous mailbox and Blind Vault.
+        let MessagingStores {
+            chat_relay_enabled,
+            chat_relay,
+            anonymous_mailbox,
+            blind_vault,
+            chat_relay_runtime_ready,
+            anonymous_mailbox_runtime_ready,
+            blind_vault_runtime_ready,
+        } = self.init_messaging_stores(&storage).await?;
 
         let peer_store = self
             .init_peer_store_with_storage_runtime(
@@ -2143,95 +2113,32 @@ impl Server {
         } else {
             None
         };
-        if let Some(task) = self.spawn_peer_store_persistence_task(
-            Arc::clone(&peer_store),
-            Arc::clone(&peer_http_clients.control),
-        ) {
-            tasks.push(("peer-cache-persistence", task));
-        }
-        if let Some(task) = self.spawn_directory_chain_persistence_task(
-            Arc::clone(&peer_store),
-            directory_chain_store.clone(),
-        ) {
-            tasks.push(("directory-chain-persistence", task));
-        }
-        if let Some(task) = self.spawn_directory_replica_sync_task(
-            Arc::clone(&peer_store),
-            directory_replica_store.clone(),
-            Arc::clone(&directory_replica_sync_runtime),
-            Arc::clone(&peer_http_clients.directory_sync),
-        )? {
-            tasks.push((
-                "directory-replica-sync",
-                Self::supervise_required_runtime_task(
-                    "directory-replica-sync",
-                    task,
-                    Arc::clone(&self.shutdown),
-                    critical_failure_tx.clone(),
-                ),
-            ));
-        }
-        if let Some(task) = self.spawn_discovery_gossip_task(
-            Arc::clone(&peer_store),
-            directory_replica_store.clone(),
+        // [NODE-ROLES 2026-10-09 by Claude] Peer-cache, directory-chain,
+        // directory-replica and discovery-gossip background tasks.
+        self.spawn_discovery_tasks(
+            &peer_store,
+            &peer_http_clients,
+            &directory_chain_store,
+            &directory_replica_store,
+            &directory_replica_sync_runtime,
             chat_relay_runtime_ready,
-            blind_vault.clone(),
             anonymous_mailbox_runtime_ready,
-            Arc::clone(&peer_http_clients.gossip),
-        ) {
-            tasks.push(("discovery-gossip", task));
-        }
+            &blind_vault,
+            &mut tasks,
+            &critical_failure_tx,
+        )?;
 
-        if let Some(ref relay) = chat_relay {
-            let relay_cleanup_task = self.spawn_chat_relay_cleanup_task(Arc::clone(relay));
-            tasks.push(("chat-relay-cleanup", relay_cleanup_task));
-
-            let routes = Arc::clone(&relay.wallet_routes);
-            let mut rx = self.shutdown_tx.subscribe();
-            tasks.push((
-                "wallet-routes-cleanup",
-                tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_secs(60));
-                    loop {
-                        tokio::select! {
-                            _ = rx.recv() => break,
-                            _ = interval.tick() => {
-                                let evicted = routes.cleanup_stale(Duration::from_secs(300));
-                                if evicted > 0 {
-                                    debug!(evicted, "[CHAT_RELAY] Stale wallet routes evicted");
-                                }
-                            }
-                        }
-                    }
-                }),
-            ));
-            info!("[CHAT_RELAY] Wallet route cleanup task started (ttl=300s, interval=60s)");
-        }
-
-        let anonymous_mailbox_cleanup_runtime_supervised = if let Some(cleanup_task) = self
-            .spawn_anonymous_mailbox_cleanup_task(
-                anonymous_mailbox.clone(),
-                anonymous_mailbox_source_journal,
-            ) {
-            tasks.push((
-                "anonymous-mailbox-cleanup",
-                Self::supervise_required_runtime_task(
-                    "anonymous-mailbox-cleanup",
-                    cleanup_task,
-                    Arc::clone(&self.shutdown),
-                    critical_failure_tx.clone(),
-                ),
-            ));
-            true
-        } else {
-            false
-        };
-
-        if let Some(ref vault) = blind_vault {
-            let cleanup_task = self.spawn_blind_vault_cleanup_task(Arc::clone(vault));
-            tasks.push(("blind-vault-cleanup", cleanup_task));
-        }
-
+        // [NODE-ROLES 2026-10-09 by Claude] Cleanup loops for the messaging
+        // role. Returns whether the mailbox cleanup loop is a supervised
+        // required task; API readiness is reported only when it is.
+        let anonymous_mailbox_cleanup_runtime_supervised = self.spawn_messaging_tasks(
+            chat_relay.clone(),
+            anonymous_mailbox.clone(),
+            anonymous_mailbox_source_journal,
+            blind_vault.clone(),
+            &mut tasks,
+            &critical_failure_tx,
+        );
         // [NODE-ROLES 2026-10-09 by Claude] The role handles the API and the
         // memory tasks read, built once every role above is up.
         let directory = Directory {

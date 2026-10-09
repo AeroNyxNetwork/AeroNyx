@@ -568,4 +568,126 @@ impl Server {
             }
         })
     }
+
+    // [NODE-ROLES 2026-10-09 by Claude] Moved verbatim out of `Server::run`:
+    // the messaging role's cleanup loops. Returns whether the anonymous
+    // mailbox cleanup loop is registered as a supervised required task.
+    pub(super) fn spawn_messaging_tasks(
+        &self,
+        chat_relay: Option<Arc<ChatRelayService>>,
+        anonymous_mailbox: Option<Arc<SqliteAnonymousMailboxStore>>,
+        anonymous_mailbox_source_journal: Option<Arc<SqliteAnonymousMailboxSourceJournal>>,
+        blind_vault: Option<Arc<BlindVaultService>>,
+        tasks: &mut RuntimeTaskRegistry,
+        critical_failure_tx: &mpsc::Sender<CriticalRuntimeFailure>,
+    ) -> bool {
+        if let Some(ref relay) = chat_relay {
+            let relay_cleanup_task = self.spawn_chat_relay_cleanup_task(Arc::clone(relay));
+            tasks.push(("chat-relay-cleanup", relay_cleanup_task));
+
+            let routes = Arc::clone(&relay.wallet_routes);
+            let mut rx = self.shutdown_tx.subscribe();
+            tasks.push((
+                "wallet-routes-cleanup",
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(60));
+                    loop {
+                        tokio::select! {
+                            _ = rx.recv() => break,
+                            _ = interval.tick() => {
+                                let evicted = routes.cleanup_stale(Duration::from_secs(300));
+                                if evicted > 0 {
+                                    debug!(evicted, "[CHAT_RELAY] Stale wallet routes evicted");
+                                }
+                            }
+                        }
+                    }
+                }),
+            ));
+            info!("[CHAT_RELAY] Wallet route cleanup task started (ttl=300s, interval=60s)");
+        }
+
+        let anonymous_mailbox_cleanup_runtime_supervised = if let Some(cleanup_task) = self
+            .spawn_anonymous_mailbox_cleanup_task(
+                anonymous_mailbox.clone(),
+                anonymous_mailbox_source_journal,
+            ) {
+            tasks.push((
+                "anonymous-mailbox-cleanup",
+                Self::supervise_required_runtime_task(
+                    "anonymous-mailbox-cleanup",
+                    cleanup_task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
+            true
+        } else {
+            false
+        };
+
+        if let Some(ref vault) = blind_vault {
+            let cleanup_task = self.spawn_blind_vault_cleanup_task(Arc::clone(vault));
+            tasks.push(("blind-vault-cleanup", cleanup_task));
+        }
+        anonymous_mailbox_cleanup_runtime_supervised
+    }
+
+    // [NODE-ROLES 2026-10-09 by Claude] Moved verbatim out of `Server::run`:
+    // peer-cache persistence, directory-chain persistence, directory-replica
+    // sync and discovery gossip.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn spawn_discovery_tasks(
+        &self,
+        peer_store: &Arc<PeerStore>,
+        peer_http_clients: &PeerHttpClients,
+        directory_chain_store: &Option<Arc<DirectoryChainStore>>,
+        directory_replica_store: &Option<Arc<DirectoryReplicaStore>>,
+        directory_replica_sync_runtime: &Arc<DirectoryReplicaSyncRuntime>,
+        chat_relay_runtime_ready: bool,
+        anonymous_mailbox_runtime_ready: bool,
+        blind_vault: &Option<Arc<BlindVaultService>>,
+        tasks: &mut RuntimeTaskRegistry,
+        critical_failure_tx: &mpsc::Sender<CriticalRuntimeFailure>,
+    ) -> Result<()> {
+        if let Some(task) = self.spawn_peer_store_persistence_task(
+            Arc::clone(&peer_store),
+            Arc::clone(&peer_http_clients.control),
+        ) {
+            tasks.push(("peer-cache-persistence", task));
+        }
+        if let Some(task) = self.spawn_directory_chain_persistence_task(
+            Arc::clone(&peer_store),
+            directory_chain_store.clone(),
+        ) {
+            tasks.push(("directory-chain-persistence", task));
+        }
+        if let Some(task) = self.spawn_directory_replica_sync_task(
+            Arc::clone(&peer_store),
+            directory_replica_store.clone(),
+            Arc::clone(&directory_replica_sync_runtime),
+            Arc::clone(&peer_http_clients.directory_sync),
+        )? {
+            tasks.push((
+                "directory-replica-sync",
+                Self::supervise_required_runtime_task(
+                    "directory-replica-sync",
+                    task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
+        }
+        if let Some(task) = self.spawn_discovery_gossip_task(
+            Arc::clone(&peer_store),
+            directory_replica_store.clone(),
+            chat_relay_runtime_ready,
+            blind_vault.clone(),
+            anonymous_mailbox_runtime_ready,
+            Arc::clone(&peer_http_clients.gossip),
+        ) {
+            tasks.push(("discovery-gossip", task));
+        }
+        Ok(())
+    }
 }
