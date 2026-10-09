@@ -697,6 +697,20 @@ const MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS: usize = 64;
 /// occupying Tokio workers or creating an unbounded blocking-task backlog.
 const MAX_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT: usize = 8;
 
+/// Floor for concurrent blind-relay cryptographic workers on small hosts.
+///
+/// [NODE-CAPACITY 2026-10-09 by Claude] Half the CPU threads, rounded up,
+/// gave one worker on 1-2 vCPU hosts, and ingress keeps one total permit in
+/// reserve, so ingress was also one. Admission is `try_acquire`: two
+/// requests arriving within the same sub-millisecond operation made the
+/// second fail with `Backpressure`, so a small relay or a Phala `tdx.small`
+/// node shed ordinary concurrent onion traffic. Each operation is a
+/// signature check, an X25519 peel or a signing step, so a few of them
+/// timeshare a single core without harm, and one permit saturated by an
+/// attacker already consumes a whole core. Four total leaves three for
+/// ingress and the reserved progress permit for outbound and completion.
+const MIN_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT: usize = 4;
+
 /// Process-wide total admission for CPU-bound blind-relay cryptography.
 static BLIND_RELAY_CRYPTO_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
@@ -1757,6 +1771,7 @@ use blind_relay::authenticate_peer_blind_relay_request_with_admission;
 use blind_relay::authenticate_peer_blind_relay_request_with_permits;
 use blind_relay::begin_blind_relay_route;
 use blind_relay::blind_relay_authenticated_request_commitment;
+use blind_relay::blind_relay_capacity_for_threads;
 use blind_relay::blind_relay_crypto_admission;
 use blind_relay::blind_relay_crypto_capacity;
 use blind_relay::blind_relay_failure_response;

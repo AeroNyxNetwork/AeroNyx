@@ -217,8 +217,31 @@ pub(super) fn build_blind_relay_failure_response(
         .into_response()
 }
 
+/// Concurrent blind-relay crypto workers for a host with `hardware_threads`:
+/// half the threads rounded up, never below
+/// `MIN_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT` and never above
+/// `MAX_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT`.
+///
+/// A pure function so the policy can be tested for any core count; the
+/// runtime value below feeds it the detected parallelism.
+pub(super) fn blind_relay_capacity_for_threads(hardware_threads: usize) -> usize {
+    (hardware_threads.saturating_add(1) / 2)
+        .max(MIN_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT)
+        .min(MAX_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT)
+}
+
 pub(super) fn blind_relay_crypto_capacity() -> usize {
-    signature_verification_capacity(MAX_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT)
+    // [CI-DETERMINISTIC-CAPACITY 2026-10-09 by Claude] Unit tests share these
+    // process-global semaphores and run in parallel, so they use the fixed
+    // ceiling instead of the host's core count.
+    if cfg!(test) {
+        return MAX_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT;
+    }
+    blind_relay_capacity_for_threads(
+        std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(1),
+    )
 }
 
 pub(super) fn blind_relay_ingress_crypto_capacity(total_capacity: usize) -> usize {

@@ -2871,3 +2871,63 @@ async fn blind_relay_forward_retries_timeout_without_endpoint_leak() {
             && !event.detail.contains("opaque encrypted relay bytes")
     }));
 }
+
+#[test]
+fn blind_relay_crypto_capacity_has_a_floor_on_small_hosts() {
+    // [NODE-CAPACITY 2026-10-09 by Claude] One or two vCPUs used to yield a
+    // single ingress permit, so concurrent onion requests shed Backpressure.
+    let table = [
+        (0usize, 4usize),
+        (1, 4),
+        (2, 4),
+        (4, 4),
+        (8, 4),
+        (9, 5),
+        (14, 7),
+        (16, 8),
+        (64, 8),
+        (usize::MAX, 8),
+    ];
+    for (threads, expected) in table {
+        assert_eq!(
+            blind_relay_capacity_for_threads(threads),
+            expected,
+            "capacity for {threads} hardware threads"
+        );
+    }
+}
+
+#[test]
+fn blind_relay_ingress_keeps_a_reserved_progress_permit_at_every_size() {
+    for threads in [1usize, 2, 3, 4, 8, 16, 64] {
+        let total = blind_relay_capacity_for_threads(threads);
+        let ingress = blind_relay_ingress_crypto_capacity(total);
+        assert!(ingress >= 3, "{threads} threads: ingress {ingress}");
+        assert!(
+            ingress < total,
+            "{threads} threads: ingress {ingress} must leave one of {total} for outbound/completion"
+        );
+    }
+}
+
+#[test]
+fn a_one_core_host_admits_concurrent_ingress_instead_of_shedding_the_second() {
+    // [NODE-CAPACITY 2026-10-09 by Claude] The failure this fixes: with a
+    // single hardware thread the ingress semaphore had one permit, so a second
+    // request arriving while the first was still in its crypto step got
+    // `Backpressure` from `try_acquire`.
+    let total = blind_relay_capacity_for_threads(1);
+    let ingress = Arc::new(Semaphore::new(blind_relay_ingress_crypto_capacity(total)));
+    let held: Vec<_> = (0..3)
+        .map(|n| {
+            Arc::clone(&ingress)
+                .try_acquire_owned()
+                .unwrap_or_else(|_| panic!("ingress request {n} was shed on a one-core host"))
+        })
+        .collect();
+    assert!(
+        Arc::clone(&ingress).try_acquire_owned().is_err(),
+        "admission must still be bounded"
+    );
+    drop(held);
+}
