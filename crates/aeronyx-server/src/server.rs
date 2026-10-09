@@ -2061,66 +2061,12 @@ impl Server {
             peer_http_clients.control.as_ref(),
         )
         .await;
-        let directory_chain_store = self.init_directory_chain(&peer_store).await?;
-        let directory_replica_store = self.init_directory_replica().await?;
-        let directory_replica_sync_runtime = Arc::new(DirectoryReplicaSyncRuntime::default());
-        if let Some(ref commitment_storage) = storage {
-            self.verify_memchain_commitment_startup_witnesses(
-                commitment_storage,
-                &peer_store,
-                peer_http_clients.control.as_ref(),
-            )
-            .await?;
-        }
-        let commitment_coordinator_lease_instance = if let Some(ref commitment_storage) = storage {
-            self.acquire_memchain_commitment_coordinator_lease(
-                commitment_storage,
-                &peer_store,
-                peer_http_clients.control.as_ref(),
-            )
-            .await?
-        } else {
-            None
-        };
-        if let Some(task) = self.spawn_peer_store_persistence_task(
-            Arc::clone(&peer_store),
-            Arc::clone(&peer_http_clients.control),
-        ) {
-            tasks.push(("peer-cache-persistence", task));
-        }
-        if let Some(task) = self.spawn_directory_chain_persistence_task(
-            Arc::clone(&peer_store),
-            directory_chain_store.clone(),
-        ) {
-            tasks.push(("directory-chain-persistence", task));
-        }
-        if let Some(task) = self.spawn_directory_replica_sync_task(
-            Arc::clone(&peer_store),
-            directory_replica_store.clone(),
-            Arc::clone(&directory_replica_sync_runtime),
-            Arc::clone(&peer_http_clients.directory_sync),
-        )? {
-            tasks.push((
-                "directory-replica-sync",
-                Self::supervise_required_runtime_task(
-                    "directory-replica-sync",
-                    task,
-                    Arc::clone(&self.shutdown),
-                    critical_failure_tx.clone(),
-                ),
-            ));
-        }
-        if let Some(task) = self.spawn_discovery_gossip_task(
-            Arc::clone(&peer_store),
-            directory_replica_store.clone(),
-            chat_relay_runtime_ready,
-            blind_vault.clone(),
-            anonymous_mailbox_runtime_ready,
-            Arc::clone(&peer_http_clients.gossip),
-        ) {
-            tasks.push(("discovery-gossip", task));
-        }
-
+        // [VPN-BEFORE-DIRECTORY 2026-10-09 by Claude] Bring the VPN data
+        // plane (UDP, TUN, gateway DNS, sessions, management, keepalive) up
+        // before the Directory Chain/replica startup audits. Nothing below
+        // depends on the directory stores; on JP1 those audits held VPN
+        // users offline for ~98 s per restart and grew with chain length.
+        // Directory features still start only after their audits pass.
         let udp = Arc::new(
             UdpTransport::bind_addr(self.config.listen_addr())
                 .await
@@ -2316,6 +2262,67 @@ impl Server {
             );
             tasks.push(("vpn-keepalive", keepalive_task));
         }
+
+        let directory_chain_store = self.init_directory_chain(&peer_store).await?;
+        let directory_replica_store = self.init_directory_replica().await?;
+        let directory_replica_sync_runtime = Arc::new(DirectoryReplicaSyncRuntime::default());
+        if let Some(ref commitment_storage) = storage {
+            self.verify_memchain_commitment_startup_witnesses(
+                commitment_storage,
+                &peer_store,
+                peer_http_clients.control.as_ref(),
+            )
+            .await?;
+        }
+        let commitment_coordinator_lease_instance = if let Some(ref commitment_storage) = storage {
+            self.acquire_memchain_commitment_coordinator_lease(
+                commitment_storage,
+                &peer_store,
+                peer_http_clients.control.as_ref(),
+            )
+            .await?
+        } else {
+            None
+        };
+        if let Some(task) = self.spawn_peer_store_persistence_task(
+            Arc::clone(&peer_store),
+            Arc::clone(&peer_http_clients.control),
+        ) {
+            tasks.push(("peer-cache-persistence", task));
+        }
+        if let Some(task) = self.spawn_directory_chain_persistence_task(
+            Arc::clone(&peer_store),
+            directory_chain_store.clone(),
+        ) {
+            tasks.push(("directory-chain-persistence", task));
+        }
+        if let Some(task) = self.spawn_directory_replica_sync_task(
+            Arc::clone(&peer_store),
+            directory_replica_store.clone(),
+            Arc::clone(&directory_replica_sync_runtime),
+            Arc::clone(&peer_http_clients.directory_sync),
+        )? {
+            tasks.push((
+                "directory-replica-sync",
+                Self::supervise_required_runtime_task(
+                    "directory-replica-sync",
+                    task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
+        }
+        if let Some(task) = self.spawn_discovery_gossip_task(
+            Arc::clone(&peer_store),
+            directory_replica_store.clone(),
+            chat_relay_runtime_ready,
+            blind_vault.clone(),
+            anonymous_mailbox_runtime_ready,
+            Arc::clone(&peer_http_clients.gossip),
+        ) {
+            tasks.push(("discovery-gossip", task));
+        }
+
 
         if let Some(ref relay) = chat_relay {
             let relay_cleanup_task = self.spawn_chat_relay_cleanup_task(Arc::clone(relay));
