@@ -161,6 +161,23 @@ pub struct DirectoryChainStore {
     connection: Mutex<Connection>,
     path: PathBuf,
     producer: [u8; 32],
+    /// [INCREMENTAL-CHAIN-AUDIT 2026-10-09 by Claude] Last complete-or-
+    /// extended audit, valid only while no other SQLite connection has
+    /// written the file (`PRAGMA data_version` unchanged).
+    audit_checkpoint: Mutex<Option<AuditCheckpoint>>,
+}
+
+/// A verified audit plus the connection-local data version it was read at.
+///
+/// SQLite changes `PRAGMA data_version` on this connection whenever any
+/// *other* connection or process commits to the file, and never for this
+/// connection's own commits. While it is unchanged, every row up to
+/// `report.tip_height` is exactly what was verified, so only later blocks
+/// need verification; any outside write forces a complete audit again.
+#[derive(Debug, Clone, Copy)]
+struct AuditCheckpoint {
+    data_version: i64,
+    report: DirectoryChainAudit,
 }
 
 #[derive(Debug)]
@@ -214,6 +231,7 @@ impl DirectoryChainStore {
             connection: Mutex::new(connection),
             path,
             producer,
+            audit_checkpoint: Mutex::new(None),
         };
         let audit = store.audit(observed_at)?;
         Ok((store, audit))
@@ -347,15 +365,34 @@ impl DirectoryChainStore {
     /// orphaned/extra commitment index.
     pub fn audit(&self, observed_at: u64) -> Result<DirectoryChainAudit, DirectoryChainStoreError> {
         let connection = self.connection.lock();
+        let data_version: i64 =
+            connection.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        // [INCREMENTAL-CHAIN-AUDIT 2026-10-09 by Claude] Previously every
+        // call re-verified the whole chain; peer directory requests call this
+        // per request (~24 s on a 56k-block chain). With an unchanged data
+        // version only blocks after the verified tip are new.
+        let base = (*self.audit_checkpoint.lock())
+            .filter(|checkpoint| checkpoint.data_version == data_version);
+        let after_height = base.map_or(0, |checkpoint| checkpoint.report.tip_height);
+        let after_height_sql = i64::try_from(after_height).map_err(|_| {
+            DirectoryChainStoreError::Integrity("audit checkpoint height exceeds i64".to_string())
+        })?;
         Self::validate_metadata(&connection, &self.producer)?;
-        let rows = Self::load_all_block_rows(&connection)?;
-        let mut indexed_commitments = Self::load_commitment_index(&connection)?;
-        let mut descriptor_objects = Self::load_descriptor_objects(&connection)?;
+        if let Some(checkpoint) = base {
+            Self::verify_checkpoint_tip(&connection, &checkpoint.report)?;
+        }
+        let rows = Self::load_block_rows_after(&connection, after_height_sql)?;
+        let mut indexed_commitments = Self::load_commitment_index_after(&connection, after_height_sql)?;
+        let mut descriptor_objects =
+            Self::load_descriptor_objects_after(&connection, after_height_sql)?;
+        let totals = Self::row_totals(&connection)?;
         drop(connection);
-        let mut report = DirectoryChainAudit::empty();
-        let mut expected_height = 1u64;
-        let mut expected_previous_hash = [0u8; 32];
-        let mut previous_timestamp = 0u64;
+        let mut report = base.map_or(DirectoryChainAudit::empty(), |checkpoint| checkpoint.report);
+        let mut expected_height = report.tip_height.checked_add(1).ok_or_else(|| {
+            DirectoryChainStoreError::Integrity("directory chain height exhausted".to_string())
+        })?;
+        let mut expected_previous_hash = report.tip_hash;
+        let mut previous_timestamp = report.tip_timestamp;
 
         for row in rows {
             let block = decode_block(&row.block_blob)?;
@@ -440,6 +477,18 @@ impl DirectoryChainStore {
                 "descriptor object store contains uncommitted records".to_string(),
             ));
         }
+        // Every commitment owns exactly one descriptor object, so the three
+        // table sizes are fixed by the verified report. This is what lets an
+        // extended audit skip rows at or below the checkpoint.
+        if totals != (report.blocks, report.commitments, report.commitments) {
+            return Err(DirectoryChainStoreError::Integrity(
+                "directory chain table sizes do not match the verified chain".to_string(),
+            ));
+        }
+        *self.audit_checkpoint.lock() = Some(AuditCheckpoint {
+            data_version,
+            report,
+        });
         Ok(report)
     }
 
@@ -954,15 +1003,54 @@ impl DirectoryChainStore {
         Ok(())
     }
 
-    fn load_all_block_rows(
+    /// `(blocks, commitment index rows, descriptor objects)`.
+    fn row_totals(connection: &Connection) -> Result<(u64, u64, u64), DirectoryChainStoreError> {
+        let count = |table: &str| -> Result<u64, DirectoryChainStoreError> {
+            let value: i64 =
+                connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?;
+            nonnegative_i64_to_u64(value, "table row count")
+        };
+        Ok((
+            count("directory_chain_blocks")?,
+            count("directory_chain_commitments")?,
+            count("directory_descriptor_objects")?,
+        ))
+    }
+
+    /// The checkpoint's tip row must still be the verified block.
+    fn verify_checkpoint_tip(
         connection: &Connection,
+        report: &DirectoryChainAudit,
+    ) -> Result<(), DirectoryChainStoreError> {
+        if report.tip_height == 0 {
+            return Ok(());
+        }
+        let height = i64::try_from(report.tip_height).map_err(|_| {
+            DirectoryChainStoreError::Integrity("audit checkpoint height exceeds i64".to_string())
+        })?;
+        let stored: Vec<u8> = connection.query_row(
+            "SELECT block_hash FROM directory_chain_blocks WHERE height = ?1",
+            [height],
+            |row| row.get(0),
+        )?;
+        if bytes32(&stored, "checkpoint tip hash")? != report.tip_hash {
+            return Err(DirectoryChainStoreError::Integrity(
+                "verified tip block changed without an outside write".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_block_rows_after(
+        connection: &Connection,
+        after_height: i64,
     ) -> Result<Vec<StoredBlockRow>, DirectoryChainStoreError> {
         let mut statement = connection.prepare(
             "SELECT height, block_hash, prev_block_hash, produced_at,
                     commitment_count, block_blob
-             FROM directory_chain_blocks ORDER BY height ASC",
+             FROM directory_chain_blocks WHERE height > ?1 ORDER BY height ASC",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map([after_height], |row| {
             Ok(StoredBlockRow {
                 height: row.get(0)?,
                 block_hash: row.get(1)?,
@@ -976,15 +1064,16 @@ impl DirectoryChainStore {
             .map_err(DirectoryChainStoreError::from)
     }
 
-    fn load_commitment_index(
+    fn load_commitment_index_after(
         connection: &Connection,
+        after_height: i64,
     ) -> Result<BTreeMap<i64, Vec<DirectoryDescriptorCommitmentV1>>, DirectoryChainStoreError> {
         let mut statement = connection.prepare(
             "SELECT block_height, commitment_hash, node_id, sequence_le, descriptor_hash
-             FROM directory_chain_commitments
+             FROM directory_chain_commitments WHERE block_height > ?1
              ORDER BY block_height ASC, commitment_hash ASC",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map([after_height], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -1016,14 +1105,21 @@ impl DirectoryChainStore {
         Ok(index)
     }
 
-    fn load_descriptor_objects(
+    /// Objects referenced by commitments above `after_height`; with
+    /// `after_height = 0` this is every object, including unreferenced ones
+    /// (those are detected by the table-size check).
+    fn load_descriptor_objects_after(
         connection: &Connection,
+        after_height: i64,
     ) -> Result<BTreeMap<[u8; 32], DirectoryDescriptorCommitmentV1>, DirectoryChainStoreError> {
         let mut statement = connection.prepare(
             "SELECT descriptor_hash, node_id, sequence_le, descriptor_blob
-             FROM directory_descriptor_objects ORDER BY descriptor_hash ASC",
+             FROM directory_descriptor_objects
+             WHERE ?1 = 0 OR descriptor_hash IN (
+                 SELECT descriptor_hash FROM directory_chain_commitments WHERE block_height > ?1)
+             ORDER BY descriptor_hash ASC",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map([after_height], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -1478,5 +1574,88 @@ mod tests {
         drop(connection);
 
         assert!(DirectoryChainStore::open(&path, producer.public_key_bytes(), NOW + 1).is_err());
+    }
+
+    // [INCREMENTAL-CHAIN-AUDIT 2026-10-09 by Claude]
+    #[test]
+    fn extended_audit_after_own_appends_equals_a_complete_audit() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let producer = IdentityKeyPair::from_bytes(&[0x81; 32]).unwrap();
+        let (store, _) =
+            DirectoryChainStore::open(&path, producer.public_key_bytes(), NOW).unwrap();
+        for (seed, sequence) in [(0x82u8, 1u64), (0x83, 1), (0x82, 2)] {
+            let peer = IdentityKeyPair::from_bytes(&[seed; 32]).unwrap();
+            store
+                .append_descriptors(&[signed_descriptor(&peer, sequence, "peer.example:8422")], NOW, &producer)
+                .unwrap();
+            // Each audit after an own append extends the checkpoint.
+            store.audit(NOW + 1).unwrap();
+        }
+        let extended = store.audit(NOW + 2).unwrap();
+        drop(store);
+        let (_, complete) =
+            DirectoryChainStore::open(&path, producer.public_key_bytes(), NOW + 2).unwrap();
+        assert_eq!(extended, complete);
+        assert_eq!(complete.blocks, 3);
+    }
+
+    #[test]
+    fn outside_write_after_checkpoint_forces_a_complete_audit_that_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let producer = IdentityKeyPair::from_bytes(&[0x84; 32]).unwrap();
+        let peer = IdentityKeyPair::from_bytes(&[0x85; 32]).unwrap();
+        let (store, _) =
+            DirectoryChainStore::open(&path, producer.public_key_bytes(), NOW).unwrap();
+        store
+            .append_descriptors(&[signed_descriptor(&peer, 1, "peer.example:8422")], NOW, &producer)
+            .unwrap();
+        store.audit(NOW + 1).unwrap();
+        let later = IdentityKeyPair::from_bytes(&[0x86; 32]).unwrap();
+        store
+            .append_descriptors(&[signed_descriptor(&later, 1, "later.example:8422")], NOW, &producer)
+            .unwrap();
+        // Tamper with a row at or below the checkpoint through another
+        // connection while the store stays open.
+        let outside = Connection::open(&path).unwrap();
+        outside
+            .execute(
+                "UPDATE directory_chain_commitments SET node_id = zeroblob(32) WHERE block_height = 1",
+                [],
+            )
+            .unwrap();
+        drop(outside);
+        assert!(store.audit(NOW + 2).is_err());
+        assert!(store.audited_tip(NOW + 2).is_err());
+    }
+
+    /// Manual measurement against a copy of a real store:
+    /// `AERONYX_DIRECTORY_CHAIN_BENCH_DB=/copy/directory-chain.db
+    ///  AERONYX_DIRECTORY_CHAIN_BENCH_PRODUCER=<hex node id>
+    ///  cargo test --release -p aeronyx-server --lib -- --ignored --nocapture directory_chain_audit_timing`
+    #[test]
+    #[ignore = "manual timing against a copied production store"]
+    fn directory_chain_audit_timing() {
+        let path = std::env::var("AERONYX_DIRECTORY_CHAIN_BENCH_DB").unwrap();
+        let producer: [u8; 32] = hex::decode(std::env::var("AERONYX_DIRECTORY_CHAIN_BENCH_PRODUCER").unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let started = std::time::Instant::now();
+        let (store, complete) = DirectoryChainStore::open(&path, producer, now).unwrap();
+        let open_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let extended = store.audit(now).unwrap();
+        let extended_elapsed = started.elapsed();
+        assert_eq!(complete, extended);
+        println!(
+            "TIMING blocks={} commitments={} open_complete_audit={:?} next_audit={:?}",
+            complete.blocks, complete.commitments, open_elapsed, extended_elapsed
+        );
     }
 }
