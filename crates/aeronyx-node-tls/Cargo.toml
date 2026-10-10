@@ -1,0 +1,39 @@
+# ============================================
+# File: crates/aeronyx-node-tls/Cargo.toml
+# ============================================
+# [NODE-TLS-BINDING 2026-10-10 by Claude] Identity-bound TLS for node
+# endpoints: no domain and no certificate authority. One implementation of the
+# binding format and its verification, shared by the node and (vendored,
+# hash-pinned) the Flutter client's Rust crate.
+#
+# The default build is verification only and bytes-in/bytes-out (no I/O, no
+# async). Certificate generation needs rcgen and is behind `generate`, which
+# only the node enables. Dalek versions match aeronyx-mailbox-wire, i.e. what
+# the client already locks.
+# ============================================
+
+[package]
+name = "aeronyx-node-tls"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "AeroNyx identity-bound TLS certificates for node endpoints"
+publish = false
+
+[features]
+default = []
+generate = ["dep:rcgen"]
+
+[dependencies]
+ed25519-dalek = "2.1"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "1.0"
+x509-cert = { version = "0.3", default-features = false }
+der = { version = "0.8", default-features = false, features = ["alloc"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"], optional = true }
+
+[dev-dependencies]
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+serde_json = "1"

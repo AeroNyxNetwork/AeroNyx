@@ -465,6 +465,16 @@ pub struct DiscoveryConfig {
     /// by default so existing deployments never expose the full local API.
     #[serde(default)]
     pub public_api_listen_addr: Option<SocketAddr>,
+    /// Serves identity-bound TLS on the public API listener's own port.
+    ///
+    /// [NODE-TLS-BINDING 2026-10-10 by Claude] The listener tells TLS from
+    /// plain HTTP by the first byte, so one port serves both and operators
+    /// open nothing new. The certificate is self-signed and endorsed by this
+    /// node's identity (`aeronyx-node-tls`), which lets clients and peers that
+    /// know the node id reach it over HTTPS with neither a domain nor a CA.
+    /// Plain HTTP on the same port is unchanged.
+    #[serde(default = "DiscoveryConfig::default_public_api_identity_tls")]
+    pub public_api_identity_tls: bool,
     // [PERMISSIONLESS-ENDPOINT-PROOF 2026-09-24 by Codex] Roll out public
     // candidate verification independently from ordinary discovery.
     /// Enables descriptor-authenticated endpoint proof routes on the public listener.
@@ -541,6 +551,12 @@ pub struct DiscoveryConfig {
 }
 
 impl DiscoveryConfig {
+    /// Identity-bound TLS on the public listener is on unless disabled.
+    #[must_use]
+    pub const fn default_public_api_identity_tls() -> bool {
+        true
+    }
+
     /// Default self advertisement behavior when discovery is enabled.
     #[must_use]
     pub const fn default_advertise_self() -> bool {
@@ -1775,6 +1791,7 @@ impl Default for DiscoveryConfig {
             require_route_domain_attestations_for_multi_hop: false,
             public_endpoint: None,
             public_api_listen_addr: None,
+            public_api_identity_tls: Self::default_public_api_identity_tls(),
             permissionless_endpoint_proof_enabled: false,
             permissionless_endpoint_proof_max_entries:
                 Self::default_permissionless_endpoint_proof_max_entries(),

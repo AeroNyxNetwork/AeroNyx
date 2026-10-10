@@ -101,6 +101,24 @@ impl Server {
             chat_relay_runtime_ready,
         );
         let node_identity = Arc::new(self.identity.clone());
+        // [NODE-TLS-BINDING 2026-10-10 by Claude] Generate the first bound
+        // certificate before anything is served; a node configured for TLS
+        // that cannot produce one fails startup instead of silently serving
+        // HTTP only.
+        let public_identity_tls = if public_api_listener.is_some()
+            && self.config.discovery.public_api_identity_tls
+        {
+            Some(Arc::new(
+                super::public_tls::IdentityTls::new(Arc::clone(&node_identity), unix_now_secs())
+                    .map_err(|error| {
+                        ServerError::startup_failed(format!(
+                            "Public API identity TLS unavailable: {error}"
+                        ))
+                    })?,
+            ))
+        } else {
+            None
+        };
         // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Open every
         // private evidence gate before any public route or task is exposed.
         // Disabled mode allocates no DB, key, responder, or scheduler.
@@ -314,6 +332,7 @@ impl Server {
                         public_addr,
                         public_listener,
                         public_app,
+                        public_identity_tls,
                         shutdown_rx_public,
                     )
                     .await
@@ -770,20 +789,54 @@ impl Server {
         listen_addr: SocketAddr,
         listener: tokio::net::TcpListener,
         app: axum::Router,
-        shutdown_rx: broadcast::Receiver<()>,
+        identity_tls: Option<Arc<super::public_tls::IdentityTls>>,
+        mut shutdown_rx: broadcast::Receiver<()>,
     ) -> RequiredApiListenerExit {
         info!(
-            "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/discovery/peer/directory/*, /api/chat/peer/*, /api/memchain/peer/block-announce, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint, /api/memchain/peer/coordinator-lease, /api/memchain/peer/custody-audit-anchor-witness, /api/discovery/peer/verified-delivery-anchor-witness)",
-            listen_addr
+            "[DISCOVERY] Public node API on {} (routes: /api/discovery/*, /api/discovery/peer/directory/*, /api/chat/peer/*, /api/memchain/peer/block-announce, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint, /api/memchain/peer/coordinator-lease, /api/memchain/peer/custody-audit-anchor-witness, /api/discovery/peer/verified-delivery-anchor-witness)",
+            super::public_tls::describe(listen_addr, identity_tls.is_some())
         );
-        Self::serve_required_api_listener(
-            "public_node_api",
-            listen_addr,
+        let Some(identity_tls) = identity_tls else {
+            return Self::serve_required_api_listener(
+                "public_node_api",
+                listen_addr,
+                listener,
+                app,
+                shutdown_rx,
+            )
+            .await;
+        };
+        // [NODE-TLS-BINDING 2026-10-10 by Claude] Same supervision contract
+        // as `serve_required_api_listener`: the terminal result goes back to
+        // the listener group.
+        let result = super::public_tls::serve_http_and_identity_tls(
             listener,
             app,
-            shutdown_rx,
+            identity_tls,
+            unix_now_secs,
+            async move {
+                let _ = shutdown_rx.recv().await;
+            },
         )
-        .await
+        .await;
+        match result.as_ref() {
+            Ok(()) => info!(
+                listener_role = "public_node_api",
+                address = %listen_addr,
+                "[API] Required listener stopped"
+            ),
+            Err(error) => error!(
+                listener_role = "public_node_api",
+                address = %listen_addr,
+                %error,
+                "[API] Required listener failed"
+            ),
+        }
+        RequiredApiListenerExit {
+            role: "public_node_api",
+            address: listen_addr,
+            result,
+        }
     }
 
     // ============================================

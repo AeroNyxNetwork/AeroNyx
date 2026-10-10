@@ -50,6 +50,7 @@ members = [
     "crates/aeronyx-server",
     "crates/aeronyx-common",
     "crates/aeronyx-mailbox-wire",
+    "crates/aeronyx-node-tls",
 ]
 
 [workspace.package]

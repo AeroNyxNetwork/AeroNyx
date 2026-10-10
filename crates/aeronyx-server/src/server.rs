@@ -1214,6 +1214,9 @@ mod background_tasks;
 // assembly and management task construction in a focused child while keeping
 // startup call sites and failure ordering stable.
 mod api_runtime;
+// [NODE-TLS-BINDING 2026-10-10 by Claude] Plain HTTP and identity-bound TLS
+// on the public API port.
+mod public_tls;
 // [SERVER-SESSION-RUNTIME-SPLIT 2026-09-25 by Codex] Keep VPN service
 // initialization and transport shutdown in one focused child; data-plane
 // handshake/session task bodies remain in data_plane_runtime.
