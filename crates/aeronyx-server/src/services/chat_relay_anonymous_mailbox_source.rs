@@ -42,7 +42,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBeha
 use sha2::{Digest, Sha256};
 
 use crate::api::chat_peer::{prepare_exact_peer_blind_relay_http_request, PeerBlindRelayRequest};
-use crate::api::{canonical_peer_http_url, peer_endpoint_is_permitted};
+use crate::api::{peer_endpoint_is_permitted, peer_transport_url};
 use crate::config_chat_relay::{
     AnonymousMailboxSourceConfig, MAX_ANONYMOUS_MAILBOX_SOURCE_TERMINAL_RETENTION_SECS,
 };
@@ -1376,7 +1376,7 @@ impl AnonymousMailboxSourceCoordinator {
         if !peer_endpoint_is_permitted(&endpoint) {
             return Err(AnonymousMailboxSourceError::Unavailable);
         }
-        let url = canonical_peer_http_url(&endpoint, PEER_BLIND_RELAY_PATH)
+        let url = peer_transport_url(&endpoint, PEER_BLIND_RELAY_PATH)
             .map_err(|_| AnonymousMailboxSourceError::Unavailable)?;
         let request: PeerBlindRelayRequest = serde_json::from_slice(&record.body)
             .map_err(|_| AnonymousMailboxSourceError::Corrupt)?;

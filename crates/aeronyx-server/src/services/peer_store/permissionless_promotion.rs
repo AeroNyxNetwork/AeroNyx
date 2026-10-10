@@ -79,6 +79,7 @@ impl PeerStore {
     }
 
     pub(super) fn prune_expired_permissionless_promotions(&self, now: u64) -> usize {
+        let _tls_directory = super::IdentityTlsDirectoryRefresh(self);
         // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] Never drop
         // a deny gate while its exact live descriptor remains in the peer
         // map: that would turn expiry into route authority on clock rollback.

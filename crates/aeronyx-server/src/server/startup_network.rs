@@ -119,6 +119,9 @@ impl Server {
     ) -> Result<Arc<PeerStore>> {
         let peer_store = Self::new_discovery_peer_store();
         peer_store.set_max_peers(Some(self.config.discovery.max_peers));
+        // [NODE-TLS-BINDING 2026-10-10 by Claude] Before any import, so no
+        // peer that advertises identity-bound TLS is ever reached over HTTP.
+        peer_store.enable_identity_tls_directory();
         peer_store.configure_verified_delivery_witness_requesters(
             &self
                 .config

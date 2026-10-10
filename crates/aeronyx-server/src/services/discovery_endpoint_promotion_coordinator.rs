@@ -70,7 +70,8 @@ use super::discovery_endpoint_quarantine_revocation::{
 use super::peer_store::PeerStore;
 use crate::api::public_node_router::public_endpoint_flow_context;
 use crate::api::{
-    canonical_peer_http_url, peer_endpoint_is_permitted, privacy_safe_peer_http_client_builder,
+    canonical_peer_http_url, peer_endpoint_is_permitted, peer_transport_url,
+    privacy_safe_peer_http_client_builder,
 };
 
 const RESPOND_PATH: &str = "/api/discovery/endpoint-proof/respond";
@@ -135,9 +136,7 @@ fn select_attestation_gossip_targets(
                 && *node_id != candidate_id
                 && peer_endpoint_is_permitted(endpoint)
         })
-        .filter_map(|(_, endpoint)| {
-            canonical_peer_http_url(&endpoint, "/api/discovery/gossip").ok()
-        })
+        .filter_map(|(_, endpoint)| peer_transport_url(&endpoint, "/api/discovery/gossip").ok())
         .filter(|url| seen_urls.insert(url.clone()))
         .collect::<Vec<_>>();
     if !targets.is_empty() {

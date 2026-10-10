@@ -589,6 +589,7 @@ impl PeerStore {
         now: u64,
         source: String,
     ) -> Result<bool, PeerStoreError> {
+        let _tls_directory = IdentityTlsDirectoryRefresh(self);
         if descriptor.verify_signature().is_err() || descriptor.descriptor.is_valid_at(now) {
             return Err(PeerStoreError::VerificationFailed);
         }

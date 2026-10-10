@@ -187,6 +187,24 @@ pub(crate) fn canonical_peer_http_url(
     Ok(url)
 }
 
+/// The URL an outbound peer request is actually sent to.
+///
+/// [NODE-TLS-BINDING 2026-10-10 by Claude] Canonicalizes like
+/// [`canonical_peer_http_url`], then applies the identity-bound TLS directory:
+/// an endpoint whose one established claimant advertises
+/// `IdentityBoundTlsV1` becomes an identity-pinned `https://` URL, an endpoint
+/// several identities claim yields `Invalid` (fail closed, never plain HTTP),
+/// and every other endpoint is unchanged. Use this, not
+/// `canonical_peer_http_url`, wherever a request is sent.
+pub(crate) fn peer_transport_url(
+    endpoint: &str,
+    path: &str,
+) -> Result<reqwest::Url, PeerEndpointUrlError> {
+    let url = canonical_peer_http_url(endpoint, path)?;
+    peer_tls::apply_directory(url, &peer_tls::current_directory())
+        .ok_or(PeerEndpointUrlError::Invalid)
+}
+
 /// Starts a fail-closed client builder for permissionless peer transports.
 ///
 /// [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] Callers add their own timeout and
@@ -198,6 +216,9 @@ pub(crate) fn privacy_safe_peer_http_client_builder() -> reqwest::ClientBuilder 
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .dns_resolver(Arc::new(PublicOnlyResolver))
+        // [NODE-TLS-BINDING 2026-10-10 by Claude] Identity binding for
+        // reserved peer names, CA verification for everything else.
+        .use_preconfigured_tls(peer_tls::peer_tls_client_config())
 }
 
 /// Accepts the destinations a permissionless descriptor may name.
@@ -262,6 +283,16 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
     fn resolve(&self, name: hyper_v014::client::connect::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_owned();
         Box::pin(async move {
+            // [NODE-TLS-BINDING 2026-10-10 by Claude] Reserved peer names
+            // carry their IP and never touch DNS; the public-address policy
+            // still applies to it.
+            if let Some((_, ip)) = peer_tls::decode_peer_tls_host(&host) {
+                let public = retain_public_socket_addrs([SocketAddr::new(ip, 0)]);
+                if public.is_empty() {
+                    return Err("peer host resolved to no public address".into());
+                }
+                return Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs);
+            }
             let resolved = tokio::net::lookup_host((host.as_str(), 0)).await?;
             let public = retain_public_socket_addrs(resolved);
             if public.is_empty() {
@@ -290,6 +321,11 @@ fn retain_public_socket_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Ve
 #[cfg(test)]
 pub(crate) fn peer_endpoint_is_loopback_ip(endpoint: &str) -> bool {
     peer_endpoint_ip_literal(endpoint).is_some_and(|address| address.is_loopback())
+}
+
+/// Whether an endpoint names an IP literal rather than a DNS host.
+pub(crate) fn peer_endpoint_is_ip_literal(endpoint: &str) -> bool {
+    peer_endpoint_ip_literal(endpoint).is_some()
 }
 
 fn peer_endpoint_ip_literal(endpoint: &str) -> Option<IpAddr> {
@@ -639,6 +675,9 @@ pub mod memchain_peer;
 // [PERMISSIONLESS-ENDPOINT-PROOF 2026-09-24 by Codex] Keep public candidate
 // authentication composition separate from local and peer API surfaces.
 pub(crate) mod public_node_router;
+// [NODE-TLS-BINDING 2026-10-10 by Claude] Identity-pinned TLS for outbound
+// node-to-node requests.
+pub(crate) mod peer_tls;
 pub mod voice;
 pub mod vpn_health;
 

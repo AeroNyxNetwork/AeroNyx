@@ -102,7 +102,7 @@ where
         if !endpoint_allowed(endpoint) {
             continue;
         }
-        let Ok(url) = canonical_peer_http_url(endpoint, "/api/discovery/gossip") else {
+        let Ok(url) = crate::api::peer_transport_url(endpoint, "/api/discovery/gossip") else {
             continue;
         };
         urls.push(url);

@@ -2906,6 +2906,9 @@ pub struct PeerStore {
     bootstrap_status: RwLock<PeerStoreBootstrapStatus>,
     peer_cache_dirty: AtomicBool,
     peer_cache_notify: Notify,
+    /// [NODE-TLS-BINDING 2026-10-10 by Claude] Whether this store publishes
+    /// the process-wide identity-bound TLS directory (production store only).
+    identity_tls_directory_enabled: AtomicBool,
 }
 
 // [ARCH-SPLIT 2026-10-02] Child modules keep the same call paths.
@@ -2916,6 +2919,18 @@ mod gossip_status;
 mod path_proof_log;
 mod route_evidence;
 mod verified_upsert;
+
+/// Refreshes the identity-bound TLS directory when a peer-map writer returns.
+///
+/// [NODE-TLS-BINDING 2026-10-10 by Claude] Declared first in each writer, so
+/// it drops last: after the write lock is released, on every return path.
+struct IdentityTlsDirectoryRefresh<'a>(&'a PeerStore);
+
+impl Drop for IdentityTlsDirectoryRefresh<'_> {
+    fn drop(&mut self) {
+        self.0.refresh_identity_tls_directory();
+    }
+}
 
 impl PeerStore {
     /// Creates an empty peer store.
@@ -2951,7 +2966,32 @@ impl PeerStore {
             bootstrap_status: RwLock::new(PeerStoreBootstrapStatus::default()),
             peer_cache_dirty: AtomicBool::new(false),
             peer_cache_notify: Notify::new(),
+            identity_tls_directory_enabled: AtomicBool::new(false),
         }
+    }
+
+    /// Makes this store the source of the process-wide identity-bound TLS
+    /// directory used by every outbound peer URL.
+    ///
+    /// [NODE-TLS-BINDING 2026-10-10 by Claude] Called once by the server for
+    /// its discovery store. Other stores (tests, operator tools) never publish,
+    /// so they cannot change how this process reaches its peers.
+    pub fn enable_identity_tls_directory(&self) {
+        self.identity_tls_directory_enabled
+            .store(true, Ordering::SeqCst);
+        self.refresh_identity_tls_directory();
+    }
+
+    /// Rebuilds the directory from the current peer map, if enabled.
+    pub(crate) fn refresh_identity_tls_directory(&self) {
+        if !self.identity_tls_directory_enabled.load(Ordering::SeqCst) {
+            return;
+        }
+        let directory = {
+            let peers = self.peers.read();
+            crate::api::peer_tls::PeerTlsDirectory::from_descriptors(peers.values())
+        };
+        crate::api::peer_tls::install_directory(directory);
     }
 
     /// Creates an empty peer store with a maximum descriptor capacity.

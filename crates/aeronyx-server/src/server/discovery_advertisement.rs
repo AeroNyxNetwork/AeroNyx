@@ -106,6 +106,28 @@ impl Server {
             // was injected into both peer routers.
             protocol_features.push(NodeProtocolFeature::AnonymousMailboxV1);
         }
+        let advertised_endpoint = config
+            .discovery
+            .public_endpoint
+            .as_ref()
+            .or(config.network.public_endpoint.as_ref())
+            .map(|endpoint| endpoint.trim().to_string())
+            .filter(|endpoint| !endpoint.is_empty());
+        if config.discovery.public_api_identity_tls
+            && config.discovery.public_api_listen_addr.is_some()
+            && advertised_endpoint
+                .as_deref()
+                .is_some_and(crate::api::peer_endpoint_is_ip_literal)
+        {
+            // [NODE-TLS-BINDING 2026-10-10 by Claude] The public listener
+            // serves identity-bound TLS whenever this is configured; if the
+            // first bound certificate cannot be generated, startup aborts, so
+            // a running node never advertises the token without serving it.
+            // Only an IP-literal endpoint reaches that listener directly: a DNS
+            // endpoint (e.g. a TEE gateway) terminates TLS elsewhere with a CA
+            // certificate, so it must not claim identity-bound TLS.
+            protocol_features.push(NodeProtocolFeature::IdentityBoundTlsV1);
+        }
         let mut descriptor = NodeDescriptor::new(
             identity.public_key_bytes(),
             now,
@@ -114,13 +136,7 @@ impl Server {
             env!("CARGO_PKG_VERSION"),
         )
         .with_protocol_features(protocol_features);
-        descriptor.public_endpoint = config
-            .discovery
-            .public_endpoint
-            .as_ref()
-            .or(config.network.public_endpoint.as_ref())
-            .map(|endpoint| endpoint.trim().to_string())
-            .filter(|endpoint| !endpoint.is_empty());
+        descriptor.public_endpoint = advertised_endpoint;
 
         descriptor.capabilities = Self::discovery_capabilities_for_runtime_state(
             config,

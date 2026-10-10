@@ -1059,3 +1059,50 @@ fn test_peer_summary_tracks_source_ttl_health_and_capabilities() {
         .iter()
         .all(|peer| peer.capabilities.contains(&"chat_relay".to_string())));
 }
+
+// [NODE-TLS-BINDING 2026-10-10 by Claude] The production store publishes the
+// identity-bound TLS directory as soon as a TLS-advertising peer is admitted,
+// so the very next outbound URL to it is pinned HTTPS, and a store that is not
+// enabled publishes nothing. The endpoint is unique to this test.
+#[test]
+fn test_identity_tls_directory_follows_admission() {
+    use aeronyx_core::protocol::discovery::NodeProtocolFeature;
+
+    const ENDPOINT: &str = "http://34.117.201.77:8422";
+    let kp = IdentityKeyPair::generate();
+    let mut descriptor = NodeDescriptor::new(
+        kp.public_key_bytes(),
+        1,
+        1_700_000_000,
+        1_700_001_000,
+        "test",
+    )
+    .with_protocol_features([NodeProtocolFeature::IdentityBoundTlsV1]);
+    descriptor.public_endpoint = Some(ENDPOINT.to_string());
+    descriptor.capabilities = vec![NodeCapability::PrivacyRelay, NodeCapability::ChatRelay];
+    let signed = SignedNodeDescriptor::sign(descriptor, &kp).unwrap();
+
+    let silent = PeerStore::new();
+    silent
+        .upsert_verified(signed.clone(), 1_700_000_100)
+        .unwrap();
+    assert_eq!(
+        crate::api::peer_transport_url(ENDPOINT, "/x")
+            .unwrap()
+            .scheme(),
+        "http",
+        "a store that is not enabled must not publish"
+    );
+
+    let store = PeerStore::new();
+    store.enable_identity_tls_directory();
+    store.upsert_verified(signed, 1_700_000_100).unwrap();
+    let url = crate::api::peer_transport_url(ENDPOINT, "/api/discovery/gossip").unwrap();
+    assert_eq!(url.scheme(), "https");
+    assert_eq!(
+        crate::api::peer_tls::decode_peer_tls_host(url.host_str().unwrap()),
+        Some((kp.public_key_bytes(), "34.117.201.77".parse().unwrap()))
+    );
+
+    crate::api::peer_tls::install_directory(Default::default());
+}

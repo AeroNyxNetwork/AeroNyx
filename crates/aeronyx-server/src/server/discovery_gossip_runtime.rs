@@ -2755,7 +2755,7 @@ impl Server {
     }
 
     pub(super) fn discovery_gossip_url(endpoint: &str) -> Option<String> {
-        canonical_peer_http_url(endpoint, "/api/discovery/gossip")
+        crate::api::peer_transport_url(endpoint, "/api/discovery/gossip")
             .ok()
             .map(|url| url.to_string())
     }

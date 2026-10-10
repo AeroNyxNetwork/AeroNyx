@@ -21,7 +21,7 @@ use super::super::chat_peer_retry::{
 };
 use super::super::chat_peer_transport::{BlindRelayTransport, ReqwestBlindRelayTransport};
 use super::*;
-use crate::api::{canonical_peer_http_url, peer_endpoint_is_permitted};
+use crate::api::{peer_endpoint_is_permitted, peer_transport_url};
 use bytes::Bytes;
 use tokio::time::sleep;
 
@@ -749,7 +749,7 @@ pub(super) fn blind_peer_relay_url(endpoint: &str) -> Option<String> {
             return None;
         }
     }
-    canonical_peer_http_url(endpoint, "/api/chat/peer/blind-relay")
+    peer_transport_url(endpoint, "/api/chat/peer/blind-relay")
         .ok()
         .map(|url| url.to_string())
 }

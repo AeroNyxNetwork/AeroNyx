@@ -240,3 +240,34 @@ async fn endpoint_attestation_inbox_disabled_has_zero_filesystem_side_effect() {
     assert!(!absent.exists());
     assert!(!absent.parent().expect("parent").exists());
 }
+
+// [NODE-TLS-BINDING 2026-10-10 by Claude] The token is signed only when the
+// advertised endpoint reaches this node's own listener (an IP literal) and
+// identity TLS is enabled on it; a gateway DNS name never claims it.
+#[test]
+fn identity_bound_tls_is_advertised_only_for_an_ip_literal_public_listener() {
+    let advertises = |config: &ServerConfig| {
+        let identity = IdentityKeyPair::generate();
+        Server::build_self_discovery_descriptor_for(config, &identity, 1_800_000_000)
+            .unwrap()
+            .descriptor
+            .advertises_protocol_feature(NodeProtocolFeature::IdentityBoundTlsV1)
+    };
+    let mut config = ServerConfig::default();
+    config.discovery.enabled = true;
+    config.discovery.public_endpoint = Some("http://34.51.97.227:8422".to_string());
+    config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+    assert!(advertises(&config));
+
+    config.discovery.public_endpoint =
+        Some("https://abc-8422.dstack-pha-prod9.phala.network".to_string());
+    assert!(!advertises(&config), "DNS endpoint behind a gateway");
+
+    config.discovery.public_endpoint = Some("http://34.51.97.227:8422".to_string());
+    config.discovery.public_api_identity_tls = false;
+    assert!(!advertises(&config), "identity TLS disabled");
+
+    config.discovery.public_api_identity_tls = true;
+    config.discovery.public_api_listen_addr = None;
+    assert!(!advertises(&config), "no public listener");
+}

@@ -28,6 +28,7 @@ impl PeerStore {
         now: u64,
         source: impl Into<String>,
     ) -> Result<bool, PeerStoreError> {
+        let _tls_directory = IdentityTlsDirectoryRefresh(self);
         let node_id = descriptor.node_id();
         let incoming_sequence = descriptor.sequence();
         let incoming_route_fingerprint =

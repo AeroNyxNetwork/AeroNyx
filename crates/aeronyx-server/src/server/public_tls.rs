@@ -508,4 +508,87 @@ mod tests {
             .unwrap();
         assert_eq!(idle.read(&mut buffer).await.unwrap(), 0);
     }
+
+    /// Resolves reserved peer names to their (loopback) IP for this test only;
+    /// production uses `PublicOnlyResolver`, which refuses loopback.
+    struct LoopbackPeerResolver;
+
+    impl reqwest::dns::Resolve for LoopbackPeerResolver {
+        fn resolve(&self, name: hyper_v014::client::connect::dns::Name) -> reqwest::dns::Resolving {
+            let decoded = crate::api::peer_tls::decode_peer_tls_host(name.as_str());
+            Box::pin(async move {
+                let (_, ip) = decoded.ok_or("not a reserved peer name")?;
+                Ok(Box::new(std::iter::once(SocketAddr::new(ip, 0))) as reqwest::dns::Addrs)
+            })
+        }
+    }
+
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    // [NODE-TLS-BINDING 2026-10-10 by Claude] The outbound peer stack end to
+    // end: rewritten URL -> resolver -> rustls 0.21 verifier -> this listener.
+    #[tokio::test]
+    async fn the_peer_client_reaches_only_the_pinned_identity() {
+        use crate::api::peer_tls::{peer_tls_client_config, peer_tls_host};
+
+        let node = identity(0x31);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tls = Arc::new(IdentityTls::new(Arc::clone(&node), unix_now()).unwrap());
+        let app = Router::new().route("/ping", axum::routing::get(|| async { "pong" }));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(serve_http_and_identity_tls(
+            listener,
+            app,
+            tls,
+            unix_now,
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(Arc::new(LoopbackPeerResolver))
+            .use_preconfigured_tls(peer_tls_client_config())
+            .build()
+            .unwrap();
+        let url_for = |node_id: &[u8; 32]| {
+            format!(
+                "https://{}:{}/ping",
+                peer_tls_host(node_id, addr.ip()),
+                addr.port()
+            )
+        };
+
+        let response = client
+            .get(url_for(&node.public_key_bytes()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "pong");
+
+        let other = identity(0x32).public_key_bytes();
+        assert!(client.get(url_for(&other)).send().await.is_err());
+
+        // The production resolver refuses a reserved name that carries a
+        // non-public address, before any connection is made.
+        let production = crate::api::privacy_safe_peer_http_client_builder()
+            .build()
+            .unwrap();
+        assert!(production
+            .get(url_for(&node.public_key_bytes()))
+            .send()
+            .await
+            .is_err());
+
+        stop.send(()).unwrap();
+        served.await.unwrap().unwrap();
+    }
 }

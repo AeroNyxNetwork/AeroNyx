@@ -1246,7 +1246,7 @@ impl Server {
                 return None;
             }
         }
-        canonical_peer_http_url(endpoint, path)
+        crate::api::peer_transport_url(endpoint, path)
             .ok()
             .map(|url| url.to_string())
     }

@@ -56,7 +56,7 @@ pub(super) fn custody_audit_anchor_witness_url(endpoint: &str) -> Result<Url, St
 }
 
 pub(crate) fn commitment_peer_url(endpoint: &str, path: &str) -> Result<Url, String> {
-    canonical_peer_http_url(endpoint, path).map_err(|error| match error {
+    crate::api::peer_transport_url(endpoint, path).map_err(|error| match error {
         PeerEndpointUrlError::Missing => "pinned_coordinator_missing_endpoint".to_string(),
         PeerEndpointUrlError::Invalid => "pinned_coordinator_invalid_endpoint".to_string(),
     })

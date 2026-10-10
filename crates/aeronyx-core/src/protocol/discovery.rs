@@ -534,11 +534,19 @@ pub enum NodeProtocolFeature {
     /// [ANONYMOUS-MAILBOX-V1 2026-09-02 by Codex] This advertises only protocol
     /// support. It is not a mailbox locator and discloses no tenant activity.
     AnonymousMailboxV1,
+    /// The node's `public_endpoint` port also serves TLS 1.3 with a
+    /// certificate bound to this descriptor's identity (`aeronyx-node-tls`).
+    ///
+    /// [NODE-TLS-BINDING 2026-10-10 by Claude] A peer that sees this signed
+    /// token connects to an IP-literal endpoint only over identity-pinned TLS
+    /// and never falls back to plain HTTP, so a network attacker cannot strip
+    /// the upgrade. Nodes without it keep plain HTTP.
+    IdentityBoundTlsV1,
 }
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::BlindRelayFailureReceiptV1,
         Self::BlindRelaySuccessReceiptV1,
         Self::PurposeBoundDeliveryReceiptV2,
@@ -556,6 +564,7 @@ impl NodeProtocolFeature {
         Self::OnionBlindVaultLeaseInventoryV1,
         Self::OnionBlindVaultEncryptedFailureV1,
         Self::AnonymousMailboxV1,
+        Self::IdentityBoundTlsV1,
     ];
 
     /// Exact SemVer build-metadata identifier used on the signed wire.
@@ -579,6 +588,7 @@ impl NodeProtocolFeature {
             Self::OnionBlindVaultLeaseInventoryV1 => "anpf1-obli1",
             Self::OnionBlindVaultEncryptedFailureV1 => "anpf1-obef1",
             Self::AnonymousMailboxV1 => "anpf1-amb1",
+            Self::IdentityBoundTlsV1 => "anpf1-ibt1",
         }
     }
 }
@@ -4808,7 +4818,6 @@ mod tests {
         // fleet-wide capability claim, never a mailbox or receiver locator.
         let feature = NodeProtocolFeature::AnonymousMailboxV1;
         assert_eq!(feature.semver_build_token(), "anpf1-amb1");
-        assert_eq!(NodeProtocolFeature::ALL.len(), 17);
         assert_eq!(NodeProtocolFeature::ALL[16], feature);
 
         let identity = IdentityKeyPair::from_bytes(&[0x9a; 32]).expect("identity");
@@ -4816,6 +4825,25 @@ mod tests {
         assert!(descriptor.advertises_protocol_feature(feature));
         let signed = SignedNodeDescriptor::sign(descriptor, &identity).expect("sign descriptor");
         assert!(signed.verify_at(1_700_000_100).is_ok());
+    }
+
+    #[test]
+    fn identity_bound_tls_feature_is_signed_and_append_only() {
+        // [NODE-TLS-BINDING 2026-10-10 by Claude] Appended after every
+        // existing feature, so earlier tokens and their order are unchanged.
+        let feature = NodeProtocolFeature::IdentityBoundTlsV1;
+        assert_eq!(feature.semver_build_token(), "anpf1-ibt1");
+        assert_eq!(NodeProtocolFeature::ALL.len(), 18);
+        assert_eq!(NodeProtocolFeature::ALL[17], feature);
+
+        let identity = IdentityKeyPair::from_bytes(&[0x9b; 32]).expect("identity");
+        let descriptor = descriptor_for(&identity).with_protocol_features([feature]);
+        assert!(descriptor.advertises_protocol_feature(feature));
+        let signed = SignedNodeDescriptor::sign(descriptor, &identity).expect("sign descriptor");
+        assert!(signed.verify_at(1_700_000_100).is_ok());
+        let mut stripped = signed;
+        stripped.descriptor.software_version = "0.1.0".to_string();
+        assert!(stripped.verify_at(1_700_000_100).is_err());
     }
 
     fn work_policy_descriptor(identity: &IdentityKeyPair) -> NodeDescriptor {
