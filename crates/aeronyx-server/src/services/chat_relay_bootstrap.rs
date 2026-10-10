@@ -44,6 +44,16 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// How long a chat relay SQLite statement waits for a competing lock.
+///
+/// [CHAT-HTTP-503-INVARIANT 2026-10-10 by Claude] Must stay shorter than the
+/// HTTP deadline in `api::chat_handlers::CHAT_HTTP_TIMEOUT`: when the HTTP
+/// layer gives up it answers 503 but cannot cancel the blocking SQLite worker,
+/// so "503 means the mutation did not happen" only holds if the worker has
+/// already stopped waiting by then. A compile-time assertion in `chat_handlers`
+/// enforces it.
+pub(crate) const CHAT_RELAY_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 use parking_lot::Mutex;
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::Connection;
@@ -131,7 +141,7 @@ impl ChatRelayService {
         }
         // A short bounded wait absorbs transient locks from an operator backup
         // or diagnostic reader without allowing relay requests to hang forever.
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(CHAT_RELAY_SQLITE_BUSY_TIMEOUT)?;
         verify_sqlite_physical_integrity(&conn, "sqlite_startup_integrity")?;
         let synchronous_level =
             configure_full_durability(&conn, CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL)?;

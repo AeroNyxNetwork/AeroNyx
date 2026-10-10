@@ -146,6 +146,17 @@ const CHAT_HTTP_REQUEST_MAX_BYTES: usize = 4 * 1024;
 const CHAT_HTTP_RESPONSE_MAX_BYTES: usize = 1 + 2 * 1024 * 1024;
 const CHAT_HTTP_MAX_IN_FLIGHT: usize = 8;
 const CHAT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+// [CHAT-HTTP-503-INVARIANT 2026-10-10 by Claude] `run_chat_blocking` answers
+// 503 when this deadline passes, but the SQLite worker keeps running and still
+// holds its admission permit. A 503 therefore only means "nothing was
+// changed" if SQLite stops waiting for a lock before the deadline; otherwise a
+// timed-out ACK could still delete the message after the client was told it
+// failed. Keep the busy timeout strictly shorter.
+const _: () = assert!(
+    crate::services::chat_relay::CHAT_RELAY_SQLITE_BUSY_TIMEOUT.as_millis()
+        < CHAT_HTTP_TIMEOUT.as_millis(),
+    "chat relay SQLite busy timeout must be shorter than the chat HTTP deadline"
+);
 const CHAT_PULL_HTTP_DOMAIN: &str = "AeroNyx-ChatPull-v2-http";
 const CHAT_ACK_HTTP_DOMAIN: &str = "AeroNyx-ChatAck-v1-http";
 const CHAT_PULL_HTTP_VERSION: u8 = 1;

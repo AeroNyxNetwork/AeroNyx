@@ -844,6 +844,9 @@ pub struct ChatRelayService {
 
 #[path = "chat_relay_bootstrap.rs"]
 mod bootstrap;
+// [CHAT-HTTP-503-INVARIANT 2026-10-10 by Claude] Read by `api::chat_handlers`
+// to assert the busy timeout stays below the HTTP deadline.
+pub(crate) use bootstrap::CHAT_RELAY_SQLITE_BUSY_TIMEOUT;
 
 #[path = "chat_relay_backup_support.rs"]
 mod backup_support;
