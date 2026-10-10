@@ -116,9 +116,14 @@ impl Server {
             .config
             .discovery
             .require_route_domain_attestations_for_multi_hop;
-        let (store, audit, policy, route_domain_policy, route_domain_attestor_policy) =
+        let (store, audit, reaudited, policy, route_domain_policy, route_domain_attestor_policy) =
             tokio::task::spawn_blocking(move || {
-                let (store, _) =
+                // [STARTUP-AUDIT-ONCE 2026-10-10 by Claude] open() already ran a
+                // complete audit. Reconciliation below writes only when the
+                // configured policy changed; with an unchanged policy the store
+                // is exactly what that audit verified, so repeating it (a second
+                // full pass, ~27 s on JP1) proves nothing new.
+                let (store, opened_audit) =
                     DirectoryReplicaStore::open(&open_path, local_node_id, observed_at)?;
                 let policy = store.reconcile_observation_witness_policy(
                     &identity,
@@ -139,10 +144,18 @@ impl Server {
                     route_domain_attestor_strict,
                     observed_at,
                 )?;
-                let audit = store.audit(observed_at)?;
+                let reaudited = policy.appended
+                    || route_domain_policy.appended
+                    || route_domain_attestor_policy.appended;
+                let audit = if reaudited {
+                    store.audit(observed_at)?
+                } else {
+                    opened_audit
+                };
                 Ok::<_, crate::services::DirectoryReplicaStoreError>((
                     store,
                     audit,
+                    reaudited,
                     policy,
                     route_domain_policy,
                     route_domain_attestor_policy,
@@ -199,6 +212,7 @@ impl Server {
                 route_domain_attestor_policy.minimum_attestors,
             route_domain_attestor_policy_strict = route_domain_attestor_policy.strict_required,
             retry_states = audit.retry_states,
+            post_reconcile_audit = reaudited,
             "[DIRECTORY_REPLICA] Startup audit and local policy reconciliation passed"
         );
         Ok(Some(Arc::new(store)))

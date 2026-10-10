@@ -337,3 +337,57 @@ fn schema_v7_adds_policy_anchor_evidence_tables_atomically() {
     assert_eq!(anchor_tables, 2);
     assert_eq!(receipt_index, 1);
 }
+
+// [STARTUP-AUDIT-ONCE 2026-10-10 by Claude] Startup reuses the audit from
+// open() when no policy reconciliation wrote anything. That is only sound if
+// reconciling an unchanged policy leaves the store exactly as audited.
+#[test]
+fn unchanged_policy_reconcile_leaves_the_opened_audit_valid() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("directory.db");
+    let local = IdentityKeyPair::from_bytes(&[0x0b; 32]).unwrap();
+    let witness_a = IdentityKeyPair::from_bytes(&[0x0c; 32]).unwrap();
+    let witness_b = IdentityKeyPair::from_bytes(&[0x0d; 32]).unwrap();
+    let witnesses = [witness_a.public_key_bytes(), witness_b.public_key_bytes()];
+    let reconcile = |store: &DirectoryReplicaStore, at: u64| {
+        (
+            store
+                .reconcile_observation_witness_policy(&local, &witnesses, 1, at)
+                .unwrap()
+                .appended,
+            store
+                .reconcile_route_domain_policy(&local, &[], false, at)
+                .unwrap()
+                .appended,
+            store
+                .reconcile_route_domain_attestor_policy(&local, &[], 1, false, at)
+                .unwrap()
+                .appended,
+        )
+    };
+
+    // First start: the witness policy is new and is written.
+    let (store, _) =
+        DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+    let first = reconcile(&store, NOW + 20);
+    assert!(first.0, "a new witness policy must be appended");
+    drop(store);
+
+    // Restart with the same configuration: nothing is written, and a fresh
+    // audit equals the one open() returned, so startup may reuse it.
+    let (store, opened) =
+        DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 30).unwrap();
+    assert_eq!(reconcile(&store, NOW + 30), (false, false, false));
+    assert_eq!(store.audit(NOW + 30).unwrap(), opened);
+    drop(store);
+
+    // Restart with a changed policy: it is appended, so startup must audit again.
+    let (store, _) =
+        DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 40).unwrap();
+    assert!(
+        store
+            .reconcile_observation_witness_policy(&local, &witnesses, 2, NOW + 40)
+            .unwrap()
+            .appended
+    );
+}
