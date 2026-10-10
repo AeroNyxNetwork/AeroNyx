@@ -365,6 +365,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::config::PinnedRouteDomainAssignment;
+use crate::services::directory_chain::parallel_try_map;
 
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::discovery::{
@@ -2518,6 +2519,21 @@ impl DirectoryReplicaSyncRuntime {
         observations
     }
 }
+
+/// One commitment row read during an audit, checked for everything except the
+/// descriptor signature, which is verified later in a parallel batch.
+///
+/// [PARALLEL-DIRECTORY-AUDIT 2026-10-10 by Claude]
+#[derive(Debug)]
+pub(super) struct PendingReplicaCommitment {
+    pub(super) commitment: DirectoryDescriptorCommitmentV1,
+    pub(super) object_node_id: [u8; 32],
+    pub(super) object_sequence: u64,
+    pub(super) descriptor_blob: Vec<u8>,
+}
+
+/// Replica blocks read and verified per batch during an audit.
+const AUDIT_REPLICA_BLOCK_BATCH: usize = 512;
 
 #[derive(Debug)]
 struct StoredReplicaBlockRow {

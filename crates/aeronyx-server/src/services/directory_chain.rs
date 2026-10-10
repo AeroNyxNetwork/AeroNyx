@@ -395,77 +395,87 @@ impl DirectoryChainStore {
         let mut expected_previous_hash = report.tip_hash;
         let mut previous_timestamp = report.tip_timestamp;
 
-        for row in rows {
-            let block = decode_block(&row.block_blob)?;
-            let row_height = positive_i64_to_u64(row.height, "block height")?;
-            let row_timestamp = positive_i64_to_u64(row.produced_at, "block timestamp")?;
-            let row_count = nonnegative_i64_to_u64(row.commitment_count, "commitment count")?;
-            let row_hash = bytes32(&row.block_hash, "stored block hash")?;
-            let row_previous_hash = bytes32(&row.prev_block_hash, "stored previous hash")?;
+        // [PARALLEL-DIRECTORY-AUDIT 2026-10-10 by Claude] Signature, Merkle root
+        // and canonical payload of each block do not depend on its neighbours,
+        // so they are verified for a batch of blocks concurrently. Everything
+        // that does (height, previous hash, timestamps, index and object
+        // matching) still runs below in chain order. Startup spent ~85% of a
+        // 25 s audit in Ed25519 verification on one core.
+        for chunk in rows.chunks(AUDIT_BLOCK_BATCH) {
+            let blocks = parallel_try_map(chunk, |row| {
+                let block = decode_block(&row.block_blob)?;
+                block.verify_contents(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID, observed_at)?;
+                Ok::<_, DirectoryChainStoreError>(block)
+            })?;
+            for (row, block) in chunk.iter().zip(blocks) {
+                let row_height = positive_i64_to_u64(row.height, "block height")?;
+                let row_timestamp = positive_i64_to_u64(row.produced_at, "block timestamp")?;
+                let row_count = nonnegative_i64_to_u64(row.commitment_count, "commitment count")?;
+                let row_hash = bytes32(&row.block_hash, "stored block hash")?;
+                let row_previous_hash = bytes32(&row.prev_block_hash, "stored previous hash")?;
 
-            if block.header.producer != self.producer {
-                return Err(DirectoryChainStoreError::Integrity(format!(
-                    "block {row_height} producer differs from pinned local producer"
-                )));
-            }
-            if row_height != expected_height
-                || row_height != block.header.height
-                || row_timestamp != block.header.timestamp
-                || row_previous_hash != block.header.prev_block_hash
-                || row_hash != block.hash()
-                || row_count != u64::from(block.header.commitment_count)
-            {
-                return Err(DirectoryChainStoreError::Integrity(format!(
-                    "block {row_height} columns do not match the signed block"
-                )));
-            }
-            block.verify_at(
-                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-                expected_height,
-                &expected_previous_hash,
-                previous_timestamp,
-                observed_at,
-            )?;
-
-            let mut expected_commitments = block.commitments.clone();
-            expected_commitments.sort_unstable();
-            let mut actual_commitments =
-                indexed_commitments.remove(&row.height).unwrap_or_default();
-            actual_commitments.sort_unstable();
-            if actual_commitments != expected_commitments {
-                return Err(DirectoryChainStoreError::Integrity(format!(
-                    "block {row_height} commitment index does not match its signed payload"
-                )));
-            }
-            for commitment in &block.commitments {
-                let object_commitment = descriptor_objects
-                    .remove(&commitment.descriptor_hash)
-                    .ok_or_else(|| {
-                        DirectoryChainStoreError::Integrity(format!(
-                            "block {row_height} descriptor object is missing"
-                        ))
-                    })?;
-                if object_commitment != *commitment {
+                if block.header.producer != self.producer {
                     return Err(DirectoryChainStoreError::Integrity(format!(
-                        "block {row_height} descriptor object does not match its commitment"
+                        "block {row_height} producer differs from pinned local producer"
                     )));
                 }
-            }
+                if row_height != expected_height
+                    || row_height != block.header.height
+                    || row_timestamp != block.header.timestamp
+                    || row_previous_hash != block.header.prev_block_hash
+                    || row_hash != block.hash()
+                    || row_count != u64::from(block.header.commitment_count)
+                {
+                    return Err(DirectoryChainStoreError::Integrity(format!(
+                        "block {row_height} columns do not match the signed block"
+                    )));
+                }
+                block.verify_position(
+                    expected_height,
+                    &expected_previous_hash,
+                    previous_timestamp,
+                )?;
 
-            report.blocks = report.blocks.saturating_add(1);
-            report.commitments = report
-                .commitments
-                .saturating_add(u64::from(block.header.commitment_count));
-            report.tip_height = block.header.height;
-            report.tip_hash = block.hash();
-            report.tip_timestamp = block.header.timestamp;
-            expected_previous_hash = report.tip_hash;
-            previous_timestamp = report.tip_timestamp;
-            expected_height = expected_height.checked_add(1).ok_or_else(|| {
-                DirectoryChainStoreError::Integrity(
-                    "directory chain height exhausted during audit".to_string(),
-                )
-            })?;
+                let mut expected_commitments = block.commitments.clone();
+                expected_commitments.sort_unstable();
+                let mut actual_commitments =
+                    indexed_commitments.remove(&row.height).unwrap_or_default();
+                actual_commitments.sort_unstable();
+                if actual_commitments != expected_commitments {
+                    return Err(DirectoryChainStoreError::Integrity(format!(
+                        "block {row_height} commitment index does not match its signed payload"
+                    )));
+                }
+                for commitment in &block.commitments {
+                    let object_commitment = descriptor_objects
+                        .remove(&commitment.descriptor_hash)
+                        .ok_or_else(|| {
+                            DirectoryChainStoreError::Integrity(format!(
+                                "block {row_height} descriptor object is missing"
+                            ))
+                        })?;
+                    if object_commitment != *commitment {
+                        return Err(DirectoryChainStoreError::Integrity(format!(
+                            "block {row_height} descriptor object does not match its commitment"
+                        )));
+                    }
+                }
+
+                report.blocks = report.blocks.saturating_add(1);
+                report.commitments = report
+                    .commitments
+                    .saturating_add(u64::from(block.header.commitment_count));
+                report.tip_height = block.header.height;
+                report.tip_hash = block.hash();
+                report.tip_timestamp = block.header.timestamp;
+                expected_previous_hash = report.tip_hash;
+                previous_timestamp = report.tip_timestamp;
+                expected_height = expected_height.checked_add(1).ok_or_else(|| {
+                    DirectoryChainStoreError::Integrity(
+                        "directory chain height exhausted during audit".to_string(),
+                    )
+                })?;
+            }
         }
 
         if !indexed_commitments.is_empty() {
@@ -1130,35 +1140,103 @@ impl DirectoryChainStore {
                 row.get::<_, Vec<u8>>(3)?,
             ))
         })?;
+        // [PARALLEL-DIRECTORY-AUDIT 2026-10-10 by Claude] Each object carries
+        // its own Ed25519 signature; verify a bounded batch concurrently, then
+        // detect duplicates in order. Memory stays bounded by one batch.
         let mut objects = BTreeMap::new();
-        for row in rows {
-            let (stored_hash, stored_node_id, stored_sequence, descriptor_blob) = row?;
-            let descriptor = decode_descriptor_object(&descriptor_blob)?;
-            let commitment =
-                DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
-                    .map_err(|error| DirectoryChainStoreError::Descriptor(error.to_string()))?;
-            let sequence_bytes: [u8; 8] = stored_sequence.try_into().map_err(|_| {
-                DirectoryChainStoreError::Integrity(
-                    "descriptor object sequence must contain exactly 8 bytes".to_string(),
-                )
-            })?;
-            let descriptor_hash = bytes32(&stored_hash, "descriptor object hash")?;
-            if descriptor_hash != commitment.descriptor_hash
-                || bytes32(&stored_node_id, "descriptor object node id")? != commitment.node_id
-                || u64::from_le_bytes(sequence_bytes) != commitment.sequence
-            {
-                return Err(DirectoryChainStoreError::Integrity(
-                    "signed descriptor object does not match its stored index fields".to_string(),
-                ));
+        let mut batch = Vec::with_capacity(AUDIT_OBJECT_BATCH);
+        let mut rows = rows.peekable();
+        while rows.peek().is_some() {
+            batch.clear();
+            while batch.len() < AUDIT_OBJECT_BATCH {
+                match rows.next() {
+                    Some(row) => batch.push(row?),
+                    None => break,
+                }
             }
-            if objects.insert(descriptor_hash, commitment).is_some() {
-                return Err(DirectoryChainStoreError::Integrity(
-                    "duplicate descriptor object hash".to_string(),
-                ));
+            let verified = parallel_try_map(&batch, |row| {
+                let (stored_hash, stored_node_id, stored_sequence, descriptor_blob) = row;
+                let descriptor = decode_descriptor_object(descriptor_blob)?;
+                let commitment =
+                    DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
+                        .map_err(|error| DirectoryChainStoreError::Descriptor(error.to_string()))?;
+                let sequence_bytes: [u8; 8] =
+                    stored_sequence.as_slice().try_into().map_err(|_| {
+                        DirectoryChainStoreError::Integrity(
+                            "descriptor object sequence must contain exactly 8 bytes".to_string(),
+                        )
+                    })?;
+                let descriptor_hash = bytes32(stored_hash, "descriptor object hash")?;
+                if descriptor_hash != commitment.descriptor_hash
+                    || bytes32(stored_node_id, "descriptor object node id")? != commitment.node_id
+                    || u64::from_le_bytes(sequence_bytes) != commitment.sequence
+                {
+                    return Err(DirectoryChainStoreError::Integrity(
+                        "signed descriptor object does not match its stored index fields"
+                            .to_string(),
+                    ));
+                }
+                Ok((descriptor_hash, commitment))
+            })?;
+            for (descriptor_hash, commitment) in verified {
+                if objects.insert(descriptor_hash, commitment).is_some() {
+                    return Err(DirectoryChainStoreError::Integrity(
+                        "duplicate descriptor object hash".to_string(),
+                    ));
+                }
             }
         }
         Ok(objects)
     }
+}
+
+/// Blocks verified concurrently per batch during an audit.
+const AUDIT_BLOCK_BATCH: usize = 2048;
+/// Descriptor objects verified concurrently per batch during an audit.
+const AUDIT_OBJECT_BATCH: usize = 8192;
+/// Upper bound on audit worker threads, so a startup audit does not take every
+/// core of a host that also runs other services.
+const AUDIT_MAX_THREADS: usize = 8;
+
+/// Maps `items` with `verify` on up to [`AUDIT_MAX_THREADS`] scoped threads and
+/// returns the results in input order.
+///
+/// [PARALLEL-DIRECTORY-AUDIT 2026-10-10 by Claude] Used for the independent,
+/// CPU-bound part of directory audits (decoding and Ed25519 verification).
+/// Each worker stops at its first error; the error returned is the first one in
+/// input order, as a sequential loop would report. Small inputs and one-core
+/// hosts run on the calling thread.
+pub(crate) fn parallel_try_map<T, R, E, F>(items: &[T], verify: F) -> Result<Vec<R>, E>
+where
+    T: Sync,
+    R: Send,
+    E: Send,
+    F: Fn(&T) -> Result<R, E> + Sync,
+{
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(AUDIT_MAX_THREADS);
+    if threads <= 1 || items.len() < 2 * threads {
+        return items.iter().map(&verify).collect();
+    }
+    let chunk_len = items.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let workers = items
+            .chunks(chunk_len)
+            .map(|chunk| {
+                let verify = &verify;
+                scope.spawn(move || chunk.iter().map(verify).collect::<Result<Vec<R>, E>>())
+            })
+            .collect::<Vec<_>>();
+        let mut results = Vec::with_capacity(items.len());
+        for worker in workers {
+            match worker.join() {
+                Ok(chunk) => results.extend(chunk?),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        Ok(results)
+    })
 }
 
 fn encode_block(block: &DirectoryCommitmentBlockV1) -> Result<Vec<u8>, DirectoryChainStoreError> {
@@ -1645,6 +1723,122 @@ mod tests {
         assert!(store.audited_tip(NOW + 2).is_err());
     }
 
+    // [PARALLEL-DIRECTORY-AUDIT 2026-10-10 by Claude]
+    #[test]
+    fn parallel_try_map_keeps_order_and_reports_the_earliest_error() {
+        let items: Vec<u32> = (0..5_000).collect();
+        let doubled = parallel_try_map(&items, |item| Ok::<_, u32>(item * 2)).unwrap();
+        assert_eq!(
+            doubled,
+            items.iter().map(|item| item * 2).collect::<Vec<_>>()
+        );
+        let earliest = parallel_try_map(&items, |item| {
+            if *item == 1_234 || *item == 4_321 {
+                Err(*item)
+            } else {
+                Ok(*item)
+            }
+        });
+        assert_eq!(earliest, Err(1_234));
+        let panicked = std::panic::catch_unwind(|| {
+            parallel_try_map(&items, |item| {
+                assert_ne!(*item, 4_000, "worker panic must reach the caller");
+                Ok::<_, ()>(*item)
+            })
+        });
+        assert!(panicked.is_err());
+    }
+
+    /// Long enough that the audit takes the multi-threaded path.
+    const LONG_CHAIN_BLOCKS: u64 = 160;
+
+    fn long_chain(path: &std::path::Path, producer: &IdentityKeyPair) {
+        let peer = IdentityKeyPair::from_bytes(&[0x93; 32]).unwrap();
+        let (store, _) = DirectoryChainStore::open(path, producer.public_key_bytes(), NOW).unwrap();
+        for sequence in 1..=LONG_CHAIN_BLOCKS {
+            store
+                .append_descriptors(
+                    &[signed_descriptor(&peer, sequence, "peer.example:8422")],
+                    NOW,
+                    producer,
+                )
+                .unwrap();
+        }
+    }
+
+    fn flip_last_byte(path: &std::path::Path, table: &str, blob: &str, filter: &str) {
+        let connection = Connection::open(path).unwrap();
+        let mut bytes: Vec<u8> = connection
+            .query_row(
+                &format!("SELECT {blob} FROM {table} WHERE {filter}"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        *bytes.last_mut().unwrap() ^= 0x01;
+        let changed = connection
+            .execute(
+                &format!("UPDATE {table} SET {blob} = ?1 WHERE {filter}"),
+                [bytes],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+
+    #[test]
+    fn long_chain_audit_runs_in_parallel_and_matches_the_chain() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let producer = IdentityKeyPair::from_bytes(&[0x91; 32]).unwrap();
+        long_chain(&path, &producer);
+        let (_, report) =
+            DirectoryChainStore::open(&path, producer.public_key_bytes(), NOW + 1).unwrap();
+        assert_eq!(report.blocks, LONG_CHAIN_BLOCKS);
+        assert_eq!(report.commitments, LONG_CHAIN_BLOCKS);
+        assert_eq!(report.tip_height, LONG_CHAIN_BLOCKS);
+    }
+
+    #[test]
+    fn long_chain_block_signature_tampering_deep_in_the_chain_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let producer = IdentityKeyPair::from_bytes(&[0x92; 32]).unwrap();
+        long_chain(&path, &producer);
+        // The stored block hash covers only the header, so this leaves every
+        // column intact: only signature verification can catch it.
+        flip_last_byte(
+            &path,
+            "directory_chain_blocks",
+            "block_blob",
+            "height = 117",
+        );
+        assert!(matches!(
+            DirectoryChainStore::open(&path, producer.public_key_bytes(), NOW + 1),
+            Err(DirectoryChainStoreError::Block(
+                DirectoryCommitmentValidationError::InvalidSignature
+            ))
+        ));
+    }
+
+    #[test]
+    fn long_chain_descriptor_signature_tampering_deep_in_the_chain_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let producer = IdentityKeyPair::from_bytes(&[0x94; 32]).unwrap();
+        long_chain(&path, &producer);
+        flip_last_byte(
+            &path,
+            "directory_descriptor_objects",
+            "descriptor_blob",
+            "descriptor_hash = (SELECT descriptor_hash FROM directory_chain_commitments
+                                WHERE block_height = 101)",
+        );
+        assert!(matches!(
+            DirectoryChainStore::open(&path, producer.public_key_bytes(), NOW + 1),
+            Err(DirectoryChainStoreError::Descriptor(_))
+        ));
+    }
+
     /// Manual measurement against a copy of a real store:
     /// `AERONYX_DIRECTORY_CHAIN_BENCH_DB=/copy/directory-chain.db
     ///  AERONYX_DIRECTORY_CHAIN_BENCH_PRODUCER=<hex node id>
@@ -1672,6 +1866,19 @@ mod tests {
         println!(
             "TIMING blocks={} commitments={} open_complete_audit={:?} next_audit={:?}",
             complete.blocks, complete.commitments, open_elapsed, extended_elapsed
+        );
+        drop(store);
+        // [PARALLEL-DIRECTORY-AUDIT 2026-10-10 by Claude] The replica tables
+        // share the file and are audited at startup as well.
+        let started = std::time::Instant::now();
+        let (_, replica) =
+            crate::services::DirectoryReplicaStore::open(&path, producer, now).unwrap();
+        println!(
+            "TIMING replica producers={} blocks={} commitments={} open_complete_audit={:?}",
+            replica.producers,
+            replica.blocks,
+            replica.commitments,
+            started.elapsed()
         );
     }
 }

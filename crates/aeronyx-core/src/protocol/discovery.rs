@@ -1861,12 +1861,47 @@ impl DirectoryCommitmentBlockV1 {
         previous_timestamp: u64,
         observed_at: u64,
     ) -> Result<(), DirectoryCommitmentValidationError> {
-        if self.header.protocol_version != DIRECTORY_COMMITMENT_BLOCK_VERSION_V1 {
-            return Err(DirectoryCommitmentValidationError::UnsupportedVersion);
-        }
-        if &self.header.chain_id != expected_chain_id {
-            return Err(DirectoryCommitmentValidationError::WrongChain);
-        }
+        // Same checks, same order as before the split: contract, position,
+        // then payload and signature.
+        self.verify_contract(expected_chain_id)?;
+        self.verify_position(expected_height, expected_prev_hash, previous_timestamp)?;
+        self.verify_payload(observed_at)
+    }
+
+    /// Validates everything that does not depend on the previous block:
+    /// contract, future-clock bound, canonical payload, Merkle root and
+    /// producer signature.
+    ///
+    /// [PARALLEL-DIRECTORY-AUDIT 2026-10-10 by Claude] Lets an audit verify the
+    /// expensive, independent part of many blocks concurrently and then run
+    /// [`Self::verify_position`] in chain order. `verify_contents` followed by
+    /// `verify_position` accepts exactly the blocks [`Self::verify_at`] accepts.
+    ///
+    /// # Errors
+    /// Returns a [`DirectoryCommitmentValidationError`] when the block breaks
+    /// the V1 contract, timestamp bound, canonical payload, Merkle commitment,
+    /// producer identity, or signature.
+    pub fn verify_contents(
+        &self,
+        expected_chain_id: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<(), DirectoryCommitmentValidationError> {
+        self.verify_contract(expected_chain_id)?;
+        self.verify_payload(observed_at)
+    }
+
+    /// Validates the block's position after its predecessor: height,
+    /// previous-block hash, genesis rules and non-decreasing timestamp.
+    ///
+    /// # Errors
+    /// Returns a [`DirectoryCommitmentValidationError`] when the block does not
+    /// directly follow the expected predecessor.
+    pub fn verify_position(
+        &self,
+        expected_height: u64,
+        expected_prev_hash: &[u8; 32],
+        previous_timestamp: u64,
+    ) -> Result<(), DirectoryCommitmentValidationError> {
         if self.header.height != expected_height {
             return Err(DirectoryCommitmentValidationError::InvalidHeight);
         }
@@ -1878,7 +1913,23 @@ impl DirectoryCommitmentBlockV1 {
             self.header.timestamp,
             &self.header.prev_block_hash,
             previous_timestamp,
-        )?;
+        )
+    }
+
+    fn verify_contract(
+        &self,
+        expected_chain_id: &[u8; 32],
+    ) -> Result<(), DirectoryCommitmentValidationError> {
+        if self.header.protocol_version != DIRECTORY_COMMITMENT_BLOCK_VERSION_V1 {
+            return Err(DirectoryCommitmentValidationError::UnsupportedVersion);
+        }
+        if &self.header.chain_id != expected_chain_id {
+            return Err(DirectoryCommitmentValidationError::WrongChain);
+        }
+        Ok(())
+    }
+
+    fn verify_payload(&self, observed_at: u64) -> Result<(), DirectoryCommitmentValidationError> {
         if self.header.timestamp > observed_at.saturating_add(MAX_DIRECTORY_BLOCK_FUTURE_SKEW_SECS)
         {
             return Err(DirectoryCommitmentValidationError::InvalidTimestamp);
@@ -5217,6 +5268,97 @@ mod tests {
         let decoded = decode_discovery_message(&bytes).unwrap();
 
         assert_eq!(decoded, message);
+    }
+
+    // [PARALLEL-DIRECTORY-AUDIT 2026-10-10 by Claude] Audits now run
+    // verify_contents (in parallel) and verify_position (in order) instead of
+    // verify_at. The pair must accept exactly the blocks verify_at accepts.
+    #[test]
+    fn verify_contents_then_position_accepts_exactly_what_verify_at_accepts() {
+        let producer = IdentityKeyPair::from_bytes(&[0x83; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x84; 32]).unwrap();
+        let descriptor = SignedNodeDescriptor::sign(descriptor_for(&subject), &subject).unwrap();
+        let commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).unwrap();
+        let now = 1_700_000_100;
+        let chain = AERONYX_DIRECTORY_MAINNET_CHAIN_ID;
+        let genesis =
+            DirectoryCommitmentBlockV1::new_signed(1, now, [0u8; 32], vec![commitment], &producer)
+                .unwrap();
+        let second = DirectoryCommitmentBlockV1::new_signed(
+            2,
+            now + 1,
+            genesis.hash(),
+            vec![commitment],
+            &producer,
+        )
+        .unwrap();
+        let mut bad_signature = second.clone();
+        bad_signature.producer_signature[0] ^= 0x01;
+        let mut wrong_chain = second.clone();
+        wrong_chain.header.chain_id[0] ^= 0x01;
+        let mut wrong_root = second.clone();
+        wrong_root.header.commitment_root[0] ^= 0x01;
+        let future = DirectoryCommitmentBlockV1::new_signed(
+            2,
+            now + MAX_DIRECTORY_BLOCK_FUTURE_SKEW_SECS + 10,
+            genesis.hash(),
+            vec![commitment],
+            &producer,
+        )
+        .unwrap();
+
+        let cases: Vec<(&str, &DirectoryCommitmentBlockV1, u64, [u8; 32], u64, bool)> = vec![
+            ("genesis", &genesis, 1, [0u8; 32], 0, true),
+            ("second", &second, 2, genesis.hash(), now, true),
+            ("wrong height", &second, 3, genesis.hash(), now, false),
+            ("wrong previous hash", &second, 2, [0x07; 32], now, false),
+            (
+                "timestamp before predecessor",
+                &second,
+                2,
+                genesis.hash(),
+                now + 5,
+                false,
+            ),
+            (
+                "bad signature",
+                &bad_signature,
+                2,
+                genesis.hash(),
+                now,
+                false,
+            ),
+            ("wrong chain", &wrong_chain, 2, genesis.hash(), now, false),
+            (
+                "wrong Merkle root",
+                &wrong_root,
+                2,
+                genesis.hash(),
+                now,
+                false,
+            ),
+            (
+                "too far in the future",
+                &future,
+                2,
+                genesis.hash(),
+                now,
+                false,
+            ),
+        ];
+        for (name, block, height, previous_hash, previous_timestamp, valid) in cases {
+            let combined = block.verify_at(&chain, height, &previous_hash, previous_timestamp, now);
+            let split = block
+                .verify_contents(&chain, now)
+                .and_then(|()| block.verify_position(height, &previous_hash, previous_timestamp));
+            assert_eq!(combined.is_ok(), valid, "{name}: verify_at");
+            assert_eq!(
+                split.is_ok(),
+                valid,
+                "{name}: verify_contents + verify_position"
+            );
+        }
     }
 
     #[test]

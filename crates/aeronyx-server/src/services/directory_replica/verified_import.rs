@@ -886,11 +886,18 @@ impl DirectoryReplicaStore {
             .collect()
     }
 
-    pub(super) fn load_verified_commitments_for_block(
+    /// Reads one block's commitment rows and their descriptor objects and runs
+    /// every check that needs no signature verification.
+    ///
+    /// [PARALLEL-DIRECTORY-AUDIT 2026-10-10 by Claude] Split from the former
+    /// load-and-verify helper so the audit reads (sequentially, inside its
+    /// snapshot) and verifies descriptor signatures (concurrently, per batch)
+    /// separately. [`Self::verify_pending_commitment`] finishes each row.
+    pub(super) fn load_commitment_rows_for_block(
         connection: &Connection,
         producer: &[u8; 32],
         block_height: i64,
-    ) -> Result<Vec<DirectoryDescriptorCommitmentV1>, DirectoryReplicaStoreError> {
+    ) -> Result<Vec<PendingReplicaCommitment>, DirectoryReplicaStoreError> {
         let mut statement = connection.prepare(
             "SELECT c.commitment_hash, c.node_id, c.sequence_le, c.descriptor_hash,
                     o.node_id, o.sequence_le, length(o.descriptor_blob),
@@ -967,31 +974,44 @@ impl DirectoryReplicaStore {
                     "replica commitment is missing its descriptor sequence".to_string(),
                 )
             })?;
-            let object_blob = materialize_admitted_replica_blob(
+            let descriptor_blob = materialize_admitted_replica_blob(
                 object_blob_length,
                 object_blob,
                 PersistedReplicaBlobKind::Descriptor,
             )?;
-            let descriptor = decode_descriptor_object(&object_blob)?;
-            let object_commitment =
-                DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
-                    .map_err(|error| DirectoryReplicaStoreError::Descriptor(error.to_string()))?;
             let object_sequence: [u8; 8] = object_sequence.try_into().map_err(|_| {
                 DirectoryReplicaStoreError::Integrity(
                     "replica descriptor sequence must contain 8 bytes".to_string(),
                 )
             })?;
-            if object_commitment != commitment
-                || bytes32(&object_node_id, "replica descriptor node id")? != commitment.node_id
-                || u64::from_le_bytes(object_sequence) != commitment.sequence
-            {
-                return Err(DirectoryReplicaStoreError::Integrity(
-                    "replica descriptor object index mismatch".to_string(),
-                ));
-            }
-            commitments.push(commitment);
+            commitments.push(PendingReplicaCommitment {
+                commitment,
+                object_node_id: bytes32(&object_node_id, "replica descriptor node id")?,
+                object_sequence: u64::from_le_bytes(object_sequence),
+                descriptor_blob,
+            });
         }
         Ok(commitments)
+    }
+
+    /// Verifies one descriptor object's signature and that it is exactly the
+    /// object its commitment row names.
+    pub(super) fn verify_pending_commitment(
+        pending: &PendingReplicaCommitment,
+    ) -> Result<DirectoryDescriptorCommitmentV1, DirectoryReplicaStoreError> {
+        let descriptor = decode_descriptor_object(&pending.descriptor_blob)?;
+        let object_commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
+                .map_err(|error| DirectoryReplicaStoreError::Descriptor(error.to_string()))?;
+        if object_commitment != pending.commitment
+            || pending.object_node_id != pending.commitment.node_id
+            || pending.object_sequence != pending.commitment.sequence
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "replica descriptor object index mismatch".to_string(),
+            ));
+        }
+        Ok(pending.commitment)
     }
 
     pub(super) fn ensure_producer_row(
@@ -1081,72 +1101,93 @@ impl DirectoryReplicaStore {
         let mut previous_hash = [0u8; 32];
         let mut previous_timestamp = 0u64;
         let mut audited_commitments = 0u64;
-        while let Some(row) = rows.next()? {
-            let block_blob = materialize_admitted_replica_blob(
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<Vec<u8>>>(6)?,
-                PersistedReplicaBlobKind::Block,
-            )?;
-            let row = StoredReplicaBlockRow {
-                height: row.get(0)?,
-                block_hash: row.get(1)?,
-                prev_block_hash: row.get(2)?,
-                produced_at: row.get(3)?,
-                commitment_count: row.get(4)?,
-                block_blob,
-            };
-            let block = decode_block(&row.block_blob)?;
-            let height = positive_i64_to_u64(row.height, "replica block height")?;
-            if block.header.producer != tip.producer
-                || height != expected_height
-                || height != block.header.height
-                || bytes32(&row.block_hash, "stored replica block hash")? != block.hash()
-                || bytes32(&row.prev_block_hash, "stored replica previous hash")?
-                    != block.header.prev_block_hash
-                || positive_i64_to_u64(row.produced_at, "replica produced timestamp")?
-                    != block.header.timestamp
-                || nonnegative_i64_to_u64(row.commitment_count, "replica commitment count")?
-                    != u64::from(block.header.commitment_count)
-            {
-                return Err(DirectoryReplicaStoreError::Integrity(format!(
-                    "replica block {height} columns do not match its signed object"
-                )));
+        // [PARALLEL-DIRECTORY-AUDIT 2026-10-10 by Claude] Read a bounded batch
+        // of blocks with their commitment rows inside the audit snapshot, verify
+        // their independent parts (block and descriptor signatures, Merkle root,
+        // canonical payload) concurrently, then run every order-dependent check
+        // in chain order. Memory stays bounded by one batch.
+        let mut pending: Vec<(StoredReplicaBlockRow, Vec<PendingReplicaCommitment>)> =
+            Vec::with_capacity(AUDIT_REPLICA_BLOCK_BATCH);
+        loop {
+            pending.clear();
+            while pending.len() < AUDIT_REPLICA_BLOCK_BATCH {
+                let Some(row) = rows.next()? else {
+                    break;
+                };
+                let block_blob = materialize_admitted_replica_blob(
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    PersistedReplicaBlobKind::Block,
+                )?;
+                let row = StoredReplicaBlockRow {
+                    height: row.get(0)?,
+                    block_hash: row.get(1)?,
+                    prev_block_hash: row.get(2)?,
+                    produced_at: row.get(3)?,
+                    commitment_count: row.get(4)?,
+                    block_blob,
+                };
+                let commitments =
+                    Self::load_commitment_rows_for_block(connection, &tip.producer, row.height)?;
+                pending.push((row, commitments));
             }
-            block.verify_at(
-                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-                expected_height,
-                &previous_hash,
-                previous_timestamp,
-                observed_at,
-            )?;
-            let mut actual =
-                Self::load_verified_commitments_for_block(connection, &tip.producer, row.height)?;
-            actual.sort_unstable();
-            if actual != block.commitments {
-                return Err(DirectoryReplicaStoreError::Integrity(format!(
-                    "replica block {height} commitment index mismatch"
-                )));
+            if pending.is_empty() {
+                break;
             }
-            report.blocks = report.blocks.saturating_add(1);
-            report.commitments = report
-                .commitments
-                .saturating_add(u64::from(block.header.commitment_count));
-            audited_commitments = audited_commitments
-                .checked_add(u64::from(block.header.commitment_count))
-                .ok_or_else(|| {
-                    DirectoryReplicaStoreError::Integrity(
-                        "replica producer commitment count exhausted".to_string(),
-                    )
-                })?;
-            #[cfg(test)]
-            notify_directory_replica_audit_test_observer(
-                DirectoryReplicaAuditTestEvent::BlockVerified(height),
-            );
-            previous_hash = block.hash();
-            previous_timestamp = block.header.timestamp;
-            expected_height = expected_height.checked_add(1).ok_or_else(|| {
-                DirectoryReplicaStoreError::Integrity("replica height exhausted".to_string())
+            let verified = parallel_try_map(&pending, |(row, commitments)| {
+                let block = decode_block(&row.block_blob)?;
+                block.verify_contents(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID, observed_at)?;
+                let mut actual = commitments
+                    .iter()
+                    .map(Self::verify_pending_commitment)
+                    .collect::<Result<Vec<_>, _>>()?;
+                actual.sort_unstable();
+                Ok::<_, DirectoryReplicaStoreError>((block, actual))
             })?;
+            for ((row, _), (block, actual)) in pending.iter().zip(verified) {
+                let height = positive_i64_to_u64(row.height, "replica block height")?;
+                if block.header.producer != tip.producer
+                    || height != expected_height
+                    || height != block.header.height
+                    || bytes32(&row.block_hash, "stored replica block hash")? != block.hash()
+                    || bytes32(&row.prev_block_hash, "stored replica previous hash")?
+                        != block.header.prev_block_hash
+                    || positive_i64_to_u64(row.produced_at, "replica produced timestamp")?
+                        != block.header.timestamp
+                    || nonnegative_i64_to_u64(row.commitment_count, "replica commitment count")?
+                        != u64::from(block.header.commitment_count)
+                {
+                    return Err(DirectoryReplicaStoreError::Integrity(format!(
+                        "replica block {height} columns do not match its signed object"
+                    )));
+                }
+                block.verify_position(expected_height, &previous_hash, previous_timestamp)?;
+                if actual != block.commitments {
+                    return Err(DirectoryReplicaStoreError::Integrity(format!(
+                        "replica block {height} commitment index mismatch"
+                    )));
+                }
+                report.blocks = report.blocks.saturating_add(1);
+                report.commitments = report
+                    .commitments
+                    .saturating_add(u64::from(block.header.commitment_count));
+                audited_commitments = audited_commitments
+                    .checked_add(u64::from(block.header.commitment_count))
+                    .ok_or_else(|| {
+                        DirectoryReplicaStoreError::Integrity(
+                            "replica producer commitment count exhausted".to_string(),
+                        )
+                    })?;
+                #[cfg(test)]
+                notify_directory_replica_audit_test_observer(
+                    DirectoryReplicaAuditTestEvent::BlockVerified(height),
+                );
+                previous_hash = block.hash();
+                previous_timestamp = block.header.timestamp;
+                expected_height = expected_height.checked_add(1).ok_or_else(|| {
+                    DirectoryReplicaStoreError::Integrity("replica height exhausted".to_string())
+                })?;
+            }
         }
         drop(rows);
         drop(statement);

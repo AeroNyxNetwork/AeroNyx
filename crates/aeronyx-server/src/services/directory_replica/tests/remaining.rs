@@ -715,3 +715,94 @@ fn malformed_or_unrelated_objects_are_rejected_before_sqlite_changes() {
         0
     );
 }
+
+// [PARALLEL-DIRECTORY-AUDIT 2026-10-10 by Claude] Long enough that the replica
+// audit verifies batches on several threads.
+const LONG_REPLICA_BLOCKS: u64 = 64;
+
+fn long_replica_chain(path: &std::path::Path, local: &IdentityKeyPair, producer: &IdentityKeyPair) {
+    let subject = IdentityKeyPair::from_bytes(&[0x63; 32]).unwrap();
+    let (store, _) = DirectoryReplicaStore::open(path, local.public_key_bytes(), NOW + 20).unwrap();
+    let mut previous = [0u8; 32];
+    for height in 1..=LONG_REPLICA_BLOCKS {
+        let object = descriptor(&subject, height);
+        let replica_block = block(producer, height, previous, &object);
+        let request_id = [u8::try_from(height).unwrap(); 16];
+        import_replica_block(&store, producer, &object, &replica_block, request_id);
+        previous = replica_block.hash();
+    }
+}
+
+fn flip_last_replica_byte(path: &std::path::Path, table: &str, blob: &str, filter: &str) {
+    let connection = Connection::open(path).unwrap();
+    let mut bytes: Vec<u8> = connection
+        .query_row(
+            &format!("SELECT {blob} FROM {table} WHERE {filter}"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    *bytes.last_mut().unwrap() ^= 0x01;
+    let changed = connection
+        .execute(
+            &format!("UPDATE {table} SET {blob} = ?1 WHERE {filter}"),
+            [bytes],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+#[test]
+fn long_replica_audit_runs_in_parallel_and_matches_the_chain() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("directory.db");
+    let local = IdentityKeyPair::from_bytes(&[0x61; 32]).unwrap();
+    let producer = IdentityKeyPair::from_bytes(&[0x62; 32]).unwrap();
+    long_replica_chain(&path, &local, &producer);
+    let (store, opened) =
+        DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 21).unwrap();
+    assert_eq!(opened.blocks, LONG_REPLICA_BLOCKS);
+    assert_eq!(opened.commitments, LONG_REPLICA_BLOCKS);
+    assert_eq!(store.audit(NOW + 21).unwrap(), opened);
+}
+
+#[test]
+fn long_replica_block_signature_tampering_deep_in_the_chain_fails_closed() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("directory.db");
+    let local = IdentityKeyPair::from_bytes(&[0x64; 32]).unwrap();
+    let producer = IdentityKeyPair::from_bytes(&[0x65; 32]).unwrap();
+    long_replica_chain(&path, &local, &producer);
+    flip_last_replica_byte(
+        &path,
+        "directory_replica_blocks",
+        "block_blob",
+        "height = 41",
+    );
+    assert!(matches!(
+        DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 21),
+        Err(DirectoryReplicaStoreError::Block(
+            DirectoryCommitmentValidationError::InvalidSignature
+        ))
+    ));
+}
+
+#[test]
+fn long_replica_descriptor_signature_tampering_deep_in_the_chain_fails_closed() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("directory.db");
+    let local = IdentityKeyPair::from_bytes(&[0x66; 32]).unwrap();
+    let producer = IdentityKeyPair::from_bytes(&[0x67; 32]).unwrap();
+    long_replica_chain(&path, &local, &producer);
+    flip_last_replica_byte(
+        &path,
+        "directory_replica_descriptor_objects",
+        "descriptor_blob",
+        "descriptor_hash = (SELECT descriptor_hash FROM directory_replica_commitments
+                            WHERE block_height = 40)",
+    );
+    assert!(matches!(
+        DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 21),
+        Err(DirectoryReplicaStoreError::Descriptor(_))
+    ));
+}
