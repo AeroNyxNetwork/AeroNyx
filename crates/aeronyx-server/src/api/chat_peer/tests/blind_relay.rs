@@ -443,7 +443,10 @@ async fn blind_relay_rejects_future_timestamp_without_parsing_blob() {
         next_hop: node_identity.public_key_bytes(),
         ttl: 2,
         encrypted_blob: br#"{"opaque":"future route frame"}"#.to_vec(),
-        timestamp: now + BLIND_RELAY_MAX_FUTURE_SKEW_SECS + 1,
+        // [TEST-CLOCK-MARGIN 2026-10-10 by Claude] process_peer_blind_relay
+        // reads the live clock again; a 1 s margin failed on a slow CI runner
+        // whenever a second boundary passed between `now` and the check.
+        timestamp: now + BLIND_RELAY_MAX_FUTURE_SKEW_SECS + 60,
         signature: [0u8; 64],
     }
     .sign_with(&previous_hop);
