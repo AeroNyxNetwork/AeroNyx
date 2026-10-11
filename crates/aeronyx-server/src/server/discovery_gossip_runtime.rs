@@ -514,6 +514,19 @@ impl Server {
                 let mut gossip_peer_identity_hints = DiscoveryPeerIdentityHints::default();
 
                 for endpoint in &config.discovery.seed_endpoints {
+                    // [PINNED-SEEDS 2026-10-11 by Claude] A pinned address is
+                    // reached only through its pinned exchange below.
+                    let pinned_addr = crate::api::peer_tls::ip_literal_socket_addr(endpoint)
+                        .is_some_and(|addr| {
+                            peer_store
+                                .pin_policy()
+                                .pins()
+                                .iter()
+                                .any(|pin| pin.addr == addr)
+                        });
+                    if pinned_addr {
+                        continue;
+                    }
                     let Some(url) = Self::discovery_gossip_url(endpoint) else {
                         continue;
                     };
@@ -530,7 +543,7 @@ impl Server {
 
                 let mut gossip_round = DiscoveryGossipRoundAccumulator::default();
 
-                let seed_attempted = gossip_urls.len();
+                let seed_attempted = gossip_urls.len() + peer_store.pin_policy().pins().len();
 
                 if include_cached_peers {
                     // [DISCOVERY-IDENTITY-AMBIGUITY 2026-07-28 by Codex] Build
@@ -658,6 +671,44 @@ impl Server {
                     snapshot_limit: config.discovery.gossip_peer_limit,
                     peer_timeout,
                 };
+                // [PINNED-SEEDS 2026-10-11 by Claude] Operator pins first, each
+                // over identity-bound TLS pinned to its id. Only these answers
+                // can establish a pinned identity; the proof is consumed by
+                // the one import and never kept.
+                for pin in peer_store.pin_policy().pins() {
+                    gossip_round.attempted += 1;
+                    let exchange = tokio::time::timeout(
+                        peer_timeout,
+                        crate::services::peer_store::fetch_pinned_snapshot(
+                            gossip_http_client.as_ref(),
+                            pin,
+                            self_descriptor.clone(),
+                            now,
+                            config.discovery.gossip_peer_limit,
+                            DISCOVERY_GOSSIP_RESPONSE_MAX_BYTES,
+                        ),
+                    )
+                    .await;
+                    match exchange {
+                        Ok(Ok((proof, Some(message)))) => {
+                            peer_store.apply_pinned_seed_response(proof, &message, now);
+                            gossip_round.succeeded += 1;
+                        }
+                        Ok(Ok((_proof, None))) => gossip_round.succeeded += 1,
+                        Ok(Err(error)) => peer_store.record_audit_event(
+                            now,
+                            "pinned_seed_exchange",
+                            "warning",
+                            error.reason(),
+                        ),
+                        Err(_) => peer_store.record_audit_event(
+                            now,
+                            "pinned_seed_exchange",
+                            "warning",
+                            "pin_timeout",
+                        ),
+                    }
+                }
                 let reports = Self::gossip_with_peers_bounded(
                     execution,
                     gossip_urls,

@@ -2922,6 +2922,9 @@ pub struct PeerStore {
     /// [NODE-TLS-BINDING 2026-10-10 by Claude] Whether this store publishes
     /// the process-wide identity-bound TLS directory (production store only).
     identity_tls_directory_enabled: AtomicBool,
+    /// [PINNED-SEEDS 2026-10-11 by Claude] Pins `P` and quarantine `Q`, fixed
+    /// at construction (no setter): every import sees the same policy.
+    pin_policy: std::sync::Arc<PinPolicy>,
 }
 
 // [ARCH-SPLIT 2026-10-02] Child modules keep the same call paths.
@@ -2932,6 +2935,13 @@ mod gossip_status;
 mod path_proof_log;
 mod route_evidence;
 mod verified_upsert;
+// [PINNED-SEEDS 2026-10-11 by Claude] Operator-pinned discovery seeds.
+mod pinned_seeds;
+pub(crate) use pinned_seeds::PeerOrigin;
+pub use pinned_seeds::{
+    fetch_pinned_snapshot, load_and_extend_quarantine, parse_pinned_seeds, quarantine_path,
+    FsQuarantineIo, PinPolicy, PinnedFetchError, PinnedSeed, PinnedTlsProof, QuarantineIo,
+};
 
 /// Refreshes the identity-bound TLS directory when a peer-map writer returns.
 ///
@@ -2980,7 +2990,24 @@ impl PeerStore {
             peer_cache_dirty: AtomicBool::new(false),
             peer_cache_notify: Notify::new(),
             identity_tls_directory_enabled: AtomicBool::new(false),
+            pin_policy: std::sync::Arc::new(PinPolicy::empty()),
         }
+    }
+
+    /// [PINNED-SEEDS 2026-10-11 by Claude] A store whose pins and quarantine
+    /// are fixed before it exists, so no import can run under another policy.
+    #[must_use]
+    pub fn new_with_pin_policy(policy: PinPolicy) -> Self {
+        Self {
+            pin_policy: std::sync::Arc::new(policy),
+            ..Self::new()
+        }
+    }
+
+    /// The fixed pin policy.
+    #[must_use]
+    pub fn pin_policy(&self) -> &PinPolicy {
+        &self.pin_policy
     }
 
     /// Makes this store the source of the process-wide identity-bound TLS
@@ -3002,7 +3029,12 @@ impl PeerStore {
         }
         let directory = {
             let peers = self.peers.read();
-            crate::api::peer_tls::PeerTlsDirectory::from_descriptors(peers.values())
+            // [PINNED-SEEDS 2026-10-11 by Claude] Pins are claimants on every
+            // rebuild, before and after their descriptor is known.
+            crate::api::peer_tls::PeerTlsDirectory::from_descriptors_and_pins(
+                peers.values(),
+                self.pin_policy.pins(),
+            )
         };
         crate::api::peer_tls::install_directory(directory);
     }

@@ -51,11 +51,15 @@ region = "@REGION@"
 peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
 directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
 gossip_enabled = true
-seed_endpoints = [
-  "http://8.213.146.244:8422",
-  "http://35.201.143.10:8422",
-  "http://34.32.67.213:8422",
-  "http://111.68.15.70:8422",
+# [PINNED-SEEDS 2026-10-11 by Claude] Operator-pinned seeds: the TEE node has
+# no operator snapshot, so these pins are its only trust anchors. Each is
+# reached only over identity-bound TLS pinned to the id. No plaintext seeds:
+# this template ships inside the image, so a rollback restores the old one.
+pinned_seeds = [
+  "fa29c129f789d4f79ed2075c5c2706cdbcf8ae11196b13048174598e1dca4d54@8.213.146.244:8422",
+  "2df04a2eba722a84ac1453ba25a946c625629c3827e8a4a8cbd59794f0f3fb37@35.201.143.10:8422",
+  "e25fc32a2d7be350523a7b512248d7b8fbd4c42672805dcf517041d2e12c7ce0@34.32.67.213:8422",
+  "e16cc241997d759ac0706faa749ec03d66ff9a9cc0089ce55cc26cdf67897189@111.68.15.70:8422",
 ]
 
 [memchain.chat_relay]

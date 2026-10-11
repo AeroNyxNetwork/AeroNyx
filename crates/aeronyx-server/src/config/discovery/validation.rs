@@ -115,6 +115,24 @@ impl DiscoveryConfig {
             Self::validate_seed_endpoint(endpoint)?;
         }
 
+        // [PINNED-SEEDS 2026-10-11 by Claude] Syntax, public address and
+        // cross-entry checks; the own-identity check runs at startup, where
+        // the identity is known.
+        if !self.pinned_seeds.is_empty() {
+            crate::services::peer_store::parse_pinned_seeds(&self.pinned_seeds, None)
+                .map_err(|reason| ServerError::config_invalid("discovery.pinned_seeds", reason))?;
+            if self
+                .peer_cache_path
+                .as_deref()
+                .is_none_or(|path| path.trim().is_empty())
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.pinned_seeds",
+                    "requires discovery.peer_cache_path for the pin quarantine",
+                ));
+            }
+        }
+
         if let Some(path) = &self.peer_cache_path {
             if path.trim().is_empty() {
                 return Err(ServerError::config_invalid(

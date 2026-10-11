@@ -562,7 +562,15 @@ impl PeerStore {
 
         for descriptor in &snapshot.peers {
             if descriptor.verify_at(now).is_ok() {
-                match self.upsert_verified_from_source(descriptor.clone(), now, source.clone()) {
+                // [PINNED-SEEDS 2026-10-11 by Claude] Typed cache origin: pins
+                // and quarantined ids never come back from a cache file.
+                match self.upsert_verified_with_origin(
+                    descriptor.clone(),
+                    now,
+                    source.clone(),
+                    PeerOrigin::CacheValid,
+                    None,
+                ) {
                     Ok(true) => report.inserted += 1,
                     Ok(false) => report.unchanged += 1,
                     Err(PeerStoreError::StaleSequence { .. }) => report.stale += 1,
@@ -597,6 +605,22 @@ impl PeerStore {
         let node_id = descriptor.node_id();
         let incoming_sequence = descriptor.sequence();
         let mut peers = self.peers.write();
+        // [PINNED-SEEDS 2026-10-11 by Claude] W2: same pin rules, same lock.
+        if let Err(rejection) =
+            self.pin_admission(&peers, &descriptor, PeerOrigin::CacheExpired, None)
+        {
+            drop(peers);
+            self.record_peer_event(
+                now,
+                "peer_rejected",
+                "rejected",
+                source,
+                &node_id,
+                Some(incoming_sequence),
+                Some(rejection.reason()),
+            );
+            return Err(PeerStoreError::VerificationFailed);
+        }
         let existing = peers.get(&node_id);
         let existing_sequence = existing.map(SignedNodeDescriptor::sequence);
 
@@ -738,6 +762,9 @@ impl PeerStore {
                     .read()
                     .contains_key(&descriptor.node_id())
             })
+            // [PINNED-SEEDS 2026-10-11 by Claude] Neither pins nor any id
+            // ever pinned (Q ⊇ P) is persisted: each start re-proves pins.
+            .filter(|descriptor| !self.pin_policy.is_quarantined(&descriptor.node_id()))
             .inspect(|descriptor| {
                 if descriptor.descriptor.is_valid_at(generated_at) {
                     valid += 1;

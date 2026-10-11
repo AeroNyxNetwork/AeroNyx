@@ -12,8 +12,8 @@ use std::sync::atomic::Ordering;
 use aeronyx_core::protocol::discovery::{DirectoryDescriptorCommitmentV1, SignedNodeDescriptor};
 
 use super::{
-    PeerStore, PeerStoreError, UntrustedDiscoveryCandidateState, VerifiedPromotionMaterial,
-    UNTRUSTED_DISCOVERY_CANDIDATE_CAPACITY,
+    PeerOrigin, PeerStore, PeerStoreError, UntrustedDiscoveryCandidateState,
+    VerifiedPromotionMaterial, UNTRUSTED_DISCOVERY_CANDIDATE_CAPACITY,
 };
 
 // [PERMISSIONLESS-ENDPOINT-PROMOTION 2026-09-24 by Codex] A promoted Stage-A
@@ -162,10 +162,14 @@ impl PeerStore {
             },
         );
         drop(gates);
-        let changed = match self.upsert_verified_from_source(
+        // [PINNED-SEEDS 2026-10-11 by Claude] Typed origin: a pinned id is
+        // only ever established over its pinned TLS, never by promotion.
+        let changed = match self.upsert_verified_with_origin(
             descriptor.clone(),
             now,
             "permissionless_promotion",
+            PeerOrigin::Promotion,
+            None,
         ) {
             Ok(changed) => changed,
             Err(error) => {

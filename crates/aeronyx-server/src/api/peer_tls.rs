@@ -64,10 +64,29 @@ impl PeerTlsDirectory {
     ///
     /// Expired-but-retained descriptors count too: a node's signed statement
     /// that it serves TLS does not lapse into a plain-HTTP fallback.
+    #[cfg(test)]
     pub(crate) fn from_descriptors<'a>(
         descriptors: impl IntoIterator<Item = &'a SignedNodeDescriptor>,
     ) -> Self {
+        Self::from_descriptors_and_pins(descriptors, &[])
+    }
+
+    /// [PINNED-SEEDS 2026-10-11 by Claude] Also counts operator pins as
+    /// claimants that serve identity-bound TLS. A pinned address is `Pinned`
+    /// only while no other identity claims it, with or without a descriptor
+    /// of the pin itself; any other claimant makes it `Ambiguous`.
+    pub(crate) fn from_descriptors_and_pins<'a>(
+        descriptors: impl IntoIterator<Item = &'a SignedNodeDescriptor>,
+        pins: &[crate::services::peer_store::PinnedSeed],
+    ) -> Self {
         let mut claimants: HashMap<SocketAddr, (Vec<[u8; 32]>, bool)> = HashMap::new();
+        for pin in pins {
+            let entry = claimants.entry(pin.addr).or_default();
+            if !entry.0.contains(&pin.node_id) {
+                entry.0.push(pin.node_id);
+            }
+            entry.1 = true;
+        }
         for descriptor in descriptors {
             let Some(addr) = descriptor
                 .descriptor
@@ -119,7 +138,7 @@ pub(crate) fn current_directory() -> Arc<PeerTlsDirectory> {
     DIRECTORY.load_full()
 }
 
-fn ip_literal_socket_addr(endpoint: &str) -> Option<SocketAddr> {
+pub(crate) fn ip_literal_socket_addr(endpoint: &str) -> Option<SocketAddr> {
     let url = super::canonical_peer_http_url(endpoint, "/").ok()?;
     let port = url.port_or_known_default()?;
     let ip = match url.host()? {

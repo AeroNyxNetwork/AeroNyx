@@ -9,7 +9,7 @@ fn startup_peer_store_keeps_pre_router_snapshot_candidate_only() {
     // before any API router is constructed. Only an independently
     // established peer may remain live or enter the sampled URL set.
     let now = 1_800_000_000;
-    let store = Server::new_discovery_peer_store();
+    let store = Server::new_discovery_peer_store(crate::services::peer_store::PinPolicy::empty());
     let signed_public_peer = |seed: u8, endpoint: &str| {
         let identity = IdentityKeyPair::from_bytes(&[seed; 32])
             .unwrap_or_else(|_| panic!("test identity must be valid"));

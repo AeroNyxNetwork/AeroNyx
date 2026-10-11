@@ -157,7 +157,10 @@ pub(super) fn collect_startup_self_check(
         discovery_status,
         &["peer_store", "bootstrap", "seed_endpoints_configured"],
     )
-    .unwrap_or(config.discovery.seed_endpoints.len() as u64);
+    // [PINNED-SEEDS 2026-10-11 by Claude] Pins count as seeds.
+    .unwrap_or(
+        (config.discovery.seed_endpoints.len() + config.discovery.pinned_seeds.len()) as u64,
+    );
     let stability_health = discovery_str(discovery_status, &["peer_store", "stability", "health"])
         .unwrap_or("unknown");
     let restart_recovery_configured = discovery_bool(

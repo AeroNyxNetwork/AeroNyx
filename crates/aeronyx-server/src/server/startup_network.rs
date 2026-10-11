@@ -2,6 +2,7 @@
 // Public address, peer store, and discovery self-check. Bootstrap file import lives next to this call.
 // Bodies are unchanged. Private items are pub(super) so the parent flow can call them.
 use super::*;
+use crate::services::peer_store::PinPolicy;
 
 impl Server {
     // ============================================
@@ -97,13 +98,59 @@ impl Server {
 
     /// Installs the untrusted-gossip admission boundary before any startup
     /// cache read, network await, or outbound gossip task can import a frame.
-    pub(super) fn new_discovery_peer_store() -> Arc<PeerStore> {
+    pub(super) fn new_discovery_peer_store(policy: PinPolicy) -> Arc<PeerStore> {
         // [PERMISSIONLESS-DISCOVERY-STARTUP-GATE 2026-09-24 by Codex] Router
         // construction repeats this idempotent switch later, but may occur
         // after an immediate outbound gossip snapshot response.
-        let peer_store = Arc::new(PeerStore::new());
+        // [PINNED-SEEDS 2026-10-11 by Claude] The pin policy is fixed at
+        // construction, before the first import of any kind.
+        let peer_store = Arc::new(PeerStore::new_with_pin_policy(policy));
         peer_store.enable_untrusted_discovery_candidate_mode();
         peer_store
+    }
+
+    /// [PINNED-SEEDS 2026-10-11 by Claude] Parses the pins (refusing this
+    /// node's own id) and persists the quarantine `Q ∪ P` before any import.
+    /// No pins and no quarantine file is exactly the old behavior; an existing
+    /// quarantine still applies when the pins were removed. Every failure
+    /// other than an absent quarantine file refuses startup.
+    pub(super) async fn load_pin_policy(&self) -> Result<PinPolicy> {
+        let discovery = &self.config.discovery;
+        let own_id = self.identity.public_key_bytes();
+        let pins =
+            crate::services::peer_store::parse_pinned_seeds(&discovery.pinned_seeds, Some(&own_id))
+                .map_err(|reason| ServerError::config_invalid("discovery.pinned_seeds", reason))?;
+        let Some(cache_path) = discovery
+            .peer_cache_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+        else {
+            if pins.is_empty() {
+                return Ok(PinPolicy::empty());
+            }
+            return Err(ServerError::config_invalid(
+                "discovery.pinned_seeds",
+                "requires discovery.peer_cache_path for the pin quarantine",
+            ));
+        };
+        let path = crate::services::peer_store::quarantine_path(cache_path);
+        let pins_for_io = pins.clone();
+        let quarantine = tokio::task::spawn_blocking(move || {
+            crate::services::peer_store::load_and_extend_quarantine(
+                &crate::services::peer_store::FsQuarantineIo,
+                &path,
+                &pins_for_io,
+            )
+        })
+        .await
+        .map_err(|error| {
+            ServerError::config_invalid(
+                "discovery.pinned_seeds",
+                format!("quarantine task: {error}"),
+            )
+        })?
+        .map_err(|reason| ServerError::config_invalid("discovery.pinned_seeds", reason))?;
+        Ok(PinPolicy::new(pins, quarantine))
     }
 
     /// Initializes discovery with explicitly observed storage readiness.
@@ -117,7 +164,7 @@ impl Server {
         anonymous_mailbox_runtime_ready: bool,
         control_http_client: &reqwest::Client,
     ) -> Result<Arc<PeerStore>> {
-        let peer_store = Self::new_discovery_peer_store();
+        let peer_store = Self::new_discovery_peer_store(self.load_pin_policy().await?);
         peer_store.set_max_peers(Some(self.config.discovery.max_peers));
         // [NODE-TLS-BINDING 2026-10-10 by Claude] Before any import, so no
         // peer that advertises identity-bound TLS is ever reached over HTTP.
@@ -166,7 +213,8 @@ impl Server {
             self.config.discovery.enabled,
             self.config.discovery.peer_cache_path.is_some(),
             self.config.discovery.gossip_enabled,
-            self.config.discovery.seed_endpoints.len(),
+            // [PINNED-SEEDS 2026-10-11 by Claude] Pins count as seeds.
+            self.config.discovery.seed_endpoints.len() + self.config.discovery.pinned_seeds.len(),
         );
         let now = unix_now_secs();
         let (self_check_status, self_check_detail) =
@@ -425,7 +473,11 @@ impl Server {
         if !discovery.gossip_enabled {
             missing.push("gossip_enabled");
         }
-        if discovery.gossip_enabled && discovery.seed_endpoints.is_empty() {
+        // [PINNED-SEEDS 2026-10-11 by Claude] Pinned seeds are seeds too.
+        if discovery.gossip_enabled
+            && discovery.seed_endpoints.is_empty()
+            && discovery.pinned_seeds.is_empty()
+        {
             missing.push("seed_endpoints");
         }
         let public_endpoint_configured =

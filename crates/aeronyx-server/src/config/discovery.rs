@@ -56,6 +56,16 @@ pub struct DiscoveryConfig {
     /// cached peer descriptor has an outdated public endpoint.
     #[serde(default)]
     pub seed_endpoints: Vec<String>,
+    /// [PINNED-SEEDS 2026-10-11 by Claude] Operator-pinned seeds,
+    /// `"<64 lowercase hex node id>@<public ip>:<port>"` (IPv6 in brackets).
+    ///
+    /// Unlike `seed_endpoints`, a pin is a trust statement: the identity is
+    /// reached only over identity-bound TLS pinned to it and may enter the
+    /// live peer view on that evidence alone. See
+    /// `services::peer_store::pinned_seeds` for the full rules. Requires
+    /// `peer_cache_path` (the pin quarantine lives next to the cache).
+    #[serde(default)]
+    pub pinned_seeds: Vec<String>,
     /// Timeout in seconds for fetching a remote bootstrap snapshot.
     #[serde(default = "DiscoveryConfig::default_fetch_timeout_secs")]
     pub fetch_timeout_secs: u64,
@@ -690,6 +700,7 @@ impl Default for DiscoveryConfig {
             bootstrap_snapshot_path: None,
             bootstrap_snapshot_url: None,
             seed_endpoints: Vec::new(),
+            pinned_seeds: Vec::new(),
             fetch_timeout_secs: Self::default_fetch_timeout_secs(),
             peer_cache_path: None,
             directory_chain_path: None,

@@ -28,6 +28,23 @@ impl PeerStore {
         now: u64,
         source: impl Into<String>,
     ) -> Result<bool, PeerStoreError> {
+        self.upsert_verified_with_origin(descriptor, now, source, PeerOrigin::Other, None)
+    }
+
+    /// W1, the write boundary of every verified insert or refresh.
+    ///
+    /// [PINNED-SEEDS 2026-10-11 by Claude] `origin` and `proof` take part in
+    /// the pin rules, which run inside the `peers` write lock before any other
+    /// decision, so "already established?" and the insert are one critical
+    /// section. `source` stays a diagnostic label only.
+    pub(crate) fn upsert_verified_with_origin(
+        &self,
+        descriptor: SignedNodeDescriptor,
+        now: u64,
+        source: impl Into<String>,
+        origin: PeerOrigin,
+        proof: Option<&PinnedTlsProof>,
+    ) -> Result<bool, PeerStoreError> {
         let _tls_directory = IdentityTlsDirectoryRefresh(self);
         let node_id = descriptor.node_id();
         let incoming_sequence = descriptor.sequence();
@@ -48,6 +65,21 @@ impl PeerStore {
         }
 
         let mut peers = self.peers.write();
+        #[cfg(test)]
+        pinned_seeds::test_pause_point(&node_id);
+        if let Err(rejection) = self.pin_admission(&peers, &descriptor, origin, proof) {
+            drop(peers);
+            self.record_peer_event(
+                now,
+                "peer_rejected",
+                "rejected",
+                source,
+                &node_id,
+                Some(incoming_sequence),
+                Some(rejection.reason()),
+            );
+            return Err(PeerStoreError::VerificationFailed);
+        }
         let mut route_surface_changed = false;
 
         let is_existing_peer = if let Some(existing) = peers.get(&node_id) {
