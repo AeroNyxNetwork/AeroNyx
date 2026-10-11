@@ -384,6 +384,7 @@ async fn blind_relay_rejects_stale_timestamp_without_parsing_blob() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let now = now_secs();
     let envelope = BlindRelayEnvelope {
@@ -436,6 +437,7 @@ async fn blind_relay_rejects_future_timestamp_without_parsing_blob() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let now = now_secs();
     let envelope = BlindRelayEnvelope {
@@ -494,6 +496,7 @@ async fn onion_terminal_layer_is_peeled_and_delivered() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let now = now_secs();
 
@@ -654,6 +657,7 @@ async fn onion_terminal_armed_claim_recovers_without_duplicate_storage() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
 
     let recovered = process_peer_blind_relay(state, request)
@@ -739,6 +743,7 @@ async fn onion_middle_armed_claim_recovers_through_terminal_durable_replay() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let route_id = [0x69; 16];
     let request = PeerBlindRelayRequest {
@@ -857,6 +862,7 @@ async fn onion_middle_armed_claim_recovers_through_terminal_durable_replay() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let recovered_peel = try_open_onion_layer(
         &request.envelope.encrypted_blob,
@@ -943,6 +949,7 @@ async fn onion_terminal_rejects_same_message_id_with_different_ciphertext() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let now = now_secs();
     let receiver = [0xA2; 32];
@@ -1036,6 +1043,7 @@ async fn onion_terminal_persists_anonymous_blind_vault_put_idempotently() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
 
     let make_envelope = |route_id| {
@@ -1138,6 +1146,7 @@ async fn onion_terminal_requires_chat_relay_delivery_before_ack() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::clone(&replay_registry),
         blind_relay_abuse_guard: Arc::clone(&abuse_guard),
+        central_handoff: None,
     };
     let now = now_secs();
 
@@ -1179,6 +1188,7 @@ async fn onion_terminal_requires_chat_relay_delivery_before_ack() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::clone(&replay_registry),
         blind_relay_abuse_guard: Arc::clone(&abuse_guard),
+        central_handoff: None,
     };
 
     // A terminal delivery failure must release the route id from the
@@ -1230,6 +1240,7 @@ async fn onion_layer_with_wrong_node_key_is_rejected() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let now = now_secs();
 
@@ -1333,6 +1344,7 @@ async fn onion_middle_allows_fresh_signed_peer_before_routeability_probe() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
 
     // Build a true two-layer onion. The middle hop can peel only the outer
@@ -1537,6 +1549,7 @@ async fn two_hop_onion_relay_delivers_real_ciphertext_payload_to_terminal_store(
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
 
     let middle_hop = OnionHop {
@@ -1634,6 +1647,7 @@ async fn blind_relay_http_gate_requires_durable_replay_before_body_parse() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let app = Router::new()
         .route("/api/chat/peer/blind-relay", post(peer_blind_relay_handler))
@@ -1695,6 +1709,7 @@ async fn blind_relay_rejects_immediate_previous_hop_loop_without_parsing_blob() 
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let envelope = BlindRelayEnvelope {
         route_id: [0x44u8; 16],
@@ -1883,6 +1898,7 @@ async fn blind_relay_replays_completed_response_without_forwarding_again() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let envelope = BlindRelayEnvelope {
         route_id: [0x45u8; 16],
@@ -1980,6 +1996,7 @@ async fn blind_relay_in_flight_duplicate_never_returns_false_acceptance() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let error = process_peer_blind_relay(state, request).await.unwrap_err();
 
@@ -2042,6 +2059,7 @@ async fn blind_relay_capacity_rejects_before_terminal_or_forward_effects() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(replay_registry),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let error = process_peer_blind_relay(state, request).await.unwrap_err();
 
@@ -2119,6 +2137,7 @@ async fn blind_relay_forward_retries_transient_next_hop_failure() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let envelope = BlindRelayEnvelope {
         route_id: [0x42u8; 16],
@@ -2223,6 +2242,7 @@ async fn blind_relay_middle_hop_forwards_onward_envelope_without_payload_inspect
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let outer_envelope = BlindRelayEnvelope {
         route_id: [0x62u8; 16],
@@ -2346,6 +2366,7 @@ async fn blind_relay_forward_requires_accepted_next_hop_ack() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let envelope = BlindRelayEnvelope {
         route_id: [0x56u8; 16],
@@ -2429,6 +2450,7 @@ async fn blind_relay_forward_rejects_malformed_success_ack() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let envelope = BlindRelayEnvelope {
         route_id: [0x57u8; 16],
@@ -2520,6 +2542,7 @@ async fn blind_relay_requires_next_hop_chat_relay_capability() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let envelope = BlindRelayEnvelope {
         route_id: [0x54u8; 16],
@@ -2613,6 +2636,7 @@ async fn blind_relay_requires_routeability_evidence_before_forwarding() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let envelope = BlindRelayEnvelope {
         route_id: [0x59u8; 16],
@@ -2711,6 +2735,7 @@ async fn blind_relay_forward_reports_retry_exhaustion_without_payload_data() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let envelope = BlindRelayEnvelope {
         route_id: [0x43u8; 16],
@@ -2821,6 +2846,7 @@ async fn blind_relay_forward_retries_timeout_without_endpoint_leak() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let envelope = BlindRelayEnvelope {
         route_id: [0x58u8; 16],
@@ -2933,4 +2959,218 @@ fn a_one_core_host_admits_concurrent_ingress_instead_of_shedding_the_second() {
         "admission must still be bounded"
     );
     drop(held);
+}
+
+// [ONION-CENTRAL-HANDOFF 2026-10-11 by Claude] A stand-in for the central
+// relay that checks what the real one checks: the node's X-Node-* request
+// signature and the sender's own signature on the exact canonical envelope.
+// It answers with `status`/`body` and records each envelope it verified.
+async fn spawn_handoff_relay(
+    node_id: [u8; 32],
+    status: u16,
+    body: &'static str,
+) -> (String, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+    use axum::{body::Bytes, http::HeaderMap, http::StatusCode, routing::post, Router};
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    let received = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let sink = Arc::clone(&received);
+    let app = Router::new().route(
+        "/handoff",
+        post(move |headers: HeaderMap, request: Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let header = |name: &str| {
+                    headers
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let node_hex = header("X-Node-ID");
+                assert_eq!(node_hex, hex::encode(node_id));
+                let request_text = std::str::from_utf8(&request).unwrap();
+                let digest = Sha256::digest(
+                    format!("{node_hex}{}{request_text}", header("X-Timestamp")).as_bytes(),
+                );
+                let signature: [u8; 64] = hex::decode(header("X-Signature"))
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                IdentityPublicKey::from_bytes(&node_id)
+                    .unwrap()
+                    .verify(&digest, &signature)
+                    .expect("node request signature");
+                let value: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                let envelope_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(value["envelope_b64"].as_str().unwrap())
+                    .unwrap();
+                aeronyx_core::protocol::chat::decode_envelope_strict_verified(&envelope_bytes)
+                    .expect("canonical envelope signed by its sender");
+                sink.lock().unwrap().push(envelope_bytes);
+                (StatusCode::from_u16(status).unwrap(), body)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{address}/handoff"), received)
+}
+
+fn handoff_state(
+    node_identity: &Arc<IdentityKeyPair>,
+    relay: &Arc<ChatRelayService>,
+    peer_store: &Arc<PeerStore>,
+    udp: Arc<UdpTransport>,
+    handoff_url: &str,
+) -> ChatPeerState {
+    ChatPeerState {
+        chat_relay: Some(Arc::clone(relay)),
+        blind_vault: None,
+        anonymous_mailbox: None,
+        sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+        udp,
+        peer_store: Arc::clone(peer_store),
+        node_identity: Arc::clone(node_identity),
+        http_client: Arc::new(reqwest::Client::new()),
+        blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+        blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
+        blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: Some(Arc::new(
+            central_handoff::CentralHandoff::new(handoff_url, Arc::clone(node_identity)).unwrap(),
+        )),
+    }
+}
+
+/// The receipt now means "in the receiver's inbox": the terminal signs only
+/// after the relay accepted the exact envelope, and keeps no local copy that
+/// a receiver elsewhere could never pull.
+#[tokio::test]
+async fn onion_terminal_hands_the_envelope_to_the_receiver_inbox() {
+    use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
+
+    let source = IdentityKeyPair::generate();
+    let node_identity = Arc::new(IdentityKeyPair::generate());
+    let peer_store = Arc::new(PeerStore::new());
+    let (relay, path) = temp_chat_relay("onion-terminal-handoff");
+    let (url, received) = spawn_handoff_relay(
+        node_identity.public_key_bytes(),
+        202,
+        r#"{"accepted":true,"delivered_live":false}"#,
+    )
+    .await;
+    let state = handoff_state(
+        &node_identity,
+        &relay,
+        &peer_store,
+        Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+        &url,
+    );
+    let now = now_secs();
+    let delivered_envelope = signed_envelope();
+    let inner = encode_envelope(&delivered_envelope).unwrap();
+    let hop = OnionHop {
+        node_id: node_identity.public_key_bytes(),
+        kem_pub: crate::services::onion_keys::current_public_key(),
+    };
+    let envelope = build_onion_envelope(&[hop], &inner, [0x57u8; 16], 4, now, &source).unwrap();
+
+    let result = process_peer_blind_relay(
+        state,
+        PeerBlindRelayRequest {
+            envelope,
+            previous_hop_node_id: source.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(result.terminal);
+    result
+        .delivery_receipt
+        .as_ref()
+        .expect("an accepted hand-off is a delivery")
+        .verify_expected_for_purpose(
+            &[0x57u8; 16],
+            &inner,
+            OnionRoutePurpose::MessageRelay,
+            &node_identity.public_key_bytes(),
+        )
+        .expect("receipt binds the exact terminal payload, purpose, and node");
+    assert_eq!(*received.lock().unwrap(), vec![inner.clone()]);
+    let (pending, _) = relay
+        .pull_pending(&delivered_envelope.receiver, 0, &[0u8; 16], 10)
+        .unwrap();
+    assert!(pending.is_empty(), "nothing is left in node-local custody");
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// A refusal or an outage is no delivery: no receipt, no local fallback copy,
+/// and the two stay distinguishable for the sender.
+#[tokio::test]
+async fn onion_terminal_handoff_failure_signs_nothing() {
+    use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
+
+    for (status, body, expected) in [
+        (403, r#"{"error":"recipient_unavailable"}"#, "rejected"),
+        (503, r#"{"error":"delivery_unavailable"}"#, "unavailable"),
+        (202, r#"{"accepted":false}"#, "unavailable"),
+    ] {
+        let source = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let peer_store = Arc::new(PeerStore::new());
+        let (relay, path) = temp_chat_relay("onion-terminal-handoff-failure");
+        let (url, received) =
+            spawn_handoff_relay(node_identity.public_key_bytes(), status, body).await;
+        let state = handoff_state(
+            &node_identity,
+            &relay,
+            &peer_store,
+            Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            &url,
+        );
+        let delivered_envelope = signed_envelope();
+        let inner = encode_envelope(&delivered_envelope).unwrap();
+        let hop = OnionHop {
+            node_id: node_identity.public_key_bytes(),
+            kem_pub: crate::services::onion_keys::current_public_key(),
+        };
+        let envelope =
+            build_onion_envelope(&[hop], &inner, [0x58u8; 16], 4, now_secs(), &source).unwrap();
+
+        let result = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: source.public_key_bytes(),
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            },
+        )
+        .await;
+
+        match expected {
+            "rejected" => assert!(
+                matches!(result, Err(BlindRelayError::OnionTerminalPayloadRejected)),
+                "{status} {body}"
+            ),
+            _ => assert!(
+                matches!(result, Err(BlindRelayError::ForwardFailed)),
+                "{status} {body}"
+            ),
+        }
+        assert_eq!(received.lock().unwrap().len(), 1, "the relay saw it once");
+        let (pending, _) = relay
+            .pull_pending(&delivered_envelope.receiver, 0, &[0u8; 16], 10)
+            .unwrap();
+        assert!(pending.is_empty(), "no silent node-local fallback");
+        let _ = std::fs::remove_file(path);
+    }
 }

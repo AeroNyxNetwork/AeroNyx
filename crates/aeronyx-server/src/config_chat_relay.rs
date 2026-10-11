@@ -169,6 +169,11 @@ pub const DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 1_200;
 /// can be rotated and therefore cannot provide Sybil resistance by themselves.
 pub const DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 240;
 
+/// [ONION-CENTRAL-HANDOFF 2026-10-11 by Claude] The official network's relay
+/// endpoint for onion terminal hand-offs.
+pub const DEFAULT_CENTRAL_HANDOFF_URL: &str =
+    "https://api.aeronyx.network/api/relay/node/v1/onion-handoff";
+
 /// Default logical opaque-BLOB budget for live blind-route replay evidence.
 pub const DEFAULT_BLIND_ROUTE_REPLAY_MAX_BYTES_TOTAL: u64 = 512 * 1024 * 1024;
 
@@ -518,9 +523,12 @@ impl AnonymousMailboxSourceConfig {
 /// custody_backup_retention_target_artifacts = 8
 /// custody_backup_retention_target_bytes = 8589934592  # 8 GiB
 /// custody_backup_partial_grace_secs = 86400             # 24 hours
+/// central_handoff_url = "https://api.aeronyx.network/api/relay/node/v1/onion-handoff"
 /// ```
 ///
 /// ## Last Modified
+/// v1.14.0-OnionCentralHandoff — Onion terminals hand messages to the
+///   receiver's relay inbox (`central_handoff_url`).
 /// v1.13.0-BlindRouteResourceBound — Typed blind-route resource budgets.
 /// v1.10.0-CustodyBackupRetention — Bounded private recovery-image retention.
 /// v1.8.0-VerifiedCustodyBackup — Private WAL-aware recovery artifacts.
@@ -716,6 +724,20 @@ pub struct ChatRelayConfig {
     #[serde(default = "default_custody_backup_retention_target_artifacts")]
     pub custody_backup_retention_target_artifacts: usize,
 
+    /// Where an onion terminal hands a delivered chat envelope to the
+    /// receiver's relay inbox. The relay verifies the sender's signature and
+    /// queues it like a normal send; the terminal signs its delivery receipt
+    /// only after that hand-off is accepted.
+    ///
+    /// Empty disables the hand-off: the terminal then keeps the envelope in
+    /// its own pending store and reaches only receivers connected to this
+    /// node, which is what every terminal did before.
+    /// Default: [`DEFAULT_CENTRAL_HANDOFF_URL`].
+    ///
+    /// [ONION-CENTRAL-HANDOFF 2026-10-11 by Claude]
+    #[serde(default = "default_central_handoff_url")]
+    pub central_handoff_url: String,
+
     /// Planning target for aggregate verified recovery-image bytes.
     ///
     /// The newest verified image is always modeled as retained even when it
@@ -835,6 +857,31 @@ fn default_peer_relay_requests_per_minute() -> u32 {
 fn default_authenticated_peer_relay_requests_per_minute() -> u32 {
     DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE
 }
+fn default_central_handoff_url() -> String {
+    DEFAULT_CENTRAL_HANDOFF_URL.to_string()
+}
+
+/// [ONION-CENTRAL-HANDOFF 2026-10-11 by Claude] A hand-off URL must be
+/// `https` without credentials; plain `http` only to a loopback host (tests).
+///
+/// # Errors
+/// Returns why the URL is unusable.
+pub fn validate_central_handoff_url(url: &str) -> std::result::Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|error| format!("invalid url: {error}"))?;
+    let loopback = matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+    match parsed.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        _ => return Err("must be https".to_string()),
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("must not carry credentials".to_string());
+    }
+    if parsed.host_str().is_none() {
+        return Err("must name a host".to_string());
+    }
+    Ok(())
+}
 fn default_blind_route_replay_max_bytes_total() -> u64 {
     DEFAULT_BLIND_ROUTE_REPLAY_MAX_BYTES_TOTAL
 }
@@ -879,6 +926,7 @@ impl Default for ChatRelayConfig {
                 default_custody_backup_retention_target_artifacts(),
             custody_backup_retention_target_bytes: default_custody_backup_retention_target_bytes(),
             custody_backup_partial_grace_secs: default_custody_backup_partial_grace_secs(),
+            central_handoff_url: default_central_handoff_url(),
         }
     }
 }
@@ -1048,6 +1096,12 @@ impl ChatRelayConfig {
                 "memchain.chat_relay.peer_relay_authenticated_requests_per_minute",
                 "must be > 0",
             ));
+        }
+
+        if !self.central_handoff_url.is_empty() {
+            validate_central_handoff_url(&self.central_handoff_url).map_err(|reason| {
+                ServerError::config_invalid("memchain.chat_relay.central_handoff_url", reason)
+            })?;
         }
 
         if self.blind_route_replay_max_bytes_total < MIN_BLIND_ROUTE_RESOURCE_BUDGET_BYTES {
@@ -1229,6 +1283,7 @@ mod tests {
             custody_backup_retention_target_artifacts: 0,
             custody_backup_retention_target_bytes: 0,
             custody_backup_partial_grace_secs: 0,
+            central_handoff_url: String::new(),
         };
         assert!(cr.validate().is_ok());
     }

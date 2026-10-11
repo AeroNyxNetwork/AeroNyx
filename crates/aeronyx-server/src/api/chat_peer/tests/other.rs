@@ -235,6 +235,7 @@ async fn peer_request_in_flight_guard_enforces_backpressure_limit() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
 
     assert!(InFlightRequestGuard::try_acquire(
@@ -284,6 +285,7 @@ async fn forged_previous_hop_signatures_cannot_poison_node_quarantine() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let now = now_secs();
     let claimed_node_id = claimed_previous_hop.public_key_bytes();
@@ -426,6 +428,7 @@ async fn peer_declared_downstream_failure_does_not_poison_next_hop_reputation() 
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let envelope = BlindRelayEnvelope {
         route_id: [0x59u8; 16],

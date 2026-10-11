@@ -866,6 +866,7 @@ async fn advertised_failure_receipt_omission_penalizes_exact_next_hop_surface() 
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let request = PeerBlindRelayRequest {
         envelope: BlindRelayEnvelope {
@@ -976,6 +977,7 @@ async fn invalid_failure_receipt_penalizes_immediate_next_hop_protocol() {
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff: None,
     };
     let request = PeerBlindRelayRequest {
         envelope: BlindRelayEnvelope {

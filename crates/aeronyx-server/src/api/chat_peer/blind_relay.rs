@@ -1343,19 +1343,39 @@ pub(super) async fn execute_onion_terminal_payload(
         PreparedOnionTerminalPayload::Message {
             envelope,
             storage_permit,
-        } => process_authenticated_peer_relay_with_storage_permit(
-            state.clone(),
-            envelope,
-            now_secs,
-            storage_permit,
-        )
-        .await
-        .map(|_| OnionTerminalDelivery {
-            purpose: OnionRoutePurpose::MessageRelay,
-            proof_mode: OnionReplyProofMode::RelayVisibleTerminalReceipt,
-            opaque_response_b64: None,
-        })
-        .map_err(|_| BlindRelayError::ForwardFailed),
+        } => {
+            // [ONION-CENTRAL-HANDOFF 2026-10-11 by Claude] With a hand-off
+            // configured, the receipt follows acceptance into the receiver's
+            // relay inbox. The storage permit stays held as the bound on
+            // concurrent terminal work; nothing is written locally.
+            let delivered = if let Some(handoff) = state.central_handoff.as_ref() {
+                let _storage_permit = storage_permit;
+                handoff
+                    .deliver(&envelope)
+                    .await
+                    .map_err(|error| match error {
+                        CentralHandoffError::Rejected => {
+                            BlindRelayError::OnionTerminalPayloadRejected
+                        }
+                        CentralHandoffError::Unavailable => BlindRelayError::ForwardFailed,
+                    })
+            } else {
+                process_authenticated_peer_relay_with_storage_permit(
+                    state.clone(),
+                    envelope,
+                    now_secs,
+                    storage_permit,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|_| BlindRelayError::ForwardFailed)
+            };
+            delivered.map(|()| OnionTerminalDelivery {
+                purpose: OnionRoutePurpose::MessageRelay,
+                proof_mode: OnionReplyProofMode::RelayVisibleTerminalReceipt,
+                opaque_response_b64: None,
+            })
+        }
     }
 }
 

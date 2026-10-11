@@ -780,6 +780,10 @@ struct ChatPeerState {
     /// [CHAT-PEER-ABUSE-DOMAIN 2026-08-26 by Codex] Blind relay rate and
     /// quarantine state are composed behind a payload-blind policy boundary.
     blind_relay_abuse_guard: Arc<dyn BlindRelayAbusePolicy>,
+    /// [ONION-CENTRAL-HANDOFF 2026-10-11 by Claude] Where a `MessageRelay`
+    /// terminal hands the envelope to the receiver's relay inbox. `None`
+    /// keeps the node-local custody every terminal used before.
+    central_handoff: Option<Arc<central_handoff::CentralHandoff>>,
 }
 
 #[derive(Clone)]
@@ -1760,6 +1764,7 @@ impl ChatPeerRelayError {
 
 // [ARCH-SPLIT 2026-10-02] Child modules keep the same call paths.
 mod blind_relay;
+mod central_handoff;
 mod direct_relay;
 
 use blind_relay::acquire_blind_relay_ingress_crypto;
@@ -1813,6 +1818,7 @@ use blind_relay::try_acquire_blind_relay_ingress_crypto;
 use blind_relay::validate_blind_relay_envelope;
 use blind_relay::validate_blind_relay_metadata;
 use blind_relay::validate_blind_relay_timestamp;
+use central_handoff::CentralHandoffError;
 use direct_relay::acquire_chat_relay_storage;
 use direct_relay::authenticate_direct_peer_relay_request;
 use direct_relay::authenticated_peer_relay_response;
@@ -1890,6 +1896,19 @@ pub fn build_chat_peer_router_with_anonymous_mailbox(
         authenticated_peer_relay_requests_per_minute,
         chat_relay.clone(),
     ));
+    // [ONION-CENTRAL-HANDOFF 2026-10-11 by Claude] The URL was validated with
+    // the rest of the config; a client that still cannot be built leaves the
+    // terminal on node-local custody rather than refusing every message.
+    let central_handoff = chat_relay
+        .as_ref()
+        .map(|relay| relay.config().central_handoff_url.clone())
+        .filter(|url| !url.is_empty())
+        .and_then(|url| {
+            central_handoff::CentralHandoff::new(&url, Arc::clone(&node_identity))
+                .map(Arc::new)
+                .map_err(|reason| warn!(%reason, "[CHAT_PEER] Central hand-off disabled"))
+                .ok()
+        });
     let state = ChatPeerState {
         chat_relay,
         blind_vault,
@@ -1902,6 +1921,7 @@ pub fn build_chat_peer_router_with_anonymous_mailbox(
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
+        central_handoff,
     };
     let peer_relay_router = Router::new()
         .route("/api/chat/peer/relay", post(peer_relay_handler))
@@ -2131,6 +2151,10 @@ mod tests {
         ChatRelayConfig {
             enabled: true,
             db_path: path,
+            // [ONION-CENTRAL-HANDOFF 2026-10-11 by Claude] Tests stay off the
+            // network: the default would hand terminal deliveries to the real
+            // relay. Hand-off tests point a terminal at a local stand-in.
+            central_handoff_url: String::new(),
             ..ChatRelayConfig::default()
         }
     }

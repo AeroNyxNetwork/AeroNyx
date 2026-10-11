@@ -129,6 +129,25 @@ use super::config::ManagementConfig;
 use super::models::*;
 use aeronyx_core::crypto::IdentityKeyPair;
 
+/// The `X-Signature` value for a node request: Ed25519 over the raw
+/// SHA-256 of `node_id + timestamp + body`, hex. The backend's
+/// `NodeSignatureAuthentication` verifies exactly this.
+///
+/// [ONION-CENTRAL-HANDOFF 2026-10-11 by Claude] Shared with the onion
+/// terminal hand-off so both requests carry one signature scheme.
+pub(crate) fn sign_node_request(
+    identity: &IdentityKeyPair,
+    node_id_hex: &str,
+    timestamp: u64,
+    body: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(node_id_hex.as_bytes());
+    hasher.update(timestamp.to_string().as_bytes());
+    hasher.update(body.as_bytes());
+    hex::encode(identity.sign(&hasher.finalize()))
+}
+
 static RUNTIME_STARTED_AT: OnceLock<u64> = OnceLock::new();
 static RUNTIME_ID: OnceLock<String> = OnceLock::new();
 
@@ -694,26 +713,13 @@ impl ManagementClient {
     /// Creates an Ed25519 signature over SHA256(node_id + timestamp + body).
     fn create_signature(&self, timestamp: u64, body: &str) -> String {
         let node_id = self.node_id();
-        let message = format!("{}{}{}", node_id, timestamp, body);
-
         trace!(
             node_id       = %node_id,
             timestamp     = timestamp,
             body_preview  = %body.chars().take(200).collect::<String>(),
             "[SIGNATURE] Creating signature"
         );
-
-        let mut hasher = Sha256::new();
-        hasher.update(message.as_bytes());
-        let message_hash = hasher.finalize();
-
-        trace!(hash = %hex::encode(&message_hash), "[SIGNATURE] Message hash computed");
-
-        let signature = self.identity.sign(&message_hash);
-        let sig_hex = hex::encode(signature);
-
-        trace!(signature = %sig_hex, "[SIGNATURE] Signature created");
-        sig_hex
+        sign_node_request(&self.identity, &node_id, timestamp, body)
     }
 
     fn signed_headers(
