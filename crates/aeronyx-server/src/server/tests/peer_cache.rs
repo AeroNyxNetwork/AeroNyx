@@ -2221,3 +2221,205 @@ async fn peer_store_persistence_task_flushes_cache_on_shutdown() {
 
     let _ = tokio::fs::remove_file(path).await;
 }
+
+// [PINNED-SEEDS 2026-10-11 by Claude] Review of 6515223: the production
+// startup path keeps the old behavior for a node without pins.
+#[tokio::test]
+async fn startup_without_pins_adds_no_new_failure_and_with_pins_persists_q() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent_parent = dir.path().join("absent/peers-cache.json");
+    let mut config = ServerConfig::default();
+    config.discovery.peer_cache_path = Some(absent_parent.display().to_string());
+    let server = Server::new(config.clone(), IdentityKeyPair::generate(), None);
+    let policy = server.load_pin_policy().await.unwrap();
+    assert!(policy.pins().is_empty());
+    assert!(
+        !dir.path().join("absent").exists(),
+        "nothing created without pins"
+    );
+
+    // An existing, broken Q still refuses start, pins or not.
+    let cache = dir.path().join("peers-cache.json");
+    let qpath = crate::services::peer_store::quarantine_path(cache.to_str().unwrap());
+    std::fs::write(&qpath, b"{broken").unwrap();
+    config.discovery.peer_cache_path = Some(cache.display().to_string());
+    let server = Server::new(config.clone(), IdentityKeyPair::generate(), None);
+    assert!(server.load_pin_policy().await.is_err());
+    std::fs::remove_file(&qpath).unwrap();
+
+    // With a pin, Q is persisted before the store exists.
+    let other = IdentityKeyPair::generate();
+    config.discovery.pinned_seeds = vec![format!(
+        "{}@8.8.8.8:8422",
+        hex::encode(other.public_key_bytes())
+    )];
+    let server = Server::new(config.clone(), IdentityKeyPair::generate(), None);
+    let policy = server.load_pin_policy().await.unwrap();
+    assert_eq!(policy.pins().len(), 1);
+    assert!(std::fs::read_to_string(&qpath)
+        .unwrap()
+        .contains(&hex::encode(other.public_key_bytes())));
+
+    // Pinning this node's own identity is refused.
+    let own = IdentityKeyPair::generate();
+    config.discovery.pinned_seeds = vec![format!(
+        "{}@8.8.8.8:8422",
+        hex::encode(own.public_key_bytes())
+    )];
+    assert!(Server::new(config, own, None)
+        .load_pin_policy()
+        .await
+        .is_err());
+}
+
+// [PINNED-SEEDS 2026-10-11 by Claude] Review of 6515223: the real transport,
+// over the node's real identity-bound TLS listener on loopback.
+#[tokio::test]
+async fn pinned_exchange_end_to_end_over_real_identity_tls() {
+    use crate::api::discovery::GossipResponse;
+    use crate::api::peer_tls::PeerTlsDirectory;
+    use crate::services::peer_store::{
+        fetch_pinned_snapshot_with_directory, PeerStoreImportReport, PinPolicy, PinnedFetchError,
+        PinnedSeed, PinnedSeedTransport,
+    };
+    use aeronyx_core::protocol::discovery::{
+        NodeBootstrapSnapshot, NodeDescriptor, NodeDiscoveryMessage, NodeProtocolFeature,
+    };
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let sign = |kp: &IdentityKeyPair, endpoint: &str| {
+        let mut d = NodeDescriptor::new(kp.public_key_bytes(), 1, now - 10, now + 3_600, "0.1.0")
+            .with_protocol_features([NodeProtocolFeature::IdentityBoundTlsV1]);
+        d.public_endpoint = Some(endpoint.to_string());
+        SignedNodeDescriptor::sign(d, kp).unwrap()
+    };
+    let seed = Arc::new(IdentityKeyPair::generate());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seed_descriptor = sign(&seed, &format!("http://{addr}"));
+    let third = IdentityKeyPair::generate();
+    let third_descriptor = sign(&third, "http://127.0.0.1:1");
+    let answer = GossipResponse {
+        applied: PeerStoreImportReport::empty(),
+        response: Some(NodeDiscoveryMessage::SnapshotResponse {
+            snapshot: NodeBootstrapSnapshot::new(now, vec![seed_descriptor, third_descriptor]),
+        }),
+    };
+    let answer = Arc::new(serde_json::to_vec(&answer).unwrap());
+    // 0 ok, 1 redirect, 2 slow, 3 oversize, 4 not json.
+    let mode = Arc::new(AtomicU8::new(0));
+    let router = {
+        let (mode, answer) = (mode.clone(), answer.clone());
+        axum::Router::new().route(
+            "/api/discovery/gossip",
+            axum::routing::post(move || {
+                let (mode, answer) = (mode.clone(), answer.clone());
+                async move {
+                    let json = |bytes: Vec<u8>| {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            bytes,
+                        )
+                            .into_response()
+                    };
+                    match mode.load(Ordering::SeqCst) {
+                        1 => (
+                            axum::http::StatusCode::TEMPORARY_REDIRECT,
+                            [(axum::http::header::LOCATION, "https://example.com/")],
+                        )
+                            .into_response(),
+                        2 => {
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            json(answer.to_vec())
+                        }
+                        3 => {
+                            let mut big = answer.to_vec();
+                            big.truncate(big.len() - 1);
+                            big.extend(format!(",\"pad\":\"{}\"}}", "x".repeat(64 * 1024)).bytes());
+                            json(big)
+                        }
+                        4 => json(b"not json".to_vec()),
+                        _ => json(answer.to_vec()),
+                    }
+                }
+            }),
+        )
+    };
+    let tls = Arc::new(crate::server::public_tls::IdentityTls::new(seed.clone(), now).unwrap());
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(crate::server::public_tls::serve_http_and_identity_tls(
+        listener,
+        router,
+        tls,
+        move || now,
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+
+    let pin = PinnedSeed {
+        node_id: seed.public_key_bytes(),
+        addr,
+    };
+    let directory = PeerTlsDirectory::from_descriptors_and_pins(std::iter::empty(), &[pin]);
+    let transport =
+        PinnedSeedTransport::loopback_for_test(std::time::Duration::from_secs(1)).unwrap();
+    let me = IdentityKeyPair::generate();
+    let me_descriptor = sign(&me, "http://127.0.0.1:2");
+    let fetch = |pin: PinnedSeed, directory: PeerTlsDirectory, max: usize| {
+        let transport = &transport;
+        let me_descriptor = me_descriptor.clone();
+        async move {
+            fetch_pinned_snapshot_with_directory(
+                transport,
+                &pin,
+                &directory,
+                me_descriptor,
+                now,
+                64,
+                max,
+            )
+            .await
+        }
+    };
+
+    // The right pin: proof, import, the pin becomes a peer, the third party
+    // only a candidate.
+    let (proof, message) = fetch(pin, directory.clone(), 1 << 20).await.unwrap();
+    let store = PeerStore::new_with_pin_policy(PinPolicy::new(vec![pin], Default::default()));
+    store.enable_untrusted_discovery_candidate_mode();
+    store.apply_pinned_seed_response(proof, &message.unwrap(), now);
+    assert!(store.get_valid(&seed.public_key_bytes(), now).is_some());
+    assert!(store.get_valid(&third.public_key_bytes(), now).is_none());
+
+    // A wrong pin for the same address: the TLS binding refuses it.
+    let wrong = PinnedSeed {
+        node_id: IdentityKeyPair::generate().public_key_bytes(),
+        addr,
+    };
+    let wrong_directory = PeerTlsDirectory::from_descriptors_and_pins(std::iter::empty(), &[wrong]);
+    assert_eq!(
+        fetch(wrong, wrong_directory, 1 << 20).await.err(),
+        Some(PinnedFetchError::Transport)
+    );
+
+    for (m, expected, max) in [
+        (1, PinnedFetchError::Status, 1 << 20),
+        (2, PinnedFetchError::Transport, 1 << 20),
+        (3, PinnedFetchError::Decode, 16 * 1024),
+        (4, PinnedFetchError::Decode, 1 << 20),
+    ] {
+        mode.store(m, Ordering::SeqCst);
+        assert_eq!(
+            fetch(pin, directory.clone(), max).await.err(),
+            Some(expected),
+            "mode {m}"
+        );
+    }
+    let _ = stop_tx.send(());
+}

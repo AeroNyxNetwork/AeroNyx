@@ -401,11 +401,82 @@ pub(crate) fn pinned_gossip_url(
     Ok(url)
 }
 
+/// The only transport a pinned exchange can run on.
+///
+/// [PINNED-SEEDS 2026-10-11 by Claude] (review of 6515223) The proof means
+/// "this answer came over TLS pinned to this id", so the client may not be the
+/// caller's choice. The inner client is private and the one production
+/// constructor uses `privacy_safe_peer_http_client_builder`: identity-bound
+/// TLS verifier, no redirects, no proxy, public-only resolution.
+pub struct PinnedSeedTransport {
+    client: reqwest::Client,
+}
+
+impl PinnedSeedTransport {
+    /// The production transport, with one request timeout.
+    pub fn new(timeout: std::time::Duration) -> reqwest::Result<Self> {
+        Ok(Self {
+            client: crate::api::privacy_safe_peer_http_client_builder()
+                .timeout(timeout)
+                .build()?,
+        })
+    }
+
+    /// The same transport, except that synthetic peer names may resolve to
+    /// loopback, so tests can run a real identity-bound TLS listener.
+    #[cfg(test)]
+    pub(crate) fn loopback_for_test(timeout: std::time::Duration) -> reqwest::Result<Self> {
+        Ok(Self {
+            client: crate::api::privacy_safe_peer_http_client_builder()
+                .dns_resolver(std::sync::Arc::new(LoopbackPeerResolver))
+                .timeout(timeout)
+                .build()?,
+        })
+    }
+}
+
+#[cfg(test)]
+struct LoopbackPeerResolver;
+
+#[cfg(test)]
+impl reqwest::dns::Resolve for LoopbackPeerResolver {
+    fn resolve(&self, name: hyper_v014::client::connect::dns::Name) -> reqwest::dns::Resolving {
+        let decoded = peer_tls::decode_peer_tls_host(name.as_str());
+        Box::pin(async move {
+            match decoded {
+                Some((_, ip)) if ip.is_loopback() => {
+                    Ok(Box::new(std::iter::once(SocketAddr::new(ip, 0))) as reqwest::dns::Addrs)
+                }
+                _ => Err("test resolver serves loopback peer names only".into()),
+            }
+        })
+    }
+}
+
+async fn pinned_post(
+    transport: &PinnedSeedTransport,
+    url: reqwest::Url,
+    message: &NodeDiscoveryMessage,
+) -> Result<reqwest::Response, PinnedFetchError> {
+    let response = transport
+        .client
+        .post(url)
+        .json(message)
+        .send()
+        .await
+        .map_err(|_| PinnedFetchError::Transport)?;
+    // Only 2xx: `error_for_status` lets a 3xx through, and redirects are
+    // never followed.
+    if !response.status().is_success() {
+        return Err(PinnedFetchError::Status);
+    }
+    Ok(response)
+}
+
 /// Exchanges descriptors with one pinned seed and mints the proof only after
-/// a successful answer over the pinned TLS URL. `client` must be the peer
-/// client (identity-bound TLS verifier, no redirects, no proxy).
+/// a successful answer over the pinned TLS URL.
 pub async fn fetch_pinned_snapshot(
-    client: &reqwest::Client,
+    transport: &PinnedSeedTransport,
     pin: &PinnedSeed,
     self_descriptor: SignedNodeDescriptor,
     now: u64,
@@ -413,28 +484,47 @@ pub async fn fetch_pinned_snapshot(
     max_response_bytes: usize,
 ) -> Result<(PinnedTlsProof, Option<NodeDiscoveryMessage>), PinnedFetchError> {
     let directory = peer_tls::current_directory();
-    let url = pinned_gossip_url(pin, &directory)?;
-    client
-        .post(url.clone())
-        .json(&NodeDiscoveryMessage::DescriptorAnnounce {
+    fetch_pinned_snapshot_with_directory(
+        transport,
+        pin,
+        &directory,
+        self_descriptor,
+        now,
+        limit,
+        max_response_bytes,
+    )
+    .await
+}
+
+/// The exchange against one given directory snapshot: the claim check and
+/// the URL rewrite both use `directory`.
+pub(crate) async fn fetch_pinned_snapshot_with_directory(
+    transport: &PinnedSeedTransport,
+    pin: &PinnedSeed,
+    directory: &peer_tls::PeerTlsDirectory,
+    self_descriptor: SignedNodeDescriptor,
+    now: u64,
+    limit: u16,
+    max_response_bytes: usize,
+) -> Result<(PinnedTlsProof, Option<NodeDiscoveryMessage>), PinnedFetchError> {
+    let url = pinned_gossip_url(pin, directory)?;
+    pinned_post(
+        transport,
+        url.clone(),
+        &NodeDiscoveryMessage::DescriptorAnnounce {
             descriptor: self_descriptor,
-        })
-        .send()
-        .await
-        .map_err(|_| PinnedFetchError::Transport)?
-        .error_for_status()
-        .map_err(|_| PinnedFetchError::Status)?;
-    let response = client
-        .post(url)
-        .json(&NodeDiscoveryMessage::SnapshotRequest {
+        },
+    )
+    .await?;
+    let response = pinned_post(
+        transport,
+        url,
+        &NodeDiscoveryMessage::SnapshotRequest {
             requested_at: now,
             limit: Some(limit),
-        })
-        .send()
-        .await
-        .map_err(|_| PinnedFetchError::Transport)?
-        .error_for_status()
-        .map_err(|_| PinnedFetchError::Status)?;
+        },
+    )
+    .await?;
     let answer = crate::api::decode_bounded_json_response::<crate::api::discovery::GossipResponse>(
         response,
         max_response_bytes,
@@ -466,6 +556,8 @@ pub fn quarantine_path(peer_cache_path: &str) -> PathBuf {
 pub trait QuarantineIo {
     /// Opens (creating) and exclusively locks `path` for the whole update.
     fn lock(&self, path: &Path) -> io::Result<File>;
+    /// Opens an existing file for a durability flush.
+    fn open_existing(&self, path: &Path) -> io::Result<File>;
     /// Reads at most `max + 1` bytes; `NotFound` when the file is absent.
     fn read_bounded(&self, path: &Path, max: u64) -> io::Result<Vec<u8>>;
     /// Creates `path` (which must not exist) holding `bytes`.
@@ -490,6 +582,10 @@ impl QuarantineIo for FsQuarantineIo {
             .open(path)?;
         file.lock()?;
         Ok(file)
+    }
+
+    fn open_existing(&self, path: &Path) -> io::Result<File> {
+        File::open(path)
     }
 
     fn read_bounded(&self, path: &Path, max: u64) -> io::Result<Vec<u8>> {
@@ -548,24 +644,58 @@ fn parse_quarantine(bytes: &[u8]) -> Result<HashSet<[u8; 32]>, String> {
     Ok(ids)
 }
 
+fn quarantine_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// Flushes an existing `Q` file and its directory entry. Run on every start
+/// that finds `Q`, changed or not: a previous start may have renamed it into
+/// place and then failed its directory sync (review of 6515223).
+fn make_quarantine_durable(io: &dyn QuarantineIo, path: &Path) -> Result<(), String> {
+    let file = io
+        .open_existing(path)
+        .map_err(|error| format!("pin quarantine reopen failed: {error}"))?;
+    io.sync_file(&file)
+        .map_err(|error| format!("pin quarantine sync failed: {error}"))?;
+    io.sync_dir(quarantine_dir(path))
+        .map_err(|error| format!("pin quarantine directory sync failed: {error}"))
+}
+
 /// Loads `Q`, adds the current pins and persists the union before returning.
 ///
 /// Only an absent file reads as empty; every other failure (permission, I/O,
-/// size, format, version, capacity, any step of the atomic write) is an error
-/// and startup must refuse. The exclusive lock spans read-modify-write, so
-/// two processes starting together cannot lose each other's ids.
+/// size, format, version, capacity, any step of the atomic write or of the
+/// durability flush) is an error and startup must refuse. With pins, the
+/// exclusive lock spans read-modify-write, so two processes starting together
+/// cannot lose each other's ids. Without pins nothing is created: an absent
+/// `Q` (even in an absent directory) is simply empty, as before pinned seeds.
 pub fn load_and_extend_quarantine(
     io: &dyn QuarantineIo,
     path: &Path,
     pins: &[PinnedSeed],
 ) -> Result<HashSet<[u8; 32]>, String> {
+    if pins.is_empty() {
+        // Read-only: `Q` is replaced by rename, so a reader sees one whole
+        // version without the lock.
+        return match io.read_bounded(path, PIN_QUARANTINE_MAX_BYTES) {
+            Ok(bytes) => {
+                let ids = parse_quarantine(&bytes)?;
+                make_quarantine_durable(io, path)?;
+                Ok(ids)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(HashSet::new()),
+            Err(error) => Err(format!("pin quarantine read failed: {error}")),
+        };
+    }
     let lock_path = PathBuf::from(format!("{}.lock", path.display()));
     let _lock = io
         .lock(&lock_path)
         .map_err(|error| format!("pin quarantine lock failed: {error}"))?;
-    let mut ids = match io.read_bounded(path, PIN_QUARANTINE_MAX_BYTES) {
-        Ok(bytes) => parse_quarantine(&bytes)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => HashSet::new(),
+    let (mut ids, existed) = match io.read_bounded(path, PIN_QUARANTINE_MAX_BYTES) {
+        Ok(bytes) => (parse_quarantine(&bytes)?, true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (HashSet::new(), false),
         Err(error) => return Err(format!("pin quarantine read failed: {error}")),
     };
     let before = ids.len();
@@ -573,7 +703,8 @@ pub fn load_and_extend_quarantine(
     if ids.len() > MAX_PIN_QUARANTINE_IDS {
         return Err("pin quarantine would exceed its capacity".to_string());
     }
-    if ids.len() == before {
+    if ids.len() == before && existed {
+        make_quarantine_durable(io, path)?;
         return Ok(ids);
     }
     let mut sorted: Vec<String> = ids.iter().map(hex::encode).collect();
@@ -593,8 +724,7 @@ pub fn load_and_extend_quarantine(
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("pin quarantine write failed: {error}"));
     }
-    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
-    io.sync_dir(dir.unwrap_or_else(|| Path::new(".")))
+    io.sync_dir(quarantine_dir(path))
         .map_err(|error| format!("pin quarantine directory sync failed: {error}"))?;
     Ok(ids)
 }
@@ -1138,6 +1268,24 @@ mod tests {
         let unrelated = live(&identity(7), 1, "http://127.0.0.1:19007", true);
         let rebuilt = peer_tls::PeerTlsDirectory::from_descriptors_and_pins([&unrelated], &[pin]);
         assert!(pinned_gossip_url(&pin, &rebuilt).is_ok());
+        // A directory that pins the address to another identity is reported
+        // as not pinned (the audit bucket), before any rewrite is attempted.
+        let foreign = PinnedSeed {
+            node_id: other.public_key_bytes(),
+            addr: pin.addr,
+        };
+        let foreign_only =
+            peer_tls::PeerTlsDirectory::from_descriptors_and_pins(std::iter::empty(), &[foreign]);
+        assert_eq!(
+            pinned_gossip_url(&pin, &foreign_only),
+            Err(PinnedFetchError::NotPinned)
+        );
+        let unclaimed =
+            peer_tls::PeerTlsDirectory::from_descriptors_and_pins(std::iter::empty(), &[]);
+        assert_eq!(
+            pinned_gossip_url(&pin, &unclaimed),
+            Err(PinnedFetchError::NotPinned)
+        );
         // Another identity claims the pinned address: refuse, no URL.
         let squatter = live(&other, 1, PIN_ENDPOINT, true);
         let ambiguous = peer_tls::PeerTlsDirectory::from_descriptors_and_pins([&squatter], &[pin]);
@@ -1160,11 +1308,15 @@ mod tests {
     struct FaultyIo {
         fail_at: Option<&'static str>,
         read_error: Option<io::ErrorKind>,
+        sync_dir_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl QuarantineIo for FaultyIo {
         fn lock(&self, path: &Path) -> io::Result<File> {
             FsQuarantineIo.lock(path)
+        }
+        fn open_existing(&self, path: &Path) -> io::Result<File> {
+            FsQuarantineIo.open_existing(path)
         }
         fn read_bounded(&self, path: &Path, max: u64) -> io::Result<Vec<u8>> {
             match self.read_error {
@@ -1182,6 +1334,8 @@ mod tests {
             self.step("rename", || FsQuarantineIo.rename(from, to))
         }
         fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+            self.sync_dir_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.step("sync_dir", || FsQuarantineIo.sync_dir(dir))
         }
     }
@@ -1312,5 +1466,65 @@ mod tests {
             }
             assert_eq!(read_ids(&path).len(), 2);
         }
+    }
+
+    // Review of 6515223: a rename that landed before a failed directory sync
+    // must be completed by the next start, not waved through as "unchanged".
+    #[test]
+    fn a_failed_directory_sync_is_completed_by_a_later_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.json");
+        let pin = pin_of(&identity(1));
+        let failing = || FaultyIo {
+            fail_at: Some("sync_dir"),
+            ..FaultyIo::default()
+        };
+        assert!(load_and_extend_quarantine(&failing(), &path, &[pin]).is_err());
+        assert!(read_ids(&path).contains(&pin.node_id), "renamed into place");
+        assert!(
+            load_and_extend_quarantine(&failing(), &path, &[pin]).is_err(),
+            "an unchanged Q still owes its directory sync"
+        );
+        assert!(
+            load_and_extend_quarantine(&failing(), &path, &[]).is_err(),
+            "also when the pins were removed"
+        );
+        let healthy = FaultyIo::default();
+        assert!(load_and_extend_quarantine(&healthy, &path, &[pin]).is_ok());
+        assert_eq!(
+            healthy
+                .sync_dir_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the completing start syncs the directory"
+        );
+    }
+
+    // Review of 6515223: a node without pins gains no new way to fail start.
+    #[test]
+    fn without_pins_an_absent_quarantine_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing/deeper/q.json");
+        let io = FaultyIo::default();
+        assert!(load_and_extend_quarantine(&io, &path, &[])
+            .unwrap()
+            .is_empty());
+        assert!(
+            !dir.path().join("missing").exists(),
+            "no directory, lock or file"
+        );
+        assert_eq!(
+            io.sync_dir_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        // An existing Q is still read strictly without pins.
+        let existing = dir.path().join("q.json");
+        std::fs::write(&existing, b"not json").unwrap();
+        assert!(load_and_extend_quarantine(&FsQuarantineIo, &existing, &[]).is_err());
+        let denied = FaultyIo {
+            read_error: Some(io::ErrorKind::PermissionDenied),
+            ..FaultyIo::default()
+        };
+        assert!(load_and_extend_quarantine(&denied, &existing, &[]).is_err());
     }
 }

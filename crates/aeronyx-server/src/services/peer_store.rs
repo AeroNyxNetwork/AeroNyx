@@ -2937,11 +2937,12 @@ mod route_evidence;
 mod verified_upsert;
 // [PINNED-SEEDS 2026-10-11 by Claude] Operator-pinned discovery seeds.
 mod pinned_seeds;
-pub(crate) use pinned_seeds::PeerOrigin;
 pub use pinned_seeds::{
     fetch_pinned_snapshot, load_and_extend_quarantine, parse_pinned_seeds, quarantine_path,
-    FsQuarantineIo, PinPolicy, PinnedFetchError, PinnedSeed, PinnedTlsProof, QuarantineIo,
+    FsQuarantineIo, PinPolicy, PinnedFetchError, PinnedSeed, PinnedSeedTransport, PinnedTlsProof,
+    QuarantineIo,
 };
+pub(crate) use pinned_seeds::{fetch_pinned_snapshot_with_directory, PeerOrigin};
 
 /// Refreshes the identity-bound TLS directory when a peer-map writer returns.
 ///

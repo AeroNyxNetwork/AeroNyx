@@ -409,6 +409,21 @@ impl Server {
             let mut last_blind_relay_probe_at = 0u64;
             let mut last_two_hop_blind_relay_probe_at = 0u64;
             let mut last_three_hop_blind_relay_probe_at = 0u64;
+            // [PINNED-SEEDS 2026-10-11 by Claude] The one controlled transport
+            // a pinned exchange may use, built once for the task.
+            let pinned_transport = if peer_store.pin_policy().pins().is_empty() {
+                None
+            } else {
+                match crate::services::peer_store::PinnedSeedTransport::new(Duration::from_secs(
+                    config.discovery.fetch_timeout_secs,
+                )) {
+                    Ok(transport) => Some(transport),
+                    Err(error) => {
+                        warn!(%error, "[DISCOVERY] Pinned seed transport unavailable");
+                        None
+                    }
+                }
+            };
             'gossip: loop {
                 if run_immediately {
                     run_immediately = false;
@@ -677,10 +692,19 @@ impl Server {
                 // the one import and never kept.
                 for pin in peer_store.pin_policy().pins() {
                     gossip_round.attempted += 1;
+                    let Some(transport) = pinned_transport.as_ref() else {
+                        peer_store.record_audit_event(
+                            now,
+                            "pinned_seed_exchange",
+                            "warning",
+                            "pin_transport_unavailable",
+                        );
+                        continue;
+                    };
                     let exchange = tokio::time::timeout(
                         peer_timeout,
                         crate::services::peer_store::fetch_pinned_snapshot(
-                            gossip_http_client.as_ref(),
+                            transport,
                             pin,
                             self_descriptor.clone(),
                             now,
