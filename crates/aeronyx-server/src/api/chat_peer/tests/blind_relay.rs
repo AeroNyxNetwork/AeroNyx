@@ -3197,3 +3197,112 @@ fn blind_relay_rejections_are_counted_by_allow_listed_reason() {
         .keys()
         .all(|reason| !reason.contains('=') && !reason.contains("22aa")));
 }
+
+/// [ONION-HANDOFF-REVIEW 2026-10-11 by Claude] A node's synthetic delivery
+/// probe is addressed to a wallet nobody holds. It keeps node-local custody
+/// (and its receipt) and never reaches the receiver relay.
+#[tokio::test]
+async fn onion_terminal_keeps_synthetic_probes_off_the_handoff() {
+    use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
+
+    let prober = IdentityKeyPair::generate();
+    let node_identity = Arc::new(IdentityKeyPair::generate());
+    let peer_store = Arc::new(PeerStore::new());
+    let (relay, path) = temp_chat_relay("onion-terminal-probe-local");
+    let (url, received) = spawn_handoff_relay(
+        node_identity.public_key_bytes(),
+        202,
+        r#"{"accepted":true}"#,
+    )
+    .await;
+    let state = handoff_state(
+        &node_identity,
+        &relay,
+        &peer_store,
+        Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+        &url,
+    );
+    let now = now_secs();
+    let mut probe = ChatEnvelope {
+        message_id: [0x59; 16],
+        sender: prober.public_key_bytes(),
+        receiver: [0x5a; 32],
+        timestamp: now,
+        ciphertext: synthetic_probe_blob(
+            now,
+            &prober.public_key_bytes(),
+            &node_identity.public_key_bytes(),
+        ),
+        nonce: [0x5b; 24],
+        content_type: ChatContentType::System,
+        signature: [0; 64],
+    };
+    probe.signature = prober.sign(&probe.sign_data());
+    let inner = encode_envelope(&probe).unwrap();
+    let hop = OnionHop {
+        node_id: node_identity.public_key_bytes(),
+        kem_pub: crate::services::onion_keys::current_public_key(),
+    };
+    let envelope = build_onion_envelope(&[hop], &inner, [0x59u8; 16], 4, now, &prober).unwrap();
+
+    let result = process_peer_blind_relay(
+        state,
+        PeerBlindRelayRequest {
+            envelope,
+            previous_hop_node_id: prober.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        result.delivery_receipt.is_some(),
+        "the probe still proves the path"
+    );
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "never handed to the relay"
+    );
+    let (pending, _) = relay
+        .pull_pending(&probe.receiver, 0, &[0u8; 16], 10)
+        .unwrap();
+    assert_eq!(pending.len(), 1, "kept in node-local custody as before");
+    let _ = std::fs::remove_file(path);
+}
+
+/// The detector recognises exactly the probe the gossip runtime builds for
+/// this terminal, and nothing addressed elsewhere or carrying other bytes.
+#[test]
+fn synthetic_probe_detection_is_exact() {
+    let prober = IdentityKeyPair::generate();
+    let terminal = IdentityKeyPair::generate().public_key_bytes();
+    let elsewhere = IdentityKeyPair::generate().public_key_bytes();
+    let now = 1_800_000_000;
+    let mut probe = signed_envelope_at(now);
+    probe.sender = prober.public_key_bytes();
+    probe.content_type = ChatContentType::System;
+    probe.ciphertext = synthetic_probe_blob(now, &prober.public_key_bytes(), &terminal);
+    assert!(central_handoff::is_synthetic_delivery_probe(
+        &probe, &terminal
+    ));
+    assert!(!central_handoff::is_synthetic_delivery_probe(
+        &probe, &elsewhere
+    ));
+    let mut text = probe.clone();
+    text.content_type = ChatContentType::Text;
+    assert!(!central_handoff::is_synthetic_delivery_probe(
+        &text, &terminal
+    ));
+    let mut other = probe.clone();
+    other.ciphertext[0] ^= 1;
+    assert!(!central_handoff::is_synthetic_delivery_probe(
+        &other, &terminal
+    ));
+    let mut late = probe;
+    late.timestamp += 1;
+    assert!(!central_handoff::is_synthetic_delivery_probe(
+        &late, &terminal
+    ));
+}

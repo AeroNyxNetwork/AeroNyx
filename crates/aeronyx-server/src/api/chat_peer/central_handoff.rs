@@ -59,6 +59,38 @@ const MAX_IN_FLIGHT: usize = 32;
 /// treated as no verdict, so each in-flight hand-off holds at most this much.
 const MAX_RESPONSE_BYTES: usize = 4096;
 
+/// The opaque blob a node's synthetic delivery probe carries as ciphertext:
+/// SHA-256 over a fixed domain, the probe time, the probing node and the hop
+/// it is addressed to. The probe sender (`discovery_gossip_runtime`) and the
+/// terminal's detector below share this one definition.
+#[must_use]
+pub fn synthetic_probe_blob(now: u64, prober_node_id: &[u8; 32], next_hop: &[u8; 32]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"aeronyx:blind-relay-probe:opaque-blob:v1");
+    hasher.update(now.to_le_bytes());
+    hasher.update(prober_node_id);
+    hasher.update(next_hop);
+    hasher.finalize().to_vec()
+}
+
+/// [ONION-HANDOFF-REVIEW 2026-10-11 by Claude] Whether a terminal envelope is
+/// a node's own synthetic delivery probe addressed to this terminal. Such a
+/// probe is signed by the probing node and sent to a wallet id that nobody
+/// holds; handing it to the receiver relay would only fill the relay with
+/// queues nobody pulls (it did, for a few minutes after 89e00b5). Probes keep
+/// node-local custody, which is all they ever needed to prove.
+#[must_use]
+pub(super) fn is_synthetic_delivery_probe(
+    envelope: &ChatEnvelope,
+    local_node_id: &[u8; 32],
+) -> bool {
+    use aeronyx_core::protocol::chat::ChatContentType;
+    envelope.content_type == ChatContentType::System
+        && envelope.ciphertext
+            == synthetic_probe_blob(envelope.timestamp, &envelope.sender, local_node_id)
+}
+
 /// Why a hand-off did not end in acceptance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CentralHandoffError {

@@ -1349,7 +1349,10 @@ pub(super) async fn execute_onion_terminal_payload(
             // "relay custody": see central_handoff.rs). The storage permit
             // stays held as the bound on concurrent terminal work; nothing is
             // written locally.
-            let delivered = if let Some(handoff) = state.central_handoff.as_ref() {
+            let handoff = state.central_handoff.as_ref().filter(|_| {
+                !is_synthetic_delivery_probe(&envelope, &state.node_identity.public_key_bytes())
+            });
+            let delivered = if let Some(handoff) = handoff {
                 let _storage_permit = storage_permit;
                 handoff
                     .deliver(&envelope)

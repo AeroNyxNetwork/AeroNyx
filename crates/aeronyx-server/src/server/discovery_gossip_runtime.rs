@@ -2746,12 +2746,9 @@ impl Server {
         self_node_id: &[u8; 32],
         next_hop: &[u8; 32],
     ) -> Vec<u8> {
-        let mut hasher = Sha256::new();
-        hasher.update(b"aeronyx:blind-relay-probe:opaque-blob:v1");
-        hasher.update(now.to_le_bytes());
-        hasher.update(&self_node_id[..]);
-        hasher.update(&next_hop[..]);
-        hasher.finalize().to_vec()
+        // [ONION-HANDOFF-REVIEW 2026-10-11 by Claude] One definition, shared
+        // with the terminal that must recognise these probes.
+        crate::api::chat_peer::synthetic_probe_blob(now, self_node_id, next_hop)
     }
 
     pub(super) fn discovery_gossip_url(endpoint: &str) -> Option<String> {

@@ -1818,6 +1818,8 @@ use blind_relay::try_acquire_blind_relay_ingress_crypto;
 use blind_relay::validate_blind_relay_envelope;
 use blind_relay::validate_blind_relay_metadata;
 use blind_relay::validate_blind_relay_timestamp;
+use central_handoff::is_synthetic_delivery_probe;
+pub(crate) use central_handoff::synthetic_probe_blob;
 use central_handoff::CentralHandoffError;
 use direct_relay::acquire_chat_relay_storage;
 use direct_relay::authenticate_direct_peer_relay_request;
