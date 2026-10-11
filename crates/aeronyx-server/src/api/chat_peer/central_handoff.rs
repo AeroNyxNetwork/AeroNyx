@@ -12,9 +12,16 @@
 //!
 //! With a hand-off URL configured, the terminal instead gives the exact signed
 //! envelope to the central relay, which verifies the sender's own signature
-//! and queues it for the receiver like any relay send. Only an accepted
-//! hand-off lets the terminal sign its receipt, so a receipt now means "in the
-//! receiver's inbox", not "held by a node the receiver may never reach".
+//! and queues it for the receiver like any relay send. The terminal signs its
+//! receipt only after the relay accepted it.
+//!
+//! [ONION-HANDOFF-REVIEW 2026-10-11 by Claude] (Codex review) What the receipt
+//! proves is unchanged: "accepted into relay custody". A node with the
+//! hand-off disabled still signs the same `message_relay` receipt for its own
+//! node-local custody, and nothing in the receipt tells the two apart, so a
+//! client must not read it as "in the receiver's inbox". Telling them apart
+//! needs a verifiable contract (a distinct purpose or proof mode), not a
+//! deployment setting.
 //!
 //! What each party sees is unchanged: this terminal already held the envelope
 //! (sender, receiver, ciphertext); the central relay sees what a normal send
@@ -46,6 +53,11 @@ const HANDOFF_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 /// Concurrent hand-offs per node. Beyond this the terminal reports
 /// unavailable rather than queueing outbound requests without bound.
 const MAX_IN_FLIGHT: usize = 32;
+
+/// [ONION-HANDOFF-REVIEW 2026-10-11 by Claude] The relay's verdict is a few
+/// dozen bytes. Anything longer is read only up to this bound and then
+/// treated as no verdict, so each in-flight hand-off holds at most this much.
+const MAX_RESPONSE_BYTES: usize = 4096;
 
 /// Why a hand-off did not end in acceptance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,8 +114,8 @@ impl CentralHandoff {
             .map_err(|_| CentralHandoffError::Rejected)
     }
 
-    /// Gives one envelope to the relay; `Ok` only once it has been accepted
-    /// into the receiver's inbox (or was already accepted earlier).
+    /// Gives one envelope to the relay; `Ok` only once the relay accepted it
+    /// (or had already accepted it).
     ///
     /// # Errors
     /// [`CentralHandoffError::Rejected`] for a refusal that a retry cannot
@@ -130,11 +142,36 @@ impl CentralHandoff {
             .send()
             .await
             .map_err(|_| CentralHandoffError::Unavailable)?;
-        classify_response(
-            response.status().as_u16(),
-            &response.bytes().await.unwrap_or_default(),
-        )
+        let status = response.status().as_u16();
+        let body = read_bounded(response, MAX_RESPONSE_BYTES).await?;
+        classify_response(status, &body)
     }
+}
+
+/// The response body, read chunk by chunk and abandoned as soon as it grows
+/// past `limit`; an oversized answer is no verdict.
+async fn read_bounded(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, CentralHandoffError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(CentralHandoffError::Unavailable);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| CentralHandoffError::Unavailable)?
+    {
+        if body.len() + chunk.len() > limit {
+            return Err(CentralHandoffError::Unavailable);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// The relay's verdict. Acceptance must be explicit: a 2xx without
@@ -190,6 +227,62 @@ mod tests {
                 Err(CentralHandoffError::Rejected),
                 "{status}"
             );
+        }
+    }
+
+    /// [ONION-HANDOFF-REVIEW 2026-10-11 by Claude] An answer larger than the
+    /// bound is no verdict, whether it announces its length or streams.
+    #[tokio::test]
+    async fn an_oversized_answer_is_no_verdict_and_is_not_read_whole() {
+        use axum::{body::Body, http::StatusCode, response::Response, routing::post, Router};
+
+        let announced = Router::new().route(
+            "/announced",
+            // A genuine acceptance, padded: without the bound it would pass.
+            post(|| async {
+                (
+                    StatusCode::ACCEPTED,
+                    format!(r#"{{"accepted":true,"pad":"{}"}}"#, "x".repeat(1 << 20)),
+                )
+            }),
+        );
+        let streamed = Router::new().route(
+            "/streamed",
+            post(|| async {
+                // The same padded acceptance as 64 KiB chunks, no
+                // Content-Length; far beyond the bound.
+                let mut parts = vec![br#"{"accepted":true,"pad":""#.to_vec()];
+                parts.extend((0..64).map(|_| vec![b'x'; 64 * 1024]));
+                parts.push(br#""}"#.to_vec());
+                let chunks = futures::stream::iter(parts.into_iter().map(Ok::<_, std::io::Error>));
+                Response::builder()
+                    .status(StatusCode::ACCEPTED)
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }),
+        );
+        let small = Router::new().route(
+            "/small",
+            post(|| async { (StatusCode::ACCEPTED, r#"{"accepted":true}"#) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, announced.merge(streamed).merge(small))
+                .await
+                .unwrap();
+        });
+        let identity = Arc::new(IdentityKeyPair::generate());
+        let envelope = golden::golden_envelope();
+        for (path, expected) in [
+            ("announced", Err(CentralHandoffError::Unavailable)),
+            ("streamed", Err(CentralHandoffError::Unavailable)),
+            ("small", Ok(())),
+        ] {
+            let handoff =
+                CentralHandoff::new(&format!("http://{address}/{path}"), Arc::clone(&identity))
+                    .unwrap();
+            assert_eq!(handoff.deliver(&envelope).await, expected, "{path}");
         }
     }
 

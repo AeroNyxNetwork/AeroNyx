@@ -1345,9 +1345,10 @@ pub(super) async fn execute_onion_terminal_payload(
             storage_permit,
         } => {
             // [ONION-CENTRAL-HANDOFF 2026-10-11 by Claude] With a hand-off
-            // configured, the receipt follows acceptance into the receiver's
-            // relay inbox. The storage permit stays held as the bound on
-            // concurrent terminal work; nothing is written locally.
+            // configured, the receipt follows the relay's acceptance (still
+            // "relay custody": see central_handoff.rs). The storage permit
+            // stays held as the bound on concurrent terminal work; nothing is
+            // written locally.
             let delivered = if let Some(handoff) = state.central_handoff.as_ref() {
                 let _storage_permit = storage_permit;
                 handoff

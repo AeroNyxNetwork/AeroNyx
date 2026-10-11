@@ -3046,9 +3046,8 @@ fn handoff_state(
     }
 }
 
-/// The receipt now means "in the receiver's inbox": the terminal signs only
-/// after the relay accepted the exact envelope, and keeps no local copy that
-/// a receiver elsewhere could never pull.
+/// The terminal signs only after the relay accepted the exact envelope, and
+/// keeps no local copy that a receiver elsewhere could never pull.
 #[tokio::test]
 async fn onion_terminal_hands_the_envelope_to_the_receiver_inbox() {
     use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
@@ -3173,4 +3172,28 @@ async fn onion_terminal_handoff_failure_signs_nothing() {
         assert!(pending.is_empty(), "no silent node-local fallback");
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// [ONION-HANDOFF-REVIEW 2026-10-11 by Claude] Rejections are counted by
+/// allow-listed category, and anything off the list only as `unknown`.
+#[test]
+fn blind_relay_rejections_are_counted_by_allow_listed_reason() {
+    let peer_store = PeerStore::new();
+    let now = now_secs();
+    peer_store.record_blind_relay_rejected(now, "onion_terminal_delivery_failed");
+    peer_store.record_blind_relay_rejected(now, "onion_terminal_delivery_failed");
+    peer_store.record_blind_relay_rejected(now, "backpressure");
+    peer_store.record_blind_relay_rejected(now, "receiver=22aa... route=55ee");
+    let stats = peer_store.status(now + 1).runtime.blind_relay;
+    assert_eq!(stats.rejected, 4);
+    assert_eq!(
+        stats.rejected_reasons.get("onion_terminal_delivery_failed"),
+        Some(&2)
+    );
+    assert_eq!(stats.rejected_reasons.get("backpressure"), Some(&1));
+    assert_eq!(stats.rejected_reasons.values().sum::<u64>(), 4);
+    assert!(stats
+        .rejected_reasons
+        .keys()
+        .all(|reason| !reason.contains('=') && !reason.contains("22aa")));
 }

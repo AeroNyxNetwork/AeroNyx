@@ -1392,6 +1392,12 @@ pub struct PeerStoreBlindRelayStats {
     pub forwarded: u64,
     /// Requests rejected before terminal handling or next-hop forwarding.
     pub rejected: u64,
+    /// [ONION-HANDOFF-REVIEW 2026-10-11 by Claude] `rejected` split by its
+    /// privacy-safe reason category (the same allow-list as the audit log;
+    /// anything else is counted as `unknown`). Categories only: no route id,
+    /// endpoint, node, sender, receiver or payload detail.
+    #[serde(default)]
+    pub rejected_reasons: std::collections::BTreeMap<String, u64>,
     /// Requests rejected because the endpoint was under local backpressure.
     pub backpressure_dropped: u64,
     /// Requests rejected because the previous-hop key or signature was invalid.
@@ -2603,6 +2609,7 @@ struct PeerStoreCounters {
     blind_relay_terminal: AtomicU64,
     blind_relay_forwarded: AtomicU64,
     blind_relay_rejected: AtomicU64,
+    blind_relay_rejected_reasons: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
     blind_relay_backpressure_dropped: AtomicU64,
     blind_relay_invalid_signature: AtomicU64,
     blind_relay_envelope_too_large: AtomicU64,
@@ -2655,6 +2662,7 @@ impl PeerStoreCounters {
             blind_relay_terminal: AtomicU64::new(0),
             blind_relay_forwarded: AtomicU64::new(0),
             blind_relay_rejected: AtomicU64::new(0),
+            blind_relay_rejected_reasons: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             blind_relay_backpressure_dropped: AtomicU64::new(0),
             blind_relay_invalid_signature: AtomicU64::new(0),
             blind_relay_envelope_too_large: AtomicU64::new(0),
@@ -2712,6 +2720,11 @@ impl PeerStoreCounters {
                 terminal: self.blind_relay_terminal.load(Ordering::Relaxed),
                 forwarded: self.blind_relay_forwarded.load(Ordering::Relaxed),
                 rejected: self.blind_relay_rejected.load(Ordering::Relaxed),
+                rejected_reasons: self
+                    .blind_relay_rejected_reasons
+                    .lock()
+                    .map(|reasons| reasons.clone())
+                    .unwrap_or_default(),
                 backpressure_dropped: self
                     .blind_relay_backpressure_dropped
                     .load(Ordering::Relaxed),

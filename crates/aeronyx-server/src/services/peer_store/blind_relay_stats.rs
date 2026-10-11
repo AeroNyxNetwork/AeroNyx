@@ -305,6 +305,11 @@ impl PeerStore {
         self.counters
             .blind_relay_rejected
             .fetch_add(1, Ordering::Relaxed);
+        // [ONION-HANDOFF-REVIEW 2026-10-11 by Claude] The reason is already
+        // reduced to the allow-list above, so this map stays bounded.
+        if let Ok(mut reasons) = self.counters.blind_relay_rejected_reasons.lock() {
+            *reasons.entry(reason.to_string()).or_default() += 1;
+        }
         self.counters
             .last_blind_relay_at
             .store(now, Ordering::Relaxed);
