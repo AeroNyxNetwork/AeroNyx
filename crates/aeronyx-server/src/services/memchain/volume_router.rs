@@ -220,6 +220,17 @@ pub struct FilesystemVolumeUsageProbe;
 
 impl VolumeUsageProbe for FilesystemVolumeUsageProbe {
     fn usage_bytes(&self, volume_root: &Path) -> Result<u64, VolumeUsageProbeError> {
+        Self::usage_bytes_with(volume_root, |path| std::fs::symlink_metadata(path))
+    }
+}
+
+impl FilesystemVolumeUsageProbe {
+    /// The probe with the per-entry metadata read injected, so tests can
+    /// interleave a deletion between listing and reading deterministically.
+    fn usage_bytes_with(
+        volume_root: &Path,
+        entry_metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    ) -> Result<u64, VolumeUsageProbeError> {
         // [VOLUME-USAGE-OBSERVABILITY 2026-08-31 by Codex] Reject a symlinked
         // root and inspect only its direct entries. No recursive traversal can
         // escape the configured volume, and symlink metadata never follows an
@@ -248,6 +259,7 @@ impl VolumeUsageProbe for FilesystemVolumeUsageProbe {
                 source,
             })?;
         let mut total = 0u64;
+        let mut vanished = false;
         for entry in entries {
             let entry = entry.map_err(|source| VolumeUsageProbeError::Io {
                 operation: "read volume directory entry",
@@ -259,16 +271,50 @@ impl VolumeUsageProbe for FilesystemVolumeUsageProbe {
             }
 
             let path = entry.path();
-            let metadata =
-                std::fs::symlink_metadata(&path).map_err(|source| VolumeUsageProbeError::Io {
-                    operation: "inspect managed volume file",
-                    path: path.clone(),
-                    source,
-                })?;
+            let metadata = match entry_metadata(&path) {
+                Ok(metadata) => metadata,
+                // [VOLUME-USAGE-RACE 2026-10-12 by Claude] An entry listed by
+                // read_dir and gone by the time it is read (an SQLite
+                // connection closing removes its -wal/-shm) holds no bytes.
+                // Only NotFound, only for a listed entry: every other error
+                // still fails the probe.
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    vanished = true;
+                    continue;
+                }
+                Err(source) => {
+                    return Err(VolumeUsageProbeError::Io {
+                        operation: "inspect managed volume file",
+                        path: path.clone(),
+                        source,
+                    })
+                }
+            };
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 continue;
             }
             total = checked_add_usage(total, metadata.len(), &path)?;
+        }
+        if vanished {
+            // A vanished entry is fine; a vanished or replaced root is not:
+            // it must never read as an empty volume.
+            let root = std::fs::symlink_metadata(volume_root).map_err(|source| {
+                VolumeUsageProbeError::Io {
+                    operation: "inspect volume root",
+                    path: volume_root.to_path_buf(),
+                    source,
+                }
+            })?;
+            if root.file_type().is_symlink() {
+                return Err(VolumeUsageProbeError::SymlinkRoot(
+                    volume_root.to_path_buf(),
+                ));
+            }
+            if !root.is_dir() {
+                return Err(VolumeUsageProbeError::InvalidRoot(
+                    volume_root.to_path_buf(),
+                ));
+            }
         }
         Ok(total)
     }
@@ -1833,6 +1879,87 @@ mod tests {
             FilesystemVolumeUsageProbe.usage_bytes(&root_link),
             Err(VolumeUsageProbeError::SymlinkRoot(path)) if path == root_link
         ));
+    }
+
+    // [VOLUME-USAGE-RACE 2026-10-12 by Claude] The CI failure of
+    // test_concurrent_new_owners_respect_cache_capacity, made deterministic:
+    // the -wal is listed, then removed before it is read.
+    fn racing_volume(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        let volume = dir.path().join("volume");
+        std::fs::create_dir(&volume).unwrap();
+        let owner = "0123456789abcdef";
+        std::fs::write(volume.join(format!("{owner}.db")), [0u8; 3]).unwrap();
+        std::fs::write(volume.join(format!("{owner}.db-wal")), [0u8; 5]).unwrap();
+        std::fs::write(volume.join(format!("{owner}.db-shm")), [0u8; 7]).unwrap();
+        std::fs::write(volume.join(format!("{owner}.vec")), [0u8; 11]).unwrap();
+        let wal = volume.join(format!("{owner}.db-wal"));
+        (volume, wal)
+    }
+
+    #[test]
+    fn filesystem_usage_probe_skips_an_entry_removed_after_listing() {
+        let dir = TempDir::new().unwrap();
+        let (volume, wal) = racing_volume(&dir);
+        let usage = FilesystemVolumeUsageProbe::usage_bytes_with(&volume, |path| {
+            if path == wal.as_path() {
+                std::fs::remove_file(path).unwrap();
+            }
+            std::fs::symlink_metadata(path)
+        })
+        .unwrap();
+        assert_eq!(usage, 3 + 7 + 11, "the other files still count");
+    }
+
+    #[test]
+    fn filesystem_usage_probe_still_fails_on_other_entry_errors() {
+        let dir = TempDir::new().unwrap();
+        let (volume, wal) = racing_volume(&dir);
+        let result = FilesystemVolumeUsageProbe::usage_bytes_with(&volume, |path| {
+            if path == wal.as_path() {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            std::fs::symlink_metadata(path)
+        });
+        assert!(matches!(
+            result,
+            Err(VolumeUsageProbeError::Io { operation: "inspect managed volume file", path, .. })
+                if path == wal
+        ));
+    }
+
+    #[test]
+    fn filesystem_usage_probe_never_reads_a_vanished_root_as_empty() {
+        let dir = TempDir::new().unwrap();
+        let (volume, _) = racing_volume(&dir);
+        let result = FilesystemVolumeUsageProbe::usage_bytes_with(&volume, |path| {
+            if volume.exists() {
+                std::fs::remove_dir_all(&volume).unwrap();
+            }
+            std::fs::symlink_metadata(path)
+        });
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_usage_probe_rejects_a_root_swapped_for_a_symlink_mid_scan() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let (volume, _) = racing_volume(&dir);
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let result = FilesystemVolumeUsageProbe::usage_bytes_with(&volume, |path| {
+            if std::fs::symlink_metadata(&volume).is_ok_and(|m| m.is_dir()) {
+                std::fs::remove_dir_all(&volume).unwrap();
+                symlink(&elsewhere, &volume).unwrap();
+            }
+            std::fs::symlink_metadata(path)
+        });
+        assert!(
+            matches!(result, Err(VolumeUsageProbeError::SymlinkRoot(ref path)) if *path == volume),
+            "{result:?}"
+        );
     }
 
     #[test]
