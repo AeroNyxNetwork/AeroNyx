@@ -171,6 +171,11 @@ pub(crate) enum PeerOrigin {
     Promotion,
     /// Only together with a [`PinnedTlsProof`].
     PinnedSeed,
+    /// [HELD-IDENTITY-REFRESH 2026-10-15 by Claude] A refresh of an identity
+    /// this store already holds (an anonymous announce, or a relayed copy of
+    /// its own signed descriptor). W1 rejects it inside the write lock when
+    /// the identity is not held at that moment: it can never establish one.
+    HeldRefresh,
 }
 
 /// Why a descriptor was refused by a pin rule.
@@ -1526,5 +1531,58 @@ mod tests {
             ..FaultyIo::default()
         };
         assert!(load_and_extend_quarantine(&denied, &existing, &[]).is_err());
+    }
+
+    // [HELD-IDENTITY-REFRESH 2026-10-15 by Claude] A snapshot that relays a
+    // pinned identity's descriptor reaches the same W1 guard as an announce:
+    // it may refresh the pin only at its pinned address and with TLS.
+    #[test]
+    fn a_relayed_snapshot_obeys_the_pinned_identity_guard() {
+        use aeronyx_core::protocol::discovery::{NodeBootstrapSnapshot, NodeDiscoveryMessage};
+        let x = identity(1);
+        let store = pinned_store(pin_of(&x), &[]);
+        let proof = PinnedTlsProof::for_test(&pin_of(&x));
+        let original = live(&x, 1, PIN_ENDPOINT, true);
+        assert!(pinned(&store, original.clone(), &proof).unwrap());
+        store.enable_untrusted_discovery_candidate_mode();
+        let relay = |d: SignedNodeDescriptor| {
+            store.apply_discovery_message(
+                &NodeDiscoveryMessage::SnapshotResponse {
+                    snapshot: NodeBootstrapSnapshot::new(NOW, vec![d]),
+                },
+                NOW,
+            )
+        };
+        for bad in [
+            live(&x, 2, "http://127.0.0.1:18423", true),
+            live(&x, 2, PIN_ENDPOINT, false),
+        ] {
+            assert_eq!(relay(bad).inserted, 0);
+            assert_eq!(
+                store.peers.read().get(&x.public_key_bytes()),
+                Some(&original)
+            );
+        }
+        let good = live(&x, 2, PIN_ENDPOINT, true);
+        assert_eq!(relay(good.clone()).inserted, 1);
+        assert_eq!(store.peers.read().get(&x.public_key_bytes()), Some(&good));
+    }
+
+    // [HELD-IDENTITY-REFRESH 2026-10-15 by Claude] A pin that is not yet
+    // established is never established by a relayed copy, however valid.
+    #[test]
+    fn an_unestablished_pin_is_not_established_by_a_relayed_snapshot() {
+        use aeronyx_core::protocol::discovery::{NodeBootstrapSnapshot, NodeDiscoveryMessage};
+        let x = identity(1);
+        let store = pinned_store(pin_of(&x), &[]);
+        store.enable_untrusted_discovery_candidate_mode();
+        let report = store.apply_discovery_message(
+            &NodeDiscoveryMessage::SnapshotResponse {
+                snapshot: NodeBootstrapSnapshot::new(NOW, vec![live(&x, 1, PIN_ENDPOINT, true)]),
+            },
+            NOW,
+        );
+        assert_eq!(report.inserted, 0);
+        assert!(!has(&store, &x));
     }
 }

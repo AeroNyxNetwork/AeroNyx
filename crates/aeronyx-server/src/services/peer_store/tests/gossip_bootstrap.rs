@@ -673,3 +673,533 @@ fn test_stability_accepts_peer_cache_as_restart_recovery() {
         vec!["peer_cache".to_string()]
     );
 }
+
+// [HELD-IDENTITY-REFRESH 2026-10-15 by Claude] A held identity is refreshed by
+// any relay of its own signed descriptor, not only by its own announce; a new
+// identity relayed the same way stays a non-routeable candidate.
+fn held_after_expiry(kp: &IdentityKeyPair, store: &PeerStore) -> u64 {
+    let expired = signed_descriptor_for(kp, 1, 1_700_000_600);
+    let now = 1_700_001_000;
+    let snapshot = NodeBootstrapSnapshot::new(now, vec![expired]);
+    assert_eq!(
+        store
+            .load_peer_cache_snapshot_from_source(&snapshot, now, "cache")
+            .inserted,
+        1
+    );
+    assert!(store.get_valid(&kp.public_key_bytes(), now).is_none());
+    store.enable_untrusted_discovery_candidate_mode();
+    now
+}
+
+fn relayed(store: &PeerStore, now: u64, peers: Vec<SignedNodeDescriptor>) -> PeerStoreImportReport {
+    store.apply_discovery_message(
+        &NodeDiscoveryMessage::SnapshotResponse {
+            snapshot: NodeBootstrapSnapshot::new(now, peers),
+        },
+        now,
+    )
+}
+
+#[test]
+fn a_held_identity_whose_descriptor_expired_is_refreshed_by_a_relayed_snapshot() {
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = held_after_expiry(&kp, &store);
+    let fresh = signed_descriptor_for(&kp, 2, now + 3_600);
+    let stranger = signed_descriptor(1, now + 600);
+
+    let report = relayed(&store, now, vec![fresh.clone(), stranger.clone()]);
+
+    assert_eq!(report.inserted, 1, "{report:?}");
+    assert_eq!(report.candidates, 1, "{report:?}");
+    assert_eq!(store.get_valid(&kp.public_key_bytes(), now), Some(fresh));
+    assert!(store.get_valid(&stranger.node_id(), now).is_none());
+    assert_eq!(
+        store.len(),
+        1,
+        "a relayed new identity never becomes a peer"
+    );
+}
+
+#[test]
+fn a_relayed_snapshot_never_rolls_back_or_rewrites_a_held_identity() {
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = held_after_expiry(&kp, &store);
+    let current = signed_descriptor_for(&kp, 3, now + 3_600);
+    assert_eq!(relayed(&store, now, vec![current.clone()]).inserted, 1);
+
+    let older = signed_descriptor_for(&kp, 2, now + 3_600);
+    let conflicting = signed_descriptor_for(&kp, 3, now + 3_000);
+    for attempt in [older, conflicting] {
+        let report = relayed(&store, now, vec![attempt]);
+        assert_eq!(report.inserted, 0, "{report:?}");
+        assert_eq!(report.stale + report.rejected, 1, "{report:?}");
+        assert_eq!(
+            store.get_valid(&kp.public_key_bytes(), now),
+            Some(current.clone())
+        );
+    }
+}
+
+#[test]
+fn a_tampered_relayed_descriptor_of_a_held_identity_is_rejected() {
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = held_after_expiry(&kp, &store);
+    let mut tampered = signed_descriptor_for(&kp, 2, now + 3_600);
+    tampered.signature[0] ^= 0x01;
+
+    let report = relayed(&store, now, vec![tampered]);
+
+    assert_eq!(report.inserted, 0, "{report:?}");
+    assert!(store.get_valid(&kp.public_key_bytes(), now).is_none());
+}
+
+#[test]
+fn relayed_copies_of_a_held_identity_keep_the_per_message_bound() {
+    // Only the first UNTRUSTED_DISCOVERY_CANDIDATES_PER_MESSAGE descriptors
+    // are looked at, as before; the highest of those is applied.
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = held_after_expiry(&kp, &store);
+    let copies = (2..52)
+        .map(|sequence| signed_descriptor_for(&kp, sequence, now + 3_600))
+        .collect::<Vec<_>>();
+    let considered = UNTRUSTED_DISCOVERY_CANDIDATES_PER_MESSAGE;
+    let highest_considered = copies[considered - 1].clone();
+
+    let report = relayed(&store, now, copies);
+
+    assert_eq!(report.total, 50, "{report:?}");
+    assert_eq!(report.inserted, 1, "{report:?}");
+    assert_eq!(report.unchanged, considered - 1, "{report:?}");
+    assert_eq!(report.rejected, 50 - considered, "{report:?}");
+    assert_eq!(
+        store.get_valid(&kp.public_key_bytes(), now),
+        Some(highest_considered)
+    );
+}
+
+#[test]
+fn a_held_descriptor_beyond_the_per_message_bound_is_not_looked_at() {
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = held_after_expiry(&kp, &store);
+    let mut batch = (0..UNTRUSTED_DISCOVERY_CANDIDATES_PER_MESSAGE)
+        .map(|_| signed_descriptor(1, now + 600))
+        .collect::<Vec<_>>();
+    batch.push(signed_descriptor_for(&kp, 2, now + 3_600));
+
+    let report = relayed(&store, now, batch);
+
+    assert_eq!(report.inserted, 0, "{report:?}");
+    assert!(store.get_valid(&kp.public_key_bytes(), now).is_none());
+}
+
+#[test]
+fn an_invalid_high_sequence_cannot_hide_a_valid_lower_refresh_in_either_order() {
+    for forged_first in [true, false] {
+        let kp = IdentityKeyPair::generate();
+        let store = PeerStore::new();
+        let now = held_after_expiry(&kp, &store);
+        let valid = signed_descriptor_for(&kp, 2, now + 3_600);
+        let mut forged = signed_descriptor_for(&kp, 9, now + 3_600);
+        forged.signature[0] ^= 0x01;
+        let batch = if forged_first {
+            vec![forged, valid.clone()]
+        } else {
+            vec![valid.clone(), forged]
+        };
+
+        let report = relayed(&store, now, batch);
+
+        assert_eq!(report.inserted, 1, "forged_first={forged_first} {report:?}");
+        assert_eq!(store.get_valid(&kp.public_key_bytes(), now), Some(valid));
+    }
+}
+
+#[test]
+fn two_different_descriptors_at_the_top_sequence_refresh_nothing_in_either_order() {
+    let mut outcomes = Vec::new();
+    for a_first in [true, false] {
+        let kp = IdentityKeyPair::generate();
+        let store = PeerStore::new();
+        let now = held_after_expiry(&kp, &store);
+        let held_before = store.peers.read().get(&kp.public_key_bytes()).cloned();
+        let a = signed_descriptor_for(&kp, 2, now + 3_600);
+        let b = signed_descriptor_for(&kp, 2, now + 3_000);
+        let batch = if a_first { vec![a, b] } else { vec![b, a] };
+
+        let report = relayed(&store, now, batch);
+
+        assert_eq!(report.inserted, 0, "a_first={a_first} {report:?}");
+        assert_eq!(report.rejected, 2, "a_first={a_first} {report:?}");
+        assert_eq!(
+            store.peers.read().get(&kp.public_key_bytes()).cloned(),
+            held_before
+        );
+        outcomes.push((report.inserted, report.rejected));
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
+}
+
+#[test]
+fn exact_copies_of_the_top_descriptor_collapse_into_one_refresh() {
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = held_after_expiry(&kp, &store);
+    let fresh = signed_descriptor_for(&kp, 2, now + 3_600);
+
+    let report = relayed(&store, now, vec![fresh.clone(), fresh.clone()]);
+
+    assert_eq!(report.inserted, 1, "{report:?}");
+    assert_eq!(report.unchanged, 1, "{report:?}");
+    assert_eq!(store.get_valid(&kp.public_key_bytes(), now), Some(fresh));
+}
+
+#[test]
+fn an_identity_removed_after_classification_is_not_recreated_by_its_refresh() {
+    let kp = IdentityKeyPair::generate();
+    let node_id = kp.public_key_bytes();
+    let store = std::sync::Arc::new(PeerStore::new());
+    let now = held_after_expiry(&kp, &store);
+    let fresh = signed_descriptor_for(&kp, 2, now + 3_600);
+    let (entered, release) = super::super::verified_upsert::arm_pause_before_held_refresh(node_id);
+    let worker = {
+        let store = store.clone();
+        std::thread::spawn(move || relayed(&store, now, vec![fresh]))
+    };
+    let removed = remove_while_paused(&store, node_id, entered, release, PAUSE_LIMIT);
+    // join() itself has no deadline: the pause is bounded, the rest of the
+    // writer is not. The test process runs under an outer timeout instead.
+    let report = worker.join().unwrap();
+    removed.unwrap();
+
+    assert_eq!(report.inserted, 0, "{report:?}");
+    assert_eq!(report.rejected, 1, "{report:?}");
+    assert!(
+        !store.peers.read().contains_key(&node_id),
+        "never re-created"
+    );
+}
+
+const PAUSE_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Waits at most `limit` for a writer to reach the armed pause, removes the
+/// identity while that writer is between classification and W1, then lets it
+/// go. The waits inside this helper and the writer's pause are bounded, and
+/// the failure path frees the writer: returning
+/// drops `release`, and a missing writer leaves no armed pause behind.
+fn remove_while_paused(
+    store: &PeerStore,
+    node_id: [u8; 32],
+    entered: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+    limit: std::time::Duration,
+) -> Result<(), String> {
+    if let Err(error) = entered.recv_timeout(limit) {
+        super::super::verified_upsert::disarm_pause_before_held_refresh(&node_id);
+        return Err(format!("the writer never reached the seam: {error:?}"));
+    }
+    let removed = store.peers.write().remove(&node_id).is_some();
+    let _ = release.send(());
+    if removed {
+        Ok(())
+    } else {
+        Err("the identity was not held".to_string())
+    }
+}
+
+#[test]
+fn the_interleave_helper_fails_fast_when_no_writer_arrives() {
+    let store = PeerStore::new();
+    let node_id = IdentityKeyPair::generate().public_key_bytes();
+    let (entered, release) = super::super::verified_upsert::arm_pause_before_held_refresh(node_id);
+    let began = std::time::Instant::now();
+
+    let outcome = remove_while_paused(
+        &store,
+        node_id,
+        entered,
+        release,
+        std::time::Duration::from_millis(200),
+    );
+
+    assert!(outcome.unwrap_err().contains("never reached"));
+    assert!(began.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn the_interleave_helper_fails_fast_when_the_writer_dies_after_taking_the_pause() {
+    let store = PeerStore::new();
+    let node_id = IdentityKeyPair::generate().public_key_bytes();
+    let (entered, release) = super::super::verified_upsert::arm_pause_before_held_refresh(node_id);
+    // A writer that took the pause and failed before signalling drops it.
+    std::thread::spawn(move || {
+        super::super::verified_upsert::disarm_pause_before_held_refresh(&node_id)
+    })
+    .join()
+    .unwrap();
+    let began = std::time::Instant::now();
+
+    let outcome = remove_while_paused(&store, node_id, entered, release, PAUSE_LIMIT);
+
+    assert!(outcome.unwrap_err().contains("Disconnected"));
+    assert!(began.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn an_announce_for_an_identity_removed_after_its_check_is_not_recreated() {
+    let kp = IdentityKeyPair::generate();
+    let node_id = kp.public_key_bytes();
+    let store = std::sync::Arc::new(PeerStore::new());
+    let now = held_after_expiry(&kp, &store);
+    let fresh = signed_descriptor_for(&kp, 2, now + 3_600);
+    let (entered, release) = super::super::verified_upsert::arm_pause_before_held_refresh(node_id);
+    let worker = {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            store.apply_discovery_message(
+                &NodeDiscoveryMessage::DescriptorAnnounce { descriptor: fresh },
+                now,
+            )
+        })
+    };
+    let removed = remove_while_paused(&store, node_id, entered, release, PAUSE_LIMIT);
+    let report = worker.join().unwrap();
+    removed.unwrap();
+
+    assert_eq!(report.inserted, 0, "{report:?}");
+    assert!(
+        !store.peers.read().contains_key(&node_id),
+        "never re-created"
+    );
+}
+
+/// (total_imported, inserted, candidate_admitted, unchanged, stale, rejected)
+/// and the number of `descriptor_import` audit events.
+fn import_counters(store: &PeerStore, now: u64) -> ([u64; 6], usize, Option<String>) {
+    let status = store.status(now);
+    let r = &status.runtime;
+    let imports = status
+        .recent_audit_events
+        .iter()
+        .filter(|event| event.action == "descriptor_import")
+        .collect::<Vec<_>>();
+    (
+        [
+            r.total_imported,
+            r.inserted,
+            r.candidate_admitted,
+            r.unchanged,
+            r.stale,
+            r.rejected,
+        ],
+        imports.len(),
+        imports.last().map(|event| event.detail.clone()),
+    )
+}
+
+/// The returned report, the persistent counters and the audit trail agree,
+/// the message is recorded exactly once, and the outcomes add up to total.
+fn assert_recorded_once(
+    store: &PeerStore,
+    now: u64,
+    batch: Vec<SignedNodeDescriptor>,
+) -> PeerStoreImportReport {
+    let (before, audits_before, _) = import_counters(store, now);
+    let report = relayed(store, now, batch);
+    let (after, audits_after, detail) = import_counters(store, now);
+    let delta: Vec<u64> = after
+        .iter()
+        .zip(before.iter())
+        .map(|(a, b)| a - b)
+        .collect();
+    assert_eq!(
+        delta,
+        vec![
+            report.total as u64,
+            report.inserted as u64,
+            report.candidates as u64,
+            report.unchanged as u64,
+            report.stale as u64,
+            report.rejected as u64,
+        ],
+        "{report:?}"
+    );
+    assert_eq!(audits_after, audits_before + 1, "exactly one import record");
+    assert_eq!(
+        detail.unwrap(),
+        format!(
+            "total={} inserted={} candidates={} unchanged={} stale={} rejected={}",
+            report.total,
+            report.inserted,
+            report.candidates,
+            report.unchanged,
+            report.stale,
+            report.rejected
+        )
+    );
+    assert_eq!(
+        report.inserted + report.candidates + report.unchanged + report.stale + report.rejected,
+        report.total,
+        "{report:?}"
+    );
+    report
+}
+
+#[test]
+fn a_pure_conflict_batch_is_recorded_once_and_consistently() {
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = held_after_expiry(&kp, &store);
+    let report = assert_recorded_once(
+        &store,
+        now,
+        vec![
+            signed_descriptor_for(&kp, 2, now + 3_600),
+            signed_descriptor_for(&kp, 2, now + 3_000),
+        ],
+    );
+    assert_eq!(report.rejected, 2, "{report:?}");
+}
+
+#[test]
+fn an_over_limit_batch_is_recorded_once_and_consistently() {
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = held_after_expiry(&kp, &store);
+    let mut batch = (0..UNTRUSTED_DISCOVERY_CANDIDATES_PER_MESSAGE)
+        .map(|_| signed_descriptor(1, now + 600))
+        .collect::<Vec<_>>();
+    batch.push(signed_descriptor_for(&kp, 2, now + 3_600));
+    let report = assert_recorded_once(&store, now, batch);
+    assert_eq!(
+        report.candidates, UNTRUSTED_DISCOVERY_CANDIDATES_PER_MESSAGE,
+        "{report:?}"
+    );
+    assert_eq!(report.rejected, 1, "{report:?}");
+}
+
+#[test]
+fn a_duplicate_batch_is_recorded_once_and_consistently() {
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = held_after_expiry(&kp, &store);
+    let fresh = signed_descriptor_for(&kp, 2, now + 3_600);
+    let report = assert_recorded_once(&store, now, vec![fresh.clone(), fresh]);
+    assert_eq!((report.inserted, report.unchanged), (1, 1), "{report:?}");
+}
+
+#[test]
+fn a_mixed_batch_is_recorded_once_and_consistently() {
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = held_after_expiry(&kp, &store);
+    let mut tampered = signed_descriptor_for(&kp, 5, now + 3_600);
+    tampered.signature[0] ^= 0x01;
+    let report = assert_recorded_once(
+        &store,
+        now,
+        vec![
+            signed_descriptor_for(&kp, 2, now + 3_600),
+            signed_descriptor(1, now + 600),
+            tampered,
+            signed_descriptor_for(&kp, 1, now + 3_600),
+        ],
+    );
+    assert_eq!(report.inserted, 1, "{report:?}");
+    assert_eq!(report.candidates, 1, "{report:?}");
+    assert_eq!(report.unchanged, 1, "{report:?}");
+    assert_eq!(report.rejected, 1, "{report:?}");
+}
+
+#[test]
+fn the_write_boundary_never_establishes_an_identity_through_held_refresh() {
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = 1_700_001_000;
+    let fresh = signed_descriptor_for(&kp, 2, now + 3_600);
+
+    let result = store.upsert_verified_with_origin(
+        fresh,
+        now,
+        "local_identity_refresh",
+        super::super::pinned_seeds::PeerOrigin::HeldRefresh,
+        None,
+    );
+
+    assert!(result.is_err());
+    assert_eq!(store.len(), 0);
+}
+
+#[test]
+fn an_already_expired_relayed_descriptor_of_a_held_identity_is_not_applied() {
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = held_after_expiry(&kp, &store);
+    let stale_window = signed_descriptor_for(&kp, 2, now - 1);
+
+    let report = relayed(&store, now, vec![stale_window]);
+
+    assert_eq!(report.inserted, 0, "{report:?}");
+    assert!(store.get_valid(&kp.public_key_bytes(), now).is_none());
+}
+
+#[test]
+fn a_stranger_cannot_become_refreshable_within_one_batch() {
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = held_after_expiry(&kp, &store);
+    let stranger = IdentityKeyPair::generate();
+    let batch = vec![
+        signed_descriptor_for(&stranger, 1, now + 3_600),
+        signed_descriptor_for(&stranger, 2, now + 3_600),
+    ];
+
+    let report = relayed(&store, now, batch);
+
+    assert_eq!(report.inserted, 0, "{report:?}");
+    assert!(!store
+        .peers
+        .read()
+        .contains_key(&stranger.public_key_bytes()));
+    assert_eq!(store.len(), 1, "only the held identity is a peer");
+}
+
+#[test]
+fn trusted_mode_snapshots_are_unchanged_by_held_refresh() {
+    // Outside untrusted-candidate mode a snapshot response keeps its old path.
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = 1_700_001_000;
+    let fresh = signed_descriptor_for(&kp, 2, now + 3_600);
+    let report = relayed(&store, now, vec![fresh.clone()]);
+    assert_eq!(report.inserted, 1, "{report:?}");
+    assert_eq!(report.candidates, 0, "{report:?}");
+    assert_eq!(store.get_valid(&kp.public_key_bytes(), now), Some(fresh));
+}
+
+#[test]
+fn a_relayed_held_descriptor_beyond_the_untrusted_lifetime_limit_is_not_applied() {
+    // The same receiver-local lifetime limit an anonymous announce must meet.
+    let kp = IdentityKeyPair::generate();
+    let store = PeerStore::new();
+    let now = held_after_expiry(&kp, &store);
+    let too_long = signed_descriptor_for(
+        &kp,
+        2,
+        1_700_000_000 + UNTRUSTED_DISCOVERY_MAX_LIFETIME_SECS + 1,
+    );
+    assert!(
+        too_long.verify_at(now).is_ok(),
+        "the signature itself is valid"
+    );
+
+    let report = relayed(&store, now, vec![too_long]);
+
+    assert_eq!(report.inserted, 0, "{report:?}");
+    assert!(store.get_valid(&kp.public_key_bytes(), now).is_none());
+}
