@@ -40,9 +40,10 @@
 //   v1.0.0-RelayBootstrap - Initial runtime and schema bootstrap extraction
 // ============================================
 
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a chat relay SQLite statement waits for a competing lock.
 ///
@@ -53,6 +54,58 @@ use std::time::Duration;
 /// already stopped waiting by then. A compile-time assertion in `chat_handlers`
 /// enforces it.
 pub(crate) const CHAT_RELAY_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Longest single sleep between lock retries.
+const CHAT_RELAY_SQLITE_BUSY_STEP: Duration = Duration::from_millis(25);
+
+thread_local! {
+    /// When the current statement first found the database locked.
+    static CHAT_RELAY_BUSY_SINCE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Busy handler for the chat relay connection: retry until
+/// [`CHAT_RELAY_SQLITE_BUSY_TIMEOUT`] of wall-clock time has passed.
+///
+/// [CHAT-BUSY-WALL-CLOCK 2026-10-17 by Claude] `busy_timeout` counts the
+/// delays SQLite asks for, not the time that passed. On a loaded host the
+/// sleeps overrun, so a "5 s" wait outlived the 10 s HTTP deadline: the client
+/// got 503 while the worker, still holding the connection mutex, took the lock
+/// afterwards and committed (the ACK test failed this way on macOS-14 CI in 4
+/// runs: 38054116414, 38057377887, 38057872954, 39039754921). Counting real
+/// time keeps the invariant the HTTP layer relies on. The connection is used by
+/// one thread at a time under its mutex, so a thread-local start time is exact.
+fn chat_relay_busy_wait(retry: i32) -> bool {
+    let now = Instant::now();
+    let since = CHAT_RELAY_BUSY_SINCE.with(|since| {
+        let start = if retry == 0 {
+            now
+        } else {
+            since.get().unwrap_or(now)
+        };
+        since.set(Some(start));
+        start
+    });
+    match busy_wait_step(
+        now.duration_since(since),
+        retry,
+        CHAT_RELAY_SQLITE_BUSY_TIMEOUT,
+    ) {
+        Some(pause) => {
+            std::thread::sleep(pause);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Next pause for a statement that has been blocked for `elapsed`, or `None`
+/// once the wall-clock `bound` is spent. Pauses start short and never sleep
+/// past the bound.
+fn busy_wait_step(elapsed: Duration, retry: i32, bound: Duration) -> Option<Duration> {
+    let remaining = bound.checked_sub(elapsed).filter(|left| !left.is_zero())?;
+    let backoff = Duration::from_millis(1u64 << retry.clamp(0, 4) as u32);
+    Some(backoff.min(CHAT_RELAY_SQLITE_BUSY_STEP).min(remaining))
+}
 
 use parking_lot::Mutex;
 use rand::{rngs::OsRng, RngCore};
@@ -141,7 +194,7 @@ impl ChatRelayService {
         }
         // A short bounded wait absorbs transient locks from an operator backup
         // or diagnostic reader without allowing relay requests to hang forever.
-        conn.busy_timeout(CHAT_RELAY_SQLITE_BUSY_TIMEOUT)?;
+        conn.busy_handler(Some(chat_relay_busy_wait))?;
         verify_sqlite_physical_integrity(&conn, "sqlite_startup_integrity")?;
         let synchronous_level =
             configure_full_durability(&conn, CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL)?;
@@ -254,5 +307,79 @@ impl ChatRelayService {
         self.maintenance_telemetry
             .set_retained_quarantine_events(retained_quarantine_events);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod busy_wait_tests {
+    use super::*;
+
+    // [CHAT-BUSY-WALL-CLOCK 2026-10-17 by Claude]
+    #[test]
+    fn busy_wait_backs_off_and_never_sleeps_past_the_wall_clock_bound() {
+        let bound = Duration::from_millis(100);
+        assert_eq!(
+            busy_wait_step(Duration::ZERO, 0, bound),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            busy_wait_step(Duration::ZERO, 3, bound),
+            Some(Duration::from_millis(8))
+        );
+        assert_eq!(
+            busy_wait_step(Duration::ZERO, 50, bound),
+            Some(Duration::from_millis(16))
+        );
+        assert_eq!(
+            busy_wait_step(Duration::from_millis(95), 50, bound),
+            Some(Duration::from_millis(5))
+        );
+        assert_eq!(busy_wait_step(bound, 50, bound), None);
+        assert_eq!(
+            busy_wait_step(bound + Duration::from_secs(9), 1, bound),
+            None
+        );
+        assert_eq!(
+            busy_wait_step(Duration::ZERO, -3, bound),
+            Some(Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn locked_chat_relay_write_gives_up_on_wall_clock_time() {
+        // A real competing writer: the relay connection must report BUSY close
+        // to the bound in real time, never at some later multiple of it.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("busy.sqlite3");
+        let relay = Connection::open(&path).expect("relay connection");
+        relay
+            .busy_handler(Some(chat_relay_busy_wait))
+            .expect("handler");
+        relay
+            .execute_batch("CREATE TABLE t (v INTEGER);")
+            .expect("schema");
+        let blocker = Connection::open(&path).expect("blocker");
+        blocker.execute_batch("BEGIN EXCLUSIVE;").expect("lock");
+        let started = Instant::now();
+        let error = relay
+            .execute("INSERT INTO t VALUES (1)", [])
+            .expect_err("must stay locked");
+        let waited = started.elapsed();
+        assert!(matches!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        ));
+        assert!(
+            waited >= CHAT_RELAY_SQLITE_BUSY_TIMEOUT,
+            "gave up early: {waited:?}"
+        );
+        assert!(
+            waited < CHAT_RELAY_SQLITE_BUSY_TIMEOUT + Duration::from_secs(2),
+            "outlived the bound: {waited:?}"
+        );
+        blocker.execute_batch("ROLLBACK;").expect("unlock");
+        relay
+            .execute("INSERT INTO t VALUES (1)", [])
+            .expect("writes once unlocked");
     }
 }

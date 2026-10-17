@@ -151,7 +151,9 @@ const CHAT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 // holds its admission permit. A 503 therefore only means "nothing was
 // changed" if SQLite stops waiting for a lock before the deadline; otherwise a
 // timed-out ACK could still delete the message after the client was told it
-// failed. Keep the busy timeout strictly shorter.
+// failed. Keep the busy timeout strictly shorter. Since 2026-10-17 the relay
+// connection counts that wait in wall-clock time (chat_relay_busy_wait), so the
+// bound holds on a loaded host too.
 const _: () = assert!(
     crate::services::chat_relay::CHAT_RELAY_SQLITE_BUSY_TIMEOUT.as_millis()
         < CHAT_HTTP_TIMEOUT.as_millis(),
