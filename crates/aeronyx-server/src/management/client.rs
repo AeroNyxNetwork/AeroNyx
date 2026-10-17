@@ -934,8 +934,12 @@ impl ManagementClient {
 
         if !response.status().is_success() {
             let status = response.status();
+            let trace = edge_trace(response.headers());
             let body_text = response.text().await.unwrap_or_default();
-            error!("Heartbeat failed: status={}, body={}", status, body_text);
+            error!(
+                "Heartbeat failed: status={}, {}, body={}",
+                status, trace, body_text
+            );
             return Err(format!("Status: {}, Body: {}", status, body_text));
         }
 
@@ -1024,8 +1028,58 @@ impl std::fmt::Debug for ManagementClient {
     }
 }
 
+/// Edge identifiers of a failed CMS response, for looking a proxy-generated
+/// failure up on the proxy side.
+///
+/// [HEARTBEAT-EDGE-TRACE 2026-10-17 by Claude] Berlin1 logged 52 Cloudflare 520
+/// heartbeats in 56 h that never reached the origin's access log, and none of
+/// them can be traced: the ray id was not kept. Only `cf-ray` and `server` are
+/// read; neither carries node, peer or user data. Each value keeps printable
+/// ASCII only, at most 64 characters, so a hostile header cannot forge log lines.
+fn edge_trace(headers: &reqwest::header::HeaderMap) -> String {
+    let field = |name: &str| {
+        let value: String = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .chars()
+            .filter(char::is_ascii_graphic)
+            .take(64)
+            .collect();
+        if value.is_empty() {
+            "-".to_string()
+        } else {
+            value
+        }
+    };
+    format!("cf_ray={} server={}", field("cf-ray"), field("server"))
+}
+
 #[cfg(test)]
 mod tests {
+    // [HEARTBEAT-EDGE-TRACE 2026-10-17 by Claude]
+    #[test]
+    fn edge_trace_keeps_only_bounded_printable_ray_and_server() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-ray", HeaderValue::from_static("8d2f1a3b4c5d6e7f-FRA"));
+        headers.insert("server", HeaderValue::from_static("cloudflare"));
+        headers.insert("set-cookie", HeaderValue::from_static("secret=1"));
+        assert_eq!(
+            super::edge_trace(&headers),
+            "cf_ray=8d2f1a3b4c5d6e7f-FRA server=cloudflare"
+        );
+
+        assert_eq!(super::edge_trace(&HeaderMap::new()), "cf_ray=- server=-");
+
+        let mut hostile = HeaderMap::new();
+        hostile.insert("cf-ray", HeaderValue::from_static("a b\tc"));
+        hostile.insert("server", HeaderValue::from_str(&"x".repeat(200)).unwrap());
+        let trace = super::edge_trace(&hostile);
+        assert_eq!(trace, format!("cf_ray=abc server={}", "x".repeat(64)));
+        assert!(!trace.contains('\n'));
+    }
+
     use super::*;
 
     #[test]
