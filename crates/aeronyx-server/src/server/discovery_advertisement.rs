@@ -105,6 +105,9 @@ impl Server {
             // token only after the default-off store opened successfully and
             // was injected into both peer routers.
             protocol_features.push(NodeProtocolFeature::AnonymousMailboxV1);
+            // [ANONYMOUS-MAILBOX-PULL-CLASSES 2026-10-17 by Claude] Same
+            // terminal, same readiness: it answers classed pulls from here on.
+            protocol_features.push(NodeProtocolFeature::AnonymousMailboxPullClassesV1);
         }
         let advertised_endpoint = config
             .discovery

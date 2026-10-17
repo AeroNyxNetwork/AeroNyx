@@ -133,11 +133,18 @@ pub enum NodeProtocolFeature {
     /// and never falls back to plain HTTP, so a network attacker cannot strip
     /// the upgrade. Nodes without it keep plain HTTP.
     IdentityBoundTlsV1,
+    /// The anonymous mailbox terminal answers a PullOne sent with
+    /// `ANONYMOUS_MAILBOX_PULL_VERSION_CLASSED` with a class-padded result.
+    ///
+    /// [ANONYMOUS-MAILBOX-PULL-CLASSES 2026-10-17 by Claude] Signed so a source
+    /// asks only terminals that understand the request; a pre-feature terminal
+    /// keeps receiving version-1 pulls and returning the fixed V1 image.
+    AnonymousMailboxPullClassesV1,
 }
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::BlindRelayFailureReceiptV1,
         Self::BlindRelaySuccessReceiptV1,
         Self::PurposeBoundDeliveryReceiptV2,
@@ -156,6 +163,7 @@ impl NodeProtocolFeature {
         Self::OnionBlindVaultEncryptedFailureV1,
         Self::AnonymousMailboxV1,
         Self::IdentityBoundTlsV1,
+        Self::AnonymousMailboxPullClassesV1,
     ];
 
     /// Exact SemVer build-metadata identifier used on the signed wire.
@@ -180,6 +188,7 @@ impl NodeProtocolFeature {
             Self::OnionBlindVaultEncryptedFailureV1 => "anpf1-obef1",
             Self::AnonymousMailboxV1 => "anpf1-amb1",
             Self::IdentityBoundTlsV1 => "anpf1-ibt1",
+            Self::AnonymousMailboxPullClassesV1 => "anpf1-ampc1",
         }
     }
 }

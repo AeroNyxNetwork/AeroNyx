@@ -590,6 +590,9 @@ fn aad(
 }
 
 fn padding_slot(length: usize) -> Option<usize> {
+    // [ANONYMOUS-MAILBOX-PULL-CLASSES 2026-10-17 by Claude] Changing these
+    // slots changes ANONYMOUS_MAILBOX_PULL_RESULT_CLASSED_SLOTS too; a test
+    // below pins the pair.
     [4 * 1024, 16 * 1024, 64 * 1024, 128 * 1024]
         .into_iter()
         .find(|slot| length <= *slot)
@@ -1017,5 +1020,26 @@ mod tests {
         let relay = encode_blind_relay_envelope(&routed).expect("relay encode");
         assert_eq!(relay.len(), 131_962);
         assert_eq!(STANDARD.encode(relay).len(), 175_952);
+    }
+    // [ANONYMOUS-MAILBOX-PULL-CLASSES 2026-10-17 by Claude] The class-padded
+    // pull result carries a recipient-sealed item with zero padding only while
+    // its first four slots are exactly these sealed sizes.
+    #[test]
+    fn pull_result_classed_slots_are_the_recipient_sealed_item_sizes() {
+        let sealed_sizes: Vec<usize> = [4 * 1024, 16 * 1024, 64 * 1024, 128 * 1024]
+            .into_iter()
+            .map(|slot| {
+                assert_eq!(padding_slot(slot), Some(slot));
+                RECIPIENT_SEAL_PREFIX_BYTES
+                    + RECIPIENT_SEAL_ACTUAL_LENGTH_BYTES
+                    + slot
+                    + RECIPIENT_SEAL_AEAD_TAG_BYTES
+            })
+            .collect();
+        assert_eq!(
+            sealed_sizes,
+            crate::protocol::anonymous_mailbox::ANONYMOUS_MAILBOX_PULL_RESULT_CLASSED_SLOTS[..4]
+        );
+        assert_eq!(padding_slot(128 * 1024 + 1), None);
     }
 }

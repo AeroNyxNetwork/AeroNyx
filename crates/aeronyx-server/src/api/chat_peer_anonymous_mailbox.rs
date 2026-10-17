@@ -162,7 +162,10 @@ impl PreparedAnonymousMailboxTerminal {
                 )
             }
             AnonymousMailboxTerminalFrameV1::PullOne(request) => {
-                let (outcome, payload) = map_pull(repository.pull_one(request, now))?;
+                let (outcome, payload) = map_pull(
+                    repository.pull_one(request, now),
+                    request.wants_classed_result(),
+                )?;
                 (
                     AnonymousMailboxOperationV1::PullOne,
                     request.request_id,
@@ -281,6 +284,7 @@ fn map_put(
 
 fn map_pull(
     value: Result<AnonymousMailboxPullOutcome, AnonymousMailboxStoreError>,
+    classed: bool,
 ) -> Result<(AnonymousMailboxOutcomeV1, Vec<u8>), AnonymousMailboxTerminalFailure> {
     match value.map_err(map_store_error)? {
         AnonymousMailboxPullOutcome::Item(item) => {
@@ -296,9 +300,14 @@ fn map_pull(
             if result.sealed_commitment != item.sealed_commitment {
                 return Err(AnonymousMailboxTerminalFailure::Rejected);
             }
-            let result = result
-                .encode()
-                .map_err(|_| AnonymousMailboxTerminalFailure::Rejected)?;
+            // [ANONYMOUS-MAILBOX-PULL-CLASSES 2026-10-17 by Claude] The signed
+            // request version picks the image; V1 requests get V1 unchanged.
+            let result = if classed {
+                result.encode_classed()
+            } else {
+                result.encode()
+            }
+            .map_err(|_| AnonymousMailboxTerminalFailure::Rejected)?;
             Ok((AnonymousMailboxOutcomeV1::Accepted, result))
         }
         AnonymousMailboxPullOutcome::Empty => Ok((AnonymousMailboxOutcomeV1::Accepted, Vec::new())),
@@ -1691,6 +1700,49 @@ mod tests {
         assert_eq!(pulled.item_id, put.item_id);
         assert_eq!(pulled.sealed_item, opaque_item);
         assert_eq!(pulled.sealed_commitment, put.sealed_commitment());
+        assert_eq!(
+            response.sealed_payload.len(),
+            aeronyx_core::protocol::anonymous_mailbox::ANONYMOUS_MAILBOX_PULL_RESULT_BYTES
+        );
+
+        // [ANONYMOUS-MAILBOX-PULL-CLASSES 2026-10-17 by Claude] The same item,
+        // pulled with the signed classed version, comes back class-padded: a
+        // 4096-byte item fills the 4204-byte slot, 4518 bytes instead of 163130.
+        let classed_pull = AnonymousMailboxPullOneV1::new_classed(
+            mailbox_id,
+            [0xb8; 16],
+            Vec::new(),
+            1_800_000_001,
+            &reader,
+        )
+        .expect("classed pull request");
+        let response = execute_terminal_frame(
+            reopened.clone(),
+            &target,
+            [0xb9; 16],
+            AnonymousMailboxTerminalFrameV1::PullOne(classed_pull.clone()),
+        );
+        let AnonymousMailboxTerminalFrameV1::PullOneResponse(response) = response else {
+            panic!("classed pull response kind");
+        };
+        response
+            .verify_for_request(
+                AnonymousMailboxOperationV1::PullOne,
+                &classed_pull.request_id,
+                &classed_pull
+                    .request_commitment()
+                    .expect("classed commitment"),
+                &target.public_key_bytes(),
+            )
+            .expect("classed pull response binding");
+        assert_eq!(response.outcome, AnonymousMailboxOutcomeV1::Accepted);
+        assert_eq!(
+            response.sealed_payload.len(),
+            4 + 16 + 32 + 4 + 2 + 256 + 4_204
+        );
+        let classed = AnonymousMailboxPullResultV1::decode_classed(&response.sealed_payload)
+            .expect("canonical classed pull result");
+        assert_eq!(classed, pulled);
 
         let ack = AnonymousMailboxAckV1::new(
             mailbox_id,

@@ -122,10 +122,28 @@ fn identity_bound_tls_feature_is_signed_and_append_only() {
     // existing feature, so earlier tokens and their order are unchanged.
     let feature = NodeProtocolFeature::IdentityBoundTlsV1;
     assert_eq!(feature.semver_build_token(), "anpf1-ibt1");
-    assert_eq!(NodeProtocolFeature::ALL.len(), 18);
     assert_eq!(NodeProtocolFeature::ALL[17], feature);
 
     let identity = IdentityKeyPair::from_bytes(&[0x9b; 32]).expect("identity");
+    let descriptor = descriptor_for(&identity).with_protocol_features([feature]);
+    assert!(descriptor.advertises_protocol_feature(feature));
+    let signed = SignedNodeDescriptor::sign(descriptor, &identity).expect("sign descriptor");
+    assert!(signed.verify_at(1_700_000_100).is_ok());
+    let mut stripped = signed;
+    stripped.descriptor.software_version = "0.1.0".to_string();
+    assert!(stripped.verify_at(1_700_000_100).is_err());
+}
+
+#[test]
+fn anonymous_mailbox_pull_classes_feature_is_signed_and_append_only() {
+    // [ANONYMOUS-MAILBOX-PULL-CLASSES 2026-10-17 by Claude] Appended after
+    // every existing feature; earlier tokens and their order are unchanged.
+    let feature = NodeProtocolFeature::AnonymousMailboxPullClassesV1;
+    assert_eq!(feature.semver_build_token(), "anpf1-ampc1");
+    assert_eq!(NodeProtocolFeature::ALL.len(), 19);
+    assert_eq!(NodeProtocolFeature::ALL[18], feature);
+
+    let identity = IdentityKeyPair::from_bytes(&[0x9c; 32]).expect("identity");
     let descriptor = descriptor_for(&identity).with_protocol_features([feature]);
     assert!(descriptor.advertises_protocol_feature(feature));
     let signed = SignedNodeDescriptor::sign(descriptor, &identity).expect("sign descriptor");

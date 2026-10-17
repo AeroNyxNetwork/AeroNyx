@@ -102,6 +102,7 @@ const MAGIC: [u8; 2] = [0x41, 0x4d];
 const HEADER_BYTES: usize = 8;
 const BODY_BYTES: u64 = (MAX_ANONYMOUS_MAILBOX_TERMINAL_FRAME_BYTES - HEADER_BYTES) as u64;
 const PULL_RESULT_MAGIC: [u8; 4] = [0x41, 0x4d, 0x01, 0x01];
+const PULL_RESULT_CLASSED_MAGIC: [u8; 4] = [0x41, 0x4d, 0x01, 0x02];
 const SOURCE_SEALED_RESPONSE_MAGIC: [u8; 4] = *b"AMSR";
 const SOURCE_SEALED_RESPONSE_VERSION_V1: u8 = 1;
 const SOURCE_SEALED_RESPONSE_PREFIX_BYTES: usize = 4 + 1 + 32 + 24 + 4;
@@ -124,6 +125,43 @@ pub const ANONYMOUS_MAILBOX_PULL_RESULT_BYTES: usize = 4
     + 2
     + MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES
     + MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES;
+
+/// PullOne `version` that asks the terminal for a class-padded result
+/// ([`AnonymousMailboxPullResultV1::encode_classed`]). Every other request type
+/// stays at [`ANONYMOUS_MAILBOX_VERSION_V1`].
+///
+/// [ANONYMOUS-MAILBOX-PULL-CLASSES 2026-10-17 by Claude] A source sends this only
+/// to a terminal that signs `NodeProtocolFeature::AnonymousMailboxPullClassesV1`;
+/// a pre-feature terminal never sees it.
+pub const ANONYMOUS_MAILBOX_PULL_VERSION_CLASSED: u8 = 2;
+
+/// Sealed-item slots of a class-padded pull result, smallest first.
+///
+/// [ANONYMOUS-MAILBOX-PULL-CLASSES 2026-10-17 by Claude] The fixed V1 image
+/// carries every item as 163130 bytes, so a short text costs the reader a
+/// ~160-KiB onion response (5-17 s through a weak entry, measured 10-09). The
+/// first four slots are exactly the recipient-seal item sizes (4/16/64/128-KiB
+/// plaintext slot + 108 bytes of seal framing): a recipient-sealed item goes out
+/// with no padding at all, and the result reveals only the class that the
+/// item's stored length already shows the terminal, and its Put showed the
+/// entry. The last slot is the codec maximum, for any other opaque item.
+pub const ANONYMOUS_MAILBOX_PULL_RESULT_CLASSED_SLOTS: [usize; 5] = [
+    4_204,
+    16_492,
+    65_644,
+    131_180,
+    MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES,
+];
+
+/// Fixed bytes before the sealed-item block in both pull-result images.
+const PULL_RESULT_PREFIX_BYTES: usize = 4 + 16 + 32 + 4 + 2 + MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES;
+
+/// Smallest class-padded slot that holds `sealed_len` bytes.
+fn pull_result_classed_slot(sealed_len: usize) -> Option<usize> {
+    ANONYMOUS_MAILBOX_PULL_RESULT_CLASSED_SLOTS
+        .into_iter()
+        .find(|slot| sealed_len <= *slot)
+}
 
 /// Privacy-safe, coarse mailbox protocol failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -260,6 +298,13 @@ fn response_payload_bytes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
 
 fn version(value: u8) -> Result<(), AnonymousMailboxProtocolError> {
     (value == ANONYMOUS_MAILBOX_VERSION_V1)
+        .then_some(())
+        .ok_or(AnonymousMailboxProtocolError::UnsupportedVersion)
+}
+
+/// PullOne alone may also carry [`ANONYMOUS_MAILBOX_PULL_VERSION_CLASSED`].
+fn pull_version(value: u8) -> Result<(), AnonymousMailboxProtocolError> {
+    (value == ANONYMOUS_MAILBOX_VERSION_V1 || value == ANONYMOUS_MAILBOX_PULL_VERSION_CLASSED)
         .then_some(())
         .ok_or(AnonymousMailboxProtocolError::UnsupportedVersion)
 }
@@ -1054,8 +1099,46 @@ impl AnonymousMailboxPullOneV1 {
         requested_at: u64,
         reader: &IdentityKeyPair,
     ) -> Result<Self, AnonymousMailboxProtocolError> {
+        Self::new_with_version(
+            ANONYMOUS_MAILBOX_VERSION_V1,
+            mailbox_id,
+            request_id,
+            cursor,
+            requested_at,
+            reader,
+        )
+    }
+
+    /// Creates one signed pull request that asks for a class-padded result.
+    /// Send it only to a terminal advertising
+    /// `NodeProtocolFeature::AnonymousMailboxPullClassesV1`.
+    pub fn new_classed(
+        mailbox_id: [u8; 32],
+        request_id: [u8; 16],
+        cursor: Vec<u8>,
+        requested_at: u64,
+        reader: &IdentityKeyPair,
+    ) -> Result<Self, AnonymousMailboxProtocolError> {
+        Self::new_with_version(
+            ANONYMOUS_MAILBOX_PULL_VERSION_CLASSED,
+            mailbox_id,
+            request_id,
+            cursor,
+            requested_at,
+            reader,
+        )
+    }
+
+    fn new_with_version(
+        version: u8,
+        mailbox_id: [u8; 32],
+        request_id: [u8; 16],
+        cursor: Vec<u8>,
+        requested_at: u64,
+        reader: &IdentityKeyPair,
+    ) -> Result<Self, AnonymousMailboxProtocolError> {
         let mut value = Self {
-            version: ANONYMOUS_MAILBOX_VERSION_V1,
+            version,
             mailbox_id,
             request_id,
             cursor,
@@ -1065,9 +1148,16 @@ impl AnonymousMailboxPullOneV1 {
         value.signature = reader.sign(&value.signing_bytes()?);
         Ok(value)
     }
-    /// Returns the domain-separated pull transcript.
+    /// True when this request asks for a class-padded result.
+    #[must_use]
+    pub fn wants_classed_result(&self) -> bool {
+        self.version == ANONYMOUS_MAILBOX_PULL_VERSION_CLASSED
+    }
+
+    /// Returns the domain-separated pull transcript. The version byte is
+    /// signed, so a relay cannot change which result image is returned.
     pub fn signing_bytes(&self) -> Result<Vec<u8>, AnonymousMailboxProtocolError> {
-        version(self.version)?;
+        pull_version(self.version)?;
         let mut data = Vec::with_capacity(PULL_DOMAIN.len() + 93);
         data.extend_from_slice(PULL_DOMAIN);
         data.push(self.version);
@@ -1495,6 +1585,22 @@ impl AnonymousMailboxPullResultV1 {
 
     /// Returns the exact fixed-width wire bytes.
     pub fn encode(&self) -> Result<Vec<u8>, AnonymousMailboxProtocolError> {
+        self.encode_padded(PULL_RESULT_MAGIC, MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES)
+    }
+
+    /// Returns the class-padded wire bytes: the sealed item fills the smallest
+    /// [`ANONYMOUS_MAILBOX_PULL_RESULT_CLASSED_SLOTS`] entry that holds it.
+    pub fn encode_classed(&self) -> Result<Vec<u8>, AnonymousMailboxProtocolError> {
+        let slot = pull_result_classed_slot(self.sealed_item.len())
+            .ok_or(AnonymousMailboxProtocolError::TooLarge)?;
+        self.encode_padded(PULL_RESULT_CLASSED_MAGIC, slot)
+    }
+
+    fn encode_padded(
+        &self,
+        magic: [u8; 4],
+        item_slot: usize,
+    ) -> Result<Vec<u8>, AnonymousMailboxProtocolError> {
         if self.cursor.len() > MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES
             || self.sealed_item.len() > MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES
         {
@@ -1511,8 +1617,12 @@ impl AnonymousMailboxPullResultV1 {
             .map_err(|_| AnonymousMailboxProtocolError::TooLarge)?;
         let sealed_len = u32::try_from(self.sealed_item.len())
             .map_err(|_| AnonymousMailboxProtocolError::TooLarge)?;
-        let mut encoded = Vec::with_capacity(ANONYMOUS_MAILBOX_PULL_RESULT_BYTES);
-        encoded.extend_from_slice(&PULL_RESULT_MAGIC);
+        if self.sealed_item.len() > item_slot {
+            return Err(AnonymousMailboxProtocolError::TooLarge);
+        }
+        let total = PULL_RESULT_PREFIX_BYTES + item_slot;
+        let mut encoded = Vec::with_capacity(total);
+        encoded.extend_from_slice(&magic);
         encoded.extend_from_slice(&self.item_id);
         encoded.extend_from_slice(&self.sealed_commitment);
         encoded.extend_from_slice(&sealed_len.to_le_bytes());
@@ -1520,7 +1630,7 @@ impl AnonymousMailboxPullResultV1 {
         encoded.extend_from_slice(&self.cursor);
         encoded.resize(58 + MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES, 0);
         encoded.extend_from_slice(&self.sealed_item);
-        encoded.resize(ANONYMOUS_MAILBOX_PULL_RESULT_BYTES, 0);
+        encoded.resize(total, 0);
         Ok(encoded)
     }
 
@@ -1530,6 +1640,37 @@ impl AnonymousMailboxPullResultV1 {
         {
             return Err(AnonymousMailboxProtocolError::Malformed);
         }
+        Self::decode_padded(encoded)
+    }
+
+    /// Decodes one exact canonical class-padded pull result. The slot must be a
+    /// listed class and the smallest one that holds the item, so the padding
+    /// length cannot carry anything.
+    pub fn decode_classed(encoded: &[u8]) -> Result<Self, AnonymousMailboxProtocolError> {
+        if encoded.len() < PULL_RESULT_PREFIX_BYTES || encoded[..4] != PULL_RESULT_CLASSED_MAGIC {
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        let slot = encoded.len() - PULL_RESULT_PREFIX_BYTES;
+        if !ANONYMOUS_MAILBOX_PULL_RESULT_CLASSED_SLOTS.contains(&slot) {
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        let decoded = Self::decode_padded(encoded)?;
+        if pull_result_classed_slot(decoded.sealed_item.len()) != Some(slot) {
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
+        Ok(decoded)
+    }
+
+    /// Decodes either canonical image, chosen by its magic.
+    pub fn decode_any(encoded: &[u8]) -> Result<Self, AnonymousMailboxProtocolError> {
+        match encoded.get(..4) {
+            Some(magic) if magic == PULL_RESULT_MAGIC => Self::decode(encoded),
+            Some(magic) if magic == PULL_RESULT_CLASSED_MAGIC => Self::decode_classed(encoded),
+            _ => Err(AnonymousMailboxProtocolError::Malformed),
+        }
+    }
+
+    fn decode_padded(encoded: &[u8]) -> Result<Self, AnonymousMailboxProtocolError> {
         let item_id = fixed::<16>(&encoded[4..20])?;
         let sealed_commitment = fixed::<32>(&encoded[20..52])?;
         let sealed_len = u32::from_le_bytes(fixed::<4>(&encoded[52..56])?) as usize;
@@ -1540,8 +1681,11 @@ impl AnonymousMailboxPullResultV1 {
         {
             return Err(AnonymousMailboxProtocolError::Malformed);
         }
-        let cursor_block = &encoded[58..58 + MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES];
-        let item_block = &encoded[58 + MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES..];
+        let cursor_block = &encoded[58..PULL_RESULT_PREFIX_BYTES];
+        let item_block = &encoded[PULL_RESULT_PREFIX_BYTES..];
+        if sealed_len > item_block.len() {
+            return Err(AnonymousMailboxProtocolError::Malformed);
+        }
         if cursor_block[cursor_len..].iter().any(|byte| *byte != 0)
             || item_block[sealed_len..].iter().any(|byte| *byte != 0)
         {
@@ -3114,6 +3258,165 @@ mod tests {
             ),
             Err(AnonymousMailboxProtocolError::TooLarge)
         ));
+    }
+
+    // [ANONYMOUS-MAILBOX-PULL-CLASSES 2026-10-17 by Claude]
+    fn classed_fixture(sealed_len: usize) -> AnonymousMailboxPullResultV1 {
+        AnonymousMailboxPullResultV1::new([0x11; 16], vec![0x33, 0x44], vec![0xab; sealed_len])
+            .expect("pull result")
+    }
+
+    #[test]
+    fn pull_result_classed_slot_is_the_smallest_that_holds_the_item() {
+        let prefix = 4 + 16 + 32 + 4 + 2 + MAX_ANONYMOUS_MAILBOX_CURSOR_BYTES;
+        for (sealed_len, slot) in [
+            (1, 4_204),
+            (4_204, 4_204),
+            (4_205, 16_492),
+            (16_492, 16_492),
+            (16_493, 65_644),
+            (65_644, 65_644),
+            (65_645, 131_180),
+            (131_180, 131_180),
+            (131_181, MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES),
+            (
+                MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES,
+                MAX_ANONYMOUS_MAILBOX_SEALED_ITEM_BYTES,
+            ),
+        ] {
+            let fixture = classed_fixture(sealed_len);
+            let encoded = fixture.encode_classed().expect("encode classed");
+            assert_eq!(encoded.len(), prefix + slot, "item {sealed_len}");
+            assert_eq!(&encoded[..4], &[0x41, 0x4d, 0x01, 0x02]);
+            let decoded = AnonymousMailboxPullResultV1::decode_classed(&encoded).expect("decode");
+            assert_eq!(decoded, fixture);
+            assert_eq!(decoded.encode_classed().expect("re-encode"), encoded);
+            assert_eq!(
+                AnonymousMailboxPullResultV1::decode_any(&encoded).expect("any"),
+                fixture
+            );
+        }
+        // The largest class is the V1 image's item block: never larger than V1.
+        assert_eq!(
+            prefix + ANONYMOUS_MAILBOX_PULL_RESULT_CLASSED_SLOTS[4],
+            ANONYMOUS_MAILBOX_PULL_RESULT_BYTES
+        );
+    }
+
+    #[test]
+    fn pull_result_classed_rejects_drift_without_panicking() {
+        let encoded = classed_fixture(10).encode_classed().expect("encode");
+        let prefix = encoded.len() - 4_204;
+        let reject = |bytes: &[u8]| {
+            assert_eq!(
+                AnonymousMailboxPullResultV1::decode_classed(bytes),
+                Err(AnonymousMailboxProtocolError::Malformed)
+            );
+        };
+        // A slot that is not a listed class.
+        reject(&encoded[..encoded.len() - 1]);
+        let mut longer = encoded.clone();
+        longer.push(0);
+        reject(&longer);
+        // A listed class that is not the smallest one for the item: the
+        // padding length would otherwise be a free channel.
+        let mut oversized = encoded.clone();
+        oversized.resize(prefix + 16_492, 0);
+        reject(&oversized);
+        // Non-zero item padding and non-zero cursor padding.
+        let mut bad = encoded.clone();
+        let last = bad.len() - 1;
+        bad[last] = 1;
+        reject(&bad);
+        let mut bad = encoded.clone();
+        bad[60] = 1;
+        reject(&bad);
+        // A sealed length past the carried slot.
+        let mut bad = encoded.clone();
+        bad[52..56].copy_from_slice(&4_205u32.to_le_bytes());
+        reject(&bad);
+        // Wrong or truncated magic; the V1 decoder never takes a classed image.
+        let mut bad = encoded.clone();
+        bad[3] = 0x01;
+        reject(&bad);
+        reject(&encoded[..3]);
+        reject(&[]);
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode(&encoded),
+            Err(AnonymousMailboxProtocolError::Malformed)
+        );
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode_any(&[0x41, 0x4d, 0x01, 0x03]),
+            Err(AnonymousMailboxProtocolError::Malformed)
+        );
+        // A changed item no longer matches its commitment.
+        let mut bad = encoded.clone();
+        bad[prefix] ^= 1;
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode_classed(&bad),
+            Err(AnonymousMailboxProtocolError::ClaimsConflict)
+        );
+    }
+
+    #[test]
+    fn pull_result_v1_image_is_unchanged_and_still_decodes_through_any() {
+        let fixture = pull_result_fixture();
+        let encoded = fixture.encode().expect("encode");
+        assert_eq!(encoded.len(), ANONYMOUS_MAILBOX_PULL_RESULT_BYTES);
+        assert_eq!(&encoded[..4], &PULL_RESULT_MAGIC);
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode_any(&encoded).expect("any"),
+            fixture
+        );
+        assert_eq!(
+            AnonymousMailboxPullResultV1::decode_classed(&encoded),
+            Err(AnonymousMailboxProtocolError::Malformed)
+        );
+    }
+
+    #[test]
+    fn classed_pull_request_signs_its_version_and_nothing_else_widens() {
+        let reader = IdentityKeyPair::from_bytes(&[0x93; 32]).expect("reader");
+        let mailbox_id = [0x94; 32];
+        let plain =
+            AnonymousMailboxPullOneV1::new(mailbox_id, [7; 16], vec![1], 1_800_000_000, &reader)
+                .expect("v1 pull");
+        let classed = AnonymousMailboxPullOneV1::new_classed(
+            mailbox_id,
+            [7; 16],
+            vec![1],
+            1_800_000_000,
+            &reader,
+        )
+        .expect("classed pull");
+        assert!(!plain.wants_classed_result());
+        assert!(classed.wants_classed_result());
+        assert_eq!(classed.version, ANONYMOUS_MAILBOX_PULL_VERSION_CLASSED);
+        classed
+            .verify_at(&reader.public_key_bytes(), 1_800_000_000)
+            .expect("classed pull verifies");
+        assert_ne!(
+            plain.request_commitment().expect("v1 commitment"),
+            classed.request_commitment().expect("classed commitment")
+        );
+        // A relay flipping the version invalidates the reader's signature.
+        let mut flipped = plain.clone();
+        flipped.version = ANONYMOUS_MAILBOX_PULL_VERSION_CLASSED;
+        assert_eq!(
+            flipped.verify_at(&reader.public_key_bytes(), 1_800_000_000),
+            Err(AnonymousMailboxProtocolError::SignatureRejected)
+        );
+        let mut unknown = plain.clone();
+        unknown.version = 3;
+        assert_eq!(
+            unknown.verify_at(&reader.public_key_bytes(), 1_800_000_000),
+            Err(AnonymousMailboxProtocolError::UnsupportedVersion)
+        );
+        // Version 2 is a PullOne-only value: other requests still reject it.
+        assert_eq!(
+            version(ANONYMOUS_MAILBOX_PULL_VERSION_CLASSED),
+            Err(AnonymousMailboxProtocolError::UnsupportedVersion)
+        );
     }
 
     #[test]
