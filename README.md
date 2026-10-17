@@ -21,8 +21,9 @@ What you can and cannot check from here: the **node-side** guarantee — that a 
 The node never needs plaintext to do its job. Each mechanism below is implemented in this repository:
 
 - **Blind relay.** Nodes forward sealed envelopes between devices and see only an envelope, its size and where to hand it next — not the content, and not the sender's or recipient's keys (`aeronyx-core::protocol`, `aeronyx-server`).
-- **Layered onion routing.** A message is wrapped in one encryption layer per hop (ephemeral X25519 → ECDH → HKDF-SHA256 → XChaCha20-Poly1305), so each relay can peel only its own layer and learns only the next hop. A route of **two hops** means no single node knows both ends. In the app this route is used for messages and is **opt-in today**, not the default. Relay keys rotate every 24 hours and live in memory only, for forward secrecy (`aeronyx-core/src/protocol/onion.rs`, `aeronyx-server/src/services/onion_keys.rs`).
+- **Layered onion routing.** A message is wrapped in one encryption layer per hop (ephemeral X25519 → ECDH → HKDF-SHA256 → XChaCha20-Poly1305), so each relay can peel only its own layer and learns only the next hop. A route of **two hops** means no single node links your network address to who you are writing to: the first hop sees your address, the last hop sees the sender and recipient keys but not your address, and it hands the message to the receiver's relay inbox. In the app this route is used for messages and is **opt-in today**, not the default. Relay keys rotate every 24 hours and live in memory only, for forward secrecy (`aeronyx-core/src/protocol/onion.rs`, `aeronyx-server/src/services/onion_keys.rs`).
 - **Signed node discovery.** Nodes publish Ed25519-signed descriptors (including the key clients use to build onion layers). Peers verify a descriptor before treating a node as live (`aeronyx-core/src/protocol/discovery.rs`).
+- **Identity-bound TLS.** A node proves its HTTPS endpoint with its own Ed25519 identity instead of a domain name and a certificate authority: the TLS certificate carries a signature by the node identity over its own key. Nodes use it between each other when a peer advertises it (`crates/aeronyx-node-tls`, `crates/aeronyx-server/src/api/peer_tls.rs`).
 - **Blind admission.** Admission tokens use RFC 9474 blind signatures, issued by a separate, isolated process that holds the private key, so the issuer cannot link a token to the person it was issued to (`aeronyx-blind-issuer`, `deploy/blind-issuer`).
 - **Node-blind memory storage (MemChain).** Nodes store device-encrypted records and keyed blind indexes; encryption, decryption and search happen on the user's device. Design: [`docs/memchain-node-blind-refactor.md`](docs/memchain-node-blind-refactor.md), [`docs/memchain-blind-cognition-design.md`](docs/memchain-blind-cognition-design.md).
 - **VPN transport.** A UDP tunnel with a TUN device abstraction (`aeronyx-transport`). It is a single-node tunnel: like any VPN, the node you connect through can see where your traffic is going (but not the contents of encrypted connections). See [`docs/rust-vpn-transport-fallback-dev.md`](docs/rust-vpn-transport-fallback-dev.md).
@@ -59,6 +60,8 @@ To run a node, start from [`deploy/node/README.md`](deploy/node/README.md) and [
 | `crates/aeronyx-core` | Protocol definitions and cryptography |
 | `crates/aeronyx-server` | The node binary and orchestration |
 | `crates/aeronyx-transport` | Network I/O and TUN device abstraction |
+| `crates/aeronyx-mailbox-wire` | Anonymous-mailbox wire format shared by the node and the client |
+| `crates/aeronyx-node-tls` | Identity-bound TLS: certificate generation and verification |
 | `crates/aeronyx-common` | Shared utilities and types |
 | `crates/aeronyx-blind-issuer` | Isolated RFC 9474 blind-signing service |
 | `deploy/` | Install, upgrade, health-check and systemd material |
