@@ -141,7 +141,7 @@ fn verify_standard_response(
             if response.sealed_payload.is_empty() {
                 Ok(())
             } else {
-                AnonymousMailboxPullResultV1::decode(&response.sealed_payload)
+                AnonymousMailboxPullResultV1::decode_any(&response.sealed_payload)
                     .map(|_| ())
                     .map_err(|_| AnonymousMailboxSourceError::Rejected)
             }

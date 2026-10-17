@@ -309,6 +309,70 @@ fn deterministic_frames_are_byte_identical() {
     assert_eq!(core_response.signature, wire_response.signature);
 }
 
+// [ANONYMOUS-MAILBOX-PULL-CLASSES 2026-10-17 by Claude] The client-side wire
+// crate and the node agree byte for byte on the classed request and result,
+// in both directions.
+#[test]
+fn classed_pull_request_and_result_are_byte_identical() {
+    let (core_reader, wire_reader) = keys(0x61);
+    let mailbox_id = [0x62; 32];
+    let core_pull = core_mb::AnonymousMailboxPullOneV1::new_classed(
+        mailbox_id,
+        [0x63; 16],
+        vec![9; 12],
+        T0,
+        &core_reader,
+    )
+    .unwrap();
+    let wire_pull = wire_mb::AnonymousMailboxPullOneV1::new_classed(
+        mailbox_id,
+        [0x63; 16],
+        vec![9; 12],
+        T0,
+        &wire_reader,
+    )
+    .unwrap();
+    assert_eq!(
+        core_pull.signing_bytes().unwrap(),
+        wire_pull.signing_bytes().unwrap()
+    );
+    assert_eq!(core_pull.signature, wire_pull.signature);
+    assert!(core_pull.wants_classed_result() && wire_pull.wants_classed_result());
+
+    for sealed_len in [1usize, 4_204, 4_205, 131_181] {
+        let core_result = core_mb::AnonymousMailboxPullResultV1::new(
+            [0x64; 16],
+            vec![0x65; 3],
+            vec![0x66; sealed_len],
+        )
+        .unwrap();
+        let wire_result = wire_mb::AnonymousMailboxPullResultV1::new(
+            [0x64; 16],
+            vec![0x65; 3],
+            vec![0x66; sealed_len],
+        )
+        .unwrap();
+        let core_bytes = core_result.encode_classed().unwrap();
+        assert_eq!(
+            core_bytes,
+            wire_result.encode_classed().unwrap(),
+            "item {sealed_len}"
+        );
+        assert_eq!(
+            wire_mb::AnonymousMailboxPullResultV1::decode_classed(&core_bytes).unwrap(),
+            wire_result
+        );
+        assert_eq!(
+            core_mb::AnonymousMailboxPullResultV1::decode_any(&core_bytes).unwrap(),
+            core_result
+        );
+    }
+    assert_eq!(
+        core_mb::ANONYMOUS_MAILBOX_PULL_RESULT_CLASSED_SLOTS,
+        wire_mb::ANONYMOUS_MAILBOX_PULL_RESULT_CLASSED_SLOTS
+    );
+}
+
 #[test]
 fn chat_and_blind_relay_envelopes_are_byte_identical() {
     let (core_sender, wire_sender) = keys(0x51);

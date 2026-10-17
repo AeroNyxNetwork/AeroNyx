@@ -551,6 +551,11 @@ fn self_discovery_descriptor_publishes_work_policy_only_when_mailbox_runtime_is_
     assert!(!disabled
         .descriptor
         .advertises_protocol_feature(NodeProtocolFeature::AnonymousMailboxV1));
+    // [ANONYMOUS-MAILBOX-PULL-CLASSES 2026-10-17 by Claude] Classed pulls are
+    // claimed only together with the live mailbox terminal.
+    assert!(!disabled
+        .descriptor
+        .advertises_protocol_feature(NodeProtocolFeature::AnonymousMailboxPullClassesV1));
     assert_eq!(
         disabled.anonymous_mailbox_work_policy_at(1_800_000_001),
         Err(AnonymousMailboxWorkPolicyError::MissingPolicy)
@@ -564,6 +569,12 @@ fn self_discovery_descriptor_publishes_work_policy_only_when_mailbox_runtime_is_
         true,
     )
     .expect("ready descriptor");
+    assert!(ready
+        .descriptor
+        .advertises_protocol_feature(NodeProtocolFeature::AnonymousMailboxV1));
+    assert!(ready
+        .descriptor
+        .advertises_protocol_feature(NodeProtocolFeature::AnonymousMailboxPullClassesV1));
     let pin = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&ready).expect("pin");
     let policy = ready
         .anonymous_mailbox_work_policy_for_pin_at(&pin, 1_800_000_001)

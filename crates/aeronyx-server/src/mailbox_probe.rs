@@ -55,7 +55,7 @@ use aeronyx_core::protocol::anonymous_mailbox::{
     AnonymousMailboxSourceTerminalCarrierV1, AnonymousMailboxTerminalFrameV1,
     AnonymousMailboxTerminalResponseV1, AnonymousMailboxTicketIssueV1,
 };
-use aeronyx_core::protocol::discovery::SignedNodeDescriptor;
+use aeronyx_core::protocol::discovery::{NodeProtocolFeature, SignedNodeDescriptor};
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
 use aeronyx_core::protocol::onion::{OnionRoutePurpose, VerifiedOnionRoute};
 use aeronyx_server::api::chat_peer::{PeerBlindRelayRequest, PeerBlindRelayResponse};
@@ -97,6 +97,10 @@ pub struct MailboxProbeReport {
     pub steps: Vec<MailboxProbeStep>,
     pub pulled_bytes_match: bool,
     pub empty_after_ack: bool,
+    /// `classed` when the terminal signs `anpf1-ampc1`, else `fixed_v1`.
+    pub pull_result_image: &'static str,
+    /// Bytes of the pull result that carried the deposited item.
+    pub pull_result_bytes: usize,
 }
 
 /// One lifecycle step.
@@ -130,6 +134,11 @@ pub async fn run(options: MailboxProbeOptions) -> Result<MailboxProbeReport> {
                 .ok_or_else(|| anyhow!("entry descriptor not offered by any seed"))?,
         );
     }
+    // [ANONYMOUS-MAILBOX-PULL-CLASSES 2026-10-17 by Claude] Ask for the
+    // class-padded image only from a terminal that signed the feature.
+    let classed_pulls = target
+        .descriptor
+        .advertises_protocol_feature(NodeProtocolFeature::AnonymousMailboxPullClassesV1);
     path.push(target);
 
     let probe = Probe {
@@ -137,6 +146,7 @@ pub async fn run(options: MailboxProbeOptions) -> Result<MailboxProbeReport> {
         path,
         target_id,
         source: IdentityKeyPair::generate(),
+        classed_pulls,
     };
     let reader = IdentityKeyPair::generate();
     let depositor = IdentityKeyPair::generate();
@@ -240,7 +250,8 @@ pub async fn run(options: MailboxProbeOptions) -> Result<MailboxProbeReport> {
 
     // 4. Pull: what the recipient does.
     let pulled = probe.pull(mailbox_id, &reader, &mut steps).await?;
-    let pulled = pulled.ok_or_else(|| anyhow!("pull returned an empty mailbox after put"))?;
+    let (pulled, pull_result_bytes) =
+        pulled.ok_or_else(|| anyhow!("pull returned an empty mailbox after put"))?;
     let pulled_bytes_match = pulled.item_id == put_id && pulled.sealed_item == sealed;
     ensure!(
         pulled_bytes_match,
@@ -283,6 +294,12 @@ pub async fn run(options: MailboxProbeOptions) -> Result<MailboxProbeReport> {
         steps,
         pulled_bytes_match,
         empty_after_ack,
+        pull_result_image: if probe.classed_pulls {
+            "classed"
+        } else {
+            "fixed_v1"
+        },
+        pull_result_bytes,
     })
 }
 
@@ -293,6 +310,8 @@ struct Probe {
     target_id: [u8; 32],
     /// Ephemeral onion source; never a node identity.
     source: IdentityKeyPair,
+    /// The terminal signs `anpf1-ampc1`: pulls ask for the class-padded image.
+    classed_pulls: bool,
 }
 
 impl Probe {
@@ -408,15 +427,14 @@ impl Probe {
         mailbox_id: [u8; 32],
         reader: &IdentityKeyPair,
         steps: &mut Vec<MailboxProbeStep>,
-    ) -> Result<Option<AnonymousMailboxPullResultV1>> {
-        let pull = AnonymousMailboxPullOneV1::new(
-            mailbox_id,
-            random_bytes(),
-            Vec::new(),
-            unix_now()?,
-            reader,
-        )
-        .map_err(|error| anyhow!("pull request: {error:?}"))?;
+    ) -> Result<Option<(AnonymousMailboxPullResultV1, usize)>> {
+        let build = if self.classed_pulls {
+            AnonymousMailboxPullOneV1::new_classed
+        } else {
+            AnonymousMailboxPullOneV1::new
+        };
+        let pull = build(mailbox_id, random_bytes(), Vec::new(), unix_now()?, reader)
+            .map_err(|error| anyhow!("pull request: {error:?}"))?;
         let (request_id, commitment) = (
             pull.request_id,
             pull.request_commitment()
@@ -436,8 +454,13 @@ impl Probe {
         if response.sealed_payload.is_empty() {
             return Ok(None);
         }
-        AnonymousMailboxPullResultV1::decode(&response.sealed_payload)
-            .map(Some)
+        let decoded = if self.classed_pulls {
+            AnonymousMailboxPullResultV1::decode_classed(&response.sealed_payload)
+        } else {
+            AnonymousMailboxPullResultV1::decode(&response.sealed_payload)
+        };
+        decoded
+            .map(|result| Some((result, response.sealed_payload.len())))
             .map_err(|error| anyhow!("pull result: {error:?}"))
     }
 }
